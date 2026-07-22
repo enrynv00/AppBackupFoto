@@ -6,19 +6,47 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		3A446D61B0186E1CA084FF0B /* FileSyncerZeroOverwriteTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 94D134C109F6886D8DF115AF /* FileSyncerZeroOverwriteTests.swift */; };
+		3CF547AB089EA250EFD3FC89 /* Cocoa.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 52AB12F7AD7661DE5D3BEC12 /* Cocoa.framework */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		BA9C1A977AFA2D1CEC5C3512 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 695F432F2EB019B300509478 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 695F43362EB019B300509478;
+			remoteInfo = AppBackupFoto;
+		};
+/* End PBXContainerItemProxy section */
+
 /* Begin PBXFileReference section */
+		0B1238E639189FC0CBF32924 /* AppBackupFotoTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = AppBackupFotoTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		52AB12F7AD7661DE5D3BEC12 /* Cocoa.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Cocoa.framework; path = Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.0.sdk/System/Library/Frameworks/Cocoa.framework; sourceTree = DEVELOPER_DIR; };
 		695F43372EB019B300509478 /* AppBackupFoto.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = AppBackupFoto.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		94D134C109F6886D8DF115AF /* FileSyncerZeroOverwriteTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = FileSyncerZeroOverwriteTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		695F43392EB019B300509478 /* AppBackupFoto */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+			);
 			path = AppBackupFoto;
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
+		25BC34F576C4333B26E93427 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				3CF547AB089EA250EFD3FC89 /* Cocoa.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		695F43342EB019B300509478 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
@@ -29,11 +57,30 @@
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
+		0EE75A5DDCFD1660BC48D2D1 /* OS X */ = {
+			isa = PBXGroup;
+			children = (
+				52AB12F7AD7661DE5D3BEC12 /* Cocoa.framework */,
+			);
+			name = "OS X";
+			sourceTree = "<group>";
+		};
+		11123F514533138A989F11C4 /* AppBackupFotoTests */ = {
+			isa = PBXGroup;
+			children = (
+				94D134C109F6886D8DF115AF /* FileSyncerZeroOverwriteTests.swift */,
+			);
+			name = AppBackupFotoTests;
+			path = AppBackupFotoTests;
+			sourceTree = "<group>";
+		};
 		695F432E2EB019B300509478 = {
 			isa = PBXGroup;
 			children = (
 				695F43392EB019B300509478 /* AppBackupFoto */,
 				695F43382EB019B300509478 /* Products */,
+				B4ACE950B7204C71D325655C /* Frameworks */,
+				11123F514533138A989F11C4 /* AppBackupFotoTests */,
 			);
 			sourceTree = "<group>";
 		};
@@ -41,8 +88,17 @@
 			isa = PBXGroup;
 			children = (
 				695F43372EB019B300509478 /* AppBackupFoto.app */,
+				0B1238E639189FC0CBF32924 /* AppBackupFotoTests.xctest */,
 			);
 			name = Products;
+			sourceTree = "<group>";
+		};
+		B4ACE950B7204C71D325655C /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				0EE75A5DDCFD1660BC48D2D1 /* OS X */,
+			);
+			name = Frameworks;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -64,11 +120,27 @@
 				695F43392EB019B300509478 /* AppBackupFoto */,
 			);
 			name = AppBackupFoto;
-			packageProductDependencies = (
-			);
 			productName = AppBackupFoto;
 			productReference = 695F43372EB019B300509478 /* AppBackupFoto.app */;
 			productType = "com.apple.product-type.application";
+		};
+		F399FBA58764FECFCE7A060E /* AppBackupFotoTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 4EB5B41EC484A7ED2F34BFD6 /* Build configuration list for PBXNativeTarget "AppBackupFotoTests" */;
+			buildPhases = (
+				62FE197CBAC2C2E908580583 /* Sources */,
+				25BC34F576C4333B26E93427 /* Frameworks */,
+				027DCE7435EADC606FCF33B3 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				BF9DB7CC8652E1D284D73BDE /* PBXTargetDependency */,
+			);
+			name = AppBackupFotoTests;
+			productName = AppBackupFotoTests;
+			productReference = 0B1238E639189FC0CBF32924 /* AppBackupFotoTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
 		};
 /* End PBXNativeTarget section */
 
@@ -100,11 +172,19 @@
 			projectRoot = "";
 			targets = (
 				695F43362EB019B300509478 /* AppBackupFoto */,
+				F399FBA58764FECFCE7A060E /* AppBackupFotoTests */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
+		027DCE7435EADC606FCF33B3 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		695F43352EB019B300509478 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -115,6 +195,14 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
+		62FE197CBAC2C2E908580583 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				3A446D61B0186E1CA084FF0B /* FileSyncerZeroOverwriteTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		695F43332EB019B300509478 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -124,7 +212,64 @@
 		};
 /* End PBXSourcesBuildPhase section */
 
+/* Begin PBXTargetDependency section */
+		BF9DB7CC8652E1D284D73BDE /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			name = AppBackupFoto;
+			target = 695F43362EB019B300509478 /* AppBackupFoto */;
+			targetProxy = BA9C1A977AFA2D1CEC5C3512 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
 /* Begin XCBuildConfiguration section */
+		2D0090318939D3DB46737EB4 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = 653B4PS24A;
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@loader_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 15.6;
+				PRODUCT_BUNDLE_IDENTIFIER = enri.AppBackupFotoTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 5.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/AppBackupFoto.app/Contents/MacOS/AppBackupFoto";
+			};
+			name = Debug;
+		};
+		49DAA68A6D45035259CEE8FD /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = 653B4PS24A;
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@loader_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 15.6;
+				PRODUCT_BUNDLE_IDENTIFIER = enri.AppBackupFotoTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 5.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/AppBackupFoto.app/Contents/MacOS/AppBackupFoto";
+			};
+			name = Release;
+		};
 		695F43402EB019B400509478 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -250,14 +395,14 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "-";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 653B4PS24A;
-				ENABLE_APP_SANDBOX = YES;
+				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
-				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -282,14 +427,14 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "-";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 653B4PS24A;
-				ENABLE_APP_SANDBOX = YES;
+				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
-				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -312,6 +457,15 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
+		4EB5B41EC484A7ED2F34BFD6 /* Build configuration list for PBXNativeTarget "AppBackupFotoTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				49DAA68A6D45035259CEE8FD /* Release */,
+				2D0090318939D3DB46737EB4 /* Debug */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
 		695F43322EB019B300509478 /* Build configuration list for PBXProject "AppBackupFoto" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
