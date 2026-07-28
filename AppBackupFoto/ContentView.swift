@@ -1,24 +1,1999 @@
-//
-//  ContentView.swift
-//  AppBackupFoto
-//
-//  Created by Enrico Nanni Vicenzi on 27/10/25.
-//
-
 import SwiftUI
+import Combine
+import AppKit
+import UserNotifications
+import UniformTypeIdentifiers
+import CryptoKit
+import Charts
 
-struct ContentView: View {
-    var body: some View {
-        VStack {
-            Image(systemName: "globe")
-                .imageScale(.large)
-                .foregroundStyle(.tint)
-            Text("Hello, world!")
-        }
-        .padding()
+// MARK: - App entry
+@main
+struct BackupFotoEnricoApp: App {
+    var body: some Scene {
+        WindowGroup { RootView().frame(minWidth: 960, minHeight: 620) }
     }
 }
 
-#Preview {
-    ContentView()
+struct RootView: View {
+    @ObservedObject private var bm = BookmarkManager.shared
+    var body: some View {
+        Group {
+            if bm.allConfigured { ContentView() }
+            else { SetupView() }
+        }
+        .onAppear {
+            Notifier.requestAuthorization()
+            AppearanceManager.shared.apply()
+        }
+    }
+}
+
+// MARK: - Notifier
+enum Notifier {
+    static func requestAuthorization() {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+    static func send(_ title: String, _ body: String) {
+        let c = UNMutableNotificationContent(); c.title = title; c.body = body
+        UNUserNotificationCenter.current().add(
+            UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil))
+    }
+}
+
+// MARK: - AppearanceManager
+final class AppearanceManager: ObservableObject {
+    static let shared = AppearanceManager()
+    @Published var mode: String {
+        didSet { UserDefaults.standard.set(mode, forKey: "appearanceMode"); apply() }
+    }
+    private init() { mode = UserDefaults.standard.string(forKey: "appearanceMode") ?? "Sistema" }
+    func apply() {
+        DispatchQueue.main.async {
+            switch self.mode {
+            case "Chiaro": NSApp.appearance = NSAppearance(named: .aqua)
+            case "Scuro":  NSApp.appearance = NSAppearance(named: .darkAqua)
+            default:       NSApp.appearance = nil
+            }
+        }
+    }
+}
+
+// MARK: - Models
+struct JobStats {
+    var percent: Int = 0
+    var done: Int = 0
+    var total: Int = 0
+    var eta: String = "—"
+    var elapsed: String = "—"
+    var copied: Int = 0
+    var skipped: Int = 0
+    var errors: Int = 0
+    var speed: String = "—"
+    var verifiedOk: Int = 0   // file copiati con SHA256 verificato con successo
+    var hashErrors: Int = 0   // file con SHA256 mismatch dopo la copia
+}
+
+struct SpeedSample: Identifiable {
+    let id = UUID()
+    let time: Date
+    let value: Double
+}
+
+enum JobPhase: Equatable {
+    case idle, running(String), success(String), failed(String)
+    var label: String {
+        switch self {
+        case .idle: return "Pronto"
+        case .running(let s), .success(let s), .failed(let s): return s
+        }
+    }
+    var color: Color {
+        switch self {
+        case .idle: return .secondary; case .running: return .blue
+        case .success: return .green; case .failed: return .red
+        }
+    }
+    var icon: String {
+        switch self {
+        case .idle: return "circle.dotted"; case .running: return "arrow.trianglehead.2.clockwise"
+        case .success: return "checkmark.circle.fill"; case .failed: return "xmark.circle.fill"
+        }
+    }
+    var isTerminal: Bool {
+        switch self { case .success, .failed: return true; default: return false }
+    }
+}
+
+// MARK: - BookmarkManager
+final class BookmarkManager: ObservableObject {
+    static let shared = BookmarkManager()
+
+    enum Location: String, CaseIterable, Identifiable {
+        case photos, ssd, hdd
+        var id: String { rawValue }
+        var displayName: String {
+            switch self {
+            case .photos: return "Libreria Foto (originals)"
+            case .ssd: return "SSD esterno"
+            case .hdd: return "HDD esterno"
+            }
+        }
+        var hint: String {
+            switch self {
+            case .photos: return "Naviga dentro Photos Library.photoslibrary e seleziona la cartella 'originals'"
+            case .ssd:    return "Seleziona il volume SSD (es. /Volumes/SSD - Enri)"
+            case .hdd:    return "Seleziona il volume HDD (es. /Volumes/BackupHDD)"
+            }
+        }
+    }
+
+    @Published var urls: [Location: URL] = [:]
+    private var accessing: [Location: URL] = [:]
+
+    private init() {
+        for loc in Location.allCases {
+            if let url = resolve(loc) { urls[loc] = url }
+        }
+    }
+
+    var allConfigured: Bool { Location.allCases.allSatisfy { urls[$0] != nil } }
+
+    private func resolve(_ loc: Location) -> URL? {
+        guard let data = UserDefaults.standard.data(forKey: "bk_\(loc.rawValue)") else { return nil }
+        var stale = false
+        guard let url = try? URL(resolvingBookmarkData: data, options: .withSecurityScope,
+                                  relativeTo: nil, bookmarkDataIsStale: &stale), !stale else { return nil }
+        return url
+    }
+
+    func startAccessing(_ loc: Location) -> URL? {
+        guard let url = urls[loc] else { return nil }
+        guard url.startAccessingSecurityScopedResource() else { return nil }
+        accessing[loc] = url
+        return url
+    }
+
+    func stopAccessing(_ loc: Location) {
+        accessing[loc]?.stopAccessingSecurityScopedResource()
+        accessing.removeValue(forKey: loc)
+    }
+
+    func selectAndSave(_ loc: Location, completion: @escaping (Bool) -> Void) {
+        DispatchQueue.main.async {
+            let panel = NSOpenPanel()
+            panel.canChooseFiles = false
+            panel.canChooseDirectories = true
+            panel.allowsMultipleSelection = false
+            panel.treatsFilePackagesAsDirectories = true
+            panel.message = loc.hint
+            panel.prompt = "Seleziona"
+            guard panel.runModal() == .OK, let url = panel.url else { completion(false); return }
+            do {
+                let data = try url.bookmarkData(options: .withSecurityScope,
+                                                 includingResourceValuesForKeys: nil, relativeTo: nil)
+                UserDefaults.standard.set(data, forKey: "bk_\(loc.rawValue)")
+                self.urls[loc] = url
+                completion(true)
+            } catch { completion(false) }
+        }
+    }
+}
+
+// MARK: - FileSyncer
+final class FileSyncer {
+    struct SyncResult {
+        var total = 0; var done = 0; var copied = 0; var skipped = 0; var errors = 0
+        var hashErrors = 0   // file con SHA256 mismatch dopo la copia
+        var startDate = Date()
+        var percent: Int { total > 0 ? min(100, done * 100 / total) : 0 }
+        var elapsedSec: Int { Int(Date().timeIntervalSince(startDate)) }
+        var etaSec: Int {
+            guard done > 0, total > done else { return 0 }
+            let elapsed = Date().timeIntervalSince(startDate)
+            guard elapsed > 0.5 else { return 0 }
+            return Int(elapsed * Double(total - done) / Double(done))
+        }
+        static func hms(_ s: Int) -> String {
+            String(format: "%02d:%02d:%02d", s/3600, (s%3600)/60, s%60)
+        }
+    }
+
+    private var cancelled = false
+    private let fm = FileManager.default
+    private let excluded: Set<String> = [
+        ".DS_Store", ".Spotlight-V100", ".TemporaryItems", ".Trashes",
+        ".fseventsd", ".DocumentRevisions-V100", "lost+found", "Backups.backupdb"
+    ]
+
+    func cancel() { cancelled = true }
+
+    // MARK: - Dry-run preview (solo stat, nessuna copia)
+    func previewSync(from src: URL, to dst: URL, deep: Bool) async -> (toAdd: Int, toSkip: Int, estimatedSec: Int) {
+        return await withCheckedContinuation { [self] cont in
+            DispatchQueue.global(qos: .userInitiated).async {
+                self.cancelled = false
+                var toAdd = 0
+                var toSkip = 0
+                self.previewDir(src: src, dst: dst, deep: deep, toAdd: &toAdd, toSkip: &toSkip)
+                let estimatedSec = toAdd > 0 ? max(1, toAdd / 50) : 0
+                cont.resume(returning: (toAdd: toAdd, toSkip: toSkip, estimatedSec: estimatedSec))
+            }
+        }
+    }
+
+    private func previewDir(src: URL, dst: URL, deep: Bool, toAdd: inout Int, toSkip: inout Int) {
+        if cancelled { return }
+        guard let items = try? fm.contentsOfDirectory(
+            at: src,
+            includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey],
+            options: [.skipsHiddenFiles]) else { return }
+        for item in items {
+            if cancelled { return }
+            if shouldExclude(item) { continue }
+            let vals = try? item.resourceValues(forKeys: [.isRegularFileKey, .isDirectoryKey])
+            let destItem = dst.appendingPathComponent(item.lastPathComponent)
+            if vals?.isDirectory == true {
+                previewDir(src: item, dst: destItem, deep: deep, toAdd: &toAdd, toSkip: &toSkip)
+            } else if vals?.isRegularFile == true {
+                previewFile(src: item, dst: destItem, toAdd: &toAdd, toSkip: &toSkip)
+            }
+        }
+    }
+
+    private func previewFile(src: URL, dst: URL, toAdd: inout Int, toSkip: inout Int) {
+        // Zero-overwrite rule: se il file esiste gia a destinazione sara sempre skippato
+        if fm.fileExists(atPath: dst.path) {
+            toSkip += 1
+        } else {
+            toAdd += 1
+        }
+    }
+
+    func sync(from src: URL, to dst: URL, deep: Bool,
+              onStatus: @escaping (String) -> Void,
+              onProgress: @escaping (SyncResult) -> Void) async throws -> SyncResult {
+        try await withCheckedThrowingContinuation { [self] cont in
+            DispatchQueue.global(qos: .userInitiated).async {
+                self.cancelled = false
+                var result = SyncResult()
+
+                DispatchQueue.main.async { onStatus("Conteggio file in corso...") }
+                result.total = self.countFiles(at: src)
+                guard result.total > 0 else {
+                    DispatchQueue.main.async {
+                        onStatus("Nessun file trovato in '\(src.path)' — verifica il bookmark in Impostazioni")
+                        onProgress(result)
+                    }
+                    cont.resume(returning: result)
+                    return
+                }
+
+                DispatchQueue.main.async {
+                    onStatus("Trovati \(result.total) file — avvio sincronizzazione...")
+                    onProgress(result)
+                }
+
+                do {
+                    if !self.fm.fileExists(atPath: dst.path) {
+                        try self.fm.createDirectory(at: dst, withIntermediateDirectories: true)
+                    }
+                    try self.syncDir(src: src, dst: dst, base: src, deep: deep,
+                                     result: &result, onStatus: onStatus, onProgress: onProgress)
+                    cont.resume(returning: result)
+                } catch {
+                    cont.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    private func countFiles(at url: URL) -> Int {
+        guard let e = fm.enumerator(at: url, includingPropertiesForKeys: [.isRegularFileKey],
+                                     options: [.skipsHiddenFiles]) else { return 0 }
+        var n = 0
+        while let f = e.nextObject() as? URL {
+            if cancelled { break }
+            if shouldExclude(f) { e.skipDescendants(); continue }
+            if (try? f.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true { n += 1 }
+        }
+        return n
+    }
+
+    private func syncDir(src: URL, dst: URL, base: URL, deep: Bool,
+                         result: inout SyncResult,
+                         onStatus: @escaping (String) -> Void,
+                         onProgress: @escaping (SyncResult) -> Void) throws {
+        if cancelled { return }
+        if !fm.fileExists(atPath: dst.path) {
+            try fm.createDirectory(at: dst, withIntermediateDirectories: true)
+        }
+        let items = try fm.contentsOfDirectory(
+            at: src,
+            includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey,
+                                          .fileSizeKey, .contentModificationDateKey],
+            options: [.skipsHiddenFiles])
+        for item in items {
+            if cancelled { return }
+            if shouldExclude(item) { continue }
+            let vals = try? item.resourceValues(forKeys: [.isRegularFileKey, .isDirectoryKey])
+            let destItem = dst.appendingPathComponent(item.lastPathComponent)
+            if vals?.isDirectory == true {
+                try syncDir(src: item, dst: destItem, base: base, deep: deep,
+                            result: &result, onStatus: onStatus, onProgress: onProgress)
+            } else if vals?.isRegularFile == true {
+                syncFile(src: item, dst: destItem, deep: deep,
+                         result: &result, onStatus: onStatus, onProgress: onProgress)
+            }
+        }
+    }
+
+    private func syncFile(src: URL, dst: URL, deep: Bool,
+                          result: inout SyncResult,
+                          onStatus: @escaping (String) -> Void,
+                          onProgress: @escaping (SyncResult) -> Void) {
+        let needs: Bool
+        if !fm.fileExists(atPath: dst.path) {
+            needs = true
+        } else {
+            let sa = try? fm.attributesOfItem(atPath: src.path)
+            let da = try? fm.attributesOfItem(atPath: dst.path)
+            let ss = sa?[.size] as? Int ?? -1; let ds = da?[.size] as? Int ?? -2
+            if deep {
+                needs = ss != ds
+            } else {
+                let sm = sa?[.modificationDate] as? Date ?? .distantPast
+                let dm = da?[.modificationDate] as? Date ?? .distantPast
+                needs = ss != ds || abs(sm.timeIntervalSince(dm)) > 1.0
+            }
+        }
+
+        if needs {
+            if fm.fileExists(atPath: dst.path) {
+                // destination exists but differs — zero-overwrite rule: skip
+                result.skipped += 1
+            } else {
+                let snap = result
+                DispatchQueue.main.async {
+                    onStatus("Copia (\(snap.done + 1)/\(snap.total) — \(snap.percent)%): \(src.lastPathComponent)")
+                }
+                do {
+                    let parent = dst.deletingLastPathComponent()
+                    if !fm.fileExists(atPath: parent.path) {
+                        try fm.createDirectory(at: parent, withIntermediateDirectories: true)
+                    }
+                    try fm.copyItem(at: src, to: dst)
+                    DispatchQueue.main.async { onStatus("Verifica integrità: \(src.lastPathComponent)") }
+                    if let srcHash = sha256(of: src), let dstHash = sha256(of: dst), srcHash != dstHash {
+                        result.hashErrors += 1   // mismatch SHA256: conteggiato separato da errori I/O
+                        let name = src.lastPathComponent
+                        DispatchQueue.main.async { onStatus("⚠️ HASH MISMATCH: \(name) — copia non integra, controlla il log") }
+                    } else {
+                        result.copied += 1
+                    }
+                } catch { result.errors += 1 }
+            }
+        } else {
+            result.skipped += 1
+        }
+        result.done += 1
+        let snap = result
+        DispatchQueue.main.async { onProgress(snap) }
+    }
+
+    private func shouldExclude(_ url: URL) -> Bool {
+        let n = url.lastPathComponent
+        return excluded.contains(n) || n.hasPrefix("._")
+    }
+
+    private func sha256(of url: URL) -> String? {
+        guard let fh = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { fh.closeFile() }
+        var hasher = SHA256()
+        var chunk = fh.readData(ofLength: 65536)
+        while !chunk.isEmpty {
+            hasher.update(data: chunk)
+            chunk = fh.readData(ofLength: 65536)
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+// MARK: - S3Syncer (native Swift, no rclone subprocess)
+final class S3Syncer {
+
+    struct S3Config {
+        let accessKeyId: String
+        let secretAccessKey: String
+        let endpoint: String
+        let region: String
+        let bucket: String
+    }
+
+    struct SyncResult {
+        var uploaded = 0; var skipped = 0; var errors = 0
+        var total = 0; var done = 0; var startDate = Date()
+        var uploadedBytes: Int64 = 0
+        var toUploadCount: Int = 0
+        var percent: Int { total > 0 ? min(100, done * 100 / total) : 0 }
+        var elapsedSec: Int { Int(Date().timeIntervalSince(startDate)) }
+        // ETA basato sugli upload effettivi (non sui file già presenti su S3)
+        var etaSec: Int {
+            guard uploaded > 0, toUploadCount > uploaded else { return 0 }
+            let elapsed = Date().timeIntervalSince(startDate)
+            guard elapsed > 0.5 else { return 0 }
+            let rate = Double(uploaded) / elapsed
+            return Int(Double(toUploadCount - uploaded) / rate)
+        }
+        static func hms(_ s: Int) -> String {
+            String(format: "%02d:%02d:%02d", s/3600, (s%3600)/60, s%60)
+        }
+    }
+
+    private var cancelled = false
+    private lazy var session: URLSession = {
+        let cfg = URLSessionConfiguration.default
+        cfg.timeoutIntervalForRequest = 300
+        cfg.timeoutIntervalForResource = 3600
+        return URLSession(configuration: cfg)
+    }()
+
+    func cancel() { cancelled = true }
+
+    static func readConfig(remoteName: String = "Cubbit", bucket: String = "backupfoto") throws -> S3Config {
+        let path = NSHomeDirectory() + "/.config/rclone/rclone.conf"
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+           let perms = attrs[.posixPermissions] as? Int, perms & 0o077 != 0 {
+            throw NSError(domain: "S3", code: 11, userInfo: [NSLocalizedDescriptionKey:
+                "rclone.conf ha permessi troppo aperti. Esegui nel Terminale:\nchmod 600 ~/.config/rclone/rclone.conf"])
+        }
+        let content = try String(contentsOfFile: path, encoding: .utf8)
+        var inSection = false
+        var vals: [String: String] = [:]
+        for line in content.components(separatedBy: .newlines) {
+            let t = line.trimmingCharacters(in: .whitespaces)
+            if t == "[\(remoteName)]" { inSection = true; continue }
+            if t.hasPrefix("[") { if inSection { break }; continue }
+            if inSection, t.contains("=") {
+                let p = t.split(separator: "=", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
+                if p.count == 2 { vals[p[0]] = p[1] }
+            }
+        }
+        guard let ak = vals["access_key_id"], let sk = vals["secret_access_key"],
+              let ep = vals["endpoint"] else {
+            throw NSError(domain: "S3", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Credenziali '\(remoteName)' non trovate in rclone.conf"])
+        }
+        let cleanEp = ep.hasSuffix("/") ? String(ep.dropLast()) : ep
+        guard cleanEp.hasPrefix("https://") else {
+            throw NSError(domain: "S3", code: 10, userInfo: [NSLocalizedDescriptionKey:
+                "L'endpoint S3 deve usare HTTPS. Valore trovato: '\(cleanEp)'. Correggi rclone.conf."])
+        }
+        // Allow-list: se rclone.conf viene alterato per puntare a un host diverso da quello
+        // atteso, le foto verrebbero caricate verso un endpoint arbitrario. Blocca finché
+        // l'utente non conferma il nuovo host di proposito (aggiungendolo qui).
+        let allowedHosts: Set<String> = ["s3.it.cubbit.org"]
+        guard let host = URL(string: cleanEp)?.host, allowedHosts.contains(host) else {
+            throw NSError(domain: "S3", code: 13, userInfo: [NSLocalizedDescriptionKey:
+                "Endpoint S3 non riconosciuto: '\(cleanEp)'. Se hai cambiato provider di proposito, aggiorna la allow-list in S3Syncer.readConfig."])
+        }
+        return S3Config(accessKeyId: ak, secretAccessKey: sk, endpoint: cleanEp,
+                        region: vals["region"] ?? "us-east-1", bucket: bucket)
+    }
+
+    func sync(from localURL: URL, config: S3Config,
+              onStatus: @escaping (String) -> Void,
+              onProgress: @escaping (SyncResult) -> Void) async throws -> SyncResult {
+        cancelled = false
+        var result = SyncResult()
+
+        DispatchQueue.main.async { onStatus("Connessione a Cubbit S3 — recupero lista file remoti...") }
+        let existing = try await listAll(config: config)
+        let existingCount = existing.count
+        DispatchQueue.main.async { onStatus("Trovati \(existingCount) oggetti su S3 — scansione file locali...") }
+
+        let fm = FileManager.default
+        var files: [(url: URL, key: String, size: Int64)] = []
+        let base = localURL.path
+        guard let enumerator = fm.enumerator(
+            at: localURL,
+            includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
+            options: [.skipsHiddenFiles]) else {
+            throw NSError(domain: "S3", code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "Impossibile enumerare i file locali"])
+        }
+        while let f = enumerator.nextObject() as? URL {
+            if cancelled { break }
+            let v = try? f.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+            guard v?.isRegularFile == true else { continue }
+            let name = f.lastPathComponent
+            if name.hasPrefix("._") || name == ".DS_Store" { continue }
+            let rel = String(f.path.dropFirst(base.count).drop(while: { $0 == "/" }))
+            files.append((url: f, key: rel, size: Int64(v?.fileSize ?? 0)))
+        }
+
+        let toUploadCount = files.filter { existing[$0.key] != $0.size }.count
+        result.total = files.count
+        result.toUploadCount = toUploadCount
+        let localCount = files.count
+        let alreadyPresent = localCount - toUploadCount
+        let initSnap = result
+        DispatchQueue.main.async {
+            onStatus("Trovati \(localCount) file locali · \(toUploadCount) da caricare · \(alreadyPresent) già presenti")
+            onProgress(initSnap)
+        }
+
+        for item in files {
+            if cancelled { break }
+            if existing[item.key] == item.size {
+                result.skipped += 1
+            } else {
+                let msg = "Upload (\(result.done + 1)/\(result.total) — \(result.percent)%): \(item.url.lastPathComponent)"
+                DispatchQueue.main.async { onStatus(msg) }
+                do {
+                    try await upload(url: item.url, key: item.key, config: config)
+                    result.uploaded += 1
+                    result.uploadedBytes += item.size
+                } catch {
+                    result.errors += 1
+                }
+            }
+            result.done += 1
+            let snap = result
+            DispatchQueue.main.async { onProgress(snap) }
+        }
+        return result
+    }
+
+    private func listAll(config: S3Config) async throws -> [String: Int64] {
+        var objects: [String: Int64] = [:]
+        var token: String? = nil
+        repeat {
+            let (objs, next) = try await listPage(config: config, token: token)
+            objects.merge(objs) { _, n in n }
+            token = next
+        } while token != nil
+        return objects
+    }
+
+    private func listPage(config: S3Config, token: String?) async throws -> ([String: Int64], String?) {
+        guard var comps = URLComponents(string: "\(config.endpoint)/\(config.bucket)") else {
+            throw NSError(domain: "S3", code: 8,
+                userInfo: [NSLocalizedDescriptionKey: "URL non valido per il bucket: \(config.bucket)"])
+        }
+        var qi = [URLQueryItem(name: "list-type", value: "2"),
+                  URLQueryItem(name: "max-keys", value: "1000")]
+        if let t = token { qi.append(URLQueryItem(name: "continuation-token", value: t)) }
+        comps.queryItems = qi
+        guard let url = comps.url else {
+            throw NSError(domain: "S3", code: 8,
+                userInfo: [NSLocalizedDescriptionKey: "URL non valido per list"])
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        sign(&req, config: config, body: Data(), date: Date())
+        let (data, resp) = try await session.data(for: req)
+        guard (resp as? HTTPURLResponse)?.statusCode == 200 else {
+            let body = String(data: data, encoding: .utf8) ?? ""
+            throw NSError(domain: "S3", code: 3,
+                userInfo: [NSLocalizedDescriptionKey: "Errore lista S3: \(body.prefix(300))"])
+        }
+        let xml = String(data: data, encoding: .utf8) ?? ""
+        let keys = xmlAll(xml, tag: "Key")
+        let sizes = xmlAll(xml, tag: "Size").compactMap { Int64($0) }
+        var objs: [String: Int64] = [:]
+        for (k, s) in zip(keys, sizes) { objs[k] = s }
+        let isTruncated = xmlFirst(xml, tag: "IsTruncated") == "true"
+        let nextToken = isTruncated ? xmlFirst(xml, tag: "NextContinuationToken") : nil
+        return (objs, nextToken)
+    }
+
+    private func upload(url: URL, key: String, config: S3Config) async throws {
+        let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        if size > 64 * 1024 * 1024 {
+            try await multipart(url: url, key: key, config: config)
+        } else {
+            let data = try Data(contentsOf: url)
+            try await put(data: data, key: key, config: config)
+        }
+    }
+
+    private func put(data: Data, key: String, config: S3Config) async throws {
+        let encKey = key.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? key
+        guard let putURL = URL(string: "\(config.endpoint)/\(config.bucket)/\(encKey)") else {
+            throw NSError(domain: "S3", code: 12,
+                userInfo: [NSLocalizedDescriptionKey: "URL non valido per il file: \(key)"])
+        }
+        var req = URLRequest(url: putURL)
+        req.httpMethod = "PUT"
+        req.httpBody = data
+        sign(&req, config: config, body: data, date: Date())
+        let (respData, resp) = try await session.data(for: req)
+        guard let code = (resp as? HTTPURLResponse)?.statusCode, (200...299).contains(code) else {
+            let body = String(data: respData, encoding: .utf8) ?? ""
+            throw NSError(domain: "S3", code: 4,
+                userInfo: [NSLocalizedDescriptionKey: "Errore PUT \(key): \(body.prefix(100))"])
+        }
+    }
+
+    private func multipart(url: URL, key: String, config: S3Config) async throws {
+        let encKey = key.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? key
+        guard let initURL = URL(string: "\(config.endpoint)/\(config.bucket)/\(encKey)?uploads") else {
+            throw NSError(domain: "S3", code: 12,
+                userInfo: [NSLocalizedDescriptionKey: "URL non valido per il file: \(key)"])
+        }
+        var initReq = URLRequest(url: initURL)
+        initReq.httpMethod = "POST"
+        sign(&initReq, config: config, body: Data(), date: Date())
+        let (initData, initResp) = try await session.data(for: initReq)
+        guard (initResp as? HTTPURLResponse)?.statusCode == 200,
+              let uploadId = xmlFirst(String(data: initData, encoding: .utf8) ?? "", tag: "UploadId") else {
+            throw NSError(domain: "S3", code: 5,
+                userInfo: [NSLocalizedDescriptionKey: "Impossibile avviare multipart per \(key)"])
+        }
+        let encId = uploadId.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? uploadId
+
+        let fileHandle = try FileHandle(forReadingFrom: url)
+        defer { fileHandle.closeFile() }
+        let fileSize = Int64((try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+        let chunkSize = 64 * 1024 * 1024
+        var parts: [(Int, String)] = []
+        var offset: Int64 = 0; var pn = 1
+        while offset < fileSize {
+            if cancelled { break }
+            fileHandle.seek(toFileOffset: UInt64(offset))
+            let chunk = fileHandle.readData(ofLength: chunkSize)
+            guard !chunk.isEmpty else { break }
+            guard let pURL = URL(string: "\(config.endpoint)/\(config.bucket)/\(encKey)?partNumber=\(pn)&uploadId=\(encId)") else {
+                throw NSError(domain: "S3", code: 12,
+                    userInfo: [NSLocalizedDescriptionKey: "URL non valido per parte \(pn) di \(key)"])
+            }
+            var pReq = URLRequest(url: pURL)
+            pReq.httpMethod = "PUT"; pReq.httpBody = chunk
+            sign(&pReq, config: config, body: chunk, date: Date())
+            let (_, pResp) = try await session.data(for: pReq)
+            guard let pHttp = pResp as? HTTPURLResponse, (200...299).contains(pHttp.statusCode) else {
+                throw NSError(domain: "S3", code: 6,
+                    userInfo: [NSLocalizedDescriptionKey: "Errore parte \(pn) di \(key)"])
+            }
+            let etag = (pResp as? HTTPURLResponse)?.value(forHTTPHeaderField: "Etag") ?? ""
+            parts.append((pn, etag))
+            offset += Int64(chunkSize); pn += 1
+        }
+
+        if cancelled {
+            if let abortURL = URL(string: "\(config.endpoint)/\(config.bucket)/\(encKey)?uploadId=\(encId)") {
+                var abortReq = URLRequest(url: abortURL)
+                abortReq.httpMethod = "DELETE"
+                sign(&abortReq, config: config, body: Data(), date: Date())
+                _ = try? await session.data(for: abortReq)
+            }
+            throw CancellationError()
+        }
+
+        let partsXML = parts.map { "<Part><PartNumber>\($0.0)</PartNumber><ETag>\($0.1)</ETag></Part>" }.joined()
+        let completeXML = Data("<CompleteMultipartUpload>\(partsXML)</CompleteMultipartUpload>".utf8)
+        guard let cURL = URL(string: "\(config.endpoint)/\(config.bucket)/\(encKey)?uploadId=\(encId)") else {
+            throw NSError(domain: "S3", code: 12,
+                userInfo: [NSLocalizedDescriptionKey: "URL non valido per completamento multipart: \(key)"])
+        }
+        var cReq = URLRequest(url: cURL)
+        cReq.httpMethod = "POST"; cReq.httpBody = completeXML
+        sign(&cReq, config: config, body: completeXML, date: Date())
+        let (_, cResp) = try await session.data(for: cReq)
+        guard (cResp as? HTTPURLResponse)?.statusCode == 200 else {
+            throw NSError(domain: "S3", code: 7,
+                userInfo: [NSLocalizedDescriptionKey: "Errore completamento multipart \(key)"])
+        }
+    }
+
+    // MARK: - AWS Signature V4
+    private func sign(_ request: inout URLRequest, config: S3Config, body: Data, date: Date) {
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
+        fmt.timeZone = TimeZone(identifier: "UTC")!
+        let datetime = fmt.string(from: date)
+        let dateOnly = String(datetime.prefix(8))
+        let region = config.region == "auto" ? "us-east-1" : config.region
+        guard let host = URL(string: config.endpoint)?.host else { return }
+
+        request.setValue(datetime, forHTTPHeaderField: "x-amz-date")
+        let payHash = SHA256.hash(data: body).map { String(format: "%02x", $0) }.joined()
+        request.setValue(payHash, forHTTPHeaderField: "x-amz-content-sha256")
+
+        let headerVals: [String: String] = [
+            "host": host,
+            "x-amz-content-sha256": payHash,
+            "x-amz-date": datetime
+        ]
+        let signedNames = headerVals.keys.sorted()
+        let canonH = signedNames.map { "\($0):\(headerVals[$0]!)" }.joined(separator: "\n") + "\n"
+        let signedH = signedNames.joined(separator: ";")
+
+        let rawPath = request.url?.path ?? "/"
+        let s3PathAllowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_.~/"))
+        let uri = rawPath.addingPercentEncoding(withAllowedCharacters: s3PathAllowed) ?? rawPath
+
+        func sigv4Encode(_ s: String) -> String {
+            let decoded = s.removingPercentEncoding ?? s
+            let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_.~"))
+            var result = ""
+            for scalar in decoded.unicodeScalars {
+                if allowed.contains(scalar) {
+                    result.append(Character(scalar))
+                } else {
+                    for byte in String(scalar).utf8 {
+                        result += String(format: "%%%02X", byte)
+                    }
+                }
+            }
+            return result
+        }
+
+        var queryParams: [(String, String)] = []
+        if let query = request.url?.query {
+            for param in query.split(separator: "&") {
+                let parts = param.split(separator: "=", maxSplits: 1)
+                let key = parts.count > 0 ? String(parts[0]) : ""
+                let val = parts.count > 1 ? String(parts[1]) : ""
+                queryParams.append((sigv4Encode(key), sigv4Encode(val)))
+            }
+        }
+        let sortedQuery = queryParams.sorted { $0.0 < $1.0 }
+            .map { "\($0.0)=\($0.1)" }.joined(separator: "&")
+
+        let canonReq = [request.httpMethod ?? "GET", uri, sortedQuery, canonH, signedH, payHash]
+            .joined(separator: "\n")
+
+        let credScope = "\(dateOnly)/\(region)/s3/aws4_request"
+        let reqHash = SHA256.hash(data: Data(canonReq.utf8)).map { String(format: "%02x", $0) }.joined()
+        let s2s = "AWS4-HMAC-SHA256\n\(datetime)\n\(credScope)\n\(reqHash)"
+
+        func hmac(_ key: Data, _ msg: String) -> Data {
+            Data(HMAC<SHA256>.authenticationCode(for: Data(msg.utf8), using: SymmetricKey(data: key)))
+        }
+        let sigKey = hmac(hmac(hmac(hmac(Data(("AWS4" + config.secretAccessKey).utf8),
+            dateOnly), region), "s3"), "aws4_request")
+        let sig = Data(HMAC<SHA256>.authenticationCode(for: Data(s2s.utf8),
+            using: SymmetricKey(data: sigKey))).map { String(format: "%02x", $0) }.joined()
+
+        request.setValue(
+            "AWS4-HMAC-SHA256 Credential=\(config.accessKeyId)/\(credScope), " +
+            "SignedHeaders=\(signedH), Signature=\(sig)",
+            forHTTPHeaderField: "Authorization")
+    }
+
+    private func xmlDecode(_ s: String) -> String {
+        s.replacingOccurrences(of: "&amp;",  with: "&")
+         .replacingOccurrences(of: "&lt;",   with: "<")
+         .replacingOccurrences(of: "&gt;",   with: ">")
+         .replacingOccurrences(of: "&apos;", with: "'")
+         .replacingOccurrences(of: "&quot;", with: "\"")
+    }
+    private func xmlFirst(_ xml: String, tag: String) -> String? {
+        guard let s = xml.range(of: "<\(tag)>"), let e = xml.range(of: "</\(tag)>") else { return nil }
+        return xmlDecode(String(xml[s.upperBound..<e.lowerBound]))
+    }
+    private func xmlAll(_ xml: String, tag: String) -> [String] {
+        var results: [String] = []; var search = xml
+        while let s = search.range(of: "<\(tag)>"), let e = search.range(of: "</\(tag)>") {
+            results.append(xmlDecode(String(search[s.upperBound..<e.lowerBound])))
+            search = String(search[e.upperBound...])
+        }
+        return results
+    }
+}
+
+// MARK: - VolumeMonitor
+final class VolumeMonitor: ObservableObject {
+    @Published var ssdMounted = false
+    @Published var hddMounted = false
+    private let ssdPath = "/Volumes/SSD - Enri"
+    private let hddPath = "/Volumes/BackupHDD"
+    private var timer: Timer?
+    init() {
+        check()
+        timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in self?.check() }
+    }
+    private func check() {
+        let fm = FileManager.default
+        DispatchQueue.main.async {
+            self.ssdMounted = fm.fileExists(atPath: self.ssdPath)
+            self.hddMounted = fm.fileExists(atPath: self.hddPath)
+        }
+    }
+}
+
+// MARK: - BackupRunner
+@MainActor
+final class BackupRunner: ObservableObject {
+    @Published var output = ""
+    @Published var phase: JobPhase = .idle
+    @Published var stats = JobStats()
+    @Published var startTime: Date? = nil
+    @Published var completionSnapshot: (phase: JobPhase, stats: JobStats)? = nil
+    @Published var currentStatus = ""
+    @Published var speedHistory: [SpeedSample] = []
+    @Published var speedUnit: String = "file/s"
+
+    var isRunning: Bool { if case .running = phase { return true }; return false }
+
+    private let syncer = FileSyncer()
+    private let s3Syncer = S3Syncer()
+    private let bm = BookmarkManager.shared
+    private var syncTask: Task<Void, Never>?
+    private var wasStopped = false
+    private let maxOut = 60_000
+    private let maxSpeedSamples = 120
+    private let lastDeepKey = "lastDeepMirrorDate"
+    private var lastSpeedSampleDate: Date = .distantPast
+    private var smoothedEtaSec: Double = 0
+    private var elapsedTimer: AnyCancellable?
+
+    func runMacToSSD() {
+        speedUnit = "file/s"
+        guard let photosURL = bm.startAccessing(.photos) else {
+            alert("Accesso alla Libreria Foto non disponibile",
+                  "Vai in Impostazioni (ingranaggio) e riseleziona la cartella Foto.")
+            return
+        }
+        guard let ssdURL = bm.startAccessing(.ssd) else {
+            bm.stopAccessing(.photos)
+            alert("Accesso all'SSD non disponibile", "Vai in Impostazioni e riseleziona l'SSD.")
+            return
+        }
+        if !isLikelyVolumeRoot(ssdURL) {
+            bm.stopAccessing(.photos); bm.stopAccessing(.ssd)
+            alert("Bookmark SSD non valido",
+                  "Il percorso '\(ssdURL.path)' non è la radice del volume.\n\nVai in Impostazioni (⚙) → riseleziona SSD scegliendo '/Volumes/SSD - Enri' (root del volume, non una sottocartella).")
+            return
+        }
+        let dst = ssdURL.appendingPathComponent("Foto iPhone")
+        run(label: "MAC -> SSD") { [weak self] in
+            self?.publishStatus("Foto: \(photosURL.path)  →  SSD: \(dst.path)")
+            defer { self?.bm.stopAccessing(.photos); self?.bm.stopAccessing(.ssd) }
+            return try await self?.syncer.sync(from: photosURL, to: dst, deep: false,
+                onStatus: { self?.publishStatus($0) },
+                onProgress: { self?.publishProgress($0) })
+        }
+    }
+
+    func runSSDToHDD() {
+        speedUnit = "file/s"
+        guard let ssdURL = bm.startAccessing(.ssd) else {
+            alert("Accesso all'SSD non disponibile", "Vai in Impostazioni e riseleziona l'SSD.")
+            return
+        }
+        guard let hddURL = bm.startAccessing(.hdd) else {
+            bm.stopAccessing(.ssd)
+            alert("Accesso all'HDD non disponibile", "Vai in Impostazioni e riseleziona l'HDD.")
+            return
+        }
+        if !isLikelyVolumeRoot(ssdURL) {
+            bm.stopAccessing(.ssd); bm.stopAccessing(.hdd)
+            alert("Bookmark SSD non valido",
+                  "Il percorso '\(ssdURL.path)' non è la radice del volume.\n\nVai in Impostazioni (⚙) → riseleziona SSD scegliendo '/Volumes/SSD - Enri' (root del volume, non una sottocartella).")
+            return
+        }
+        if !isLikelyVolumeRoot(hddURL) {
+            bm.stopAccessing(.ssd); bm.stopAccessing(.hdd)
+            alert("Bookmark HDD non valido",
+                  "Il percorso '\(hddURL.path)' non è la radice del volume.\n\nVai in Impostazioni (⚙) → riseleziona HDD scegliendo '/Volumes/BackupHDD' (root del volume, non una sottocartella).")
+            return
+        }
+        let now = Date()
+        let lastDeep = UserDefaults.standard.object(forKey: lastDeepKey) as? Date ?? .distantPast
+        let deep = now.timeIntervalSince(lastDeep) > TimeInterval(30 * 24 * 3600)
+        let label = deep ? "SSD -> HDD (deep)" : "SSD -> HDD"
+        run(label: label) { [weak self] in
+            self?.publishStatus("SSD: \(ssdURL.path)  →  HDD: \(hddURL.path)")
+            defer { self?.bm.stopAccessing(.ssd); self?.bm.stopAccessing(.hdd) }
+            let r = try await self?.syncer.sync(from: ssdURL, to: hddURL, deep: deep,
+                onStatus: { self?.publishStatus($0) },
+                onProgress: { self?.publishProgress($0) })
+            if deep, (r?.errors ?? 1) == 0 {
+                UserDefaults.standard.set(Date(), forKey: self?.lastDeepKey ?? "")
+            }
+            return r
+        }
+    }
+
+    func runSyncS3() {
+        speedUnit = "MB/s"
+        guard let ssdURL = bm.startAccessing(.ssd) else {
+            alert("Accesso all'SSD non disponibile", "Vai in Impostazioni e riseleziona l'SSD.")
+            return
+        }
+        if !isLikelyVolumeRoot(ssdURL) {
+            bm.stopAccessing(.ssd)
+            alert("Bookmark SSD non valido",
+                  "Il percorso '\(ssdURL.path)' non è la radice del volume.\n\nVai in Impostazioni (⚙) → riseleziona SSD scegliendo '/Volumes/SSD - Enri' (root del volume, non una sottocartella).")
+            return
+        }
+        do {
+            let config = try S3Syncer.readConfig()
+            run(label: "SSD -> Cubbit S3") { [weak self] in
+                guard let s3syncer = self?.s3Syncer else { return nil }
+                defer { self?.bm.stopAccessing(.ssd) }
+                let r = try await s3syncer.sync(
+                    from: ssdURL, config: config,
+                    onStatus: { self?.publishStatus($0) },
+                    onProgress: { [weak self] snap in
+                        guard let self else { return }
+                        self.stats.percent = snap.percent
+                        self.stats.done = snap.done; self.stats.total = snap.total
+                        self.stats.copied = snap.uploaded; self.stats.skipped = snap.skipped
+                        self.stats.errors = snap.errors
+                        self.stats.elapsed = S3Syncer.SyncResult.hms(snap.elapsedSec)
+                        self.stats.eta = snap.etaSec > 0 ? self.smoothEta(raw: snap.etaSec) : "—"
+                        let elapsed = max(0.1, Date().timeIntervalSince(snap.startDate))
+                        if snap.uploadedBytes > 0 {
+                            let mbps = Double(snap.uploadedBytes) / 1_048_576.0 / elapsed
+                            self.stats.speed = String(format: "%.2f MB/s", mbps)
+                            self.appendSpeedSample(mbps)
+                        } else if snap.done > 0 {
+                            let fps = Double(snap.done) / elapsed
+                            self.stats.speed = String(format: "%.0f elem/s", fps)
+                        }
+                    })
+                var fr = FileSyncer.SyncResult()
+                fr.copied = r.uploaded; fr.skipped = r.skipped
+                fr.errors = r.errors; fr.done = r.done; fr.total = r.total
+                return fr
+            }
+        } catch {
+            bm.stopAccessing(.ssd)
+            alert("Errore configurazione S3", error.localizedDescription)
+        }
+    }
+
+    func previewMacToSSD() {
+        guard let photosURL = bm.startAccessing(.photos) else {
+            alert("Accesso alla Libreria Foto non disponibile",
+                  "Vai in Impostazioni (ingranaggio) e riseleziona la cartella Foto.")
+            return
+        }
+        guard let ssdURL = bm.startAccessing(.ssd) else {
+            bm.stopAccessing(.photos)
+            alert("Accesso all'SSD non disponibile", "Vai in Impostazioni e riseleziona l'SSD.")
+            return
+        }
+        if !isLikelyVolumeRoot(ssdURL) {
+            bm.stopAccessing(.photos); bm.stopAccessing(.ssd)
+            alert("Bookmark SSD non valido",
+                  "Il percorso '\(ssdURL.path)' non è la radice del volume.\n\nVai in Impostazioni (⚙) → riseleziona SSD scegliendo '/Volumes/SSD - Enri' (root del volume, non una sottocartella).")
+            return
+        }
+        let dst = ssdURL.appendingPathComponent("Foto iPhone")
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let result = await self.syncer.previewSync(from: photosURL, to: dst, deep: false)
+            self.bm.stopAccessing(.photos)
+            self.bm.stopAccessing(.ssd)
+            let eta = result.estimatedSec > 0
+                ? FileSyncer.SyncResult.hms(result.estimatedSec)
+                : "< 1s"
+            let a = NSAlert()
+            a.messageText = "Anteprima MAC -> SSD"
+            a.informativeText = "File da copiare: \(result.toAdd)\nFile gia presenti (skip): \(result.toSkip)\nTempo stimato: \(eta)\n\n(stima basata su 50 file/s - il tempo reale puo variare)"
+            a.alertStyle = .informational
+            a.addButton(withTitle: "OK")
+            a.runModal()
+        }
+    }
+
+    func previewSSDToHDD() {
+        guard let ssdURL = bm.startAccessing(.ssd) else {
+            alert("Accesso all'SSD non disponibile", "Vai in Impostazioni e riseleziona l'SSD.")
+            return
+        }
+        guard let hddURL = bm.startAccessing(.hdd) else {
+            bm.stopAccessing(.ssd)
+            alert("Accesso all'HDD non disponibile", "Vai in Impostazioni e riseleziona l'HDD.")
+            return
+        }
+        if !isLikelyVolumeRoot(ssdURL) {
+            bm.stopAccessing(.ssd); bm.stopAccessing(.hdd)
+            alert("Bookmark SSD non valido",
+                  "Il percorso '\(ssdURL.path)' non è la radice del volume.\n\nVai in Impostazioni (⚙) → riseleziona SSD scegliendo '/Volumes/SSD - Enri' (root del volume, non una sottocartella).")
+            return
+        }
+        if !isLikelyVolumeRoot(hddURL) {
+            bm.stopAccessing(.ssd); bm.stopAccessing(.hdd)
+            alert("Bookmark HDD non valido",
+                  "Il percorso '\(hddURL.path)' non è la radice del volume.\n\nVai in Impostazioni (⚙) → riseleziona HDD scegliendo '/Volumes/BackupHDD' (root del volume, non una sottocartella).")
+            return
+        }
+        let now = Date()
+        let lastDeep = UserDefaults.standard.object(forKey: lastDeepKey) as? Date ?? .distantPast
+        let deep = now.timeIntervalSince(lastDeep) > TimeInterval(30 * 24 * 3600)
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let result = await self.syncer.previewSync(from: ssdURL, to: hddURL, deep: deep)
+            self.bm.stopAccessing(.ssd)
+            self.bm.stopAccessing(.hdd)
+            let eta = result.estimatedSec > 0
+                ? FileSyncer.SyncResult.hms(result.estimatedSec)
+                : "< 1s"
+            let modeLabel = deep ? "deep (confronto dimensioni)" : "normale (dimensioni + data)"
+            let a = NSAlert()
+            a.messageText = "Anteprima SSD -> HDD"
+            a.informativeText = "Modalita: \(modeLabel)\nFile da copiare: \(result.toAdd)\nFile gia presenti (skip): \(result.toSkip)\nTempo stimato: \(eta)\n\n(stima basata su 50 file/s - il tempo reale puo variare)"
+            a.alertStyle = .informational
+            a.addButton(withTitle: "OK")
+            a.runModal()
+        }
+    }
+
+    func stop() {
+        wasStopped = true
+        elapsedTimer?.cancel(); elapsedTimer = nil
+        syncer.cancel()
+        s3Syncer.cancel()
+        syncTask?.cancel(); syncTask = nil
+        phase = .failed("Interrotto dall'utente")
+        completionSnapshot = (phase, stats)
+    }
+
+    private func run(label: String, work: @escaping () async throws -> FileSyncer.SyncResult?) {
+        guard !isRunning else { return }
+        output = ""; stats = JobStats(); currentStatus = ""
+        wasStopped = false
+        let now = Date()
+        completionSnapshot = nil; startTime = now
+        speedHistory = [SpeedSample(time: now.addingTimeInterval(-2.0), value: 0),
+                        SpeedSample(time: now, value: 0)]
+        lastSpeedSampleDate = now.addingTimeInterval(-2.1)
+        smoothedEtaSec = 0
+        phase = .running(label)
+
+        elapsedTimer = Timer.publish(every: 1, on: .main, in: .common)
+            .autoconnect()
+            .sink { [weak self] _ in
+                guard let self, let start = self.startTime else { return }
+                self.stats.elapsed = FileSyncer.SyncResult.hms(Int(Date().timeIntervalSince(start)))
+            }
+
+        syncTask = Task.detached(priority: .userInitiated) { [weak self] in
+            do {
+                let result = try await work()
+                await MainActor.run {
+                    guard let self else { return }
+                    self.elapsedTimer?.cancel(); self.elapsedTimer = nil
+                    if let r = result {
+                        self.stats.copied = r.copied; self.stats.skipped = r.skipped
+                        self.stats.errors = r.errors; self.stats.done = r.done
+                        self.stats.total = r.total; self.stats.percent = 100
+                        self.stats.elapsed = FileSyncer.SyncResult.hms(r.elapsedSec)
+                        self.stats.hashErrors = r.hashErrors          // mismatch SHA256
+                        self.stats.verifiedOk = r.copied              // tutti i copied sono verified ok
+                    }
+                    self.phase = .success("Completato: \(label)")
+                    Notifier.send(self.phase.label,
+                        "Copiati \(self.stats.copied) · Skippati \(self.stats.skipped) · Errori \(self.stats.errors)")
+                    self.completionSnapshot = (self.phase, self.stats)
+                }
+            } catch {
+                await MainActor.run {
+                    guard let self else { return }
+                    self.elapsedTimer?.cancel(); self.elapsedTimer = nil
+                    guard !self.wasStopped else { return }
+                    self.stats.elapsed = self.makeElapsed()
+                    self.phase = .failed("Errore: \(error.localizedDescription)")
+                    self.completionSnapshot = (self.phase, self.stats)
+                }
+            }
+        }
+    }
+
+    private func publishStatus(_ s: String) {
+        Task { @MainActor [weak self] in
+            self?.currentStatus = s
+            self?.append("STATUS: \(s)\n")
+        }
+    }
+
+    private func publishProgress(_ r: FileSyncer.SyncResult) {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.stats.percent = r.percent; self.stats.done = r.done; self.stats.total = r.total
+            self.stats.copied = r.copied; self.stats.skipped = r.skipped; self.stats.errors = r.errors
+            self.stats.elapsed = FileSyncer.SyncResult.hms(r.elapsedSec)
+            self.stats.hashErrors = r.hashErrors          // mismatch SHA256 in tempo reale
+            self.stats.verifiedOk = r.copied              // tutti i copied sono verified ok
+            self.stats.eta = (r.copied > 0 && r.etaSec > 0) ? self.smoothEta(raw: r.etaSec) : "—"
+            if r.elapsedSec > 0 {
+                if r.copied > 0 {
+                    let spd = Double(r.copied) / Double(r.elapsedSec)
+                    self.stats.speed = String(format: "%.1f file/s", spd)
+                    self.appendSpeedSample(spd)
+                } else if r.done > 0 {
+                    let spd = Double(r.done) / Double(r.elapsedSec)
+                    self.stats.speed = String(format: "%.0f scan/s", spd)
+                }
+            }
+        }
+    }
+
+    private func appendSpeedSample(_ value: Double) {
+        let now = Date()
+        guard now.timeIntervalSince(lastSpeedSampleDate) >= 2.0 else { return }
+        lastSpeedSampleDate = now
+        speedHistory.append(SpeedSample(time: now, value: value))
+        if speedHistory.count > maxSpeedSamples { speedHistory.removeFirst() }
+    }
+
+    private func smoothEta(raw: Int) -> String {
+        smoothedEtaSec = smoothedEtaSec <= 0
+            ? Double(raw)
+            : 0.15 * Double(raw) + 0.85 * smoothedEtaSec
+        return FileSyncer.SyncResult.hms(Int(smoothedEtaSec))
+    }
+
+    private func append(_ text: String) {
+        output += text
+        if output.count > maxOut { output = String(output.suffix(maxOut)) }
+    }
+
+    private func makeElapsed() -> String {
+        guard let s = startTime else { return "—" }
+        let t = Int(Date().timeIntervalSince(s))
+        return String(format: "%02d:%02d:%02d", t/3600, (t%3600)/60, t%60)
+    }
+
+    private func isLikelyVolumeRoot(_ url: URL) -> Bool {
+        // /Volumes/VolumeName ha esattamente 3 componenti: ["/", "Volumes", "Name"]
+        url.pathComponents.count <= 3
+    }
+
+    private func alert(_ title: String, _ msg: String) {
+        let a = NSAlert(); a.messageText = title; a.informativeText = msg
+        a.alertStyle = .warning; a.runModal()
+    }
+
+}
+
+// MARK: - SetupView
+struct SetupView: View {
+    @ObservedObject private var bm = BookmarkManager.shared
+    var body: some View {
+        VStack(spacing: 28) {
+            VStack(spacing: 8) {
+                Image(systemName: "folder.badge.gearshape")
+                    .font(.system(size: 52)).foregroundStyle(.blue)
+                Text("Configurazione Backup Foto")
+                    .font(.title2).fontWeight(.semibold)
+                Text("Seleziona le cartelle una volta sola — l'app le ricorderà automaticamente.")
+                    .font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center)
+            }
+            VStack(spacing: 10) {
+                ForEach(BookmarkManager.Location.allCases) { loc in
+                    LocationRow(location: loc) { bm.selectAndSave(loc) { _ in } }
+                }
+            }.padding(.horizontal, 20)
+            Text("Dopo aver selezionato tutte e tre le cartelle l'app si aprirà automaticamente.")
+                .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
+        }.padding(40).frame(minWidth: 500, minHeight: 420)
+    }
+}
+
+struct LocationRow: View {
+    @ObservedObject private var bm = BookmarkManager.shared
+    let location: BookmarkManager.Location
+    let onSelect: () -> Void
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: bm.urls[location] != nil ? "checkmark.circle.fill" : "circle")
+                .foregroundStyle(bm.urls[location] != nil ? .green : .secondary).font(.system(size: 18))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(location.displayName).font(.system(size: 13, weight: .medium))
+                if let url = bm.urls[location] {
+                    Text(url.path).font(.caption2).foregroundStyle(.secondary)
+                        .lineLimit(1).truncationMode(.middle)
+                } else {
+                    Text(location.hint).font(.caption2).foregroundStyle(.secondary)
+                        .lineLimit(1).truncationMode(.tail)
+                }
+            }
+            Spacer()
+            Button(bm.urls[location] != nil ? "Cambia" : "Seleziona", action: onSelect)
+                .buttonStyle(.bordered).controlSize(.small)
+        }
+        .padding(12).background(.quaternary.opacity(0.4)).clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+// MARK: - ContentView
+struct ContentView: View {
+    @StateObject private var runner = BackupRunner()
+    @StateObject private var volumes = VolumeMonitor()
+    @State private var showCompletion = false
+    @State private var showSettings = false
+    @State private var showHamburger = false
+    @State private var activeSpeedTab: SpeedLogTab = .speed
+    var body: some View {
+        ZStack(alignment: .leading) {
+            HSplitView {
+                SidebarView(volumes: volumes, runner: runner, showHamburger: $showHamburger)
+                    .frame(minWidth: 220, maxWidth: 260)
+                VStack(spacing: 0) {
+                    HStack(spacing: 10) {
+                        PhaseIndicator(phase: runner.phase, percent: runner.stats.percent)
+                        Spacer()
+                        Button {
+                            activeSpeedTab = .log
+                        } label: { Label("Log", systemImage: "doc.text.magnifyingglass") }
+                        .buttonStyle(.bordered).controlSize(.small)
+                        if runner.isRunning {
+                            Button(role: .destructive) { runner.stop() } label: {
+                                Label("Interrompi", systemImage: "stop.fill")
+                            }.buttonStyle(.bordered).controlSize(.small).tint(.red)
+                        }
+                    }
+                    .padding(.horizontal, 20).padding(.vertical, 10).background(.bar)
+                    Divider()
+                    SpeedLogPanel(history: runner.speedHistory, output: runner.output, speedUnit: runner.speedUnit, activeTab: $activeSpeedTab)
+                        .padding(.horizontal, 18).padding(.top, 14).padding(.bottom, 10)
+                    if runner.phase != .idle {
+                        Divider()
+                        StatsPanel(stats: runner.stats, phase: runner.phase, currentStatus: runner.currentStatus)
+                            .padding(18)
+                    }
+                    Divider()
+                    HStack {
+                        Spacer()
+                        Button("Esci") { confirmQuit() }.buttonStyle(.bordered).controlSize(.small)
+                    }
+                    .padding(.horizontal, 20).padding(.vertical, 8)
+                }
+            }
+
+            if showHamburger {
+                Color.black.opacity(0.18)
+                    .ignoresSafeArea()
+                    .onTapGesture { withAnimation(.easeInOut(duration: 0.22)) { showHamburger = false } }
+                    .zIndex(9)
+                    .transition(.opacity)
+
+                HamburgerPanel(isVisible: $showHamburger, showSettings: $showSettings, onShowLog: {
+                    activeSpeedTab = .log
+                    withAnimation(.easeInOut(duration: 0.22)) { showHamburger = false }
+                })
+                    .frame(width: 252, alignment: .leading)
+                    .frame(maxHeight: .infinity, alignment: .leading)
+                    .zIndex(10)
+                    .transition(.move(edge: .leading))
+            }
+        }
+        .onAppear { Notifier.requestAuthorization() }
+        .onChange(of: runner.completionSnapshot?.phase) { _, p in
+            if let p, p.isTerminal { showCompletion = true }
+        }
+        .sheet(isPresented: $showCompletion) {
+            if let snap = runner.completionSnapshot {
+                CompletionSheet(phase: snap.phase, stats: snap.stats) { showCompletion = false }
+            }
+        }
+        .sheet(isPresented: $showSettings) { SettingsSheet() }
+    }
+
+    private func confirmQuit() {
+        let a = NSAlert(); a.messageText = "Chiudere l'app?"
+        a.informativeText = "I processi in corso verranno interrotti."
+        a.alertStyle = .warning; a.addButton(withTitle: "Esci"); a.addButton(withTitle: "Annulla")
+        if a.runModal() == .alertFirstButtonReturn {
+            if runner.isRunning { runner.stop() }
+            NSApp.terminate(nil)
+        }
+    }
+}
+
+// MARK: - Settings sheet
+struct SettingsSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject private var bm = BookmarkManager.shared
+    var body: some View {
+        VStack(spacing: 20) {
+            Text("Impostazioni").font(.title2).fontWeight(.semibold)
+            Text("Modifica le cartelle selezionate").font(.subheadline).foregroundStyle(.secondary)
+            VStack(spacing: 10) {
+                ForEach(BookmarkManager.Location.allCases) { loc in
+                    LocationRow(location: loc) { bm.selectAndSave(loc) { _ in } }
+                }
+            }.padding(.horizontal, 20)
+            Button("Chiudi") { dismiss() }.buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
+        }.padding(36).frame(minWidth: 480)
+    }
+}
+
+// MARK: - CompletionSheet
+struct CompletionSheet: View {
+    let phase: JobPhase; let stats: JobStats; let onDismiss: () -> Void
+    private var ok: Bool { if case .success = phase { return true }; return false }
+    var body: some View {
+        VStack(spacing: 22) {
+            Image(systemName: ok ? "checkmark.circle.fill" : "xmark.circle.fill")
+                .font(.system(size: 60)).foregroundStyle(ok ? .green : .red).symbolRenderingMode(.hierarchical)
+            Text(ok ? "Backup completato" : "Backup fallito").font(.title2).fontWeight(.semibold)
+            Text(phase.label).font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center)
+            HStack(spacing: 14) {
+                CStat(label: "Copiati",  value: "\(stats.copied)",  color: .blue)
+                CStat(label: "Skippati", value: "\(stats.skipped)", color: .secondary)
+                CStat(label: "Errori",   value: "\(stats.errors)",  color: stats.errors > 0 ? .red : .secondary)
+                CStat(label: "Durata",   value: stats.elapsed,      color: .secondary)
+            }
+            if stats.verifiedOk > 0 {
+                Label("\(stats.verifiedOk) file verificati con SHA256 ✓",
+                      systemImage: "checkmark.shield.fill")
+                    .font(.caption).foregroundStyle(.green).multilineTextAlignment(.center)
+            }
+            if stats.hashErrors > 0 {
+                Label("\(stats.hashErrors) hash mismatch — controlla il log",
+                      systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption).foregroundStyle(.orange).multilineTextAlignment(.center)
+            }
+            if stats.errors > 0 {
+                Label("Controlla il log per i dettagli sugli errori.", systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption).foregroundStyle(.orange).multilineTextAlignment(.center)
+            }
+            Button(action: onDismiss) { Text("OK").frame(minWidth: 120) }
+                .buttonStyle(.borderedProminent).tint(ok ? .green : .red).keyboardShortcut(.defaultAction)
+        }.padding(38).frame(minWidth: 380)
+    }
+}
+
+struct CStat: View {
+    let label: String; let value: String; let color: Color
+    var body: some View {
+        VStack(spacing: 4) {
+            Text(value).font(.system(size: 20, weight: .semibold, design: .monospaced)).foregroundStyle(color)
+            Text(label).font(.caption2).foregroundStyle(.secondary)
+        }
+        .frame(minWidth: 58).padding(.vertical, 10).padding(.horizontal, 8)
+        .background(.quaternary.opacity(0.5)).clipShape(RoundedRectangle(cornerRadius: 10))
+    }
+}
+
+// MARK: - Sidebar
+struct SidebarView: View {
+    @ObservedObject var volumes: VolumeMonitor
+    @ObservedObject var runner: BackupRunner
+    @Binding var showHamburger: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 10) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.22)) { showHamburger.toggle() }
+                } label: {
+                    Image(systemName: "line.3.horizontal")
+                        .font(.system(size: 15, weight: .medium))
+                }
+                .buttonStyle(.borderless)
+                .foregroundStyle(showHamburger ? Color.accentColor : Color.primary)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Backup Foto").font(.title2).fontWeight(.semibold)
+                    Text("Enrico Nanni Vicenzi").font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+            .padding(.horizontal, 16).padding(.top, 20).padding(.bottom, 16)
+
+            Divider()
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Volumi").font(.caption).fontWeight(.medium).foregroundStyle(.secondary)
+                    .padding(.horizontal, 16).padding(.top, 10)
+                VolumeRow(name: "SSD - Enri",  icon: "internaldrive.fill",  mounted: volumes.ssdMounted)
+                VolumeRow(name: "BackupHDD",   icon: "externaldrive.fill",  mounted: volumes.hddMounted)
+                VolumeRow(name: "Cubbit S3",   icon: "cloud.fill",          mounted: true, alwaysOn: true)
+            }.padding(.bottom, 10)
+            Divider()
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Operazioni").font(.caption).fontWeight(.medium).foregroundStyle(.secondary)
+                    .padding(.horizontal, 16).padding(.top, 10)
+                OpsButton(title: "MAC -> SSD", subtitle: "Photos originals → SSD",
+                          icon: "photo.on.rectangle.angled", color: .blue,
+                          enabled: !runner.isRunning && volumes.ssdMounted,
+                          action: { runner.runMacToSSD() },
+                          onPreview: { runner.previewMacToSSD() })
+                OpsButton(title: "SSD -> HDD", subtitle: "Mirror locale (deep ogni 30gg)",
+                          icon: "externaldrive.badge.plus", color: .teal,
+                          enabled: !runner.isRunning && volumes.ssdMounted && volumes.hddMounted,
+                          action: { runner.runSSDToHDD() },
+                          onPreview: { runner.previewSSDToHDD() })
+                OpsButton(title: "SSD -> Cubbit S3", subtitle: "Cloud backup nativo Swift",
+                          icon: "icloud.and.arrow.up", color: .purple,
+                          enabled: !runner.isRunning && volumes.ssdMounted) { runner.runSyncS3() }
+            }
+            Spacer()
+            if let start = runner.startTime {
+                Divider()
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Avviato alle").font(.caption2).foregroundStyle(.secondary)
+                        Text(start, style: .time).font(.caption).monospacedDigit()
+                    }
+                    Spacer()
+                }.padding(.horizontal, 16).padding(.vertical, 10)
+            }
+        }.background(.windowBackground)
+    }
+}
+
+struct VolumeRow: View {
+    let name: String; let icon: String; let mounted: Bool; var alwaysOn = false
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: icon).font(.system(size: 13))
+                .foregroundStyle(mounted ? (alwaysOn ? Color.purple : Color.primary) : Color.secondary.opacity(0.4))
+                .frame(width: 20)
+            Text(name).font(.system(size: 13)).foregroundStyle(mounted ? Color.primary : Color.secondary)
+            Spacer()
+            Circle().fill(mounted ? (alwaysOn ? Color.purple : Color.green) : Color.secondary.opacity(0.3))
+                .frame(width: 7, height: 7)
+        }.padding(.horizontal, 16).padding(.vertical, 5)
+    }
+}
+
+struct OpsButton: View {
+    let title: String; let subtitle: String; let icon: String
+    let color: Color; let enabled: Bool; let action: () -> Void
+    var onPreview: (() -> Void)? = nil
+    var body: some View {
+        HStack(spacing: 0) {
+            Button(action: action) {
+                HStack(spacing: 10) {
+                    Image(systemName: icon).font(.system(size: 14, weight: .medium))
+                        .foregroundStyle(enabled ? color : Color.secondary).frame(width: 22)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(title).font(.system(size: 13, weight: .medium))
+                            .foregroundStyle(enabled ? Color.primary : Color.secondary)
+                        Text(subtitle).font(.system(size: 11)).foregroundStyle(Color.secondary)
+                    }
+                    Spacer()
+                }.padding(.horizontal, 16).padding(.vertical, 8).contentShape(Rectangle())
+            }.buttonStyle(.plain).disabled(!enabled).opacity(enabled ? 1 : 0.45)
+            if let onPreview {
+                Button(action: onPreview) {
+                    Image(systemName: "eye")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(enabled ? Color.secondary : Color.secondary.opacity(0.3))
+                        .padding(.trailing, 12)
+                        .padding(.vertical, 8)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(!enabled)
+                .opacity(enabled ? 1 : 0.45)
+                .help("Anteprima: mostra quanti file verranno copiati senza avviare il backup")
+            }
+        }
+    }
+}
+
+// MARK: - Hamburger Panel
+struct HamburgerPanel: View {
+    @Binding var isVisible: Bool
+    @Binding var showSettings: Bool
+    var onShowLog: (() -> Void)? = nil
+    private let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
+    private let profileName = "Enrico Nanni Vicenzi"
+    private let profileEmail = "enrynv@gmail.com"
+
+    @ObservedObject private var appearance = AppearanceManager.shared
+    @State private var showAppearance = false
+    @State private var showTools = false
+
+    private var initials: String {
+        profileName.split(separator: " ").prefix(2).compactMap { $0.first.map(String.init) }.joined()
+    }
+    private var systemLanguageName: String {
+        let preferred = Locale.preferredLanguages.first ?? "it"
+        let code = Locale(identifier: preferred).language.languageCode?.identifier ?? "it"
+        return Locale(identifier: preferred).localizedString(forLanguageCode: code)?.capitalized ?? code.uppercased()
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 12) {
+                    ZStack {
+                        Circle().fill(Color.accentColor.opacity(0.15)).frame(width: 44, height: 44)
+                        Text(initials).font(.system(size: 16, weight: .semibold)).foregroundStyle(Color.accentColor)
+                    }
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(profileName).font(.system(size: 13, weight: .semibold))
+                        Text(profileEmail).font(.caption2).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.22)) { isVisible = false }
+                    } label: {
+                        Image(systemName: "xmark.circle.fill").font(.system(size: 16)).foregroundStyle(.secondary)
+                    }.buttonStyle(.borderless)
+                }
+                .padding(.horizontal, 16).padding(.top, 20).padding(.bottom, 14)
+
+                Divider()
+
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 2) {
+                        HamburgerSectionLabel("Strumenti")
+                        HamburgerRow(icon: "doc.text.magnifyingglass", label: "Report Log", iconColor: .blue) {
+                            onShowLog?(); close()
+                        }
+                        HamburgerRow(icon: "gearshape.fill", label: "Configurazione", iconColor: Color(NSColor.systemGray)) {
+                            showSettings = true; close()
+                        }
+                        HamburgerRow(icon: "wrench.and.screwdriver.fill", label: "Tools", iconColor: .purple) {
+                            showTools = true
+                        }
+
+                        HamburgerSectionLabel("Preferenze").padding(.top, 6)
+                        HamburgerRow(icon: "paintbrush.fill", label: "Aspetto", iconColor: .orange, badge: appearance.mode) {
+                            showAppearance = true
+                        }
+                        HamburgerRow(icon: "globe", label: "Lingua", iconColor: .teal, badge: systemLanguageName) {
+                            if let url = URL(string: "x-apple.systempreferences:com.apple.Localization-Settings.extension") {
+                                NSWorkspace.shared.open(url)
+                            }
+                        }
+                    }
+                    .padding(.vertical, 8)
+                }
+
+                Spacer()
+                Divider()
+                HStack(spacing: 6) {
+                    Image(systemName: "info.circle").font(.caption2).foregroundStyle(.secondary)
+                    Text("Versione \(version)").font(.caption2).foregroundStyle(.secondary)
+                }
+                .padding(.horizontal, 16).padding(.vertical, 10)
+            }
+        .frame(width: 252)
+        .background(.windowBackground)
+        .shadow(color: .black.opacity(0.18), radius: 12, x: 5, y: 0)
+        .sheet(isPresented: $showAppearance) { AppearanceSheet() }
+        .sheet(isPresented: $showTools)      { ToolsSheet() }
+    }
+
+    private func close() {
+        withAnimation(.easeInOut(duration: 0.22)) { isVisible = false }
+    }
+}
+
+struct HamburgerSectionLabel: View {
+    let text: String
+    init(_ text: String) { self.text = text }
+    var body: some View {
+        Text(text.uppercased())
+            .font(.system(size: 10, weight: .semibold))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 16).padding(.top, 6).padding(.bottom, 2)
+    }
+}
+
+struct HamburgerRow: View {
+    let icon: String
+    let label: String
+    let iconColor: Color
+    var badge: String? = nil
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 12) {
+                Image(systemName: icon)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .frame(width: 28, height: 28)
+                    .background(iconColor)
+                    .clipShape(RoundedRectangle(cornerRadius: 7))
+
+                Text(label)
+                    .font(.system(size: 13))
+                    .foregroundStyle(Color.primary)
+
+                Spacer()
+
+                if let badge {
+                    Text(badge)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(Color.secondary.opacity(0.5))
+            }
+            .padding(.horizontal, 16).padding(.vertical, 8)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+// MARK: - Phase & Status
+struct PhaseIndicator: View {
+    let phase: JobPhase; let percent: Int
+    var body: some View {
+        HStack(spacing: 6) {
+            if case .running = phase {
+                ProgressView().controlSize(.small)
+                Text(percent >= 100 ? "Finalizzando..." : phase.label)
+                    .font(.system(size: 13, weight: .medium)).foregroundStyle(phase.color)
+            } else {
+                Image(systemName: phase.icon).foregroundStyle(phase.color)
+                Text(phase.label).font(.system(size: 13, weight: .medium)).foregroundStyle(phase.color)
+            }
+        }
+    }
+}
+
+struct StatusBar: View {
+    let status: String; let phase: JobPhase
+    var body: some View {
+        if !status.isEmpty {
+            HStack(spacing: 8) {
+                Image(systemName: "info.circle.fill").font(.system(size: 11))
+                    .foregroundStyle(phase.color.opacity(0.8))
+                Text(status).font(.system(size: 12)).lineLimit(2).fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+                Spacer()
+            }
+            .padding(.horizontal, 12).padding(.vertical, 8).background(phase.color.opacity(0.07))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(phase.color.opacity(0.2), lineWidth: 1))
+        }
+    }
+}
+
+// MARK: - Stats Panel
+struct StatsPanel: View {
+    let stats: JobStats; let phase: JobPhase; let currentStatus: String
+    var body: some View {
+        VStack(spacing: 14) {
+            StatusBar(status: currentStatus, phase: phase)
+            VStack(spacing: 6) {
+                HStack {
+                    Text("Avanzamento").font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    Text("\(stats.percent)%").font(.caption).monospacedDigit().foregroundStyle(.secondary)
+                }
+                ProgressView(value: Double(stats.percent), total: 100).progressViewStyle(.linear)
+                    .tint(phase == .idle ? .secondary : (stats.errors > 0 ? .red : .blue))
+                HStack {
+                    Text("\(stats.done) / \(stats.total) file")
+                        .font(.caption2).monospacedDigit().foregroundStyle(.secondary)
+                    Spacer()
+                    Text("velocita \(stats.speed)").font(.caption2).monospacedDigit().foregroundStyle(.secondary)
+                }
+            }
+            HStack(spacing: 10) {
+                StatCard(label: "Copiati",   value: "\(stats.copied)",  accent: .blue)
+                StatCard(label: "Skippati",  value: "\(stats.skipped)", accent: .secondary)
+                StatCard(label: "Errori",    value: "\(stats.errors)",  accent: stats.errors > 0 ? .red : .secondary)
+                StatCard(label: "Trascorso", value: stats.elapsed,      accent: .secondary)
+                StatCard(label: "ETA",       value: stats.eta,           accent: .secondary)
+            }
+        }
+    }
+}
+
+struct StatCard: View {
+    let label: String; let value: String; let accent: Color
+    var body: some View {
+        VStack(spacing: 4) {
+            Text(value).font(.system(size: 18, weight: .semibold, design: .monospaced))
+                .foregroundStyle(accent).lineLimit(1).minimumScaleFactor(0.6).textSelection(.enabled)
+            Text(label).font(.caption2).foregroundStyle(.secondary)
+        }.frame(maxWidth: .infinity).padding(.vertical, 10)
+        .background(.quaternary.opacity(0.5)).clipShape(RoundedRectangle(cornerRadius: 10))
+    }
+}
+
+// MARK: - Speed / Log Panel
+enum SpeedLogTab: String, CaseIterable {
+    case speed = "Speed"
+    case log = "Log"
+}
+
+struct SpeedLogPanel: View {
+    let history: [SpeedSample]
+    let output: String
+    let speedUnit: String
+    @Binding var activeTab: SpeedLogTab
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Picker("", selection: $activeTab) {
+                    ForEach(SpeedLogTab.allCases, id: \.self) { tab in
+                        Text(tab.rawValue).tag(tab)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .frame(maxWidth: 160)
+
+                Spacer()
+
+                if activeTab == .log {
+                    Button {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(output, forType: .string)
+                    } label: { Label("Copia", systemImage: "doc.on.doc") }
+                    .buttonStyle(.borderless).controlSize(.small)
+
+                    Button {
+                        let p = NSSavePanel()
+                        p.allowedContentTypes = [.plainText]
+                        p.nameFieldStringValue = "backup_log_\(Int(Date().timeIntervalSince1970)).txt"
+                        if p.runModal() == .OK, let url = p.url {
+                            try? output.data(using: .utf8)?.write(to: url)
+                        }
+                    } label: { Label("Salva", systemImage: "square.and.arrow.down") }
+                    .buttonStyle(.borderless).controlSize(.small)
+                }
+            }
+
+            if activeTab == .speed {
+                SpeedChartView(history: history, unit: speedUnit)
+            } else {
+                LogContentView(output: output)
+            }
+        }
+    }
+}
+
+struct SpeedChartView: View {
+    let history: [SpeedSample]
+    let unit: String
+
+    private var yMax: Double {
+        let peak = history.map(\.value).max() ?? 1
+        return max(peak * 1.25, unit == "MB/s" ? 1.0 : 5.0)
+    }
+
+    var body: some View {
+        Group {
+            if history.isEmpty {
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(Color.primary.opacity(0.05))
+                    .overlay(
+                        VStack(spacing: 6) {
+                            Image(systemName: "chart.line.uptrend.xyaxis")
+                                .font(.system(size: 18))
+                                .foregroundStyle(.secondary.opacity(0.4))
+                            Text("Il grafico velocità appare quando avvii un'operazione")
+                                .font(.caption2).foregroundStyle(.secondary)
+                                .multilineTextAlignment(.center)
+                        }
+                    )
+                    .frame(height: 84)
+            } else {
+                Chart(history) { sample in
+                    LineMark(
+                        x: .value("Tempo", sample.time),
+                        y: .value(unit, sample.value)
+                    )
+                    .foregroundStyle(Color.blue)
+                    .interpolationMethod(.catmullRom)
+                    .lineStyle(StrokeStyle(lineWidth: 2))
+
+                    AreaMark(
+                        x: .value("Tempo", sample.time),
+                        y: .value(unit, sample.value)
+                    )
+                    .foregroundStyle(
+                        LinearGradient(
+                            colors: [Color.blue.opacity(0.22), Color.blue.opacity(0.0)],
+                            startPoint: .top, endPoint: .bottom
+                        )
+                    )
+                    .interpolationMethod(.catmullRom)
+                }
+                .chartXAxis {
+                    AxisMarks(values: .automatic(desiredCount: 5)) { _ in
+                        AxisGridLine().foregroundStyle(Color.secondary.opacity(0.12))
+                        AxisTick().foregroundStyle(Color.secondary.opacity(0.3))
+                        AxisValueLabel(format: .dateTime.hour().minute().second())
+                            .font(.system(size: 9)).foregroundStyle(.secondary)
+                    }
+                }
+                .chartYAxis {
+                    AxisMarks(position: .trailing, values: .automatic(desiredCount: 4)) { val in
+                        AxisGridLine().foregroundStyle(Color.secondary.opacity(0.12))
+                        AxisTick().foregroundStyle(Color.secondary.opacity(0.3))
+                        AxisValueLabel {
+                            if let v = val.as(Double.self) {
+                                Text(v < 10 ? String(format: "%.1f", v) : String(format: "%.0f", v))
+                                    .font(.system(size: 9)).foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+                .chartYScale(domain: 0...yMax)
+                .chartYAxisLabel(unit, position: .trailing, alignment: .center)
+                .chartXAxisLabel("Tempo", position: .bottom, alignment: .center)
+                .animation(.easeInOut(duration: 0.5), value: history.count)
+                .padding(.trailing, 4)
+                .background(Color(NSColor.textBackgroundColor))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .overlay(RoundedRectangle(cornerRadius: 8).stroke(.quaternary, lineWidth: 0.5))
+                .frame(minHeight: 190, maxHeight: .infinity)
+            }
+        }
+    }
+}
+
+struct LogContentView: View {
+    let output: String
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                Text(output.isEmpty ? "Nessun output." : output)
+                    .font(.system(.caption2, design: .monospaced)).textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading).padding(10).id("bottom")
+            }
+            .frame(minHeight: 190, maxHeight: .infinity)
+            .background(Color(NSColor.textBackgroundColor))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(.quaternary, lineWidth: 0.5))
+            .onChange(of: output) { _, _ in proxy.scrollTo("bottom", anchor: .bottom) }
+        }
+    }
+}
+
+// MARK: - Appearance Sheet
+struct AppearanceSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject private var appearance = AppearanceManager.shared
+    private let modes = ["Sistema", "Chiaro", "Scuro"]
+    private let icons = ["circle.lefthalf.filled", "sun.max.fill", "moon.fill"]
+
+    var body: some View {
+        VStack(spacing: 24) {
+            Text("Aspetto Interfaccia").font(.title2).fontWeight(.semibold)
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(Array(zip(modes, icons)), id: \.0) { mode, icon in
+                    Button {
+                        appearance.mode = mode
+                    } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: appearance.mode == mode ? "checkmark.circle.fill" : "circle")
+                                .foregroundStyle(appearance.mode == mode ? Color.accentColor : Color.secondary)
+                            Image(systemName: icon).foregroundStyle(.secondary).frame(width: 16)
+                            Text(mode)
+                            Spacer()
+                        }
+                        .padding(.horizontal, 12).padding(.vertical, 8)
+                        .background(appearance.mode == mode ? Color.accentColor.opacity(0.08) : Color.clear)
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(8).background(.quaternary.opacity(0.4)).clipShape(RoundedRectangle(cornerRadius: 10))
+            Button("OK") { dismiss() }
+                .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
+        }
+        .padding(28).frame(width: 300)
+    }
+}
+
+// MARK: - Tools / Diagnostics Sheet
+struct ToolsSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject private var bm = BookmarkManager.shared
+    @State private var showSecret = false
+    private let lastDeepDate: String = {
+        if let d = UserDefaults.standard.object(forKey: "lastDeepMirrorDate") as? Date {
+            let f = DateFormatter(); f.dateStyle = .medium; f.timeStyle = .short
+            return f.string(from: d)
+        }
+        return "Mai eseguito"
+    }()
+
+    private func confirmReveal(_ action: @escaping () -> Void) {
+        let a = NSAlert()
+        a.messageText = "Rivelare le credenziali S3?"
+        a.informativeText = "Chiunque veda o registri lo schermo in questo momento potrà usarle per scrivere o cancellare file sul bucket. Continua solo se sei sicuro che nessuno stia guardando."
+        a.alertStyle = .warning
+        a.addButton(withTitle: "Continua")
+        a.addButton(withTitle: "Annulla")
+        if a.runModal() == .alertFirstButtonReturn { action() }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Text("Diagnostica").font(.title2).fontWeight(.semibold)
+
+            GroupBox("Cartelle Configurate") {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(BookmarkManager.Location.allCases) { loc in
+                        HStack(spacing: 8) {
+                            Image(systemName: bm.urls[loc] != nil ? "checkmark.circle.fill" : "xmark.circle.fill")
+                                .foregroundStyle(bm.urls[loc] != nil ? Color.green : Color.red)
+                                .font(.system(size: 12))
+                            Text(loc.displayName).font(.caption).frame(width: 140, alignment: .leading)
+                            Text(bm.urls[loc]?.path ?? "Non configurato")
+                                .font(.system(.caption2, design: .monospaced))
+                                .foregroundStyle(bm.urls[loc] != nil ? Color.secondary : Color.red)
+                                .lineLimit(1).truncationMode(.middle)
+                            Spacer()
+                        }
+                    }
+                }.padding(4)
+            }
+
+            GroupBox("S3 — Cubbit") {
+                VStack(alignment: .leading, spacing: 6) {
+                    if let cfg = try? S3Syncer.readConfig() {
+                        DiagRow(label: "Endpoint",  value: cfg.endpoint)
+                        DiagRow(label: "Bucket",    value: cfg.bucket)
+                        DiagRow(label: "Region",    value: cfg.region)
+                        HStack {
+                            Text("AccessKey").font(.caption).foregroundStyle(.secondary).frame(width: 82, alignment: .leading)
+                            if showSecret {
+                                Text(cfg.accessKeyId)
+                                    .font(.system(.caption, design: .monospaced))
+                                    .textSelection(.enabled)
+                            } else {
+                                Text(String(repeating: "•", count: 20))
+                                    .font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                        }
+                        HStack {
+                            Text("SecretKey").font(.caption).foregroundStyle(.secondary).frame(width: 82, alignment: .leading)
+                            if showSecret {
+                                Text(cfg.secretAccessKey)
+                                    .font(.system(.caption, design: .monospaced))
+                                    .textSelection(.enabled)
+                            } else {
+                                Text(String(repeating: "•", count: 24))
+                                    .font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Button(showSecret ? "Nascondi" : "Mostra") {
+                                if showSecret { showSecret = false } else { confirmReveal { showSecret = true } }
+                            }
+                            .buttonStyle(.borderless).font(.caption)
+                        }
+                        Button("Apri rclone.conf in TextEdit") {
+                            confirmReveal {
+                                let path = NSHomeDirectory() + "/.config/rclone/rclone.conf"
+                                NSWorkspace.shared.open(URL(fileURLWithPath: path))
+                            }
+                        }.buttonStyle(.bordered).controlSize(.small).padding(.top, 2)
+                    } else {
+                        Label("rclone.conf non trovato o credenziali mancanti",
+                              systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange).font(.caption)
+                    }
+                }.padding(4)
+            }
+
+            GroupBox("Sync Info") {
+                VStack(alignment: .leading, spacing: 6) {
+                    DiagRow(label: "Ultimo deep", value: lastDeepDate)
+                    DiagRow(label: "Log", value: "Visibile nella console principale (tab Log)")
+                }.padding(4)
+            }
+
+            HStack {
+                Spacer()
+                Button("Chiudi") { dismiss() }.buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(28).frame(minWidth: 560)
+    }
+}
+
+struct DiagRow: View {
+    let label: String; let value: String
+    var body: some View {
+        HStack(alignment: .top, spacing: 0) {
+            Text(label).font(.caption).foregroundStyle(.secondary).frame(width: 82, alignment: .leading)
+            Text(value).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+            Spacer()
+        }
+    }
 }

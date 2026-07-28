@@ -1,0 +1,12 @@
+# Xcode user state
+AppBackupFoto.xcodeproj/project.xcworkspace/xcuserdata/
+AppBackupFoto.xcodeproj/xcuserdata/
+DerivedData/
+
+# macOS
+.DS_Store
+
+# Dati foto e log di backup (mai in git — dati irrecuperabili / grandi)
+Log/
+Script/*.log
+Script/*.csv
