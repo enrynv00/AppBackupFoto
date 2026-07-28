@@ -1053,12 +1053,15 @@ final class BackupRunner: ObservableObject {
 
     func stop() {
         wasStopped = true
+        let jobLabel = phase.label   // etichetta del job in corso, catturata prima di sovrascrivere phase
         elapsedTimer?.cancel(); elapsedTimer = nil
         syncer.cancel()
         s3Syncer.cancel()
         syncTask?.cancel(); syncTask = nil
         phase = .failed("Interrotto dall'utente")
         completionSnapshot = (phase, stats)
+        JobHistoryStore.save(JobSummary(date: Date(), label: jobLabel, copied: stats.copied,
+            skipped: stats.skipped, errors: stats.errors, hashErrors: stats.hashErrors, succeeded: false))
     }
 
     private func run(label: String, work: @escaping () async throws -> FileSyncer.SyncResult?) {
@@ -1098,6 +1101,9 @@ final class BackupRunner: ObservableObject {
                     Notifier.send(self.phase.label,
                         "Copiati \(self.stats.copied) · Skippati \(self.stats.skipped) · Errori \(self.stats.errors)")
                     self.completionSnapshot = (self.phase, self.stats)
+                    JobHistoryStore.save(JobSummary(date: Date(), label: label, copied: self.stats.copied,
+                        skipped: self.stats.skipped, errors: self.stats.errors,
+                        hashErrors: self.stats.hashErrors, succeeded: true))
                 }
             } catch {
                 await MainActor.run {
@@ -1107,6 +1113,9 @@ final class BackupRunner: ObservableObject {
                     self.stats.elapsed = self.makeElapsed()
                     self.phase = .failed("Errore: \(error.localizedDescription)")
                     self.completionSnapshot = (self.phase, self.stats)
+                    JobHistoryStore.save(JobSummary(date: Date(), label: label, copied: self.stats.copied,
+                        skipped: self.stats.skipped, errors: self.stats.errors,
+                        hashErrors: self.stats.hashErrors, succeeded: false))
                 }
             }
         }
