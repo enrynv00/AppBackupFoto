@@ -9,6 +9,7 @@
 /* Begin PBXBuildFile section */
 		3A446D61B0186E1CA084FF0B /* FileSyncerZeroOverwriteTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 94D134C109F6886D8DF115AF /* FileSyncerZeroOverwriteTests.swift */; };
 		3CF547AB089EA250EFD3FC89 /* Cocoa.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 52AB12F7AD7661DE5D3BEC12 /* Cocoa.framework */; };
+		338F53C5A45F895FBD6FCF04 /* IsLikelyVolumeRootTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3394511F3BF2E42181C0DC5B /* IsLikelyVolumeRootTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -26,6 +27,7 @@
 		52AB12F7AD7661DE5D3BEC12 /* Cocoa.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Cocoa.framework; path = Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.0.sdk/System/Library/Frameworks/Cocoa.framework; sourceTree = DEVELOPER_DIR; };
 		695F43372EB019B300509478 /* AppBackupFoto.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = AppBackupFoto.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		94D134C109F6886D8DF115AF /* FileSyncerZeroOverwriteTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = FileSyncerZeroOverwriteTests.swift; sourceTree = "<group>"; };
+		3394511F3BF2E42181C0DC5B /* IsLikelyVolumeRootTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = IsLikelyVolumeRootTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -69,6 +71,7 @@
 			isa = PBXGroup;
 			children = (
 				94D134C109F6886D8DF115AF /* FileSyncerZeroOverwriteTests.swift */,
+				3394511F3BF2E42181C0DC5B /* IsLikelyVolumeRootTests.swift */,
 			);
 			name = AppBackupFotoTests;
 			path = AppBackupFotoTests;
@@ -200,6 +203,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				3A446D61B0186E1CA084FF0B /* FileSyncerZeroOverwriteTests.swift in Sources */,
+				338F53C5A45F895FBD6FCF04 /* IsLikelyVolumeRootTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

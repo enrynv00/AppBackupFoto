@@ -104,6 +104,13 @@ enum JobPhase: Equatable {
     }
 }
 
+// MARK: - Shared utilities
+
+func isLikelyVolumeRoot(_ url: URL) -> Bool {
+    // /Volumes/VolumeName ha esattamente 3 componenti: ["/", "Volumes", "Name"]
+    url.pathComponents.count <= 3
+}
+
 // MARK: - BookmarkManager
 final class BookmarkManager: ObservableObject {
     static let shared = BookmarkManager()
@@ -1138,11 +1145,6 @@ final class BackupRunner: ObservableObject {
         guard let s = startTime else { return "—" }
         let t = Int(Date().timeIntervalSince(s))
         return String(format: "%02d:%02d:%02d", t/3600, (t%3600)/60, t%60)
-    }
-
-    private func isLikelyVolumeRoot(_ url: URL) -> Bool {
-        // /Volumes/VolumeName ha esattamente 3 componenti: ["/", "Volumes", "Name"]
-        url.pathComponents.count <= 3
     }
 
     private func alert(_ title: String, _ msg: String) {
