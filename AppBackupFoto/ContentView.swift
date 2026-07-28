@@ -552,7 +552,7 @@ final class S3Syncer {
         return result
     }
 
-    private func listAll(config: S3Config) async throws -> [String: Int64] {
+    func listAll(config: S3Config) async throws -> [String: Int64] {
         var objects: [String: Int64] = [:]
         var token: String? = nil
         repeat {
@@ -692,6 +692,25 @@ final class S3Syncer {
             throw NSError(domain: "S3", code: 7,
                 userInfo: [NSLocalizedDescriptionKey: "Errore completamento multipart \(key)"])
         }
+    }
+
+    func downloadToTemp(key: String, config: S3Config) async throws -> URL {
+        let encKey = key.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? key
+        guard let getURL = URL(string: "\(config.endpoint)/\(config.bucket)/\(encKey)") else {
+            throw NSError(domain: "S3", code: 12,
+                userInfo: [NSLocalizedDescriptionKey: "URL non valido per il file: \(key)"])
+        }
+        var req = URLRequest(url: getURL)
+        req.httpMethod = "GET"
+        sign(&req, config: config, body: Data(), date: Date())
+        let (tempURL, resp) = try await session.download(for: req)
+        guard let code = (resp as? HTTPURLResponse)?.statusCode, (200...299).contains(code) else {
+            throw NSError(domain: "S3", code: 9,
+                userInfo: [NSLocalizedDescriptionKey: "Errore GET \(key)"])
+        }
+        let dest = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.moveItem(at: tempURL, to: dest)
+        return dest
     }
 
     // MARK: - AWS Signature V4
@@ -1251,6 +1270,87 @@ final class ReviewEngine {
             }
         }
         return result
+    }
+
+    private func sampleS3Pair(ssdRoot: URL, sampleSize: Int,
+                               onProgress: @escaping (String) -> Void) async throws -> IntegrityCheckResult {
+        var result = IntegrityCheckResult(pairName: "SSD ↔ S3")
+        let config = try S3Syncer.readConfig()
+        let remoteKeys = try await s3Syncer.listAll(config: config)
+        let candidates = remoteKeys.keys.filter { fm.fileExists(atPath: ssdRoot.appendingPathComponent($0).path) }
+        guard !candidates.isEmpty else { return result }
+
+        let sample = candidates.shuffled().prefix(sampleSize)
+        for key in sample {
+            onProgress("Verifica S3: \(key)")
+            let localFile = ssdRoot.appendingPathComponent(key)
+            guard let localHash = sha256(of: localFile) else { result.skippedNoSource += 1; continue }
+            result.checked += 1
+            do {
+                let tempURL = try await s3Syncer.downloadToTemp(key: key, config: config)
+                defer { try? fm.removeItem(at: tempURL) }
+                if let remoteHash = sha256(of: tempURL), remoteHash == localHash {
+                    result.matched += 1
+                } else {
+                    result.mismatches.append(key)
+                }
+            } catch {
+                result.mismatches.append("\(key) (errore download: \(error.localizedDescription))")
+            }
+        }
+        return result
+    }
+
+    func runIntegritySample(sampleSize: Int = 20,
+                             onProgress: @escaping (String) -> Void) async -> [IntegrityCheckResult] {
+        var results: [IntegrityCheckResult] = []
+
+        let photosURL = bm.startAccessing(.photos)
+        let ssdURL = bm.startAccessing(.ssd)
+        let hddURL = bm.startAccessing(.hdd)
+        defer {
+            if photosURL != nil { bm.stopAccessing(.photos) }
+            if ssdURL != nil { bm.stopAccessing(.ssd) }
+            if hddURL != nil { bm.stopAccessing(.hdd) }
+        }
+
+        onProgress("Campionamento Mac ↔ SSD…")
+        if let photosURL, let ssdURL {
+            results.append(sampleLocalPair(srcRoot: photosURL,
+                                            dstRoot: ssdURL.appendingPathComponent("Foto iPhone"),
+                                            pairName: "Mac ↔ SSD", sampleSize: sampleSize))
+        } else {
+            var r = IntegrityCheckResult(pairName: "Mac ↔ SSD")
+            r.error = "Bookmark Foto o SSD non accessibile"
+            results.append(r)
+        }
+
+        onProgress("Campionamento SSD ↔ HDD…")
+        if let ssdURL, let hddURL {
+            results.append(sampleLocalPair(srcRoot: ssdURL, dstRoot: hddURL,
+                                            pairName: "SSD ↔ HDD", sampleSize: sampleSize))
+        } else {
+            var r = IntegrityCheckResult(pairName: "SSD ↔ HDD")
+            r.error = "Bookmark SSD o HDD non accessibile"
+            results.append(r)
+        }
+
+        onProgress("Campionamento SSD ↔ S3…")
+        if let ssdURL {
+            do {
+                results.append(try await sampleS3Pair(ssdRoot: ssdURL, sampleSize: sampleSize, onProgress: onProgress))
+            } catch {
+                var r = IntegrityCheckResult(pairName: "SSD ↔ S3")
+                r.error = error.localizedDescription
+                results.append(r)
+            }
+        } else {
+            var r = IntegrityCheckResult(pairName: "SSD ↔ S3")
+            r.error = "Bookmark SSD non accessibile"
+            results.append(r)
+        }
+
+        return results
     }
 }
 
