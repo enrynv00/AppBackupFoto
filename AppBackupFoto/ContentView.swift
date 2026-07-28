@@ -2136,6 +2136,18 @@ struct ToolsSheet: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject private var bm = BookmarkManager.shared
     @State private var showSecret = false
+    @State private var reviewFindings: [ReviewFinding] = []
+    @State private var lastJob: JobSummary? = JobHistoryStore.load()
+    @State private var integrityResults: [IntegrityCheckResult] = []
+    @State private var integrityRunning = false
+    @State private var integrityStatus = ""
+    private let reviewEngine = ReviewEngine()
+
+    private let jobDateFormatter: DateFormatter = {
+        let f = DateFormatter(); f.dateStyle = .medium; f.timeStyle = .short
+        return f
+    }()
+
     private let lastDeepDate: String = {
         if let d = UserDefaults.standard.object(forKey: "lastDeepMirrorDate") as? Date {
             let f = DateFormatter(); f.dateStyle = .medium; f.timeStyle = .short
@@ -2229,6 +2241,77 @@ struct ToolsSheet: View {
                     DiagRow(label: "Log", value: "Visibile nella console principale (tab Log)")
                 }.padding(4)
             }
+
+            GroupBox("Revisione") {
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(reviewFindings) { finding in
+                        HStack(alignment: .top, spacing: 8) {
+                            Image(systemName: finding.ok ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                                .foregroundStyle(finding.ok ? Color.green : Color.orange)
+                                .font(.system(size: 12))
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(finding.title).font(.caption).fontWeight(.medium)
+                                Text(finding.detail).font(.caption2).foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+
+                    Divider()
+
+                    if let lastJob {
+                        HStack(alignment: .top, spacing: 8) {
+                            Image(systemName: lastJob.isClean ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                                .foregroundStyle(lastJob.isClean ? Color.green : Color.orange)
+                                .font(.system(size: 12))
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text("Ultimo job: \(lastJob.label)").font(.caption).fontWeight(.medium)
+                                Text("\(jobDateFormatter.string(from: lastJob.date)) · Copiati \(lastJob.copied) · Skippati \(lastJob.skipped) · Errori \(lastJob.errors) · Hash-mismatch \(lastJob.hashErrors)")
+                                    .font(.caption2).foregroundStyle(.secondary)
+                            }
+                        }
+                    } else {
+                        Text("Nessun job registrato").font(.caption).foregroundStyle(.secondary)
+                    }
+
+                    Divider()
+
+                    Button(integrityRunning ? "Verifica in corso…" : "Verifica integrità campione (20 file per coppia)") {
+                        integrityRunning = true
+                        integrityResults = []
+                        integrityStatus = ""
+                        Task {
+                            let results = await reviewEngine.runIntegritySample(onProgress: { status in
+                                Task { @MainActor in integrityStatus = status }
+                            })
+                            await MainActor.run {
+                                integrityResults = results
+                                integrityRunning = false
+                            }
+                        }
+                    }
+                    .buttonStyle(.bordered).controlSize(.small).disabled(integrityRunning)
+
+                    if integrityRunning {
+                        Text(integrityStatus).font(.caption2).foregroundStyle(.secondary)
+                    }
+
+                    ForEach(integrityResults) { result in
+                        VStack(alignment: .leading, spacing: 1) {
+                            if let error = result.error {
+                                Text("\(result.pairName): saltato — \(error)")
+                                    .font(.caption2).foregroundStyle(.orange)
+                            } else if result.mismatches.isEmpty {
+                                Text("\(result.pairName): \(result.matched)/\(result.checked) verificati, 0 problemi")
+                                    .font(.caption2).foregroundStyle(.green)
+                            } else {
+                                Text("\(result.pairName): \(result.mismatches.count) mismatch su \(result.checked) verificati — \(result.mismatches.prefix(3).joined(separator: ", "))")
+                                    .font(.caption2).foregroundStyle(.red)
+                            }
+                        }
+                    }
+                }.padding(4)
+            }
+            .onAppear { reviewFindings = reviewEngine.runConfigChecks() }
 
             HStack {
                 Spacer()
