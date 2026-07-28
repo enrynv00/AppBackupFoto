@@ -116,7 +116,16 @@ Presenta sempre l'output della revisione insieme al codice.
 - `previewMacToSSD()` / `previewSSDToHDD()` — dry-run: mostrano un `NSAlert` con conteggio file/tempo stimato senza avviare la copia
 - Deep mode SSD→HDD ogni 30 giorni (UserDefaults `lastDeepMirrorDate`), aggiornato solo se il job deep è terminato senza errori
 - `speedHistory`/`speedUnit` alimentano `SpeedChartView` — MB/s per S3, file/s per FileSyncer, "scan/s" durante la fase di conteggio
-- `stop()` cancella `syncer`/`s3Syncer`/`syncTask`, imposta `wasStopped` per evitare un doppio update della UI dopo l'interruzione
+- `stop()` cancella `syncer`/`s3Syncer`/`syncTask`, imposta `wasStopped` per evitare un doppio update della UI dopo l'interruzione; cattura `phase.label` prima di sovrascrivere `phase`, così il riepilogo persistito mantiene il nome del job originale
+- Alla fine di ogni job (successo, errore o stop manuale) salva un `JobSummary` in `JobHistoryStore`
+
+### ReviewEngine (pannello "Revisione", in `ToolsSheet`)
+
+- `runConfigChecks() -> [ReviewFinding]` — sincrono, nessun accesso ai volumi: valida che i bookmark SSD/HDD puntino alla root del volume, i permessi di `rclone.conf`, l'endpoint S3 (via `S3Syncer.readConfig()`)
+- `runIntegritySample(sampleSize:onProgress:) async -> [IntegrityCheckResult]` — su richiesta (bottone dedicato): ricampiona 20 file a caso per coppia (Mac↔SSD, SSD↔HDD, SSD↔S3), ricalcola SHA256 e confronta; per S3 scarica il campione in un file temporaneo e lo cancella subito dopo l'hash. Salta (non fallisce) le coppie i cui bookmark non sono accessibili
+- `sampleLocalPair(...)` usa `realpath()` (non `URL.resolvingSymlinksInPath()`, che lascia `/var`/`/tmp` non risolti di proposito su macOS) per calcolare correttamente i path relativi quando confronta directory temporanee — dettaglio scoperto scrivendo i test, importante se si tocca di nuovo questa logica
+- `JobSummary`/`JobHistoryStore` — riepilogo dell'ultimo job (data, label, copiati/skippati/errori/hash-mismatch), persistito in UserDefaults (`defaults` parametrizzato per testabilità), sopravvive al riavvio dell'app
+- Il motore **segnala soltanto**: nessuna `removeItem`/`copyItem`/scrittura S3 verso una destinazione persistente
 
 ---
 
@@ -126,7 +135,7 @@ Presenta sempre l'output della revisione insieme al codice.
 - **ContentView** — `HSplitView` con `SidebarView` a sinistra e pannello principale (fase corrente, `SpeedLogPanel`, `StatsPanel`, bottone Interrompi/Esci) a destra
 - **SidebarView** — hamburger `[☰]`, stato volumi (`VolumeRow`), i 3 `OpsButton` (con bottone 👁 anteprima per Mac→SSD e SSD→HDD)
 - **HamburgerPanel** — pannello laterale con: Report Log (apre il tab Log inline, non un subprocess), Configurazione (`SettingsSheet`), Tools (`ToolsSheet`), Aspetto (`AppearanceSheet`), Lingua (apre System Settings). Nessun Login/Password: app locale single-user, credenziali S3 disponibili solo in Tools → Diagnostica dietro conferma esplicita.
-- **ToolsSheet** — diagnostica: stato bookmark configurati, config S3 (endpoint/bucket/region), AccessKey/SecretKey mascherate con reveal dietro `NSAlert` di conferma, ultimo deep mirror
+- **ToolsSheet** — diagnostica: stato bookmark configurati, config S3 (endpoint/bucket/region), AccessKey/SecretKey mascherate con reveal dietro `NSAlert` di conferma, ultimo deep mirror, sezione "Revisione" (config checks, ultimo job persistito, verifica integrità campione su richiesta — vedi `ReviewEngine`)
 - **SpeedLogPanel / SpeedChartView** — grafico velocità real-time (Charts framework) + tab Log con output testuale
 - **CompletionSheet / StatsPanel** — riepilogo copiati/skippati/errori/hash-mismatch a fine job
 
@@ -151,7 +160,8 @@ Qualsiasi subprocess (rsync, bash, rclone, Process()) lanciato da un'app GUI **n
 | SettingsSheet / ToolsSheet / AppearanceSheet | ✅ Funzionano |
 | Sidebar hamburger (Report Log, Configurazione, Tools, Aspetto, Lingua) | ✅ Implementata |
 | Grafico velocità real-time | ✅ Implementato (Charts, MB/s per S3, file/s locale) |
-| Test automatici (zero-overwrite) | ✅ 5 test XCTest passano (`AppBackupFotoTests`) |
+| Pannello Revisione (ToolsSheet) | ✅ Implementato — config checks, ultimo job persistito, campione integrità SHA256 |
+| Test automatici | ✅ 19 test XCTest passano (`AppBackupFotoTests`: zero-overwrite, volume-root, persistenza job, campionamento locale) |
 | Build | ✅ `xcodebuild ... build` e `... test` verdi su questo stato |
 
 ---
@@ -168,8 +178,9 @@ Se emergono nuovi bug, documentarli qui con: sintomo osservato, causa, fix appli
 
 In ordine di priorità:
 
-1. Agente AI di revisione codice integrato nell'app (ciclo if-then che scopre bug a runtime) — unico obiettivo della lista storica non ancora affrontato
-2. Valutare se serve un meccanismo di notifica/alert se il deep mirror SSD→HDD non gira da troppo tempo (es. oltre 45 giorni) per segnalare che l'HDD non viene collegato abbastanza spesso
+1. Valutare se serve un meccanismo di notifica/alert se il deep mirror SSD→HDD non gira da troppo tempo (es. oltre 45 giorni) per segnalare che l'HDD non viene collegato abbastanza spesso
+
+**Verifica manuale ancora da fare** (non eseguibile in ambiente headless, serve l'app in mano con volumi montati): controllo visivo della sezione "Revisione" in Tools, funzionamento reale di `runIntegritySample` su Mac↔SSD/SSD↔HDD/SSD↔S3, conferma che i file temporanei scaricati da S3 per il confronto vengano effettivamente cancellati.
 
 ---
 
