@@ -1183,6 +1183,77 @@ enum JobHistoryStore {
     }
 }
 
+struct ReviewFinding: Identifiable {
+    let id = UUID()
+    let title: String
+    let ok: Bool
+    let detail: String
+}
+
+struct IntegrityCheckResult: Identifiable {
+    let id = UUID()
+    let pairName: String
+    var checked: Int = 0
+    var matched: Int = 0
+    var mismatches: [String] = []
+    var skippedNoSource: Int = 0
+    var error: String? = nil
+}
+
+final class ReviewEngine {
+    private let bm = BookmarkManager.shared
+    private let s3Syncer = S3Syncer()
+    private let fm = FileManager.default
+
+    // realpath (non URL.resolvingSymlinksInPath, che lascia /var e /tmp non risolti di proposito):
+    // l'enumeratore restituisce URL con i symlink di sistema risolti (es. /var -> /private/var),
+    // quindi per far combaciare il prefisso serve la stessa risoluzione a livello di filesystem.
+    private func realResolvedPath(_ url: URL) -> String {
+        var buf = [Int8](repeating: 0, count: Int(PATH_MAX))
+        guard let r = realpath(url.path, &buf) else { return url.path }
+        return String(cString: r)
+    }
+
+    func sampleLocalPair(srcRoot: URL, dstRoot: URL, pairName: String, sampleSize: Int) -> IntegrityCheckResult {
+        var result = IntegrityCheckResult(pairName: pairName)
+        let resolvedDstRoot = URL(fileURLWithPath: realResolvedPath(dstRoot), isDirectory: true)
+        guard let enumerator = fm.enumerator(
+            at: resolvedDstRoot, includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]) else {
+            result.error = "Impossibile enumerare \(dstRoot.path)"
+            return result
+        }
+
+        var relPaths: [String] = []
+        let base = resolvedDstRoot.path
+        while let f = enumerator.nextObject() as? URL {
+            let vals = try? f.resourceValues(forKeys: [.isRegularFileKey])
+            guard vals?.isRegularFile == true else { continue }
+            let name = f.lastPathComponent
+            if name.hasPrefix("._") || name == ".DS_Store" { continue }
+            relPaths.append(String(f.path.dropFirst(base.count).drop(while: { $0 == "/" })))
+        }
+        guard !relPaths.isEmpty else { return result }
+
+        let sample = relPaths.shuffled().prefix(sampleSize)
+        for rel in sample {
+            let dstFile = dstRoot.appendingPathComponent(rel)
+            let srcFile = srcRoot.appendingPathComponent(rel)
+            guard fm.fileExists(atPath: srcFile.path) else {
+                result.skippedNoSource += 1
+                continue
+            }
+            result.checked += 1
+            if let srcHash = sha256(of: srcFile), let dstHash = sha256(of: dstFile), srcHash == dstHash {
+                result.matched += 1
+            } else {
+                result.mismatches.append(rel)
+            }
+        }
+        return result
+    }
+}
+
 // MARK: - SetupView
 struct SetupView: View {
     @ObservedObject private var bm = BookmarkManager.shared
