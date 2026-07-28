@@ -111,6 +111,18 @@ func isLikelyVolumeRoot(_ url: URL) -> Bool {
     url.pathComponents.count <= 3
 }
 
+func sha256(of url: URL) -> String? {
+    guard let fh = try? FileHandle(forReadingFrom: url) else { return nil }
+    defer { fh.closeFile() }
+    var hasher = SHA256()
+    var chunk = fh.readData(ofLength: 65536)
+    while !chunk.isEmpty {
+        hasher.update(data: chunk)
+        chunk = fh.readData(ofLength: 65536)
+    }
+    return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+}
+
 // MARK: - BookmarkManager
 final class BookmarkManager: ObservableObject {
     static let shared = BookmarkManager()
@@ -392,17 +404,6 @@ final class FileSyncer {
         return excluded.contains(n) || n.hasPrefix("._")
     }
 
-    private func sha256(of url: URL) -> String? {
-        guard let fh = try? FileHandle(forReadingFrom: url) else { return nil }
-        defer { fh.closeFile() }
-        var hasher = SHA256()
-        var chunk = fh.readData(ofLength: 65536)
-        while !chunk.isEmpty {
-            hasher.update(data: chunk)
-            chunk = fh.readData(ofLength: 65536)
-        }
-        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
-    }
 }
 
 // MARK: - S3Syncer (native Swift, no rclone subprocess)
