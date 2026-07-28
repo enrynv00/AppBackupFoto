@@ -1155,6 +1155,34 @@ final class BackupRunner: ObservableObject {
 
 }
 
+// MARK: - Review Engine
+
+struct JobSummary: Codable {
+    let date: Date
+    let label: String
+    let copied: Int
+    let skipped: Int
+    let errors: Int
+    let hashErrors: Int
+    let succeeded: Bool
+
+    var isClean: Bool { succeeded && errors == 0 && hashErrors == 0 }
+}
+
+enum JobHistoryStore {
+    private static let key = "lastJobSummary"
+
+    static func save(_ summary: JobSummary, defaults: UserDefaults = .standard) {
+        guard let data = try? JSONEncoder().encode(summary) else { return }
+        defaults.set(data, forKey: key)
+    }
+
+    static func load(defaults: UserDefaults = .standard) -> JobSummary? {
+        guard let data = defaults.data(forKey: key) else { return nil }
+        return try? JSONDecoder().decode(JobSummary.self, from: data)
+    }
+}
+
 // MARK: - SetupView
 struct SetupView: View {
     @ObservedObject private var bm = BookmarkManager.shared

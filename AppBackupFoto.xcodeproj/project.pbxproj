@@ -10,6 +10,7 @@
 		3A446D61B0186E1CA084FF0B /* FileSyncerZeroOverwriteTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 94D134C109F6886D8DF115AF /* FileSyncerZeroOverwriteTests.swift */; };
 		3CF547AB089EA250EFD3FC89 /* Cocoa.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 52AB12F7AD7661DE5D3BEC12 /* Cocoa.framework */; };
 		338F53C5A45F895FBD6FCF04 /* IsLikelyVolumeRootTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3394511F3BF2E42181C0DC5B /* IsLikelyVolumeRootTests.swift */; };
+		485EDA68EB722EDF534AB916 /* JobHistoryStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4E591D42B2668D15E40CF9AA /* JobHistoryStoreTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -28,6 +29,7 @@
 		695F43372EB019B300509478 /* AppBackupFoto.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = AppBackupFoto.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		94D134C109F6886D8DF115AF /* FileSyncerZeroOverwriteTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = FileSyncerZeroOverwriteTests.swift; sourceTree = "<group>"; };
 		3394511F3BF2E42181C0DC5B /* IsLikelyVolumeRootTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = IsLikelyVolumeRootTests.swift; sourceTree = "<group>"; };
+		4E591D42B2668D15E40CF9AA /* JobHistoryStoreTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = JobHistoryStoreTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -72,6 +74,7 @@
 			children = (
 				94D134C109F6886D8DF115AF /* FileSyncerZeroOverwriteTests.swift */,
 				3394511F3BF2E42181C0DC5B /* IsLikelyVolumeRootTests.swift */,
+				4E591D42B2668D15E40CF9AA /* JobHistoryStoreTests.swift */,
 			);
 			name = AppBackupFotoTests;
 			path = AppBackupFotoTests;
@@ -204,6 +207,7 @@
 			files = (
 				3A446D61B0186E1CA084FF0B /* FileSyncerZeroOverwriteTests.swift in Sources */,
 				338F53C5A45F895FBD6FCF04 /* IsLikelyVolumeRootTests.swift in Sources */,
+				485EDA68EB722EDF534AB916 /* JobHistoryStoreTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
