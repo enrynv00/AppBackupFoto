@@ -1352,6 +1352,47 @@ final class ReviewEngine {
 
         return results
     }
+
+    func runConfigChecks() -> [ReviewFinding] {
+        checkBookmarkRoots() + [checkRcloneConfPermissions(), checkS3Endpoint()]
+    }
+
+    private func checkBookmarkRoots() -> [ReviewFinding] {
+        [BookmarkManager.Location.ssd, .hdd].compactMap { loc -> ReviewFinding? in
+            guard let url = bm.urls[loc] else { return nil }
+            let ok = isLikelyVolumeRoot(url)
+            let name = loc == .ssd ? "SSD" : "HDD"
+            return ReviewFinding(
+                title: "Bookmark \(name)", ok: ok,
+                detail: ok
+                    ? "Punta alla root del volume (\(url.path))"
+                    : "Punta a una sottocartella (\(url.path)), non alla root del volume")
+        }
+    }
+
+    private func checkRcloneConfPermissions() -> ReviewFinding {
+        let path = NSHomeDirectory() + "/.config/rclone/rclone.conf"
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path) else {
+            return ReviewFinding(title: "Permessi rclone.conf", ok: false,
+                detail: "File non trovato in ~/.config/rclone/rclone.conf")
+        }
+        let perms = attrs[.posixPermissions] as? Int ?? 0
+        if perms & 0o077 != 0 {
+            return ReviewFinding(title: "Permessi rclone.conf", ok: false,
+                detail: "Permessi troppo aperti (\(String(perms, radix: 8))) — esegui: chmod 600 ~/.config/rclone/rclone.conf")
+        }
+        return ReviewFinding(title: "Permessi rclone.conf", ok: true,
+            detail: "0600 — solo il proprietario può leggere/scrivere")
+    }
+
+    private func checkS3Endpoint() -> ReviewFinding {
+        do {
+            let cfg = try S3Syncer.readConfig()
+            return ReviewFinding(title: "Endpoint S3", ok: true, detail: "\(cfg.endpoint) · bucket \(cfg.bucket)")
+        } catch {
+            return ReviewFinding(title: "Endpoint S3", ok: false, detail: error.localizedDescription)
+        }
+    }
 }
 
 // MARK: - SetupView
