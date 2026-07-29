@@ -575,6 +575,7 @@ final class S3Syncer {
         var objects: [String: Int64] = [:]
         var token: String? = nil
         repeat {
+            if cancelled || Task.isCancelled { break }
             let (objs, next) = try await listPage(config: config, token: token)
             objects.merge(objs) { _, n in n }
             token = next
@@ -764,7 +765,7 @@ final class S3Syncer {
         let fm = FileManager.default
 
         for key in keys {
-            if cancelled { break }
+            if cancelled || Task.isCancelled { break }
             let destFile = destination.appendingPathComponent(key)
             if fm.fileExists(atPath: destFile.path) {
                 result.skipped += 1
@@ -1535,6 +1536,7 @@ final class RestoreEngine: ObservableObject {
     private let syncer = FileSyncer()
     private let s3Syncer = S3Syncer()
     private var wasStopped = false
+    private var runTask: Task<Void, Never>?
 
     func listAvailableFolders(rootURL: URL) -> [String] {
         let fm = FileManager.default
@@ -1574,7 +1576,7 @@ final class RestoreEngine: ObservableObject {
         progress = RestoreProgress()
         phase = .running(source.displayName)
 
-        Task { [weak self] in
+        runTask = Task { [weak self] in
             guard let self else { return }
             do {
                 switch source {
@@ -1649,6 +1651,8 @@ final class RestoreEngine: ObservableObject {
         wasStopped = true
         syncer.cancel()
         s3Syncer.cancel()
+        runTask?.cancel()
+        runTask = nil
         phase = .failed("Interrotto dall'utente")
     }
 }
