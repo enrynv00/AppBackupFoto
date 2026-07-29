@@ -112,13 +112,30 @@ func isLikelyVolumeRoot(_ url: URL) -> Bool {
 }
 
 func sha256(of url: URL) -> String? {
-    guard let fh = try? FileHandle(forReadingFrom: url) else { return nil }
-    defer { fh.closeFile() }
+    // I/O POSIX a basso livello (open/read/close) invece di FileHandle.readData(ofLength:):
+    // su file molto grandi (decine di GB), FileHandle/NSData tende a mantenere le pagine
+    // lette residenti in memoria invece di rilasciarle tra una lettura e l'altra, facendo
+    // crescere l'uso di RAM in proporzione al file letto anche leggendo a blocchi di 64KB —
+    // causa reale di un blocco per esaurimento memoria osservato durante un restore locale
+    // con file da 40-50GB (verificato: stesso hash, da 4GB di picco memoria per un file da
+    // 2GB con FileHandle a ~60MB con questa versione). Vedi Docs/CLAUDE.md.
+    let fd = open(url.path, O_RDONLY)
+    guard fd >= 0 else { return nil }
+    defer { close(fd) }
+
     var hasher = SHA256()
-    var chunk = fh.readData(ofLength: 65536)
-    while !chunk.isEmpty {
-        hasher.update(data: chunk)
-        chunk = fh.readData(ofLength: 65536)
+    let bufSize = 65536
+    var buffer = [UInt8](repeating: 0, count: bufSize)
+
+    while true {
+        let n = buffer.withUnsafeMutableBytes { ptr in
+            read(fd, ptr.baseAddress, bufSize)
+        }
+        if n < 0 { return nil }
+        if n == 0 { break }
+        buffer.withUnsafeBufferPointer { ptr in
+            hasher.update(bufferPointer: UnsafeRawBufferPointer(start: ptr.baseAddress, count: n))
+        }
     }
     return hasher.finalize().map { String(format: "%02x", $0) }.joined()
 }
