@@ -83,7 +83,8 @@ Presenta sempre l'output della revisione insieme al codice.
 - Salva/ripristina bookmark in UserDefaults (chiavi: `bk_photos`, `bk_ssd`, `bk_hdd`)
 - **Bookmark NON security-scoped** (`options: []`, non `.withSecurityScope`) — decisione presa il 2026-07-29 dopo un bug reale: la root di un volume ExFAT (es. `/Volumes/SSD - Enri`) fa fallire `bookmarkData(options: .withSecurityScope, ...)` con `NSCocoaErrorDomain` codice 256, un limite noto e mai risolto di macOS sui filesystem ExFAT/FAT — non un bug dell'app (stesso codice, stesso identico path, funziona su APFS come `BackupHDD`). L'app non è sandboxata (`ENABLE_APP_SANDBOX = NO`) e ha Full Disk Access, quindi il meccanismo di security scope non serve: `FileManager` legge/scrive comunque ovunque. Verificato che i bookmark creati in passato con `.withSecurityScope` si risolvono correttamente anche con `options: []`, quindi nessuna migrazione necessaria per bookmark già salvati.
 - `startAccessing(_ loc)` → restituisce l'URL salvato (nessuno scope da avviare) · `stopAccessing(_ loc)` → no-op, mantenuto per compatibilità con i call site esistenti (`defer { bm.stopAccessing(...) }` in `BackupRunner`/`ReviewEngine`)
-- `allConfigured` → true se tutte e 3 le cartelle sono selezionate → al primo avvio mostra `SetupView`
+- `allConfigured` → true se tutte e 3 le cartelle sono selezionate (usata come informazione, non più come gate d'ingresso)
+- `canEnterApp` → true se solo la Libreria Foto è selezionata — è questa a decidere se `RootView` mostra `ContentView` o `SetupView`: SSD/HDD non sono obbligatori per entrare, dato che sono dischi esterni che potrebbero non essere collegati in un dato momento (le operazioni che li richiedono restano comunque disattivate finché non li configuri)
 - Se un volume esterno non compare/non si lascia selezionare in `NSOpenPanel`, o se salvare la cartella "non fa nulla", `selectAndSave` mostra un `NSAlert` con l'errore reale (dominio/codice) invece di fallire in silenzio — utile diagnostica se il problema si ripresenta su un altro volume
 
 ### FileSyncer (sync locale Mac→SSD e SSD→HDD)
@@ -128,6 +129,13 @@ Presenta sempre l'output della revisione insieme al codice.
 - `JobSummary`/`JobHistoryStore` — riepilogo dell'ultimo job (data, label, copiati/skippati/errori/hash-mismatch), persistito in UserDefaults (`defaults` parametrizzato per testabilità), sopravvive al riavvio dell'app
 - Il motore **segnala soltanto**: nessuna `removeItem`/`copyItem`/scrittura S3 verso una destinazione persistente
 
+### RestoreEngine e RestoreView (ripristino guidato)
+
+- `RestoreEngine` — separato da `BackupRunner`, riusa `FileSyncer` invariato per SSD/HDD; per Cubbit usa `S3Syncer.downloadMany`. Modello di progresso volutamente semplice (`RestoreProgress`: done/total/eta/problems), non `JobStats` — la UI di restore non mostra copiati/skippati/errori/hash-mismatch, solo una barra e "Recuperate X di Y foto" in linguaggio comune.
+- `RestoreView` — 4 passi: scelta fonte (con indicatori di disponibilità in tempo reale: `VolumeMonitor` per SSD/HDD, `S3Syncer.checkReachable` per Cubbit — le fonti non disponibili in quel momento sono disattivate e motivate, non semplici bottoni che poi falliscono), scelta cartelle (spunta, tutte selezionate di default), scelta destinazione (stesso selettore usato altrove), avanzamento. Prima di un restore da Cubbit mostra una stima (conteggio file + GB) con conferma esplicita.
+- Le foto ripristinate atterrano in una cartella normale sul Mac, **non** nella libreria interna di Foto.app (troppo rischioso toccare il suo database privato) — l'utente le importa lui con un paio di click.
+- Raggiungibile da hamburger → Ripristina, e da un bottone secondario in `SetupView` (visibile anche a configurazione incompleta, grazie a `canEnterApp`).
+
 ---
 
 ## UI (SwiftUI views in ContentView.swift)
@@ -135,7 +143,7 @@ Presenta sempre l'output della revisione insieme al codice.
 - **SetupView / LocationRow** — onboarding iniziale, selezione delle 3 cartelle
 - **ContentView** — `HSplitView` con `SidebarView` a sinistra e pannello principale (fase corrente, `SpeedLogPanel`, `StatsPanel`, bottone Interrompi/Esci) a destra
 - **SidebarView** — hamburger `[☰]`, stato volumi (`VolumeRow`), i 3 `OpsButton` (con bottone 👁 anteprima per Mac→SSD e SSD→HDD)
-- **HamburgerPanel** — pannello laterale con: Report Log (apre il tab Log inline, non un subprocess), Configurazione (`SettingsSheet`), Tools (`ToolsSheet`), Aspetto (`AppearanceSheet`), Lingua (apre System Settings). Nessun Login/Password: app locale single-user, credenziali S3 disponibili solo in Tools → Diagnostica dietro conferma esplicita.
+- **HamburgerPanel** — pannello laterale con: Report Log (apre il tab Log inline, non un subprocess), Ripristina (`RestoreView`), Configurazione (`SettingsSheet`), Tools (`ToolsSheet`), Aspetto (`AppearanceSheet`), Lingua (apre System Settings). Nessun Login/Password: app locale single-user, credenziali S3 disponibili solo in Tools → Diagnostica dietro conferma esplicita.
 - **ToolsSheet** — diagnostica: stato bookmark configurati, config S3 (endpoint/bucket/region), AccessKey/SecretKey mascherate con reveal dietro `NSAlert` di conferma, ultimo deep mirror, sezione "Revisione" (config checks, ultimo job persistito, verifica integrità campione su richiesta — vedi `ReviewEngine`)
 - **SpeedLogPanel / SpeedChartView** — grafico velocità real-time (Charts framework) + tab Log con output testuale
 - **CompletionSheet / StatsPanel** — riepilogo copiati/skippati/errori/hash-mismatch a fine job
@@ -144,25 +152,26 @@ Presenta sempre l'output della revisione insieme al codice.
 
 ## Vincolo tecnico macOS Sequoia (critico)
 
-Qualsiasi subprocess (rsync, bash, rclone, Process()) lanciato da un'app GUI **non riceve i permessi TCC per i volumi esterni**, indipendentemente da Full Disk Access. L'unica soluzione senza firma Apple è: **security-scoped bookmarks + FileManager nativo**. Non proporre mai soluzioni basate su subprocess per accedere a volumi esterni.
+Qualsiasi subprocess (rsync, bash, rclone, Process()) lanciato da un'app GUI **non riceve i permessi TCC per i volumi esterni**, indipendentemente da Full Disk Access. L'unica soluzione senza firma Apple è: **bookmark + FileManager nativo** (dal 2026-07-29 bookmark normali, non più security-scoped — vedi `BookmarkManager` sopra: il meccanismo di scope non serve dato che l'app non è sandboxata e ha Full Disk Access, e su ExFAT è addirittura rotto). Non proporre mai soluzioni basate su subprocess per accedere a volumi esterni.
 
 ---
 
-## Stato attuale (aggiornato 2026-07-28)
+## Stato attuale (aggiornato 2026-07-29)
 
 | Funzione | Stato |
 | :---- | :---- |
 | Mac → SSD | ✅ Funziona, con anteprima dry-run e verifica SHA256 post-copia |
 | SSD → HDD | ✅ Funziona; validazione volume-root con alert esplicito impedisce più il caso 0/0 silenzioso |
 | SSD → S3 | ✅ Funziona, con allow-list endpoint, abort su multipart cancellato, grafico MB/s |
+| Ripristino guidato (SSD/HDD/Cubbit → cartella) | ✅ Implementato — 4 passi, indicatori di disponibilità in tempo reale, UI volutamente semplice |
 | Sheet completamento | ✅ Funziona |
 | Notifiche sistema | ✅ Funzionano |
-| SetupView | ✅ Funziona |
+| SetupView | ✅ Funziona; basta la Libreria Foto per entrare nell'app (`canEnterApp`) |
 | SettingsSheet / ToolsSheet / AppearanceSheet | ✅ Funzionano |
-| Sidebar hamburger (Report Log, Configurazione, Tools, Aspetto, Lingua) | ✅ Implementata |
+| Sidebar hamburger (Report Log, Ripristina, Configurazione, Tools, Aspetto, Lingua) | ✅ Implementata |
 | Grafico velocità real-time | ✅ Implementato (Charts, MB/s per S3, file/s locale) |
 | Pannello Revisione (ToolsSheet) | ✅ Implementato — config checks, ultimo job persistito, campione integrità SHA256 |
-| Test automatici | ✅ 19 test XCTest passano (`AppBackupFotoTests`: zero-overwrite, volume-root, persistenza job, campionamento locale) |
+| Test automatici | ✅ 23 test XCTest passano (`AppBackupFotoTests`: zero-overwrite, volume-root, persistenza job, campionamento locale, parsing cartelle S3 per il restore) |
 | Build | ✅ `xcodebuild ... build` e `... test` verdi su questo stato |
 
 ---
