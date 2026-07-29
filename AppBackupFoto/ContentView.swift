@@ -1940,6 +1940,7 @@ struct RestoreView: View {
 // MARK: - SetupView
 struct SetupView: View {
     @ObservedObject private var bm = BookmarkManager.shared
+    @State private var showRestore = false
     var body: some View {
         VStack(spacing: 28) {
             VStack(spacing: 8) {
@@ -1957,7 +1958,11 @@ struct SetupView: View {
             }.padding(.horizontal, 20)
             Text("Appena selezioni la Libreria Foto l'app si apre — SSD e HDD puoi configurarli quando vuoi, anche più avanti da Impostazioni.")
                 .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
-        }.padding(40).frame(minWidth: 500, minHeight: 420)
+            Button("Ho già un backup, voglio ripristinare") { showRestore = true }
+                .buttonStyle(.plain).font(.caption).foregroundStyle(.secondary)
+        }
+        .padding(40).frame(minWidth: 500, minHeight: 420)
+        .sheet(isPresented: $showRestore) { RestoreView() }
     }
 }
 
@@ -2268,6 +2273,7 @@ struct HamburgerPanel: View {
     @ObservedObject private var appearance = AppearanceManager.shared
     @State private var showAppearance = false
     @State private var showTools = false
+    @State private var showRestore = false
 
     private var initials: String {
         profileName.split(separator: " ").prefix(2).compactMap { $0.first.map(String.init) }.joined()
@@ -2306,6 +2312,9 @@ struct HamburgerPanel: View {
                         HamburgerRow(icon: "doc.text.magnifyingglass", label: "Report Log", iconColor: .blue) {
                             onShowLog?(); close()
                         }
+                        HamburgerRow(icon: "arrow.down.doc.fill", label: "Ripristina", iconColor: .green) {
+                            showRestore = true; close()
+                        }
                         HamburgerRow(icon: "gearshape.fill", label: "Configurazione", iconColor: Color(NSColor.systemGray)) {
                             showSettings = true; close()
                         }
@@ -2339,6 +2348,7 @@ struct HamburgerPanel: View {
         .shadow(color: .black.opacity(0.18), radius: 12, x: 5, y: 0)
         .sheet(isPresented: $showAppearance) { AppearanceSheet() }
         .sheet(isPresented: $showTools)      { ToolsSheet() }
+        .sheet(isPresented: $showRestore)    { RestoreView() }
     }
 
     private func close() {
