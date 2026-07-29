@@ -2313,7 +2313,7 @@ struct HamburgerPanel: View {
                             onShowLog?(); close()
                         }
                         HamburgerRow(icon: "arrow.down.doc.fill", label: "Ripristina", iconColor: .green) {
-                            showRestore = true; close()
+                            showRestore = true
                         }
                         HamburgerRow(icon: "gearshape.fill", label: "Configurazione", iconColor: Color(NSColor.systemGray)) {
                             showSettings = true; close()
