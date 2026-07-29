@@ -1497,6 +1497,159 @@ final class ReviewEngine {
     }
 }
 
+// MARK: - Restore
+
+enum RestoreSource: String, Identifiable {
+    case ssd, hdd, s3
+    var id: String { rawValue }
+    var displayName: String {
+        switch self {
+        case .ssd: return "Dal mio SSD"
+        case .hdd: return "Dal mio HDD"
+        case .s3:  return "Da Cubbit (cloud)"
+        }
+    }
+}
+
+struct RestoreProgress {
+    var done: Int = 0
+    var total: Int = 0
+    var startDate: Date = Date()
+    var problems: [String] = []
+    var percent: Int { total > 0 ? min(100, done * 100 / total) : 0 }
+    var etaSec: Int {
+        guard done > 0, total > done else { return 0 }
+        let elapsed = Date().timeIntervalSince(startDate)
+        guard elapsed > 0.5 else { return 0 }
+        return Int(elapsed * Double(total - done) / Double(done))
+    }
+}
+
+@MainActor
+final class RestoreEngine: ObservableObject {
+    @Published var phase: JobPhase = .idle
+    @Published var progress = RestoreProgress()
+
+    private let syncer = FileSyncer()
+    private let s3Syncer = S3Syncer()
+    private var wasStopped = false
+
+    func listAvailableFolders(rootURL: URL) -> [String] {
+        let fm = FileManager.default
+        guard let items = try? fm.contentsOfDirectory(
+            at: rootURL, includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]) else { return [] }
+        return items.compactMap { url -> String? in
+            let vals = try? url.resourceValues(forKeys: [.isDirectoryKey])
+            guard vals?.isDirectory == true else { return nil }
+            let name = url.lastPathComponent
+            return name.hasPrefix(".") ? nil : name
+        }.sorted()
+    }
+
+    func listAvailableFolders(fromS3Config config: S3Syncer.S3Config) async throws -> [String] {
+        let keys = try await s3Syncer.listAll(config: config).keys
+        return S3Syncer.topLevelFolders(fromKeys: Array(keys))
+    }
+
+    func estimateS3Download(selectedFolders: Set<String>, destination: URL,
+                             config: S3Syncer.S3Config) async throws -> (count: Int, bytes: Int64) {
+        let all = try await s3Syncer.listAll(config: config)
+        let fm = FileManager.default
+        var count = 0; var bytes: Int64 = 0
+        for (key, size) in all {
+            guard let first = key.split(separator: "/", maxSplits: 1).first,
+                  selectedFolders.contains(String(first)) else { continue }
+            guard !fm.fileExists(atPath: destination.appendingPathComponent(key).path) else { continue }
+            count += 1; bytes += size
+        }
+        return (count, bytes)
+    }
+
+    func run(source: RestoreSource, selectedFolders: Set<String>, sourceRootURL: URL?,
+             destination: URL, s3Config: S3Syncer.S3Config?) {
+        wasStopped = false
+        progress = RestoreProgress()
+        phase = .running(source.displayName)
+
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                switch source {
+                case .ssd, .hdd:
+                    guard let sourceRootURL else {
+                        throw NSError(domain: "Restore", code: 1,
+                            userInfo: [NSLocalizedDescriptionKey: "Cartella sorgente non disponibile"])
+                    }
+                    try await self.runLocal(sourceRootURL: sourceRootURL, selectedFolders: selectedFolders,
+                                             destination: destination)
+                case .s3:
+                    guard let s3Config else {
+                        throw NSError(domain: "Restore", code: 2,
+                            userInfo: [NSLocalizedDescriptionKey: "Configurazione Cubbit non disponibile"])
+                    }
+                    try await self.runS3(selectedFolders: selectedFolders, destination: destination, config: s3Config)
+                }
+                guard !self.wasStopped else { return }
+                self.phase = .success("Ripristino completato")
+            } catch {
+                guard !self.wasStopped else { return }
+                self.phase = .failed("Errore: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func runLocal(sourceRootURL: URL, selectedFolders: Set<String>, destination: URL) async throws {
+        let folders = selectedFolders.sorted()
+        var combinedTotal = 0
+        for folder in folders {
+            let preview = await syncer.previewSync(from: sourceRootURL.appendingPathComponent(folder),
+                                                     to: destination.appendingPathComponent(folder), deep: false)
+            combinedTotal += preview.toAdd + preview.toSkip
+        }
+        progress.total = combinedTotal
+
+        var offset = 0
+        for folder in folders {
+            let result = try await syncer.sync(
+                from: sourceRootURL.appendingPathComponent(folder),
+                to: destination.appendingPathComponent(folder),
+                deep: false,
+                onStatus: { _ in },
+                onProgress: { [weak self] snap in
+                    Task { @MainActor [weak self] in
+                        self?.progress.done = offset + snap.done
+                    }
+                })
+            offset += result.done
+            if result.errors > 0 {
+                progress.problems.append("\(folder): \(result.errors) file non recuperati")
+            }
+        }
+        progress.done = offset
+    }
+
+    private func runS3(selectedFolders: Set<String>, destination: URL, config: S3Syncer.S3Config) async throws {
+        let result = try await s3Syncer.downloadMany(
+            selectedFolders: selectedFolders, config: config, destination: destination,
+            onStatus: { _ in },
+            onProgress: { [weak self] snap in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.progress.done = snap.done
+                    self.progress.total = snap.total
+                }
+            })
+        progress.problems.append(contentsOf: result.problems)
+    }
+
+    func stop() {
+        wasStopped = true
+        syncer.cancel()
+        phase = .failed("Interrotto dall'utente")
+    }
+}
+
 // MARK: - SetupView
 struct SetupView: View {
     @ObservedObject private var bm = BookmarkManager.shared
