@@ -18,7 +18,7 @@ struct RootView: View {
     @ObservedObject private var bm = BookmarkManager.shared
     var body: some View {
         Group {
-            if bm.allConfigured { ContentView() }
+            if bm.canEnterApp { ContentView() }
             else { SetupView() }
         }
         .onAppear {
@@ -155,6 +155,11 @@ final class BookmarkManager: ObservableObject {
     }
 
     var allConfigured: Bool { Location.allCases.allSatisfy { urls[$0] != nil } }
+    // Solo la Libreria Foto è obbligatoria per entrare nell'app: SSD e HDD sono dischi
+    // esterni che potrebbero non essere collegati in questo momento, e le operazioni
+    // dentro ContentView già gestiscono da sole un volume non disponibile (bottone
+    // disattivato) invece di bloccare tutto.
+    var canEnterApp: Bool { urls[.photos] != nil }
 
     private func resolve(_ loc: Location) -> URL? {
         guard let data = UserDefaults.standard.data(forKey: "bk_\(loc.rawValue)") else { return nil }
@@ -1436,7 +1441,7 @@ struct SetupView: View {
                     LocationRow(location: loc) { bm.selectAndSave(loc) { _ in } }
                 }
             }.padding(.horizontal, 20)
-            Text("Dopo aver selezionato tutte e tre le cartelle l'app si aprirà automaticamente.")
+            Text("Appena selezioni la Libreria Foto l'app si apre — SSD e HDD puoi configurarli quando vuoi, anche più avanti da Impostazioni.")
                 .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
         }.padding(40).frame(minWidth: 500, minHeight: 420)
     }
