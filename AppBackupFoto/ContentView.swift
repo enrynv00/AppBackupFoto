@@ -732,6 +732,18 @@ final class S3Syncer {
         return dest
     }
 
+    // Funzione pura, nessuna rete: prende le chiavi del bucket e restituisce i nomi
+    // delle cartelle di primo livello (es. "Foto iPhone", "Takeout 2", ...), ordinate.
+    static func topLevelFolders(fromKeys keys: [String]) -> [String] {
+        var seen = Set<String>(); var ordered: [String] = []
+        for key in keys {
+            guard key.contains("/"), let first = key.split(separator: "/", maxSplits: 1).first else { continue }
+            let name = String(first)
+            if !seen.contains(name) { seen.insert(name); ordered.append(name) }
+        }
+        return ordered.sorted()
+    }
+
     // MARK: - AWS Signature V4
     private func sign(_ request: inout URLRequest, config: S3Config, body: Data, date: Date) {
         let fmt = DateFormatter()

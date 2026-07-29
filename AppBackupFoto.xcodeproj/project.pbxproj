@@ -12,6 +12,7 @@
 		338F53C5A45F895FBD6FCF04 /* IsLikelyVolumeRootTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3394511F3BF2E42181C0DC5B /* IsLikelyVolumeRootTests.swift */; };
 		485EDA68EB722EDF534AB916 /* JobHistoryStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4E591D42B2668D15E40CF9AA /* JobHistoryStoreTests.swift */; };
 		DD79BD4D0AEAC9665D7E390F /* ReviewEngineIntegritySampleTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9418B1AE0AFEE7CF8942324 /* ReviewEngineIntegritySampleTests.swift */; };
+		95FA3246894F1870CE559DCC /* RestoreS3FolderParsingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 05D303E7B7844522DC3B5521 /* RestoreS3FolderParsingTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -32,6 +33,7 @@
 		3394511F3BF2E42181C0DC5B /* IsLikelyVolumeRootTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = IsLikelyVolumeRootTests.swift; sourceTree = "<group>"; };
 		4E591D42B2668D15E40CF9AA /* JobHistoryStoreTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = JobHistoryStoreTests.swift; sourceTree = "<group>"; };
 		A9418B1AE0AFEE7CF8942324 /* ReviewEngineIntegritySampleTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ReviewEngineIntegritySampleTests.swift; sourceTree = "<group>"; };
+		05D303E7B7844522DC3B5521 /* RestoreS3FolderParsingTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = RestoreS3FolderParsingTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -78,6 +80,7 @@
 				3394511F3BF2E42181C0DC5B /* IsLikelyVolumeRootTests.swift */,
 				4E591D42B2668D15E40CF9AA /* JobHistoryStoreTests.swift */,
 				A9418B1AE0AFEE7CF8942324 /* ReviewEngineIntegritySampleTests.swift */,
+				05D303E7B7844522DC3B5521 /* RestoreS3FolderParsingTests.swift */,
 			);
 			name = AppBackupFotoTests;
 			path = AppBackupFotoTests;
@@ -212,6 +215,7 @@
 				338F53C5A45F895FBD6FCF04 /* IsLikelyVolumeRootTests.swift in Sources */,
 				485EDA68EB722EDF534AB916 /* JobHistoryStoreTests.swift in Sources */,
 				DD79BD4D0AEAC9665D7E390F /* ReviewEngineIntegritySampleTests.swift in Sources */,
+				95FA3246894F1870CE559DCC /* RestoreS3FolderParsingTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
