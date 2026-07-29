@@ -752,6 +752,7 @@ final class S3Syncer {
     func downloadMany(selectedFolders: Set<String>, config: S3Config, destination: URL,
                        onStatus: @escaping (String) -> Void,
                        onProgress: @escaping (DownloadManyResult) -> Void) async throws -> DownloadManyResult {
+        cancelled = false
         var result = DownloadManyResult()
         DispatchQueue.main.async { onStatus("Connessione a Cubbit — recupero elenco file...") }
         let all = try await listAll(config: config)
@@ -763,6 +764,7 @@ final class S3Syncer {
         let fm = FileManager.default
 
         for key in keys {
+            if cancelled { break }
             let destFile = destination.appendingPathComponent(key)
             if fm.fileExists(atPath: destFile.path) {
                 result.skipped += 1
@@ -1646,6 +1648,7 @@ final class RestoreEngine: ObservableObject {
     func stop() {
         wasStopped = true
         syncer.cancel()
+        s3Syncer.cancel()
         phase = .failed("Interrotto dall'utente")
     }
 }
