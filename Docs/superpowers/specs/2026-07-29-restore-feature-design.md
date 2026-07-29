@@ -19,6 +19,7 @@ Dentro scope:
 - Raggiungibile sia dalla schermata di configurazione iniziale (anche a setup incompleto) sia dal menu hamburger dell'app già configurata.
 - Schermata di avanzamento deliberatamente più semplice di quella delle altre operazioni: barra, conteggio in linguaggio comune, tempo stimato — non i contatori tecnici di `JobStats`.
 - Stima preventiva (dimensione/tempo) prima di avviare un restore da Cubbit, per non far partire alla cieca un download potenzialmente enorme.
+- **Indicatore di disponibilità in tempo reale per tutte e 3 le fonti nel primo passo** — l'utente ha fatto notare un caso reale (SSD collegato, HDD scollegato, Cubbit non raggiungibile in quel momento) in cui mostrare 3 bottoni identicamente cliccabili è fuorviante: quelli non disponibili vanno disattivati e motivati, non lasciati lì a fallire se premuti.
 - Fix di un bug di correttezza già trovato in `BackupRunner.run()` (vedi sotto), incluso in questo lavoro perché il nuovo motore di restore avrebbe lo stesso identico scenario a rischio.
 
 Fuori scope (esplicitamente, per questa iterazione):
@@ -96,7 +97,7 @@ final class RestoreEngine: ObservableObject {
 - Errori su singoli file **non** interrompono il resto: vengono accumulati in `progress.problems` con un messaggio semplice (nome file + cartella), il conteggio prosegue.
 - **Fix incluso**: sia il ramo di completamento normale sia `stop()` controllano `wasStopped` prima di scrivere `phase`, replicando correttamente il pattern che oggi manca nel ramo di successo di `BackupRunner.run()` (vedi sezione dedicata sotto) — qui il bug non viene mai introdotto fin dall'inizio.
 
-### `S3Syncer` — due aggiunte
+### `S3Syncer` — tre aggiunte
 
 ```swift
 extension S3Syncer {
@@ -120,10 +121,17 @@ extension S3Syncer {
     func downloadMany(selectedFolders: Set<String>, config: S3Config, destination: URL,
                        onStatus: @escaping (String) -> Void,
                        onProgress: @escaping (DownloadManyResult) -> Void) async throws -> DownloadManyResult
+
+    // Controllo rapido di raggiungibilità, usato solo dal primo passo del restore per
+    // decidere se il bottone "Da Cubbit" è selezionabile. Timeout breve (4s): non deve
+    // far percepire la schermata come bloccata se il cloud non risponde.
+    func checkReachable(config: S3Config, timeoutSec: Double = 4) async -> Bool
 }
 ```
 
 `downloadMany` lista tutte le chiavi del bucket (`listAll`, già esistente), le filtra tenendo solo quelle il cui primo componente di percorso è in `selectedFolders`, e per ciascuna: se il file esiste già in `destination/key` la salta (zero-overwrite), altrimenti chiama `downloadToTemp(key:config:)` (già esistente, usato oggi dal campione di integrità) e sposta il file temporaneo nella posizione finale, creando le sottocartelle necessarie. Un errore su un file singolo va in `problems` e non interrompe gli altri.
+
+`checkReachable` fa una singola richiesta minima (lista con `max-keys=1`, riusando la stessa firma già presente in `listPage`) su una `URLSession` con `timeoutIntervalForRequest` impostato al valore passato; qualunque errore (rete assente, timeout, credenziali non valide) restituisce `false` senza propagare l'errore — qui interessa solo un booleano "posso provarci o no", il messaggio d'errore dettagliato resta comunque disponibile più avanti se l'utente sceglie comunque Cubbit e qualcosa va storto lì.
 
 ### `RestoreView` (nuova, presentata come `.sheet`)
 
@@ -132,7 +140,10 @@ Stato interno:
 enum RestoreStep { case chooseSource, chooseFolders, chooseDestination, running }
 ```
 
-1. **`chooseSource`** — tre bottoni grandi (SSD/HDD/Cubbit). Per SSD/HDD: se il bookmark è già configurato lo riusa, altrimenti apre subito il selettore cartella (stesso meccanismo di `BookmarkManager.selectAndSave`, che nel farlo salva anche il bookmark normale — comodo se l'utente sta configurando l'app da zero mentre ripristina). Per Cubbit: legge `S3Syncer.readConfig()`, nessun selettore.
+1. **`chooseSource`** — tre bottoni grandi (SSD/HDD/Cubbit), **ciascuno con lo stato reale mostrato subito**, non semplici bottoni sempre attivi:
+   - `RestoreView` istanzia un proprio `@StateObject private var volumes = VolumeMonitor()` (stessa classe già usata da `ContentView`, un'istanza separata e leggera — nessun singleton necessario). Il bottone SSD è attivo solo se `volumes.ssdMounted`, quello HDD solo se `volumes.hddMounted`; se disattivo, mostra una riga secondaria "non collegato in questo momento" invece di restare silenziosamente non cliccabile.
+   - Il bottone Cubbit parte in stato "verifica in corso…" (spinner piccolo) appena si arriva su questo passo: in `.task` chiama `S3Syncer.checkReachable(config:)` (se `readConfig()` fallisce prima ancora di provare la rete, mostra subito "configurazione mancante" senza attendere il timeout). Al risultato, il bottone diventa selezionabile o disattivato con "non raggiungibile in questo momento".
+   - Per SSD/HDD attivi: se il bookmark è già configurato lo riusa, altrimenti apre subito il selettore cartella (stesso meccanismo di `BookmarkManager.selectAndSave`, che nel farlo salva anche il bookmark normale — comodo se l'utente sta configurando l'app da zero mentre ripristina).
 2. **`chooseFolders`** — lista con spunta delle cartelle disponibili nella fonte scelta (da `listAvailableFolders`), tutte selezionate di default.
 3. **`chooseDestination`** — stesso selettore cartella già usato altrove; scelta non persistita in `BookmarkManager` (è un target una tantum, non una delle 3 posizioni fisse dell'app).
 4. **`running`** — barra di avanzamento, "Recuperate X di Y foto", tempo stimato. Se la fonte è Cubbit, prima di entrare in questo step viene mostrato un alert con la stima (conteggio file + GB stimati) e un bottone Continua/Annulla. A fine job, la stessa schermata mostra lo stato finale: ✅ "Fatto! Le tue foto sono qui" con bottone "Apri cartella" (rivela in Finder) — oppure, se `progress.problems` non è vuoto, una riga discreta ("12 file non è stato possibile recuperare") con un bottone per vederne l'elenco semplice.
