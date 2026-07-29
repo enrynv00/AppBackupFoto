@@ -1108,6 +1108,7 @@ final class BackupRunner: ObservableObject {
                 await MainActor.run {
                     guard let self else { return }
                     self.elapsedTimer?.cancel(); self.elapsedTimer = nil
+                    guard !self.wasStopped else { return }
                     if let r = result {
                         self.stats.copied = r.copied; self.stats.skipped = r.skipped
                         self.stats.errors = r.errors; self.stats.done = r.done
