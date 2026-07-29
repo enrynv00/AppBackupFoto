@@ -524,6 +524,37 @@ final class S3Syncer {
                         region: vals["region"] ?? "us-east-1", bucket: bucket)
     }
 
+    // Dry-run: stessa logica di lista+confronto di sync(), senza caricare nulla.
+    // Sul modello di FileSyncer.previewSync, usato dai bottoni 👁 anteprima già esistenti
+    // per Mac→SSD e SSD→HDD — SSD→S3 ne era rimasto privo.
+    func previewUpload(from localURL: URL, config: S3Config) async throws -> (toUpload: Int, toSkip: Int, bytes: Int64) {
+        let existing = try await listAll(config: config)
+        let fm = FileManager.default
+        var toUpload = 0; var toSkip = 0; var bytes: Int64 = 0
+        let base = localURL.path
+        guard let enumerator = fm.enumerator(
+            at: localURL,
+            includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
+            options: [.skipsHiddenFiles]) else {
+            throw NSError(domain: "S3", code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "Impossibile enumerare i file locali"])
+        }
+        while let f = enumerator.nextObject() as? URL {
+            let v = try? f.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+            guard v?.isRegularFile == true else { continue }
+            let name = f.lastPathComponent
+            if name.hasPrefix("._") || name == ".DS_Store" { continue }
+            let rel = String(f.path.dropFirst(base.count).drop(while: { $0 == "/" }))
+            let size = Int64(v?.fileSize ?? 0)
+            if existing[rel] == size {
+                toSkip += 1
+            } else {
+                toUpload += 1; bytes += size
+            }
+        }
+        return (toUpload, toSkip, bytes)
+    }
+
     func sync(from localURL: URL, config: S3Config,
               onStatus: @escaping (String) -> Void,
               onProgress: @escaping (SyncResult) -> Void) async throws -> SyncResult {
@@ -1160,6 +1191,41 @@ final class BackupRunner: ObservableObject {
             a.alertStyle = .informational
             a.addButton(withTitle: "OK")
             a.runModal()
+        }
+    }
+
+    func previewSyncS3() {
+        guard let ssdURL = bm.startAccessing(.ssd) else {
+            alert("Accesso all'SSD non disponibile", "Vai in Impostazioni e riseleziona l'SSD.")
+            return
+        }
+        if !isLikelyVolumeRoot(ssdURL) {
+            bm.stopAccessing(.ssd)
+            alert("Bookmark SSD non valido",
+                  "Il percorso '\(ssdURL.path)' non è la radice del volume.\n\nVai in Impostazioni (⚙) → riseleziona SSD scegliendo '/Volumes/SSD - Enri' (root del volume, non una sottocartella).")
+            return
+        }
+        do {
+            let config = try S3Syncer.readConfig()
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                defer { self.bm.stopAccessing(.ssd) }
+                do {
+                    let result = try await self.s3Syncer.previewUpload(from: ssdURL, config: config)
+                    let gb = Double(result.bytes) / 1_073_741_824
+                    let a = NSAlert()
+                    a.messageText = "Anteprima SSD -> Cubbit S3"
+                    a.informativeText = "File da caricare: \(result.toUpload) (~\(String(format: "%.1f", gb)) GB)\nFile già presenti (skip): \(result.toSkip)\n\n(il tempo dipende dalla velocità della tua connessione, non stimato qui)"
+                    a.alertStyle = .informational
+                    a.addButton(withTitle: "OK")
+                    a.runModal()
+                } catch {
+                    self.alert("Errore anteprima S3", error.localizedDescription)
+                }
+            }
+        } catch {
+            bm.stopAccessing(.ssd)
+            alert("Errore configurazione S3", error.localizedDescription)
         }
     }
 
@@ -2217,7 +2283,9 @@ struct SidebarView: View {
                           onPreview: { runner.previewSSDToHDD() })
                 OpsButton(title: "SSD -> Cubbit S3", subtitle: "Cloud backup nativo Swift",
                           icon: "icloud.and.arrow.up", color: .purple,
-                          enabled: !runner.isRunning && volumes.ssdMounted) { runner.runSyncS3() }
+                          enabled: !runner.isRunning && volumes.ssdMounted,
+                          action: { runner.runSyncS3() },
+                          onPreview: { runner.previewSyncS3() })
             }
             Spacer()
             if let start = runner.startTime {
