@@ -147,7 +147,6 @@ final class BookmarkManager: ObservableObject {
     }
 
     @Published var urls: [Location: URL] = [:]
-    private var accessing: [Location: URL] = [:]
 
     private init() {
         for loc in Location.allCases {
@@ -160,21 +159,21 @@ final class BookmarkManager: ObservableObject {
     private func resolve(_ loc: Location) -> URL? {
         guard let data = UserDefaults.standard.data(forKey: "bk_\(loc.rawValue)") else { return nil }
         var stale = false
-        guard let url = try? URL(resolvingBookmarkData: data, options: .withSecurityScope,
+        // Bookmark non security-scoped: l'app non è sandboxata (ENABLE_APP_SANDBOX = NO) e ha
+        // Full Disk Access, quindi non serve il meccanismo di scope — che oltretutto fallisce
+        // in modo affidabile sulla root di volumi ExFAT (NSCocoaErrorDomain 256). I bookmark
+        // creati in passato con .withSecurityScope si risolvono comunque correttamente qui.
+        guard let url = try? URL(resolvingBookmarkData: data, options: [],
                                   relativeTo: nil, bookmarkDataIsStale: &stale), !stale else { return nil }
         return url
     }
 
     func startAccessing(_ loc: Location) -> URL? {
-        guard let url = urls[loc] else { return nil }
-        guard url.startAccessingSecurityScopedResource() else { return nil }
-        accessing[loc] = url
-        return url
+        urls[loc]
     }
 
     func stopAccessing(_ loc: Location) {
-        accessing[loc]?.stopAccessingSecurityScopedResource()
-        accessing.removeValue(forKey: loc)
+        // no-op: senza security scope non c'è nulla da rilasciare (vedi resolve()).
     }
 
     func selectAndSave(_ loc: Location, completion: @escaping (Bool) -> Void) {
@@ -188,12 +187,27 @@ final class BookmarkManager: ObservableObject {
             panel.prompt = "Seleziona"
             guard panel.runModal() == .OK, let url = panel.url else { completion(false); return }
             do {
-                let data = try url.bookmarkData(options: .withSecurityScope,
+                // Niente .withSecurityScope: fallisce in modo affidabile sulla root di volumi
+                // ExFAT (NSCocoaErrorDomain 256) e qui non serve comunque — l'app non è
+                // sandboxata e ha Full Disk Access, quindi FileManager legge/scrive ovunque
+                // senza bisogno del meccanismo di scope.
+                let data = try url.bookmarkData(options: [],
                                                  includingResourceValuesForKeys: nil, relativeTo: nil)
                 UserDefaults.standard.set(data, forKey: "bk_\(loc.rawValue)")
                 self.urls[loc] = url
                 completion(true)
-            } catch { completion(false) }
+            } catch {
+                // Alert mantenuto per diagnosticare eventuali fallimenti futuri (prima di questo
+                // fix, un errore qui spariva senza traccia — vedi Docs/CLAUDE.md).
+                let nsError = error as NSError
+                print("selectAndSave(\(loc.rawValue)) bookmarkData FAILED for \(url.path): domain=\(nsError.domain) code=\(nsError.code) \(nsError.localizedDescription)")
+                let a = NSAlert()
+                a.messageText = "Impossibile salvare '\(loc.displayName)'"
+                a.informativeText = "Percorso: \(url.path)\n\nErrore: \(nsError.localizedDescription)\n(dominio \(nsError.domain), codice \(nsError.code))"
+                a.alertStyle = .critical
+                a.runModal()
+                completion(false)
+            }
         }
     }
 }

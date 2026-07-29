@@ -80,10 +80,11 @@ Presenta sempre l'output della revisione insieme al codice.
 
 ### BookmarkManager (singleton)
 
-- Salva/ripristina security-scoped bookmarks in UserDefaults
-- Chiavi: `bk_photos`, `bk_ssd`, `bk_hdd`
-- `startAccessing(_ loc)` → URL con accesso attivo · `stopAccessing(_ loc)` → rilascia il token
+- Salva/ripristina bookmark in UserDefaults (chiavi: `bk_photos`, `bk_ssd`, `bk_hdd`)
+- **Bookmark NON security-scoped** (`options: []`, non `.withSecurityScope`) — decisione presa il 2026-07-29 dopo un bug reale: la root di un volume ExFAT (es. `/Volumes/SSD - Enri`) fa fallire `bookmarkData(options: .withSecurityScope, ...)` con `NSCocoaErrorDomain` codice 256, un limite noto e mai risolto di macOS sui filesystem ExFAT/FAT — non un bug dell'app (stesso codice, stesso identico path, funziona su APFS come `BackupHDD`). L'app non è sandboxata (`ENABLE_APP_SANDBOX = NO`) e ha Full Disk Access, quindi il meccanismo di security scope non serve: `FileManager` legge/scrive comunque ovunque. Verificato che i bookmark creati in passato con `.withSecurityScope` si risolvono correttamente anche con `options: []`, quindi nessuna migrazione necessaria per bookmark già salvati.
+- `startAccessing(_ loc)` → restituisce l'URL salvato (nessuno scope da avviare) · `stopAccessing(_ loc)` → no-op, mantenuto per compatibilità con i call site esistenti (`defer { bm.stopAccessing(...) }` in `BackupRunner`/`ReviewEngine`)
 - `allConfigured` → true se tutte e 3 le cartelle sono selezionate → al primo avvio mostra `SetupView`
+- Se un volume esterno non compare/non si lascia selezionare in `NSOpenPanel`, o se salvare la cartella "non fa nulla", `selectAndSave` mostra un `NSAlert` con l'errore reale (dominio/codice) invece di fallire in silenzio — utile diagnostica se il problema si ripresenta su un altro volume
 
 ### FileSyncer (sync locale Mac→SSD e SSD→HDD)
 
