@@ -744,6 +744,67 @@ final class S3Syncer {
         return ordered.sorted()
     }
 
+    struct DownloadManyResult {
+        var downloaded = 0; var skipped = 0; var total = 0; var done = 0
+        var problems: [String] = []
+    }
+
+    func downloadMany(selectedFolders: Set<String>, config: S3Config, destination: URL,
+                       onStatus: @escaping (String) -> Void,
+                       onProgress: @escaping (DownloadManyResult) -> Void) async throws -> DownloadManyResult {
+        var result = DownloadManyResult()
+        DispatchQueue.main.async { onStatus("Connessione a Cubbit — recupero elenco file...") }
+        let all = try await listAll(config: config)
+        let keys = all.keys.filter { key in
+            guard let first = key.split(separator: "/", maxSplits: 1).first else { return false }
+            return selectedFolders.contains(String(first))
+        }
+        result.total = keys.count
+        let fm = FileManager.default
+
+        for key in keys {
+            let destFile = destination.appendingPathComponent(key)
+            if fm.fileExists(atPath: destFile.path) {
+                result.skipped += 1
+            } else {
+                DispatchQueue.main.async { onStatus("Recupero: \(key)") }
+                do {
+                    let tempURL = try await downloadToTemp(key: key, config: config)
+                    let parent = destFile.deletingLastPathComponent()
+                    if !fm.fileExists(atPath: parent.path) {
+                        try fm.createDirectory(at: parent, withIntermediateDirectories: true)
+                    }
+                    try fm.moveItem(at: tempURL, to: destFile)
+                    result.downloaded += 1
+                } catch {
+                    result.problems.append("\(key) — \(error.localizedDescription)")
+                }
+            }
+            result.done += 1
+            let snap = result
+            DispatchQueue.main.async { onProgress(snap) }
+        }
+        return result
+    }
+
+    // Controllo rapido di raggiungibilità (solo per il primo passo del restore):
+    // timeout breve dedicato, non condivide la `session` con timeout da 300s usata altrove.
+    func checkReachable(config: S3Config, timeoutSec: Double = 4) async -> Bool {
+        guard var comps = URLComponents(string: "\(config.endpoint)/\(config.bucket)") else { return false }
+        comps.queryItems = [URLQueryItem(name: "list-type", value: "2"),
+                             URLQueryItem(name: "max-keys", value: "1")]
+        guard let url = comps.url else { return false }
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        sign(&req, config: config, body: Data(), date: Date())
+        let cfg = URLSessionConfiguration.default
+        cfg.timeoutIntervalForRequest = timeoutSec
+        cfg.timeoutIntervalForResource = timeoutSec
+        let quickSession = URLSession(configuration: cfg)
+        guard let (_, resp) = try? await quickSession.data(for: req) else { return false }
+        return (resp as? HTTPURLResponse)?.statusCode == 200
+    }
+
     // MARK: - AWS Signature V4
     private func sign(_ request: inout URLRequest, config: S3Config, body: Data, date: Date) {
         let fmt = DateFormatter()
