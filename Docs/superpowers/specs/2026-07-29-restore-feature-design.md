@@ -20,6 +20,7 @@ Dentro scope:
 - Schermata di avanzamento deliberatamente più semplice di quella delle altre operazioni: barra, conteggio in linguaggio comune, tempo stimato — non i contatori tecnici di `JobStats`.
 - Stima preventiva (dimensione/tempo) prima di avviare un restore da Cubbit, per non far partire alla cieca un download potenzialmente enorme.
 - **Indicatore di disponibilità in tempo reale per tutte e 3 le fonti nel primo passo** — l'utente ha fatto notare un caso reale (SSD collegato, HDD scollegato, Cubbit non raggiungibile in quel momento) in cui mostrare 3 bottoni identicamente cliccabili è fuorviante: quelli non disponibili vanno disattivati e motivati, non lasciati lì a fallire se premuti.
+- **La schermata iniziale non deve più bloccare tutto se manca un disco.** Stesso problema di fondo notato dall'utente, ma più a monte: oggi `SetupView` non lascia entrare nell'app finché non configuri tutte e 3 le cartelle, anche se poi dentro l'app le operazioni già gestiscono da sole un volume non collegato (bottone disattivato, non blocco totale). Basta configurare la Libreria Foto (sempre disponibile, non dipende da un disco esterno) per entrare; SSD e HDD si configurano quando ci sono, anche più avanti da Impostazioni.
 - Fix di un bug di correttezza già trovato in `BackupRunner.run()` (vedi sotto), incluso in questo lavoro perché il nuovo motore di restore avrebbe lo stesso identico scenario a rischio.
 
 Fuori scope (esplicitamente, per questa iterazione):
@@ -152,6 +153,12 @@ enum RestoreStep { case chooseSource, chooseFolders, chooseDestination, running 
 
 - **Hamburger**: nuova riga "Ripristina" (icona `arrow.down.doc`), accanto a Report Log/Configurazione/Tools — apre `RestoreView`.
 - **`SetupView`**: sotto i tre `LocationRow`, un bottone secondario "Ho già un backup, voglio ripristinare" — apre `RestoreView` senza richiedere `allConfigured`.
+
+## Fix incluso: la schermata iniziale non deve richiedere tutti e 3 i dischi
+
+Oggi `RootView` decide cosa mostrare così: `if bm.allConfigured { ContentView() } else { SetupView() }`, e `allConfigured` richiede che tutte e 3 le posizioni abbiano un bookmark salvato. Se in quel momento non hai un disco a portata di mano (es. l'HDD, come nello screenshot che hai mandato), resti bloccato su `SetupView` per sempre, anche se le operazioni dentro `ContentView` già gestiscono da sole un volume non collegato disattivando solo il bottone che lo richiede.
+
+Fix: nuova proprietà su `BookmarkManager`, `var canEnterApp: Bool { urls[.photos] != nil }` — richiede solo la Libreria Foto, sempre disponibile perché non dipende da un disco esterno. `RootView` usa `canEnterApp` al posto di `allConfigured` per decidere se mostrare `ContentView`. `allConfigured` resta invariata (continua a significare "tutte e 3 configurate", usata altrove se serve in futuro). In `SetupView`, il testo sotto ai tre `LocationRow` cambia da "Dopo aver selezionato tutte e tre le cartelle l'app si aprirà automaticamente" a qualcosa come "Appena selezioni la Libreria Foto l'app si apre — SSD e HDD puoi configurarli quando vuoi, anche più avanti da Impostazioni". SSD e HDD restano selezionabili nella stessa schermata per chi li ha già pronti, semplicemente non sono più obbligatori per procedere.
 
 ## Fix incluso: race stop()/successo in `BackupRunner`
 
