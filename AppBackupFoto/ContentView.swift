@@ -1675,9 +1675,9 @@ struct RestoreView: View {
         VStack(spacing: 20) {
             switch step {
             case .chooseSource: chooseSourceStep
-            case .chooseFolders: Text("Passo 2 — cartelle (Task 6)")
-            case .chooseDestination: Text("Passo 3 — destinazione (Task 6)")
-            case .running: Text("Passo 4 — avanzamento (Task 6)")
+            case .chooseFolders: chooseFoldersStep
+            case .chooseDestination: chooseDestinationStep
+            case .running: runningStep
             }
         }
         .padding(32)
@@ -1800,6 +1800,140 @@ struct RestoreView: View {
                 step = .chooseFolders
             }
         }
+    }
+
+    private var chooseFoldersStep: some View {
+        VStack(spacing: 18) {
+            VStack(spacing: 6) {
+                Image(systemName: "folder").font(.system(size: 36)).foregroundStyle(.blue)
+                Text("Cosa vuoi ripristinare?").font(.title2).fontWeight(.semibold)
+                Text("Sono già tutte selezionate — deseleziona solo quello che non ti serve.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            ScrollView {
+                VStack(spacing: 8) {
+                    ForEach(availableFolders, id: \.self) { folder in
+                        Button {
+                            if selectedFolders.contains(folder) { selectedFolders.remove(folder) }
+                            else { selectedFolders.insert(folder) }
+                        } label: {
+                            HStack {
+                                Image(systemName: selectedFolders.contains(folder) ? "checkmark.square.fill" : "square")
+                                    .foregroundStyle(selectedFolders.contains(folder) ? Color.accentColor : Color.secondary)
+                                Text(folder).font(.system(size: 14))
+                                Spacer()
+                            }
+                            .padding(10).background(.quaternary.opacity(0.3)).clipShape(RoundedRectangle(cornerRadius: 6))
+                        }.buttonStyle(.plain)
+                    }
+                }
+            }
+            HStack {
+                Button("Indietro") { step = .chooseSource }.buttonStyle(.bordered)
+                Spacer()
+                Button("Continua") { step = .chooseDestination }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(selectedFolders.isEmpty)
+            }
+        }
+    }
+
+    private var chooseDestinationStep: some View {
+        VStack(spacing: 18) {
+            VStack(spacing: 6) {
+                Image(systemName: "tray.and.arrow.down").font(.system(size: 36)).foregroundStyle(.blue)
+                Text("Dove vuoi salvare le foto?").font(.title2).fontWeight(.semibold)
+                Text("Dopo potrai trascinarle nell'app Foto quando vuoi.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            if let destinationURL {
+                Text(destinationURL.path).font(.caption).foregroundStyle(.secondary)
+                    .lineLimit(1).truncationMode(.middle)
+            }
+            Button(destinationURL == nil ? "Scegli cartella…" : "Cambia cartella…") {
+                let panel = NSOpenPanel()
+                panel.canChooseFiles = false
+                panel.canChooseDirectories = true
+                panel.allowsMultipleSelection = false
+                panel.prompt = "Scegli"
+                if panel.runModal() == .OK, let url = panel.url { destinationURL = url }
+            }.buttonStyle(.bordered)
+            Spacer()
+            HStack {
+                Button("Indietro") { step = .chooseFolders }.buttonStyle(.bordered)
+                Spacer()
+                Button("Ripristina") { startRestore() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(destinationURL == nil)
+            }
+        }
+        .alert("Prima di scaricare da Cubbit", isPresented: $showS3EstimateAlert) {
+            Button("Annulla", role: .cancel) { }
+            Button("Continua") { beginRun() }
+        } message: { Text(s3EstimateText) }
+    }
+
+    private var runningStep: some View {
+        VStack(spacing: 20) {
+            switch engine.phase {
+            case .running:
+                ProgressView(value: Double(engine.progress.percent), total: 100)
+                    .progressViewStyle(.linear).frame(maxWidth: 320)
+                Text("Recuperate \(engine.progress.done) di \(engine.progress.total) foto")
+                    .font(.system(size: 15, weight: .medium))
+                if engine.progress.etaSec > 0 {
+                    Text("Tempo stimato: \(FileSyncer.SyncResult.hms(engine.progress.etaSec))")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Button("Interrompi") { engine.stop() }.buttonStyle(.bordered).tint(.red)
+            case .success:
+                Image(systemName: "checkmark.circle.fill").font(.system(size: 48)).foregroundStyle(.green)
+                Text("Fatto! Le tue foto sono qui").font(.title3).fontWeight(.semibold)
+                if let destinationURL {
+                    Button("Apri cartella") { NSWorkspace.shared.activateFileViewerSelecting([destinationURL]) }
+                        .buttonStyle(.bordered)
+                }
+                if !engine.progress.problems.isEmpty {
+                    Text("\(engine.progress.problems.count) file non è stato possibile recuperare")
+                        .font(.caption).foregroundStyle(.orange)
+                }
+                Button("Chiudi") { dismiss() }.buttonStyle(.borderedProminent)
+            case .failed(let msg):
+                Image(systemName: "exclamationmark.triangle.fill").font(.system(size: 48)).foregroundStyle(.orange)
+                Text(msg).font(.system(size: 14)).multilineTextAlignment(.center)
+                Button("Chiudi") { dismiss() }.buttonStyle(.borderedProminent)
+            case .idle:
+                ProgressView()
+            }
+        }
+    }
+
+    private func startRestore() {
+        guard let selectedSource else { return }
+        if selectedSource == .s3, let destinationURL, let s3Config {
+            Task {
+                let estimate = try? await engine.estimateS3Download(
+                    selectedFolders: selectedFolders, destination: destinationURL, config: s3Config)
+                await MainActor.run {
+                    if let estimate {
+                        let gb = Double(estimate.bytes) / 1_073_741_824
+                        s3EstimateText = "Stai per scaricare \(estimate.count) file (~\(String(format: "%.1f", gb)) GB). Potrebbe richiedere qualche ora."
+                    } else {
+                        s3EstimateText = "Impossibile stimare la dimensione — continuo comunque?"
+                    }
+                    showS3EstimateAlert = true
+                }
+            }
+        } else {
+            beginRun()
+        }
+    }
+
+    private func beginRun() {
+        guard let selectedSource, let destinationURL else { return }
+        step = .running
+        engine.run(source: selectedSource, selectedFolders: selectedFolders,
+                   sourceRootURL: sourceRootURL, destination: destinationURL, s3Config: s3Config)
     }
 }
 
