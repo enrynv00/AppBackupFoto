@@ -1650,6 +1650,159 @@ final class RestoreEngine: ObservableObject {
     }
 }
 
+struct RestoreView: View {
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject private var bm = BookmarkManager.shared
+    @StateObject private var volumes = VolumeMonitor()
+    @StateObject private var engine = RestoreEngine()
+    private let s3Syncer = S3Syncer()
+
+    enum Step { case chooseSource, chooseFolders, chooseDestination, running }
+    enum S3Status { case checking, available, unavailable(String) }
+
+    @State private var step: Step = .chooseSource
+    @State private var selectedSource: RestoreSource?
+    @State private var sourceRootURL: URL?
+    @State private var s3Config: S3Syncer.S3Config?
+    @State private var s3Status: S3Status = .checking
+    @State private var availableFolders: [String] = []
+    @State private var selectedFolders: Set<String> = []
+    @State private var destinationURL: URL?
+    @State private var showS3EstimateAlert = false
+    @State private var s3EstimateText = ""
+
+    var body: some View {
+        VStack(spacing: 20) {
+            switch step {
+            case .chooseSource: chooseSourceStep
+            case .chooseFolders: Text("Passo 2 — cartelle (Task 6)")
+            case .chooseDestination: Text("Passo 3 — destinazione (Task 6)")
+            case .running: Text("Passo 4 — avanzamento (Task 6)")
+            }
+        }
+        .padding(32)
+        .frame(minWidth: 480, minHeight: 440)
+        .task { await checkS3Reachability() }
+    }
+
+    private var chooseSourceStep: some View {
+        VStack(spacing: 18) {
+            VStack(spacing: 6) {
+                Image(systemName: "arrow.down.doc").font(.system(size: 40)).foregroundStyle(.blue)
+                Text("Da dove vuoi ripristinare?").font(.title2).fontWeight(.semibold)
+            }
+            VStack(spacing: 10) {
+                restoreSourceRow(.ssd, available: volumes.ssdMounted,
+                                  unavailableReason: "non collegato in questo momento")
+                restoreSourceRow(.hdd, available: volumes.hddMounted,
+                                  unavailableReason: "non collegato in questo momento")
+                s3SourceRow
+            }
+            Spacer()
+            HStack {
+                Spacer()
+                Button("Annulla") { dismiss() }.buttonStyle(.bordered)
+            }
+        }
+    }
+
+    private func restoreSourceRow(_ source: RestoreSource, available: Bool, unavailableReason: String) -> some View {
+        Button {
+            selectedSource = source
+            let loc: BookmarkManager.Location = source == .ssd ? .ssd : .hdd
+            if let existing = bm.urls[loc] {
+                sourceRootURL = existing
+                proceedToFolders(rootURL: existing)
+            } else {
+                bm.selectAndSave(loc) { ok in
+                    guard ok, let url = bm.urls[loc] else { return }
+                    sourceRootURL = url
+                    proceedToFolders(rootURL: url)
+                }
+            }
+        } label: {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(source.displayName).font(.system(size: 14, weight: .medium))
+                    if !available {
+                        Text(unavailableReason).font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                Spacer()
+                Image(systemName: "chevron.right").font(.caption).foregroundStyle(.secondary)
+            }
+            .padding(14).background(.quaternary.opacity(0.4)).clipShape(RoundedRectangle(cornerRadius: 8))
+        }
+        .buttonStyle(.plain)
+        .disabled(!available)
+        .opacity(available ? 1 : 0.45)
+    }
+
+    private var s3SourceRow: some View {
+        Group {
+            switch s3Status {
+            case .checking:
+                HStack {
+                    ProgressView().controlSize(.small)
+                    Text("Verifica Cubbit in corso…").font(.system(size: 14)).foregroundStyle(.secondary)
+                    Spacer()
+                }.padding(14).background(.quaternary.opacity(0.4)).clipShape(RoundedRectangle(cornerRadius: 8))
+            case .available:
+                Button {
+                    selectedSource = .s3
+                    proceedToFolders(rootURL: nil)
+                } label: {
+                    HStack {
+                        Text(RestoreSource.s3.displayName).font(.system(size: 14, weight: .medium))
+                        Spacer()
+                        Image(systemName: "chevron.right").font(.caption).foregroundStyle(.secondary)
+                    }
+                    .padding(14).background(.quaternary.opacity(0.4)).clipShape(RoundedRectangle(cornerRadius: 8))
+                }.buttonStyle(.plain)
+            case .unavailable(let reason):
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(RestoreSource.s3.displayName).font(.system(size: 14, weight: .medium))
+                        Text(reason).font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                }
+                .padding(14).background(.quaternary.opacity(0.4)).clipShape(RoundedRectangle(cornerRadius: 8))
+                .opacity(0.45)
+            }
+        }
+    }
+
+    private func checkS3Reachability() async {
+        do {
+            let cfg = try S3Syncer.readConfig()
+            s3Config = cfg
+            let reachable = await s3Syncer.checkReachable(config: cfg)
+            s3Status = reachable ? .available : .unavailable("non raggiungibile in questo momento")
+        } catch {
+            s3Status = .unavailable("configurazione mancante")
+        }
+    }
+
+    private func proceedToFolders(rootURL: URL?) {
+        Task {
+            let folders: [String]
+            if let rootURL {
+                folders = engine.listAvailableFolders(rootURL: rootURL)
+            } else if let s3Config {
+                folders = (try? await engine.listAvailableFolders(fromS3Config: s3Config)) ?? []
+            } else {
+                folders = []
+            }
+            await MainActor.run {
+                availableFolders = folders
+                selectedFolders = Set(folders)
+                step = .chooseFolders
+            }
+        }
+    }
+}
+
 // MARK: - SetupView
 struct SetupView: View {
     @ObservedObject private var bm = BookmarkManager.shared
