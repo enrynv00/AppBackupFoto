@@ -136,6 +136,14 @@ Presenta sempre l'output della revisione insieme al codice.
 - Le foto ripristinate atterrano in una cartella normale sul Mac, **non** nella libreria interna di Foto.app (troppo rischioso toccare il suo database privato) — l'utente le importa lui con un paio di click.
 - Raggiungibile da hamburger → Ripristina, e da un bottone secondario in `SetupView` (visibile anche a configurazione incompleta, grazie a `canEnterApp`).
 
+### Bug critico risolto: `sha256(of:)` e file molto grandi (2026-07-30)
+
+Un restore locale reale della cartella `Zip` dell'SSD (15 file, tra cui due archivi da ~50GB: `takeout-001.zip` 53,5GB e `takeout-002.zip` 44,5GB) ha fatto salire il processo a 41-43GB di RAM (37GB di swap), quasi bloccando il Mac. Causa trovata e verificata empiricamente (non solo per lettura del codice): `sha256(of:)` — la funzione condivisa usata sia da `FileSyncer` (verifica integrità post-copia, su sorgente **e** destinazione) sia da `ReviewEngine` — leggeva il file con `FileHandle.readData(ofLength: 65536)` in un ciclo. Il chunking a 64KB è corretto sulla carta, ma su questo carico `FileHandle`/`NSData` mantiene le pagine lette residenti in memoria invece di rilasciarle tra una lettura e l'altra: la RAM cresce in proporzione ai byte totali letti, non alla dimensione del buffer. Per un file di pochi MB non si nota; per un file da 50GB, letto due volte (sorgente + destinazione), diventa un problema di sistema.
+
+Fix verificato prima di toccare il codice reale: stesso file da 2GB (`Zip/Elba-...zip`), stesso hash risultante — `FileHandle.readData(ofLength:)` picco 4,09GB di memoria residente; `open`/`read`/`close` POSIX a basso livello (stesso buffer da 64KB, riusato) picco 61MB. 67 volte meno memoria, leggermente più veloce. `sha256(of:)` ora usa questa versione POSIX — nessun'altra modifica necessaria, la funzione resta drop-in per entrambi i chiamanti.
+
+**Lezione per il futuro**: se un'altra funzione in questo progetto legge file di grandi dimensioni via `FileHandle`, verificarne il comportamento in memoria su file realmente grandi (decine di GB) prima di fidarsi del chunking sulla carta — non è garantito che basti leggere "a blocchi" per avere memoria costante.
+
 ---
 
 ## UI (SwiftUI views in ContentView.swift)
@@ -171,7 +179,7 @@ Qualsiasi subprocess (rsync, bash, rclone, Process()) lanciato da un'app GUI **n
 | Sidebar hamburger (Report Log, Ripristina, Configurazione, Tools, Aspetto, Lingua) | ✅ Implementata |
 | Grafico velocità real-time | ✅ Implementato (Charts, MB/s per S3, file/s locale) |
 | Pannello Revisione (ToolsSheet) | ✅ Implementato — config checks, ultimo job persistito, campione integrità SHA256 |
-| Test automatici | ✅ 23 test XCTest passano (`AppBackupFotoTests`: zero-overwrite, volume-root, persistenza job, campionamento locale, parsing cartelle S3 per il restore) |
+| Test automatici | ✅ 27 test XCTest passano (`AppBackupFotoTests`: zero-overwrite, volume-root, persistenza job, campionamento locale, parsing cartelle S3 per il restore, correttezza sha256) |
 | Build | ✅ `xcodebuild ... build` e `... test` verdi su questo stato |
 
 ---
