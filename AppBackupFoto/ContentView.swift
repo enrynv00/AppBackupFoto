@@ -610,7 +610,7 @@ final class S3Syncer {
                 let msg = "Upload (\(result.done + 1)/\(result.total) — \(result.percent)%): \(item.url.lastPathComponent)"
                 DispatchQueue.main.async { onStatus(msg) }
                 do {
-                    try await upload(url: item.url, key: item.key, config: config)
+                    try await upload(url: item.url, key: item.key, config: config, onStatus: onStatus)
                     result.uploaded += 1
                     result.uploadedBytes += item.size
                 } catch {
@@ -687,13 +687,15 @@ final class S3Syncer {
         }
     }
 
-    private func upload(url: URL, key: String, config: S3Config) async throws {
+    private func upload(url: URL, key: String, config: S3Config, onStatus: @escaping (String) -> Void) async throws {
         let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
         if size > 64 * 1024 * 1024 {
-            try await multipart(url: url, key: key, config: config)
+            try await multipart(url: url, key: key, config: config, onStatus: onStatus)
         } else {
             let data = try Data(contentsOf: url)
-            try await put(data: data, key: key, config: config)
+            try await retrying(key: key, onStatus: onStatus) {
+                try await self.put(data: data, key: key, config: config)
+            }
         }
     }
 
@@ -710,25 +712,32 @@ final class S3Syncer {
         let (respData, resp) = try await session.data(for: req)
         guard let code = (resp as? HTTPURLResponse)?.statusCode, (200...299).contains(code) else {
             let body = String(data: respData, encoding: .utf8) ?? ""
-            throw NSError(domain: "S3", code: 4,
-                userInfo: [NSLocalizedDescriptionKey: "Errore PUT \(key): \(body.prefix(100))"])
+            let statusCode = (resp as? HTTPURLResponse)?.statusCode ?? -1
+            throw S3HTTPError(statusCode: statusCode, message: "Errore PUT \(key): \(body.prefix(100))")
         }
     }
 
-    private func multipart(url: URL, key: String, config: S3Config) async throws {
+    private func multipart(url: URL, key: String, config: S3Config, onStatus: @escaping (String) -> Void) async throws {
         let encKey = key.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? key
         guard let initURL = URL(string: "\(config.endpoint)/\(config.bucket)/\(encKey)?uploads") else {
             throw NSError(domain: "S3", code: 12,
                 userInfo: [NSLocalizedDescriptionKey: "URL non valido per il file: \(key)"])
         }
-        var initReq = URLRequest(url: initURL)
-        initReq.httpMethod = "POST"
-        sign(&initReq, config: config, body: Data(), date: Date())
-        let (initData, initResp) = try await session.data(for: initReq)
-        guard (initResp as? HTTPURLResponse)?.statusCode == 200,
-              let uploadId = xmlFirst(String(data: initData, encoding: .utf8) ?? "", tag: "UploadId") else {
-            throw NSError(domain: "S3", code: 5,
-                userInfo: [NSLocalizedDescriptionKey: "Impossibile avviare multipart per \(key)"])
+
+        let uploadId = try await retrying(key: key, onStatus: onStatus) { () async throws -> String in
+            var initReq = URLRequest(url: initURL)
+            initReq.httpMethod = "POST"
+            self.sign(&initReq, config: config, body: Data(), date: Date())
+            let (initData, initResp) = try await self.session.data(for: initReq)
+            guard let code = (initResp as? HTTPURLResponse)?.statusCode, (200...299).contains(code) else {
+                let statusCode = (initResp as? HTTPURLResponse)?.statusCode ?? -1
+                throw S3HTTPError(statusCode: statusCode, message: "Impossibile avviare multipart per \(key)")
+            }
+            guard let uploadId = self.xmlFirst(String(data: initData, encoding: .utf8) ?? "", tag: "UploadId") else {
+                throw NSError(domain: "S3", code: 5,
+                    userInfo: [NSLocalizedDescriptionKey: "Impossibile avviare multipart per \(key)"])
+            }
+            return uploadId
         }
         let encId = uploadId.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? uploadId
 
@@ -747,15 +756,18 @@ final class S3Syncer {
                 throw NSError(domain: "S3", code: 12,
                     userInfo: [NSLocalizedDescriptionKey: "URL non valido per parte \(pn) di \(key)"])
             }
-            var pReq = URLRequest(url: pURL)
-            pReq.httpMethod = "PUT"; pReq.httpBody = chunk
-            sign(&pReq, config: config, body: chunk, date: Date())
-            let (_, pResp) = try await session.data(for: pReq)
-            guard let pHttp = pResp as? HTTPURLResponse, (200...299).contains(pHttp.statusCode) else {
-                throw NSError(domain: "S3", code: 6,
-                    userInfo: [NSLocalizedDescriptionKey: "Errore parte \(pn) di \(key)"])
+            let partNumber = pn
+            let etag = try await retrying(key: "\(key) (parte \(partNumber))", onStatus: onStatus) { () async throws -> String in
+                var pReq = URLRequest(url: pURL)
+                pReq.httpMethod = "PUT"; pReq.httpBody = chunk
+                self.sign(&pReq, config: config, body: chunk, date: Date())
+                let (_, pResp) = try await self.session.data(for: pReq)
+                guard let pHttp = pResp as? HTTPURLResponse, (200...299).contains(pHttp.statusCode) else {
+                    let statusCode = (pResp as? HTTPURLResponse)?.statusCode ?? -1
+                    throw S3HTTPError(statusCode: statusCode, message: "Errore parte \(partNumber) di \(key)")
+                }
+                return pHttp.value(forHTTPHeaderField: "Etag") ?? ""
             }
-            let etag = (pResp as? HTTPURLResponse)?.value(forHTTPHeaderField: "Etag") ?? ""
             parts.append((pn, etag))
             offset += Int64(chunkSize); pn += 1
         }
@@ -776,13 +788,15 @@ final class S3Syncer {
             throw NSError(domain: "S3", code: 12,
                 userInfo: [NSLocalizedDescriptionKey: "URL non valido per completamento multipart: \(key)"])
         }
-        var cReq = URLRequest(url: cURL)
-        cReq.httpMethod = "POST"; cReq.httpBody = completeXML
-        sign(&cReq, config: config, body: completeXML, date: Date())
-        let (_, cResp) = try await session.data(for: cReq)
-        guard (cResp as? HTTPURLResponse)?.statusCode == 200 else {
-            throw NSError(domain: "S3", code: 7,
-                userInfo: [NSLocalizedDescriptionKey: "Errore completamento multipart \(key)"])
+        try await retrying(key: key, onStatus: onStatus) {
+            var cReq = URLRequest(url: cURL)
+            cReq.httpMethod = "POST"; cReq.httpBody = completeXML
+            self.sign(&cReq, config: config, body: completeXML, date: Date())
+            let (_, cResp) = try await self.session.data(for: cReq)
+            guard let code = (cResp as? HTTPURLResponse)?.statusCode, (200...299).contains(code) else {
+                let statusCode = (cResp as? HTTPURLResponse)?.statusCode ?? -1
+                throw S3HTTPError(statusCode: statusCode, message: "Errore completamento multipart \(key)")
+            }
         }
     }
 
