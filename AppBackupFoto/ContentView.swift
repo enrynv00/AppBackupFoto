@@ -2232,7 +2232,7 @@ struct ContentView: View {
                     .zIndex(9)
                     .transition(.opacity)
 
-                HamburgerPanel(isVisible: $showHamburger, showSettings: $showSettings, onShowLog: {
+                HamburgerPanel(isVisible: $showHamburger, showSettings: $showSettings, isJobRunning: runner.isRunning, onShowLog: {
                     activeSpeedTab = .log
                     withAnimation(.easeInOut(duration: 0.22)) { showHamburger = false }
                 })
@@ -2455,6 +2455,7 @@ struct OpsButton: View {
 struct HamburgerPanel: View {
     @Binding var isVisible: Bool
     @Binding var showSettings: Bool
+    var isJobRunning: Bool = false
     var onShowLog: (() -> Void)? = nil
     private let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
     private let profileName = "Enrico Nanni Vicenzi"
@@ -2537,7 +2538,7 @@ struct HamburgerPanel: View {
         .background(.windowBackground)
         .shadow(color: .black.opacity(0.18), radius: 12, x: 5, y: 0)
         .sheet(isPresented: $showAppearance) { AppearanceSheet() }
-        .sheet(isPresented: $showTools)      { ToolsSheet() }
+        .sheet(isPresented: $showTools)      { ToolsSheet(isJobRunning: isJobRunning) }
         .sheet(isPresented: $showRestore)    { RestoreView() }
     }
 
@@ -2868,15 +2869,23 @@ struct AppearanceSheet: View {
 struct ToolsSheet: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject private var bm = BookmarkManager.shared
+    var isJobRunning: Bool = false
     @State private var showSecret = false
     @State private var reviewFindings: [ReviewFinding] = []
     @State private var lastJob: JobSummary? = JobHistoryStore.load()
     @State private var integrityResults: [IntegrityCheckResult] = []
     @State private var integrityRunning = false
     @State private var integrityStatus = ""
+    @State private var orphanedUploads: [S3Syncer.OrphanedMultipartUpload] = []
+    @State private var orphanedUploadsChecked = false
     private let reviewEngine = ReviewEngine()
 
     private let jobDateFormatter: DateFormatter = {
+        let f = DateFormatter(); f.dateStyle = .medium; f.timeStyle = .short
+        return f
+    }()
+
+    private let uploadDateFormatter: DateFormatter = {
         let f = DateFormatter(); f.dateStyle = .medium; f.timeStyle = .short
         return f
     }()
@@ -3042,9 +3051,63 @@ struct ToolsSheet: View {
                             }
                         }
                     }
+
+                    Divider()
+
+                    if isJobRunning {
+                        Text("Controllo upload incompleti disponibile a job fermo")
+                            .font(.caption).foregroundStyle(.secondary)
+                    } else if !orphanedUploads.isEmpty {
+                        Text("Upload incompleti trovati").font(.caption).fontWeight(.medium)
+                        ForEach(orphanedUploads) { upload in
+                            HStack(alignment: .top, spacing: 8) {
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text((upload.key as NSString).lastPathComponent).font(.caption2)
+                                    Text("iniziato il \(uploadDateFormatter.string(from: upload.initiated))")
+                                        .font(.caption2).foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                Button("Elimina") {
+                                    let a = NSAlert()
+                                    a.messageText = "Eliminare questo upload incompleto?"
+                                    a.informativeText = "Rimuove definitivamente le parti già caricate su Cubbit per '\((upload.key as NSString).lastPathComponent)'. Non tocca file già completati né la sorgente."
+                                    a.alertStyle = .warning
+                                    a.addButton(withTitle: "Elimina")
+                                    a.addButton(withTitle: "Annulla")
+                                    guard a.runModal() == .alertFirstButtonReturn else { return }
+                                    Task {
+                                        do {
+                                            let config = try S3Syncer.readConfig()
+                                            try await S3Syncer().abortMultipartUpload(
+                                                key: upload.key, uploadId: upload.uploadId, config: config)
+                                            await MainActor.run {
+                                                orphanedUploads.removeAll { $0.id == upload.id }
+                                            }
+                                        } catch {
+                                            await MainActor.run {
+                                                let errA = NSAlert()
+                                                errA.messageText = "Impossibile eliminare l'upload"
+                                                errA.informativeText = error.localizedDescription
+                                                errA.alertStyle = .critical
+                                                errA.runModal()
+                                            }
+                                        }
+                                    }
+                                }.buttonStyle(.bordered).controlSize(.small)
+                            }
+                        }
+                    }
                 }.padding(4)
             }
-            .onAppear { reviewFindings = reviewEngine.runConfigChecks() }
+            .onAppear {
+                reviewFindings = reviewEngine.runConfigChecks()
+                guard !isJobRunning, !orphanedUploadsChecked else { return }
+                orphanedUploadsChecked = true
+                Task {
+                    let found = (try? await reviewEngine.findOrphanedMultipartUploads()) ?? []
+                    await MainActor.run { orphanedUploads = found }
+                }
+            }
 
             HStack {
                 Spacer()
