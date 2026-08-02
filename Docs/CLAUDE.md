@@ -102,7 +102,8 @@ Presenta sempre l'output della revisione insieme al codice.
 - Legge credenziali da `~/.config/rclone/rclone.conf`, sezione `[Cubbit]`
 - **Guardie di sicurezza su `readConfig`**: rifiuta se i permessi del file sono più aperti di `0600`; rifiuta se l'endpoint non è HTTPS; **allow-list dell'host** (`s3.it.cubbit.org`) — se rclone.conf viene alterato per puntare altrove, il caricamento si blocca finché l'host non viene aggiunto esplicitamente alla allow-list nel codice
 - List bucket con paginazione (ListObjectsV2), confronto per key+size per decidere cosa caricare (mai DELETE/overwrite remoto)
-- PUT per file < 64MB, multipart per file ≥ 64MB (chunk da 64MB)
+- PUT per file < 64MB, multipart per file ≥ 64MB (chunk da 64MB), lettura parti via `readFileInChunks` (POSIX low-level, stesso fix di `sha256(of:)` — vedi sezione dedicata sotto)
+- **Upload paralleli**: `sync()` carica fino a 4 file diversi in parallelo (`S3Syncer.runBounded`, finestra fissa non configurabile). Le parti di un singolo multipart restano sequenziali (parallelizzarle non aiuterebbe: sui pochi file enormi il collo di bottiglia è la banda, non la latenza per richiesta). Cancellazione controllata dentro ogni task figlio prima di ogni chiamata di rete, non solo nel loop di schedulazione.
 - **Cancel su multipart** → chiama `AbortMultipartUpload` (nessuna parte orfana lasciata sul bucket)
 - **Retry con backoff**: ogni chiamata HTTP di upload (PUT singolo, init/parte/complete multipart) viene ritentata fino a 3 volte (1s poi 2s di attesa) per errori transitori (`URLError`, HTTP 5xx) — non per errori permanenti (HTTP 4xx) né se l'utente interrompe (`cancelled`/`Task.isCancelled` controllati prima di ogni attesa). Vedi `S3Syncer.retrying`/`isRetryable`/`S3HTTPError`.
 - **Pulizia upload multipart orfani**: `listMultipartUploads`/`abortMultipartUpload` (quest'ultima condivisa col cancel già esistente durante un job). Scoperta automatica nel pannello Revisione (Tools) quando nessun job è in corso, cancellazione sempre dietro conferma esplicita per singolo upload — mai automatica.
@@ -146,6 +147,10 @@ Fix verificato prima di toccare il codice reale: stesso file da 2GB (`Zip/Elba-.
 
 **Lezione per il futuro**: se un'altra funzione in questo progetto legge file di grandi dimensioni via `FileHandle`, verificarne il comportamento in memoria su file realmente grandi (decine di GB) prima di fidarsi del chunking sulla carta — non è garantito che basti leggere "a blocchi" per avere memoria costante.
 
+### Stessa lezione applicata: `multipart()` upload (2026-08-02)
+
+Rileggendo il codice durante il brainstorming per gli upload paralleli, `multipart()` (upload dei file ≥64MB verso Cubbit) usava lo stesso pattern a rischio: `FileHandle(forReadingFrom:)` + `readData(ofLength: chunkSize)` in un ciclo per leggere le parti da 64MB. Non è stato ancora misurato empiricamente un picco di memoria su un multipart reale (serve un upload di ore su uno degli zip da 40-50GB), ma è la stessa firma di codice del bug già trovato — corretto preventivamente riusando `S3Syncer.readFileInChunks` (stesso `open`/`read`/`close` POSIX con buffer riutilizzato). Verifica manuale con Monitor Attività ancora da fare da parte dell'utente.
+
 ---
 
 ## UI (SwiftUI views in ContentView.swift)
@@ -172,7 +177,7 @@ Qualsiasi subprocess (rsync, bash, rclone, Process()) lanciato da un'app GUI **n
 | :---- | :---- |
 | Mac → SSD | ✅ Funziona, con anteprima dry-run e verifica SHA256 post-copia |
 | SSD → HDD | ✅ Funziona; validazione volume-root con alert esplicito impedisce più il caso 0/0 silenzioso |
-| SSD → S3 | ✅ Funziona, con allow-list endpoint, abort su multipart cancellato, retry con backoff, grafico MB/s |
+| SSD → S3 | ✅ Funziona, con allow-list endpoint, abort su multipart cancellato, retry con backoff, upload paralleli (4 file), grafico MB/s |
 | Ripristino guidato (SSD/HDD/Cubbit → cartella) | ✅ Implementato — 4 passi, indicatori di disponibilità in tempo reale, UI volutamente semplice |
 | Sheet completamento | ✅ Funziona |
 | Notifiche sistema | ✅ Funzionano |
@@ -181,7 +186,7 @@ Qualsiasi subprocess (rsync, bash, rclone, Process()) lanciato da un'app GUI **n
 | Sidebar hamburger (Report Log, Ripristina, Configurazione, Tools, Aspetto, Lingua) | ✅ Implementata |
 | Grafico velocità real-time | ✅ Implementato (Charts, MB/s per S3, file/s locale) |
 | Pannello Revisione (ToolsSheet) | ✅ Implementato — config checks, ultimo job persistito, campione integrità SHA256, pulizia upload multipart orfani |
-| Test automatici | ✅ 34 test XCTest passano (`AppBackupFotoTests`: zero-overwrite, volume-root, persistenza job, campionamento locale, parsing cartelle S3 per il restore, correttezza sha256, classificazione retry S3) |
+| Test automatici | ✅ 41 test XCTest passano (`AppBackupFotoTests`: zero-overwrite, volume-root, persistenza job, campionamento locale, parsing cartelle S3 per il restore, correttezza sha256, classificazione retry S3, lettura file a blocchi, concorrenza limitata) |
 | Build | ✅ `xcodebuild ... build` e `... test` verdi su questo stato |
 
 ---

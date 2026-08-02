@@ -10,7 +10,7 @@ Versione visiva (con link alle fonti): vedi artifact pubblicato in sessione, opp
 
 **Bonus non previsto in questa lista originale, trovato e risolto durante il lavoro sul Restore**: un bug critico di memoria (`sha256(of:)` faceva salire il processo a 41-43GB di RAM su file da 40-50GB, quasi bloccando il Mac). Vedi `Docs/CLAUDE.md`, sezione ReviewEngine/RestoreEngine, per i dettagli — è probabilmente la scoperta più importante di tutta la sessione, più critica di qualunque punto elencato qui sotto.
 
-**Ancora aperti, con bozze di design pronte in `Docs/superpowers/specs/2026-07-30-next-steps-briefing.md`**: #4 cleanup multipart orfani, #5 cifratura lato client, #6 upload paralleli, #10 Keychain, #7 scheduling.
+**Ancora aperti, con bozze di design pronte in `Docs/superpowers/specs/2026-07-30-next-steps-briefing.md`**: #5 cifratura lato client, #10 Keychain, #7 scheduling.
 
 ---
 
@@ -38,8 +38,7 @@ Versione visiva (con link alle fonti): vedi artifact pubblicato in sessione, opp
 
 ## Alto — prestazioni e qualità percepita (6)
 
-6. **Upload S3 completamente sequenziali** — un file alla volta, e anche le parti multipart una alla volta, nessun parallelismo in `S3Syncer.sync`. Su ~69.000 file è probabilmente il collo di bottiglia più grande sulla velocità reale.
-   *Effort: medio · `TaskGroup` con 4-8 upload/parti concorrenti, limite configurabile*
+6. ✅ **Fatto (2026-08-02) — Upload S3 completamente sequenziali.** 4 file caricati in parallelo (`S3Syncer.runBounded`, finestra fissa non configurabile). Bonus non previsto: nello stesso intervento corretto anche un probabile bug di memoria in `multipart()` (stesso pattern già trovato in `sha256(of:)`), prima di parallelizzare. Vedi `Docs/superpowers/specs/2026-08-02-parallel-uploads-design.md`.
 
 7. **Zero automazione** — ogni backup parte solo a bottone premuto. CCC, ChronoSync e Arq offrono tutti scheduling nativo ("ogni notte se l'SSD è collegato").
    *Fonte: confronto funzionalità CCC / ChronoSync / Arq*
@@ -74,7 +73,7 @@ Versione visiva (con link alle fonti): vedi artifact pubblicato in sessione, opp
 
 ## Da dove partire (aggiornato 2026-08-02)
 
-Fatti: #1 restore, #2 race stop/successo, #3 retry S3, #9 anteprima S3. Il prossimo con più impatto è probabilmente **#4 (cleanup multipart orfani)** o **#6 (upload paralleli)** — entrambi hanno già ricerca e opzioni pronte in `Docs/superpowers/specs/2026-07-30-next-steps-briefing.md`. Il resto è ordinabile in base al tempo che vuoi investirci.
+Fatti: #1 restore, #2 race stop/successo, #3 retry S3, #4 cleanup multipart, #6 upload paralleli, #9 anteprima S3. Restano 3 interventi con bozza di ricerca già pronta in `Docs/superpowers/specs/2026-07-30-next-steps-briefing.md`: **#5 cifratura lato client** (il più delicato — tocca decisioni di sicurezza/UX che richiedono una discussione attenta con l'utente), **#10 Keychain** (migrazione credenziali, medio rischio), **#7 scheduling** (automazione backup). Il resto della lista (punti 8, 11-20) è ordinabile in base al tempo che si vuole investirci.
 
 ## Fonti consultate
 
