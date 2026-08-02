@@ -6,11 +6,13 @@ Versione visiva (con link alle fonti): vedi artifact pubblicato in sessione, opp
 
 ## Stato aggiornato (2026-08-02)
 
-**Fatti**: #1 Restore guidato, #2 race stop/successo, #3 retry con backoff S3, #9 anteprima dry-run SSD→S3. Dettagli e spec/piani in `Docs/superpowers/specs/` e `Docs/superpowers/plans/`.
+**Fatti**: #1 Restore guidato, #2 race stop/successo, #3 retry con backoff S3, #4 cleanup multipart orfani, #6 upload paralleli, #9 anteprima dry-run SSD→S3, #10 migrazione credenziali al Keychain. Dettagli e spec/piani in `Docs/superpowers/specs/` e `Docs/superpowers/plans/`.
 
 **Bonus non previsto in questa lista originale, trovato e risolto durante il lavoro sul Restore**: un bug critico di memoria (`sha256(of:)` faceva salire il processo a 41-43GB di RAM su file da 40-50GB, quasi bloccando il Mac). Vedi `Docs/CLAUDE.md`, sezione ReviewEngine/RestoreEngine, per i dettagli — è probabilmente la scoperta più importante di tutta la sessione, più critica di qualunque punto elencato qui sotto.
 
-**Ancora aperti, con bozze di design pronte in `Docs/superpowers/specs/2026-07-30-next-steps-briefing.md`**: #5 cifratura lato client, #10 Keychain, #7 scheduling.
+**#5 (cifratura lato client) valutato e deciso esplicitamente contro, per ora** (2026-08-02): rischio di perdita permanente dei dati (password/chiave persa = foto perse per sempre, nessun recupero) giudicato non accettabile rispetto al beneficio, in tensione diretta con la regola "zero delete, zero overwrite" del progetto. Nessuna implementazione, nessuna spec di design — solo la domanda di go/no-go, con risposta "no". Vedi sotto per i dettagli del trade-off presentato.
+
+**Ancora aperto, con bozza di ricerca pronta in `Docs/superpowers/specs/2026-07-30-next-steps-briefing.md`**: #7 scheduling.
 
 ---
 
@@ -33,7 +35,7 @@ Versione visiva (con link alle fonti): vedi artifact pubblicato in sessione, opp
 
 4. ✅ **Fatto (2026-08-02) — Multipart upload interrotti restavano orfani sul bucket.** Scoperta automatica + pulizia manuale nel pannello Revisione (Tools), disattivata mentre un job è in corso. Vedi `Docs/superpowers/specs/2026-08-02-multipart-cleanup-design.md`.
 
-5. **Nessuna cifratura lato client prima dell'upload.** I file arrivano in chiaro su Cubbit. Arq cifra tutto con AES-256 prima dell'invio (zero-knowledge, chiave solo utente) — per foto private è lo standard a cui puntare.
+5. 🚫 **Valutato e deciso esplicitamente contro, per ora (2026-08-02) — Nessuna cifratura lato client prima dell'upload.** I file arrivano in chiaro su Cubbit. Arq cifra tutto con AES-256 prima dell'invio (zero-knowledge, chiave solo utente) — per foto private sarebbe lo standard a cui puntare, ma il rischio non è stato ritenuto accettabile: se la password/chiave va persa, le foto cifrate diventano illeggibili per sempre, senza alcun recupero possibile — l'unico scenario in questo progetto dove i dati potrebbero andare persi in modo permanente, in tensione diretta con "zero delete, zero overwrite". Cifrare romperebbe anche la compatibilità con i 120.842 oggetti già su Cubbit (bucket misto o migrazione completa da giorni di banda) e toglierebbe la possibilità di ispezionare il bucket con un tool esterno in caso di bug dell'app. Decisione presa dopo aver presentato esplicitamente il trade-off all'utente — non un oversight, non riproporre senza un motivo nuovo.
    *Fonte: ricerca su Arq Backup*
 
 ## Alto — prestazioni e qualità percepita (6)
@@ -72,7 +74,7 @@ Versione visiva (con link alle fonti): vedi artifact pubblicato in sessione, opp
 
 ## Da dove partire (aggiornato 2026-08-02)
 
-Fatti: #1 restore, #2 race stop/successo, #3 retry S3, #4 cleanup multipart, #6 upload paralleli, #9 anteprima S3, #10 Keychain. Restano 2 interventi con bozza di ricerca già pronta in `Docs/superpowers/specs/2026-07-30-next-steps-briefing.md`: **#5 cifratura lato client** (il più delicato — tocca decisioni di sicurezza/UX che richiedono una discussione attenta con l'utente) e **#7 scheduling** (automazione backup, ricerca non ancora approfondita). Il resto della lista (punti 8, 11-20) è ordinabile in base al tempo che si vuole investirci.
+Fatti: #1 restore, #2 race stop/successo, #3 retry S3, #4 cleanup multipart, #6 upload paralleli, #9 anteprima S3, #10 Keychain. #5 (cifratura lato client) valutato e deciso esplicitamente contro, per ora — non riproporre senza un motivo nuovo, vedi sopra. Resta un solo intervento critico/alto con bozza di ricerca pronta in `Docs/superpowers/specs/2026-07-30-next-steps-briefing.md`: **#7 scheduling** (automazione backup, ricerca non ancora approfondita). Il resto della lista (punti 8, 11-20) è ordinabile in base al tempo che si vuole investirci.
 
 ## Fonti consultate
 
