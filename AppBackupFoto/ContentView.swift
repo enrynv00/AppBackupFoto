@@ -3043,6 +3043,8 @@ struct ToolsSheet: View {
             GroupBox("S3 — Cubbit") {
                 VStack(alignment: .leading, spacing: 6) {
                     if let cfg = try? S3Syncer.readConfig() {
+                        Text(S3Syncer.hasKeychainCredentials() ? "Origine: Keychain" : "Origine: rclone.conf")
+                            .font(.caption2).foregroundStyle(.secondary)
                         DiagRow(label: "Endpoint",  value: cfg.endpoint)
                         DiagRow(label: "Bucket",    value: cfg.bucket)
                         DiagRow(label: "Region",    value: cfg.region)
@@ -3078,6 +3080,28 @@ struct ToolsSheet: View {
                             confirmReveal {
                                 let path = NSHomeDirectory() + "/.config/rclone/rclone.conf"
                                 NSWorkspace.shared.open(URL(fileURLWithPath: path))
+                            }
+                        }.buttonStyle(.bordered).controlSize(.small).padding(.top, 2)
+                        Button("Aggiorna da rclone.conf") {
+                            let a = NSAlert()
+                            a.messageText = "Sovrascrivere le credenziali salvate?"
+                            a.informativeText = "Le credenziali attualmente nel Keychain verranno sostituite con quelle lette ora da rclone.conf."
+                            a.alertStyle = .warning
+                            a.addButton(withTitle: "Continua")
+                            a.addButton(withTitle: "Annulla")
+                            guard a.runModal() == .alertFirstButtonReturn else { return }
+                            do {
+                                let config = try S3Syncer.readConfigFromFile(remoteName: "Cubbit", bucket: "backupfoto")
+                                try S3Syncer.writeToKeychain(config: config, remoteName: "Cubbit")
+                                let ok = NSAlert()
+                                ok.messageText = "Credenziali aggiornate nel Keychain."
+                                ok.runModal()
+                            } catch {
+                                let err = NSAlert()
+                                err.messageText = "Errore"
+                                err.informativeText = error.localizedDescription
+                                err.alertStyle = .critical
+                                err.runModal()
                             }
                         }.buttonStyle(.bordered).controlSize(.small).padding(.top, 2)
                     } else {
