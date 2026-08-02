@@ -48,8 +48,7 @@ Versione visiva (con link alle fonti): vedi artifact pubblicato in sessione, opp
 
 9. ✅ **Fatto (2026-08-02) — Anteprima dry-run assente per SSD → S3.** `S3Syncer.previewUpload` + `previewSyncS3()`, stesso stile delle anteprime già esistenti per Mac→SSD e SSD→HDD.
 
-10. **Credenziali S3 in un file di testo, non nel Keychain** — `~/.config/rclone/rclone.conf` funziona ed è protetto da permessi POSIX 0600, ma il Keychain è pensato esattamente per questo.
-    *Effort: medio · migrazione a Security framework, fallback di lettura da rclone.conf per compatibilità*
+10. ✅ **Fatto (2026-08-02) — Credenziali S3 in un file di testo, non nel Keychain.** `readConfig()` prova prima il Keychain, fallback a rclone.conf con adozione silenziosa; bottone esplicito "Aggiorna da rclone.conf" in Tools per chi continua a modificare il file a mano. Vedi `Docs/superpowers/specs/2026-08-02-keychain-migration-design.md`.
 
 11. **Nessuna modalità menu bar / avvio in background** — l'app deve restare aperta con finestra visibile.
     *Effort: alto · `NSStatusItem` + `LSUIElement`, ristruttura RootView*
@@ -73,7 +72,7 @@ Versione visiva (con link alle fonti): vedi artifact pubblicato in sessione, opp
 
 ## Da dove partire (aggiornato 2026-08-02)
 
-Fatti: #1 restore, #2 race stop/successo, #3 retry S3, #4 cleanup multipart, #6 upload paralleli, #9 anteprima S3. Restano 3 interventi con bozza di ricerca già pronta in `Docs/superpowers/specs/2026-07-30-next-steps-briefing.md`: **#5 cifratura lato client** (il più delicato — tocca decisioni di sicurezza/UX che richiedono una discussione attenta con l'utente), **#10 Keychain** (migrazione credenziali, medio rischio), **#7 scheduling** (automazione backup). Il resto della lista (punti 8, 11-20) è ordinabile in base al tempo che si vuole investirci.
+Fatti: #1 restore, #2 race stop/successo, #3 retry S3, #4 cleanup multipart, #6 upload paralleli, #9 anteprima S3, #10 Keychain. Restano 2 interventi con bozza di ricerca già pronta in `Docs/superpowers/specs/2026-07-30-next-steps-briefing.md`: **#5 cifratura lato client** (il più delicato — tocca decisioni di sicurezza/UX che richiedono una discussione attenta con l'utente) e **#7 scheduling** (automazione backup, ricerca non ancora approfondita). Il resto della lista (punti 8, 11-20) è ordinabile in base al tempo che si vuole investirci.
 
 ## Fonti consultate
 

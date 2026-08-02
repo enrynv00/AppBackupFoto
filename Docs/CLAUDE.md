@@ -99,7 +99,7 @@ Presenta sempre l'output della revisione insieme al codice.
 
 ### S3Syncer (upload S3 nativo, SSD→Cubbit)
 
-- Legge credenziali da `~/.config/rclone/rclone.conf`, sezione `[Cubbit]`
+- **Credenziali nel Keychain**: `readConfig()` prova prima il Keychain (`kSecAttrService: "AppBackupFoto"`), fallback a `~/.config/rclone/rclone.conf` (sezione `[Cubbit]`) se vuoto, con adozione silenziosa best-effort nel Keychain al primo utilizzo utile. Nessun form di inserimento credenziali nell'app: l'utente continua a modificare `rclone.conf` a mano e forza un nuovo adottamento con il bottone "Aggiorna da rclone.conf" in Tools (nessun rilevamento automatico delle modifiche al file — scelta deliberata, coerente con "mai azioni automatiche su dati sensibili").
 - **Guardie di sicurezza su `readConfig`**: rifiuta se i permessi del file sono più aperti di `0600`; rifiuta se l'endpoint non è HTTPS; **allow-list dell'host** (`s3.it.cubbit.org`) — se rclone.conf viene alterato per puntare altrove, il caricamento si blocca finché l'host non viene aggiunto esplicitamente alla allow-list nel codice
 - List bucket con paginazione (ListObjectsV2), confronto per key+size per decidere cosa caricare (mai DELETE/overwrite remoto)
 - PUT per file < 64MB, multipart per file ≥ 64MB (chunk da 64MB), lettura parti via `readFileInChunks` (POSIX low-level, stesso fix di `sha256(of:)` — vedi sezione dedicata sotto)
@@ -186,7 +186,7 @@ Qualsiasi subprocess (rsync, bash, rclone, Process()) lanciato da un'app GUI **n
 | Sidebar hamburger (Report Log, Ripristina, Configurazione, Tools, Aspetto, Lingua) | ✅ Implementata |
 | Grafico velocità real-time | ✅ Implementato (Charts, MB/s per S3, file/s locale) |
 | Pannello Revisione (ToolsSheet) | ✅ Implementato — config checks, ultimo job persistito, campione integrità SHA256, pulizia upload multipart orfani |
-| Test automatici | ✅ 41 test XCTest passano (`AppBackupFotoTests`: zero-overwrite, volume-root, persistenza job, campionamento locale, parsing cartelle S3 per il restore, correttezza sha256, classificazione retry S3, lettura file a blocchi, concorrenza limitata) |
+| Test automatici | ✅ 45 test XCTest passano (`AppBackupFotoTests`: zero-overwrite, volume-root, persistenza job, campionamento locale, parsing cartelle S3 per il restore, correttezza sha256, classificazione retry S3, lettura file a blocchi, concorrenza limitata, validazione endpoint S3) |
 | Build | ✅ `xcodebuild ... build` e `... test` verdi su questo stato |
 
 ---
