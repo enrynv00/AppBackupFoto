@@ -31,8 +31,7 @@ Versione visiva (con link alle fonti): vedi artifact pubblicato in sessione, opp
 
 3. ✅ **Fatto (2026-08-02) — Nessun retry sui fallimenti di rete verso S3.** Fino a 3 tentativi con backoff (1s/2s) su PUT e singola parte multipart, salta i 4xx. Vedi `Docs/superpowers/specs/2026-08-02-s3-upload-retry-design.md`.
 
-4. **Multipart upload interrotti restano orfani sul bucket.** `AbortMultipartUpload` viene chiamato solo su Interrompi esplicito. Se l'app va in crash o il Mac si spegne a metà upload multipart, le parti restano su Cubbit — spazio occupato e potenziale costo indefinito a seconda delle lifecycle rule del bucket.
-   *Effort: medio · `ListMultipartUploads` + cleanup a inizio job, o verifica lifecycle rule lato Cubbit*
+4. ✅ **Fatto (2026-08-02) — Multipart upload interrotti restavano orfani sul bucket.** Scoperta automatica + pulizia manuale nel pannello Revisione (Tools), disattivata mentre un job è in corso. Vedi `Docs/superpowers/specs/2026-08-02-multipart-cleanup-design.md`.
 
 5. **Nessuna cifratura lato client prima dell'upload.** I file arrivano in chiaro su Cubbit. Arq cifra tutto con AES-256 prima dell'invio (zero-knowledge, chiave solo utente) — per foto private è lo standard a cui puntare.
    *Fonte: ricerca su Arq Backup*
