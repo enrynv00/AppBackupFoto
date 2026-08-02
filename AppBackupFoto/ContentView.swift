@@ -510,6 +510,30 @@ final class S3Syncer {
         }
     }
 
+    // Solo il chiamante di onOutcome (il loop while sotto, a thread singolo) muta
+    // stato condiviso: i task figli restituiscono un Outcome, non toccano nulla
+    // di condiviso — nessun lock/actor necessario.
+    static func runBounded<Item, Outcome>(
+        items: [Item], maxConcurrent: Int,
+        isCancelled: @escaping () -> Bool,
+        operation: @escaping (Item) async -> Outcome,
+        onOutcome: (Outcome) -> Void
+    ) async {
+        await withTaskGroup(of: Outcome.self) { group in
+            var index = 0
+            func addNext() {
+                guard index < items.count, !isCancelled() else { return }
+                let item = items[index]; index += 1
+                group.addTask { await operation(item) }
+            }
+            for _ in 0..<maxConcurrent { addNext() }
+            while let outcome = await group.next() {
+                onOutcome(outcome)
+                addNext()
+            }
+        }
+    }
+
     private var cancelled = false
     private lazy var session: URLSession = {
         let cfg = URLSessionConfiguration.default
