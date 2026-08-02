@@ -104,6 +104,7 @@ Presenta sempre l'output della revisione insieme al codice.
 - List bucket con paginazione (ListObjectsV2), confronto per key+size per decidere cosa caricare (mai DELETE/overwrite remoto)
 - PUT per file < 64MB, multipart per file ≥ 64MB (chunk da 64MB)
 - **Cancel su multipart** → chiama `AbortMultipartUpload` (nessuna parte orfana lasciata sul bucket)
+- **Retry con backoff**: ogni chiamata HTTP di upload (PUT singolo, init/parte/complete multipart) viene ritentata fino a 3 volte (1s poi 2s di attesa) per errori transitori (`URLError`, HTTP 5xx) — non per errori permanenti (HTTP 4xx) né se l'utente interrompe (`cancelled`/`Task.isCancelled` controllati prima di ogni attesa). Vedi `S3Syncer.retrying`/`isRetryable`/`S3HTTPError`.
 - AWS Signature V4 implementata manualmente — host NON va in `allHTTPHeaderFields`; `/` e `()` vanno encoded nella query string
 
 ### VolumeMonitor (`ObservableObject`)
@@ -170,7 +171,7 @@ Qualsiasi subprocess (rsync, bash, rclone, Process()) lanciato da un'app GUI **n
 | :---- | :---- |
 | Mac → SSD | ✅ Funziona, con anteprima dry-run e verifica SHA256 post-copia |
 | SSD → HDD | ✅ Funziona; validazione volume-root con alert esplicito impedisce più il caso 0/0 silenzioso |
-| SSD → S3 | ✅ Funziona, con allow-list endpoint, abort su multipart cancellato, grafico MB/s |
+| SSD → S3 | ✅ Funziona, con allow-list endpoint, abort su multipart cancellato, retry con backoff, grafico MB/s |
 | Ripristino guidato (SSD/HDD/Cubbit → cartella) | ✅ Implementato — 4 passi, indicatori di disponibilità in tempo reale, UI volutamente semplice |
 | Sheet completamento | ✅ Funziona |
 | Notifiche sistema | ✅ Funzionano |
@@ -179,7 +180,7 @@ Qualsiasi subprocess (rsync, bash, rclone, Process()) lanciato da un'app GUI **n
 | Sidebar hamburger (Report Log, Ripristina, Configurazione, Tools, Aspetto, Lingua) | ✅ Implementata |
 | Grafico velocità real-time | ✅ Implementato (Charts, MB/s per S3, file/s locale) |
 | Pannello Revisione (ToolsSheet) | ✅ Implementato — config checks, ultimo job persistito, campione integrità SHA256 |
-| Test automatici | ✅ 27 test XCTest passano (`AppBackupFotoTests`: zero-overwrite, volume-root, persistenza job, campionamento locale, parsing cartelle S3 per il restore, correttezza sha256) |
+| Test automatici | ✅ 34 test XCTest passano (`AppBackupFotoTests`: zero-overwrite, volume-root, persistenza job, campionamento locale, parsing cartelle S3 per il restore, correttezza sha256, classificazione retry S3) |
 | Build | ✅ `xcodebuild ... build` e `... test` verdi su questo stato |
 
 ---
