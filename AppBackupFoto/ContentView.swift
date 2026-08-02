@@ -592,6 +592,18 @@ final class S3Syncer {
     func cancel() { cancelled = true }
 
     static func readConfig(remoteName: String = "Cubbit", bucket: String = "backupfoto") throws -> S3Config {
+        if let creds = readFromKeychain(remoteName: remoteName) {
+            let cleanEp = try validateEndpoint(creds.endpoint)
+            return S3Config(accessKeyId: creds.accessKeyId, secretAccessKey: creds.secretAccessKey,
+                            endpoint: cleanEp, region: creds.region, bucket: bucket)
+        }
+        let config = try readConfigFromFile(remoteName: remoteName, bucket: bucket)
+        try? writeToKeychain(config: config, remoteName: remoteName)
+        return config
+    }
+
+    // Non private: deve restare richiamabile dal bottone "Aggiorna da rclone.conf" in ToolsSheet.
+    static func readConfigFromFile(remoteName: String, bucket: String) throws -> S3Config {
         let path = NSHomeDirectory() + "/.config/rclone/rclone.conf"
         if let attrs = try? FileManager.default.attributesOfItem(atPath: path),
            let perms = attrs[.posixPermissions] as? Int, perms & 0o077 != 0 {
