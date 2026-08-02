@@ -668,6 +668,25 @@ final class S3Syncer {
         return (objs, nextToken)
     }
 
+    private func retrying<T>(key: String, maxAttempts: Int = 3,
+                              onStatus: @escaping (String) -> Void,
+                              operation: () async throws -> T) async throws -> T {
+        var attempt = 1
+        while true {
+            do {
+                return try await operation()
+            } catch {
+                guard !cancelled, !Task.isCancelled else { throw error }
+                guard attempt < maxAttempts, S3Syncer.isRetryable(error) else { throw error }
+                let delaySec = pow(2.0, Double(attempt - 1))   // 1s, 2s
+                attempt += 1
+                let msg = "Errore di rete su \(key), riprovo tra \(Int(delaySec))s (tentativo \(attempt)/\(maxAttempts))"
+                DispatchQueue.main.async { onStatus(msg) }
+                try await Task.sleep(nanoseconds: UInt64(delaySec * 1_000_000_000))
+            }
+        }
+    }
+
     private func upload(url: URL, key: String, config: S3Config) async throws {
         let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
         if size > 64 * 1024 * 1024 {
