@@ -802,23 +802,17 @@ final class S3Syncer {
         }
         let encId = uploadId.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? uploadId
 
-        let fileHandle = try FileHandle(forReadingFrom: url)
-        defer { fileHandle.closeFile() }
-        let fileSize = Int64((try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
         let chunkSize = 64 * 1024 * 1024
         var parts: [(Int, String)] = []
-        var offset: Int64 = 0; var pn = 1
-        while offset < fileSize {
-            if cancelled { break }
-            fileHandle.seek(toFileOffset: UInt64(offset))
-            let chunk = fileHandle.readData(ofLength: chunkSize)
-            guard !chunk.isEmpty else { break }
+        var pn = 1
+        try await S3Syncer.readFileInChunks(path: url.path, chunkSize: chunkSize) { chunk in
+            guard !self.cancelled else { return }
             guard let pURL = URL(string: "\(config.endpoint)/\(config.bucket)/\(encKey)?partNumber=\(pn)&uploadId=\(encId)") else {
                 throw NSError(domain: "S3", code: 12,
                     userInfo: [NSLocalizedDescriptionKey: "URL non valido per parte \(pn) di \(key)"])
             }
             let partNumber = pn
-            let etag = try await retrying(key: "\(key) (parte \(partNumber))", onStatus: onStatus) { () async throws -> String in
+            let etag = try await self.retrying(key: "\(key) (parte \(partNumber))", onStatus: onStatus) { () async throws -> String in
                 var pReq = URLRequest(url: pURL)
                 pReq.httpMethod = "PUT"; pReq.httpBody = chunk
                 self.sign(&pReq, config: config, body: chunk, date: Date())
@@ -829,8 +823,8 @@ final class S3Syncer {
                 }
                 return pHttp.value(forHTTPHeaderField: "Etag") ?? ""
             }
-            parts.append((pn, etag))
-            offset += Int64(chunkSize); pn += 1
+            parts.append((partNumber, etag))
+            pn += 1
         }
 
         if cancelled {
