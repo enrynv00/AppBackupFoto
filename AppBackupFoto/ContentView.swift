@@ -453,6 +453,11 @@ final class S3Syncer {
         let bucket: String
     }
 
+    struct S3HTTPError: Error {
+        let statusCode: Int
+        let message: String
+    }
+
     struct SyncResult {
         var uploaded = 0; var skipped = 0; var errors = 0
         var total = 0; var done = 0; var startDate = Date()
@@ -791,6 +796,13 @@ final class S3Syncer {
             if !seen.contains(name) { seen.insert(name); ordered.append(name) }
         }
         return ordered.sorted()
+    }
+
+    static func isRetryable(_ error: Error) -> Bool {
+        if error is CancellationError { return false }
+        if let httpError = error as? S3HTTPError { return !(400...499).contains(httpError.statusCode) }
+        if error is URLError { return true }
+        return false
     }
 
     struct DownloadManyResult {
