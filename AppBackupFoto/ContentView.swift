@@ -2302,6 +2302,7 @@ struct ContentView: View {
     @State private var showSettings = false
     @State private var showHamburger = false
     @State private var activeSpeedTab: SpeedLogTab = .speed
+    @AppStorage("autoBackupOnSSDConnect") private var autoBackupEnabled: Bool = true
     var body: some View {
         ZStack(alignment: .leading) {
             HSplitView {
@@ -2360,6 +2361,11 @@ struct ContentView: View {
         .onChange(of: runner.completionSnapshot?.phase) { _, p in
             if let p, p.isTerminal { showCompletion = true }
         }
+        .onChange(of: volumes.ssdMounted) { _, mounted in
+            if mounted && autoBackupEnabled && !runner.isRunning {
+                runner.runMacToSSD()
+            }
+        }
         .sheet(isPresented: $showCompletion) {
             if let snap = runner.completionSnapshot {
                 CompletionSheet(phase: snap.phase, stats: snap.stats) { showCompletion = false }
@@ -2383,10 +2389,16 @@ struct ContentView: View {
 struct SettingsSheet: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject private var bm = BookmarkManager.shared
+    @AppStorage("autoBackupOnSSDConnect") private var autoBackupEnabled: Bool = true
     var body: some View {
         VStack(spacing: 20) {
             Text("Impostazioni").font(.title2).fontWeight(.semibold)
             Text("Modifica le cartelle selezionate").font(.subheadline).foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 4) {
+                Toggle("Backup automatico Mac → SSD quando colleghi l'SSD", isOn: $autoBackupEnabled)
+                Text("Appena colleghi l'SSD, se l'app è aperta, parte da sola l'aggiornamento da Foto a SSD.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }.padding(.horizontal, 20)
             VStack(spacing: 10) {
                 ForEach(BookmarkManager.Location.allCases) { loc in
                     LocationRow(location: loc) { bm.selectAndSave(loc) { _ in } }
