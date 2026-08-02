@@ -458,6 +458,13 @@ final class S3Syncer {
         let message: String
     }
 
+    struct OrphanedMultipartUpload: Identifiable {
+        let id = UUID()
+        let key: String
+        let uploadId: String
+        let initiated: Date
+    }
+
     struct SyncResult {
         var uploaded = 0; var skipped = 0; var errors = 0
         var total = 0; var done = 0; var startDate = Date()
@@ -636,6 +643,35 @@ final class S3Syncer {
         return objects
     }
 
+    func listMultipartUploads(config: S3Config) async throws -> [OrphanedMultipartUpload] {
+        guard let url = URL(string: "\(config.endpoint)/\(config.bucket)?uploads") else {
+            throw NSError(domain: "S3", code: 8,
+                userInfo: [NSLocalizedDescriptionKey: "URL non valido per list multipart"])
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        sign(&req, config: config, body: Data(), date: Date())
+        let (data, resp) = try await session.data(for: req)
+        guard (resp as? HTTPURLResponse)?.statusCode == 200 else {
+            let body = String(data: data, encoding: .utf8) ?? ""
+            throw NSError(domain: "S3", code: 3,
+                userInfo: [NSLocalizedDescriptionKey: "Errore lista multipart: \(body.prefix(300))"])
+        }
+        let xml = String(data: data, encoding: .utf8) ?? ""
+        let keys = xmlAll(xml, tag: "Key")
+        let uploadIds = xmlAll(xml, tag: "UploadId")
+        let initiatedStrings = xmlAll(xml, tag: "Initiated")
+        let fmt = ISO8601DateFormatter()
+        fmt.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        var results: [OrphanedMultipartUpload] = []
+        let count = min(keys.count, uploadIds.count, initiatedStrings.count)
+        for i in 0..<count {
+            let initiated = fmt.date(from: initiatedStrings[i]) ?? Date()
+            results.append(OrphanedMultipartUpload(key: keys[i], uploadId: uploadIds[i], initiated: initiated))
+        }
+        return results
+    }
+
     private func listPage(config: S3Config, token: String?) async throws -> ([String: Int64], String?) {
         guard var comps = URLComponents(string: "\(config.endpoint)/\(config.bucket)") else {
             throw NSError(domain: "S3", code: 8,
@@ -773,12 +809,7 @@ final class S3Syncer {
         }
 
         if cancelled {
-            if let abortURL = URL(string: "\(config.endpoint)/\(config.bucket)/\(encKey)?uploadId=\(encId)") {
-                var abortReq = URLRequest(url: abortURL)
-                abortReq.httpMethod = "DELETE"
-                sign(&abortReq, config: config, body: Data(), date: Date())
-                _ = try? await session.data(for: abortReq)
-            }
+            _ = try? await abortMultipartUpload(key: key, uploadId: uploadId, config: config)
             throw CancellationError()
         }
 
@@ -797,6 +828,23 @@ final class S3Syncer {
                 let statusCode = (cResp as? HTTPURLResponse)?.statusCode ?? -1
                 throw S3HTTPError(statusCode: statusCode, message: "Errore completamento multipart \(key)")
             }
+        }
+    }
+
+    func abortMultipartUpload(key: String, uploadId: String, config: S3Config) async throws {
+        let encKey = key.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? key
+        let encId = uploadId.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? uploadId
+        guard let abortURL = URL(string: "\(config.endpoint)/\(config.bucket)/\(encKey)?uploadId=\(encId)") else {
+            throw NSError(domain: "S3", code: 12,
+                userInfo: [NSLocalizedDescriptionKey: "URL non valido per abort: \(key)"])
+        }
+        var abortReq = URLRequest(url: abortURL)
+        abortReq.httpMethod = "DELETE"
+        sign(&abortReq, config: config, body: Data(), date: Date())
+        let (_, resp) = try await session.data(for: abortReq)
+        guard let code = (resp as? HTTPURLResponse)?.statusCode, (200...299).contains(code) else {
+            let statusCode = (resp as? HTTPURLResponse)?.statusCode ?? -1
+            throw S3HTTPError(statusCode: statusCode, message: "Errore abort upload \(key)")
         }
     }
 
