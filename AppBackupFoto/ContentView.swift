@@ -1638,6 +1638,11 @@ final class ReviewEngine {
         checkBookmarkRoots() + [checkRcloneConfPermissions(), checkS3Endpoint()]
     }
 
+    func findOrphanedMultipartUploads() async throws -> [S3Syncer.OrphanedMultipartUpload] {
+        let config = try S3Syncer.readConfig()
+        return try await s3Syncer.listMultipartUploads(config: config)
+    }
+
     private func checkBookmarkRoots() -> [ReviewFinding] {
         [BookmarkManager.Location.ssd, .hdd].compactMap { loc -> ReviewFinding? in
             guard let url = bm.urls[loc] else { return nil }
