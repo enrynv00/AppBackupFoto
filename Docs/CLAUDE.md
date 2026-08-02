@@ -123,6 +123,7 @@ Presenta sempre l'output della revisione insieme al codice.
 - `speedHistory`/`speedUnit` alimentano `SpeedChartView` — MB/s per S3, file/s per FileSyncer, "scan/s" durante la fase di conteggio
 - `stop()` cancella `syncer`/`s3Syncer`/`syncTask`, imposta `wasStopped` per evitare un doppio update della UI dopo l'interruzione; cattura `phase.label` prima di sovrascrivere `phase`, così il riepilogo persistito mantiene il nome del job originale
 - Alla fine di ogni job (successo, errore o stop manuale) salva un `JobSummary` in `JobHistoryStore`
+- **Backup automatico Mac→SSD al collegamento SSD**: `ContentView` osserva `volumes.ssdMounted` (`.onChange`) e chiama `runMacToSSD()` da sola quando passa da scollegato a collegato, se l'app è aperta e il toggle "Backup automatico" in Impostazioni è attivo (`@AppStorage("autoBackupOnSSDConnect")`, default acceso). Solo Mac→SSD si automatizza — SSD→HDD e SSD→S3 restano manuali. Nessun LaunchAgent: non funziona ad app chiusa (richiederebbe prima una modalità menu bar/background, non ancora fatta).
 
 ### ReviewEngine (pannello "Revisione", in `ToolsSheet`)
 
@@ -186,6 +187,7 @@ Qualsiasi subprocess (rsync, bash, rclone, Process()) lanciato da un'app GUI **n
 | Sidebar hamburger (Report Log, Ripristina, Configurazione, Tools, Aspetto, Lingua) | ✅ Implementata |
 | Grafico velocità real-time | ✅ Implementato (Charts, MB/s per S3, file/s locale) |
 | Pannello Revisione (ToolsSheet) | ✅ Implementato — config checks, ultimo job persistito, campione integrità SHA256, pulizia upload multipart orfani |
+| Backup automatico Mac→SSD | ✅ Implementato — trigger su collegamento SSD, toggle on/off in Impostazioni, solo ad app aperta |
 | Test automatici | ✅ 45 test XCTest passano (`AppBackupFotoTests`: zero-overwrite, volume-root, persistenza job, campionamento locale, parsing cartelle S3 per il restore, correttezza sha256, classificazione retry S3, lettura file a blocchi, concorrenza limitata, validazione endpoint S3) |
 | Build | ✅ `xcodebuild ... build` e `... test` verdi su questo stato |
 
