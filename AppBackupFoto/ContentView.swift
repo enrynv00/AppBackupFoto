@@ -465,6 +465,53 @@ final class S3Syncer {
         let initiated: Date
     }
 
+    private struct KeychainCredentials: Codable {
+        let accessKeyId: String
+        let secretAccessKey: String
+        let endpoint: String
+        let region: String
+    }
+
+    private static func keychainQuery(remoteName: String) -> [String: Any] {
+        [kSecClass as String: kSecClassGenericPassword,
+         kSecAttrService as String: "AppBackupFoto",
+         kSecAttrAccount as String: remoteName]
+    }
+
+    static func hasKeychainCredentials(remoteName: String = "Cubbit") -> Bool {
+        readFromKeychain(remoteName: remoteName) != nil
+    }
+
+    private static func readFromKeychain(remoteName: String) -> KeychainCredentials? {
+        var query = keychainQuery(remoteName: remoteName)
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var result: AnyObject?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+              let data = result as? Data else { return nil }
+        return try? JSONDecoder().decode(KeychainCredentials.self, from: data)
+    }
+
+    // internal (non private): richiamata anche dal bottone "Aggiorna da rclone.conf" in ToolsSheet.
+    static func writeToKeychain(config: S3Config, remoteName: String) throws {
+        let creds = KeychainCredentials(accessKeyId: config.accessKeyId, secretAccessKey: config.secretAccessKey,
+                                         endpoint: config.endpoint, region: config.region)
+        let data = try JSONEncoder().encode(creds)
+        let query = keychainQuery(remoteName: remoteName)
+        let updateStatus = SecItemUpdate(query as CFDictionary, [kSecValueData as String: data] as CFDictionary)
+        if updateStatus == errSecItemNotFound {
+            var addQuery = query
+            addQuery[kSecValueData as String] = data
+            guard SecItemAdd(addQuery as CFDictionary, nil) == errSecSuccess else {
+                throw NSError(domain: "S3", code: 15,
+                    userInfo: [NSLocalizedDescriptionKey: "Impossibile salvare le credenziali nel Keychain"])
+            }
+        } else if updateStatus != errSecSuccess {
+            throw NSError(domain: "S3", code: 15,
+                userInfo: [NSLocalizedDescriptionKey: "Impossibile aggiornare le credenziali nel Keychain"])
+        }
+    }
+
     struct SyncResult {
         var uploaded = 0; var skipped = 0; var errors = 0
         var total = 0; var done = 0; var startDate = Date()
