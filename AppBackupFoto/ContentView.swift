@@ -568,7 +568,14 @@ final class S3Syncer {
             throw NSError(domain: "S3", code: 1,
                 userInfo: [NSLocalizedDescriptionKey: "Credenziali '\(remoteName)' non trovate in rclone.conf"])
         }
-        let cleanEp = ep.hasSuffix("/") ? String(ep.dropLast()) : ep
+        let cleanEp = try validateEndpoint(ep)
+        return S3Config(accessKeyId: ak, secretAccessKey: sk, endpoint: cleanEp,
+                        region: vals["region"] ?? "us-east-1", bucket: bucket)
+    }
+
+    // Non private: deve restare visibile a @testable import per i test unitari.
+    static func validateEndpoint(_ raw: String) throws -> String {
+        let cleanEp = raw.hasSuffix("/") ? String(raw.dropLast()) : raw
         guard cleanEp.hasPrefix("https://") else {
             throw NSError(domain: "S3", code: 10, userInfo: [NSLocalizedDescriptionKey:
                 "L'endpoint S3 deve usare HTTPS. Valore trovato: '\(cleanEp)'. Correggi rclone.conf."])
@@ -579,10 +586,9 @@ final class S3Syncer {
         let allowedHosts: Set<String> = ["s3.it.cubbit.org"]
         guard let host = URL(string: cleanEp)?.host, allowedHosts.contains(host) else {
             throw NSError(domain: "S3", code: 13, userInfo: [NSLocalizedDescriptionKey:
-                "Endpoint S3 non riconosciuto: '\(cleanEp)'. Se hai cambiato provider di proposito, aggiorna la allow-list in S3Syncer.readConfig."])
+                "Endpoint S3 non riconosciuto: '\(cleanEp)'. Se hai cambiato provider di proposito, aggiorna la allow-list in S3Syncer.validateEndpoint."])
         }
-        return S3Config(accessKeyId: ak, secretAccessKey: sk, endpoint: cleanEp,
-                        region: vals["region"] ?? "us-east-1", bucket: bucket)
+        return cleanEp
     }
 
     // Dry-run: stessa logica di lista+confronto di sync(), senza caricare nulla.
