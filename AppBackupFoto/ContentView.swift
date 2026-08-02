@@ -647,36 +647,38 @@ final class S3Syncer {
             files.append((url: f, key: rel, size: Int64(v?.fileSize ?? 0)))
         }
 
-        let toUploadCount = files.filter { existing[$0.key] != $0.size }.count
+        let toUpload = files.filter { existing[$0.key] != $0.size }
         result.total = files.count
-        result.toUploadCount = toUploadCount
-        let localCount = files.count
-        let alreadyPresent = localCount - toUploadCount
+        result.toUploadCount = toUpload.count
+        result.skipped = files.count - toUpload.count
+        result.done = result.skipped
         let initSnap = result
         DispatchQueue.main.async {
-            onStatus("Trovati \(localCount) file locali · \(toUploadCount) da caricare · \(alreadyPresent) già presenti")
+            onStatus("Trovati \(files.count) file locali · \(toUpload.count) da caricare · \(result.skipped) già presenti")
             onProgress(initSnap)
         }
 
-        for item in files {
-            if cancelled { break }
-            if existing[item.key] == item.size {
-                result.skipped += 1
-            } else {
-                let msg = "Upload (\(result.done + 1)/\(result.total) — \(result.percent)%): \(item.url.lastPathComponent)"
-                DispatchQueue.main.async { onStatus(msg) }
+        await S3Syncer.runBounded(
+            items: toUpload, maxConcurrent: 4,
+            isCancelled: { self.cancelled },
+            operation: { [self] item -> (url: URL, size: Int64, ok: Bool) in
+                if self.cancelled || Task.isCancelled { return (item.url, item.size, false) }
+                DispatchQueue.main.async { onStatus("Carico: \(item.url.lastPathComponent)") }
                 do {
-                    try await upload(url: item.url, key: item.key, config: config, onStatus: onStatus)
-                    result.uploaded += 1
-                    result.uploadedBytes += item.size
+                    try await self.upload(url: item.url, key: item.key, config: config, onStatus: onStatus)
+                    return (item.url, item.size, true)
                 } catch {
-                    result.errors += 1
+                    return (item.url, item.size, false)
                 }
+            },
+            onOutcome: { outcome in
+                if outcome.ok { result.uploaded += 1; result.uploadedBytes += outcome.size }
+                else { result.errors += 1 }
+                result.done += 1
+                let snap = result
+                DispatchQueue.main.async { onProgress(snap) }
             }
-            result.done += 1
-            let snap = result
-            DispatchQueue.main.async { onProgress(snap) }
-        }
+        )
         return result
     }
 
