@@ -15,6 +15,7 @@
 		95FA3246894F1870CE559DCC /* RestoreS3FolderParsingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 05D303E7B7844522DC3B5521 /* RestoreS3FolderParsingTests.swift */; };
 		22B3EDC9C329247E7605B8FF /* Sha256Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 999823E50818A1766C2C1819 /* Sha256Tests.swift */; };
 		0B024A051625E6BF5881555E /* S3SyncerRetryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2EB4FE6309D38F1A70CB575B /* S3SyncerRetryTests.swift */; };
+		255A3AA71DDFE641F9C6F2AE /* FileChunkReaderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5F270C13D1A381946DF4E81B /* FileChunkReaderTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -38,6 +39,7 @@
 		05D303E7B7844522DC3B5521 /* RestoreS3FolderParsingTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = RestoreS3FolderParsingTests.swift; sourceTree = "<group>"; };
 		999823E50818A1766C2C1819 /* Sha256Tests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = Sha256Tests.swift; sourceTree = "<group>"; };
 		2EB4FE6309D38F1A70CB575B /* S3SyncerRetryTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = S3SyncerRetryTests.swift; sourceTree = "<group>"; };
+		5F270C13D1A381946DF4E81B /* FileChunkReaderTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = FileChunkReaderTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -87,6 +89,7 @@
 				05D303E7B7844522DC3B5521 /* RestoreS3FolderParsingTests.swift */,
 				999823E50818A1766C2C1819 /* Sha256Tests.swift */,
 				2EB4FE6309D38F1A70CB575B /* S3SyncerRetryTests.swift */,
+				5F270C13D1A381946DF4E81B /* FileChunkReaderTests.swift */,
 			);
 			name = AppBackupFotoTests;
 			path = AppBackupFotoTests;
@@ -224,6 +227,7 @@
 				95FA3246894F1870CE559DCC /* RestoreS3FolderParsingTests.swift in Sources */,
 				22B3EDC9C329247E7605B8FF /* Sha256Tests.swift in Sources */,
 				0B024A051625E6BF5881555E /* S3SyncerRetryTests.swift in Sources */,
+				255A3AA71DDFE641F9C6F2AE /* FileChunkReaderTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

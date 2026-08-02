@@ -485,6 +485,31 @@ final class S3Syncer {
         }
     }
 
+    static func readFileInChunks(path: String, chunkSize: Int,
+                                  onChunk: (Data) async throws -> Void) async throws {
+        // Stesso principio già in produzione per la funzione top-level sha256(of:):
+        // open/read/close POSIX con un buffer riutilizzato, invece di
+        // FileHandle.readData(ofLength:), che su file molto grandi mantiene le
+        // pagine lette residenti in memoria invece di rilasciarle tra una lettura
+        // e l'altra (bug reale osservato e corretto in questa sessione).
+        let fd = open(path, O_RDONLY)
+        guard fd >= 0 else {
+            throw NSError(domain: "S3", code: 13,
+                userInfo: [NSLocalizedDescriptionKey: "Impossibile aprire il file: \(path)"])
+        }
+        defer { close(fd) }
+        var buffer = [UInt8](repeating: 0, count: chunkSize)
+        while true {
+            let n = buffer.withUnsafeMutableBytes { read(fd, $0.baseAddress, chunkSize) }
+            if n < 0 {
+                throw NSError(domain: "S3", code: 14,
+                    userInfo: [NSLocalizedDescriptionKey: "Errore di lettura: \(path)"])
+            }
+            if n == 0 { break }
+            try await onChunk(Data(bytes: buffer, count: n))
+        }
+    }
+
     private var cancelled = false
     private lazy var session: URLSession = {
         let cfg = URLSessionConfiguration.default
