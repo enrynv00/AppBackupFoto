@@ -4,6 +4,14 @@ Analisi dello stato attuale di `ContentView.swift` (2026-07-29) incrociata con c
 
 Versione visiva (con link alle fonti): vedi artifact pubblicato in sessione, oppure questo file.
 
+## Stato aggiornato (2026-08-02)
+
+**Fatti**: #1 Restore guidato, #2 race stop/successo, #3 retry con backoff S3, #9 anteprima dry-run SSD→S3. Dettagli e spec/piani in `Docs/superpowers/specs/` e `Docs/superpowers/plans/`.
+
+**Bonus non previsto in questa lista originale, trovato e risolto durante il lavoro sul Restore**: un bug critico di memoria (`sha256(of:)` faceva salire il processo a 41-43GB di RAM su file da 40-50GB, quasi bloccando il Mac). Vedi `Docs/CLAUDE.md`, sezione ReviewEngine/RestoreEngine, per i dettagli — è probabilmente la scoperta più importante di tutta la sessione, più critica di qualunque punto elencato qui sotto.
+
+**Ancora aperti, con bozze di design pronte in `Docs/superpowers/specs/2026-07-30-next-steps-briefing.md`**: #4 cleanup multipart orfani, #5 cifratura lato client, #6 upload paralleli, #10 Keychain, #7 scheduling.
+
 ---
 
 ## Cosa già fate meglio della media
@@ -17,14 +25,11 @@ Versione visiva (con link alle fonti): vedi artifact pubblicato in sessione, opp
 
 ## Critico — rischio dati o affidabilità reale (5)
 
-1. **Nessun percorso di restore.** L'app sa solo copiare in avanti (Mac→SSD→HDD→S3). Se il Mac si guasta, il recupero da SSD/HDD/S3 richiede sapere già cosa si sta facendo — non c'è una schermata "Ripristina" guidata. È la funzione singola più importante che manca a un'app di backup.
-   *Effort: alto · componente nuovo (RestoreView + logica inversa in FileSyncer)*
+1. ✅ **Fatto (2026-07-29/30) — Nessun percorso di restore.** Ripristino guidato in 4 passi da SSD/HDD/Cubbit, con indicatori di disponibilità in tempo reale e UI volutamente semplice. Vedi `Docs/superpowers/specs/2026-07-29-restore-feature-design.md`.
 
-2. **Interrompere un job può mostrare "Completato" per errore.** `BackupRunner.stop()` imposta subito `.failed("Interrotto")`, ma il `Task` in background può terminare poco dopo e sovrascrivere silenziosamente lo stato con `.success` e statistiche parziali — il ramo di successo in `run(label:work:)` non controlla `wasStopped` come fa invece il ramo d'errore.
-   *Trovato leggendo ContentView.swift:1100-1121 in sessione — confermato dal codice, non ancora riprodotto in app.*
+2. ✅ **Fatto (2026-08-02) — Interrompere un job poteva mostrare "Completato" per errore.** Fix isolato in `BackupRunner.run()`: il ramo di successo ora controlla `wasStopped` come già faceva il ramo d'errore.
 
-3. **Nessun retry sui fallimenti di rete verso S3.** Un errore di rete su un file lo marca "errore" e il job prosegue — corretto per non bloccarsi, ma senza retry con backoff ogni blip di WiFi diventa un file permanentemente non backuppato finché non rilanci l'intero job.
-   *Effort: medio · retry loop in `S3Syncer.upload`/`multipart`*
+3. ✅ **Fatto (2026-08-02) — Nessun retry sui fallimenti di rete verso S3.** Fino a 3 tentativi con backoff (1s/2s) su PUT e singola parte multipart, salta i 4xx. Vedi `Docs/superpowers/specs/2026-08-02-s3-upload-retry-design.md`.
 
 4. **Multipart upload interrotti restano orfani sul bucket.** `AbortMultipartUpload` viene chiamato solo su Interrompi esplicito. Se l'app va in crash o il Mac si spegne a metà upload multipart, le parti restano su Cubbit — spazio occupato e potenziale costo indefinito a seconda delle lifecycle rule del bucket.
    *Effort: medio · `ListMultipartUploads` + cleanup a inizio job, o verifica lifecycle rule lato Cubbit*
@@ -43,8 +48,7 @@ Versione visiva (con link alle fonti): vedi artifact pubblicato in sessione, opp
 8. **Nessun controllo di spazio libero prima di partire** — se HDD si riempie a metà copia, l'errore arriva a job già a metà.
    *Effort: basso · `resourceValues(.volumeAvailableCapacityKey)` prima di `run()`*
 
-9. **Anteprima dry-run assente per SSD → S3** — presente per Mac→SSD e SSD→HDD, manca proprio dove il job è più lungo e costoso.
-   *Effort: basso · `previewSyncS3()` sul modello di `previewSSDToHDD()`*
+9. ✅ **Fatto (2026-08-02) — Anteprima dry-run assente per SSD → S3.** `S3Syncer.previewUpload` + `previewSyncS3()`, stesso stile delle anteprime già esistenti per Mac→SSD e SSD→HDD.
 
 10. **Credenziali S3 in un file di testo, non nel Keychain** — `~/.config/rclone/rclone.conf` funziona ed è protetto da permessi POSIX 0600, ma il Keychain è pensato esattamente per questo.
     *Effort: medio · migrazione a Security framework, fallback di lettura da rclone.conf per compatibilità*
@@ -69,9 +73,9 @@ Versione visiva (con link alle fonti): vedi artifact pubblicato in sessione, opp
 
 ---
 
-## Da dove partire
+## Da dove partire (aggiornato 2026-08-02)
 
-**Il restore (1)**, perché è l'unica cosa che rende questa un'app di backup e non solo un sincronizzatore. **La race stop/successo (2)**, perché è un bug di correttezza reale già confermato nel codice, non un'ipotesi. Il resto è ordinabile in base al tempo che vuoi investirci.
+Fatti: #1 restore, #2 race stop/successo, #3 retry S3, #9 anteprima S3. Il prossimo con più impatto è probabilmente **#4 (cleanup multipart orfani)** o **#6 (upload paralleli)** — entrambi hanno già ricerca e opzioni pronte in `Docs/superpowers/specs/2026-07-30-next-steps-briefing.md`. Il resto è ordinabile in base al tempo che vuoi investirci.
 
 ## Fonti consultate
 
