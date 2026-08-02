@@ -1767,6 +1767,10 @@ final class ReviewEngine {
     }
 
     private func checkRcloneConfPermissions() -> ReviewFinding {
+        if S3Syncer.hasKeychainCredentials(remoteName: "Cubbit") {
+            return ReviewFinding(title: "Credenziali S3", ok: true,
+                detail: "Salvate nel Keychain — rclone.conf non è più necessario")
+        }
         let path = NSHomeDirectory() + "/.config/rclone/rclone.conf"
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: path) else {
             return ReviewFinding(title: "Permessi rclone.conf", ok: false,
