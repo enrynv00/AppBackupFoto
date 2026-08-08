@@ -22,6 +22,7 @@
 		66E184233E560408CE9B1F9A /* FileSyncerPreviewBytesTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 51940FAD04DD64F802E07C9A /* FileSyncerPreviewBytesTests.swift */; };
 		DD41B3927FB846A2AF9E4853 /* S3SyncerCatalogParsingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 56FD3AB1B5F24D8EA79FEFB3 /* S3SyncerCatalogParsingTests.swift */; };
 		45A6E757F18B4077B03D1A90 /* ReviewEngineCatalogScanTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 439126F4971447F79AD91BAE /* ReviewEngineCatalogScanTests.swift */; };
+		00034BDF85EC40389491DD77 /* FilterCatalogEntriesTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6D9BE4DAD686422B9F8A78C9 /* FilterCatalogEntriesTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -52,6 +53,7 @@
 		51940FAD04DD64F802E07C9A /* FileSyncerPreviewBytesTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = FileSyncerPreviewBytesTests.swift; sourceTree = "<group>"; };
 		56FD3AB1B5F24D8EA79FEFB3 /* S3SyncerCatalogParsingTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = S3SyncerCatalogParsingTests.swift; sourceTree = "<group>"; };
 		439126F4971447F79AD91BAE /* ReviewEngineCatalogScanTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ReviewEngineCatalogScanTests.swift; sourceTree = "<group>"; };
+		6D9BE4DAD686422B9F8A78C9 /* FilterCatalogEntriesTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = FilterCatalogEntriesTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -108,6 +110,7 @@
 				51940FAD04DD64F802E07C9A /* FileSyncerPreviewBytesTests.swift */,
 				56FD3AB1B5F24D8EA79FEFB3 /* S3SyncerCatalogParsingTests.swift */,
 				439126F4971447F79AD91BAE /* ReviewEngineCatalogScanTests.swift */,
+				6D9BE4DAD686422B9F8A78C9 /* FilterCatalogEntriesTests.swift */,
 			);
 			name = AppBackupFotoTests;
 			path = AppBackupFotoTests;
@@ -252,6 +255,7 @@
 				66E184233E560408CE9B1F9A /* FileSyncerPreviewBytesTests.swift in Sources */,
 				DD41B3927FB846A2AF9E4853 /* S3SyncerCatalogParsingTests.swift in Sources */,
 				45A6E757F18B4077B03D1A90 /* ReviewEngineCatalogScanTests.swift in Sources */,
+				00034BDF85EC40389491DD77 /* FilterCatalogEntriesTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
