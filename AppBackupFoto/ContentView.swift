@@ -1874,6 +1874,38 @@ final class ReviewEngine {
         return result
     }
 
+    // Catalogo backup (roadmap #12): elenca tutti i file sotto rootURL con nome/cartella
+    // relativa/dimensione/data. Sola lettura — nessuna azione, nessuna modifica. Stessa
+    // esclusione di file di sistema già usata da FileSyncer.
+    func scanLocalCatalog(rootURL: URL) -> [CatalogEntry] {
+        let excluded: Set<String> = [
+            ".DS_Store", ".Spotlight-V100", ".TemporaryItems", ".Trashes",
+            ".fseventsd", ".DocumentRevisions-V100", "lost+found", "Backups.backupdb"
+        ]
+        let resolvedRoot = URL(fileURLWithPath: realResolvedPath(rootURL), isDirectory: true)
+        guard let enumerator = fm.enumerator(
+            at: resolvedRoot,
+            includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey],
+            options: [.skipsHiddenFiles]) else {
+            return []
+        }
+        var entries: [CatalogEntry] = []
+        let base = resolvedRoot.path
+        while let f = enumerator.nextObject() as? URL {
+            let vals = try? f.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey])
+            guard vals?.isRegularFile == true else { continue }
+            let name = f.lastPathComponent
+            if excluded.contains(name) || name.hasPrefix("._") { continue }
+            let relativePath = String(f.path.dropFirst(base.count).drop(while: { $0 == "/" }))
+            entries.append(CatalogEntry(
+                name: name,
+                relativePath: relativePath,
+                sizeBytes: Int64(vals?.fileSize ?? 0),
+                modified: vals?.contentModificationDate))
+        }
+        return entries
+    }
+
     private func sampleS3Pair(ssdRoot: URL, sampleSize: Int,
                                onProgress: @escaping (String) -> Void) async throws -> IntegrityCheckResult {
         var result = IntegrityCheckResult(pairName: "SSD ↔ S3")
