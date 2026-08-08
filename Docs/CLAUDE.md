@@ -196,7 +196,23 @@ Qualsiasi subprocess (rsync, bash, rclone, Process()) lanciato da un'app GUI **n
 
 ## Bug aperti
 
-Nessun bug noto aperto al momento. Il vecchio BUG-1 (SSD→HDD bookmark su sottocartella errata) è mitigato a livello di codice da `isLikelyVolumeRoot` + alert guidato — se dovesse ripresentarsi, il fix utente resta: Impostazioni → riseleziona il volume scegliendo la sua root (`/Volumes/SSD - Enri` o `/Volumes/BackupHDD`).
+**BUG-2 (2026-08-08) — Aprire Diagnostica può far bloccare e uccidere l'app, il prompt Keychain sembra "non accettare la password".**
+
+*Sintomo osservato dall'utente*: aprendo Tools (ora finestra indipendente, vedi sopra), macOS chiede la password dell'account per il Keychain; dovrebbe chiederla solo alla prima apertura ma la richiede ogni volta, e anche inserendo la password corretta l'accesso non va a buon fine.
+
+*Causa reale, verificata empiricamente (non solo ipotizzata) tramite `log show`/`log stream` su `securityd` mentre l'utente riproduceva il problema*: sono in realtà **due problemi distinti, sovrapposti**.
+
+1. **Firma ad-hoc instabile (causa nota, non nuova)**: `CODE_SIGN_IDENTITY[sdk=macosx*] = "-"` sia in Debug che Release (`project.pbxproj`) — nessuna Developer ID, coerente con roadmap #19 mai fatto. Il log mostra l'ACL del Keychain ancorata al `cdhash` esatto del binario (`CodeSignatureAclSubject[...][requirement:cdhash H"45a12d20e2a53f680924906d178a212d2c336246"]`): ogni ricompilazione produce un binario diverso, quindi un `cdhash` diverso, quindi il Keychain non riconosce più l'app come "già autorizzata" e richiede di nuovo la password — anche se l'utente aveva scelto "Consenti sempre" alla build precedente. Spiega il "dovrebbe chiedermelo solo la prima volta" durante lo sviluppo attivo (rebuild continui); su una build installata e stabile in `/Applications` (non ricompilata ogni volta) il problema sarebbe molto più raro.
+2. **Vero bug, probabile regressione introdotta oggi con la finestra Diagnostica indipendente**: il log mostra che il processo (`AppBackupFoto[83897]`) è stato **forzatamente terminato da `runningboardd`/Dock per mancata risposta** (`slow hid response (61.3s)`, `Displaying hang dialog for AppBackupFoto`, poi `force quit`) proprio nella finestra temporale in cui `securityd` stava cercando di mostrare il prompt di autorizzazione Keychain (`displaying keychain prompt for .../AppBackupFoto.app(83897)`), con il rifiuto finale (`user did not approve 'allow': CssmError 225`) registrato **dopo** l'inizio del force-quit. In pratica: l'app si blocca (il thread principale non risponde) invece di mostrare/gestire correttamente il prompt, e dopo ~60s macOS la uccide — quindi la password dell'utente non "non funziona", semplicemente il processo è già morto quando lui la digita.
+
+*Ipotesi di causa del blocco, da verificare prima di correggere (Fase 3 del debugging sistematico — non ancora testata)*: `ToolsSheet.onAppear` chiama `runConfigChecks()` **in modo sincrono sul thread principale**, che a sua volta chiama `S3Syncer.readConfig()` → `readFromKeychain()` → `SecItemCopyMatching` — una chiamata bloccante che, quando serve autorizzazione interattiva, normalmente sospende il thread chiamante finché l'utente non risponde al prompt di sistema. Finché `ToolsSheet` era uno `.sheet()` agganciato alla finestra principale già pienamente attiva, questo blocco sincrono non causava mai un hang rilevato dal sistema. Ora che è una `Window` scene indipendente appena creata, è plausibile che il prompt non si presenti/leghi correttamente alla nuova finestra durante la sua inizializzazione, lasciando il thread principale bloccato senza UI visibile finché il watchdog di macOS non interviene.
+
+*Direzioni di fix da valutare domani (nessuna ancora scelta né implementata)*:
+- Spostare la lettura Keychain (`checkS3Endpoint()`, quindi `runConfigChecks()`) fuori dal thread principale sincrono in `.onAppear`, eseguendola in un `Task` asincrono (stesso pattern già usato per `findOrphanedMultipartUploads()` nello stesso file) — riduce il rischio che il blocco sincrono impedisca alla finestra di restare reattiva, indipendentemente dalla causa esatta del mancato prompt.
+- Verificare se il problema si riproduce anche tornando temporaneamente a `.sheet()` (checkout del commit precedente a `6e6f92d`) — per isolare con certezza se è la `Window` scene la causa o una coincidenza.
+- Il fix duraturo per il problema (1) (re-prompt a ogni rebuild) è la notarization/Developer ID (roadmap #19) — non risolve però il vero bug (2), che va corretto comunque.
+
+**BUG-1 (storico, mitigato)**: SSD→HDD bookmark su sottocartella errata — mitigato a livello di codice da `isLikelyVolumeRoot` + alert guidato. Se dovesse ripresentarsi, il fix utente resta: Impostazioni → riseleziona il volume scegliendo la sua root (`/Volumes/SSD - Enri` o `/Volumes/BackupHDD`).
 
 Se emergono nuovi bug, documentarli qui con: sintomo osservato, causa, fix applicato o da applicare.
 

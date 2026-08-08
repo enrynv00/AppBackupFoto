@@ -78,6 +78,12 @@ Versione visiva (con link alle fonti): vedi artifact pubblicato in sessione, opp
 
 Fatti: #1 restore, #2 race stop/successo, #3 retry S3, #4 cleanup multipart, #6 upload paralleli, #7 scheduling (Mac→SSD su collegamento SSD), #9 anteprima S3, #10 Keychain. #5 (cifratura lato client) valutato e deciso esplicitamente contro, per ora — non riproporre senza un motivo nuovo, vedi sopra. Nessun punto critico/alto resta aperto nella lista originale: quello che rimane sono i punti "valore aggiunto" (8, 11-20), ordinabili in base al tempo che si vuole investirci — punto #11 (modalità menu bar/background) è il prerequisito naturale se in futuro si vorrà estendere lo scheduling anche ad app chiusa.
 
+## Priorità per la prossima sessione (2026-08-08, fine giornata)
+
+1. **BUG-2 prima di tutto** (`Docs/CLAUDE.md` → Bug aperti): aprire Diagnostica può bloccare l'app e farla uccidere da macOS durante il prompt Keychain — root cause investigata e documentata con log di sistema reali, ma il fix non è ancora scelto né implementato. Bloccante per usare la finestra Diagnostica appena shippata, quindi va prima di qualunque altro punto della lista sotto.
+2. **#19 (notarization/Developer ID) sale di priorità**, non per "qualità percepita da mercato" come nella valutazione originale ma perché la firma ad-hoc instabile è la causa diretta di metà di BUG-2 (re-prompt Keychain a ogni rebuild) — vale la pena deciderlo insieme al fix di BUG-2 invece che come voce isolata "valore aggiunto". Richiede Developer ID Application ($99/anno), da confermare con l'utente prima di procedere (costo ricorrente).
+3. Il resto dei punti "valore aggiunto" (8, 11-18, 20) resta nell'ordine libero già indicato sopra, nessuna urgenza nuova rispetto al 2026-08-02.
+
 ## Fonti consultate
 
 - [7 Best Backup Software for macOS: Top Picks for 2026 — MacObserver](https://www.macobserver.com/tips/round-ups/7-best-backup-software-for-macos/)
