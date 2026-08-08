@@ -1250,6 +1250,13 @@ final class BackupRunner: ObservableObject {
     private var smoothedEtaSec: Double = 0
     private var elapsedTimer: AnyCancellable?
 
+    private func hasSufficientSpace(bytesNeeded: Int64, atVolumeOf url: URL) -> (ok: Bool, availableBytes: Int64) {
+        let values = try? url.resourceValues(forKeys: [.volumeAvailableCapacityKey])
+        let available = Int64(values?.volumeAvailableCapacity ?? 0)
+        let margin = max(Int64(Double(bytesNeeded) * 0.05), 500_000_000)
+        return (available >= bytesNeeded + margin, available)
+    }
+
     func runMacToSSD() {
         speedUnit = "file/s"
         guard let photosURL = bm.startAccessing(.photos) else {
@@ -1269,12 +1276,28 @@ final class BackupRunner: ObservableObject {
             return
         }
         let dst = ssdURL.appendingPathComponent("Foto iPhone")
-        run(label: "MAC -> SSD") { [weak self] in
-            self?.publishStatus("Foto: \(photosURL.path)  →  SSD: \(dst.path)")
-            defer { self?.bm.stopAccessing(.photos); self?.bm.stopAccessing(.ssd) }
-            return try await self?.syncer.sync(from: photosURL, to: dst, deep: false,
-                onStatus: { self?.publishStatus($0) },
-                onProgress: { self?.publishProgress($0) })
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let preview = await self.syncer.previewSync(from: photosURL, to: dst, deep: false)
+            let space = self.hasSufficientSpace(bytesNeeded: preview.toAddBytes, atVolumeOf: ssdURL)
+            guard space.ok else {
+                self.bm.stopAccessing(.photos); self.bm.stopAccessing(.ssd)
+                let a = NSAlert()
+                a.messageText = "Spazio insufficiente sull'SSD"
+                a.informativeText = "Servono circa \(ByteCountFormatter.string(fromByteCount: preview.toAddBytes, countStyle: .file)), "
+                    + "liberi \(ByteCountFormatter.string(fromByteCount: space.availableBytes, countStyle: .file)) su \(ssdURL.path)."
+                a.alertStyle = .warning
+                a.addButton(withTitle: "OK")
+                a.runModal()
+                return
+            }
+            self.run(label: "MAC -> SSD") { [weak self] in
+                self?.publishStatus("Foto: \(photosURL.path)  →  SSD: \(dst.path)")
+                defer { self?.bm.stopAccessing(.photos); self?.bm.stopAccessing(.ssd) }
+                return try await self?.syncer.sync(from: photosURL, to: dst, deep: false,
+                    onStatus: { self?.publishStatus($0) },
+                    onProgress: { self?.publishProgress($0) })
+            }
         }
     }
 
@@ -1305,16 +1328,32 @@ final class BackupRunner: ObservableObject {
         let lastDeep = UserDefaults.standard.object(forKey: lastDeepKey) as? Date ?? .distantPast
         let deep = now.timeIntervalSince(lastDeep) > TimeInterval(30 * 24 * 3600)
         let label = deep ? "SSD -> HDD (deep)" : "SSD -> HDD"
-        run(label: label) { [weak self] in
-            self?.publishStatus("SSD: \(ssdURL.path)  →  HDD: \(hddURL.path)")
-            defer { self?.bm.stopAccessing(.ssd); self?.bm.stopAccessing(.hdd) }
-            let r = try await self?.syncer.sync(from: ssdURL, to: hddURL, deep: deep,
-                onStatus: { self?.publishStatus($0) },
-                onProgress: { self?.publishProgress($0) })
-            if deep, (r?.errors ?? 1) == 0 {
-                UserDefaults.standard.set(Date(), forKey: self?.lastDeepKey ?? "")
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let preview = await self.syncer.previewSync(from: ssdURL, to: hddURL, deep: deep)
+            let space = self.hasSufficientSpace(bytesNeeded: preview.toAddBytes, atVolumeOf: hddURL)
+            guard space.ok else {
+                self.bm.stopAccessing(.ssd); self.bm.stopAccessing(.hdd)
+                let a = NSAlert()
+                a.messageText = "Spazio insufficiente sull'HDD"
+                a.informativeText = "Servono circa \(ByteCountFormatter.string(fromByteCount: preview.toAddBytes, countStyle: .file)), "
+                    + "liberi \(ByteCountFormatter.string(fromByteCount: space.availableBytes, countStyle: .file)) su \(hddURL.path)."
+                a.alertStyle = .warning
+                a.addButton(withTitle: "OK")
+                a.runModal()
+                return
             }
-            return r
+            self.run(label: label) { [weak self] in
+                self?.publishStatus("SSD: \(ssdURL.path)  →  HDD: \(hddURL.path)")
+                defer { self?.bm.stopAccessing(.ssd); self?.bm.stopAccessing(.hdd) }
+                let r = try await self?.syncer.sync(from: ssdURL, to: hddURL, deep: deep,
+                    onStatus: { self?.publishStatus($0) },
+                    onProgress: { self?.publishProgress($0) })
+                if deep, (r?.errors ?? 1) == 0 {
+                    UserDefaults.standard.set(Date(), forKey: self?.lastDeepKey ?? "")
+                }
+                return r
+            }
         }
     }
 
