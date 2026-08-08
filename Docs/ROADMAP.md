@@ -57,7 +57,7 @@ Versione visiva (con link alle fonti): vedi artifact pubblicato in sessione, opp
 
 ## Valore aggiunto — da "buona" a "da mercato" (9)
 
-12. **Nessun catalogo/ricerca di cosa è già backuppato** — oggi serve Tools o rclone a mano; un browser dei backup (data/cartella/nome) alzerebbe la fiducia senza toccare la logica di sync.
+12. ✅ **Fatto (2026-08-09) — Nessun catalogo/ricerca di cosa è già backuppato.** Nuova finestra "Catalogo" (SSD/HDD/Cubbit S3), ricerca per nome/cartella, scansione dal vivo a ogni apertura, sola lettura. Vedi `Docs/superpowers/specs/2026-08-09-backup-catalog-design.md`.
 13. **Nessun versioning dei file modificati** — zero-overwrite skippa un file già presente anche se il contenuto locale è cambiato; nessuno storico se un file viene silenziosamente corrotto prima del backup.
 14. **Stringhe italiane hardcoded, nessuna localizzazione** — `STRING_CATALOG_GENERATE_SYMBOLS = YES` già nelle build settings, ma le stringhe non sono estratte in un String Catalog.
 15. **Nessun indicatore di progresso in dock/menu bar** — nessun modo di vedere la percentuale senza portare la finestra in primo piano.
@@ -74,7 +74,7 @@ Versione visiva (con link alle fonti): vedi artifact pubblicato in sessione, opp
 
 ## Da dove partire (aggiornato 2026-08-02)
 
-Fatti: #1 restore, #2 race stop/successo, #3 retry S3, #4 cleanup multipart, #6 upload paralleli, #7 scheduling (Mac→SSD su collegamento SSD), #8 controllo spazio, #9 anteprima S3, #10 Keychain, #11 icona menu bar (scorciatoia). #5 (cifratura lato client) valutato e deciso esplicitamente contro, per ora — non riproporre senza un motivo nuovo, vedi sopra. Nessun punto critico/alto resta aperto nella lista originale: quello che rimane sono i punti "valore aggiunto" (8, 11-20), ordinabili in base al tempo che si vuole investirci — punto #11 (modalità menu bar/background) è il prerequisito naturale se in futuro si vorrà estendere lo scheduling anche ad app chiusa.
+Fatti: #1 restore, #2 race stop/successo, #3 retry S3, #4 cleanup multipart, #6 upload paralleli, #7 scheduling (Mac→SSD su collegamento SSD), #8 controllo spazio, #9 anteprima S3, #10 Keychain, #11 icona menu bar (scorciatoia), #12 catalogo backup. #5 (cifratura lato client) valutato e deciso esplicitamente contro, per ora — non riproporre senza un motivo nuovo, vedi sopra. Nessun punto critico/alto resta aperto nella lista originale: quello che rimane sono i punti "valore aggiunto" (8, 11-20), ordinabili in base al tempo che si vuole investirci — punto #11 (modalità menu bar/background) è il prerequisito naturale se in futuro si vorrà estendere lo scheduling anche ad app chiusa.
 
 ## Stato aggiornato (2026-08-09)
 
