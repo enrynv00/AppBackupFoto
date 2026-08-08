@@ -9,8 +9,14 @@ import Charts
 // MARK: - App entry
 @main
 struct BackupFotoEnricoApp: App {
+    @StateObject private var runner = BackupRunner()
+
     var body: some Scene {
-        WindowGroup { RootView().frame(minWidth: 960, minHeight: 620) }
+        WindowGroup {
+            RootView()
+                .environmentObject(runner)
+                .frame(minWidth: 960, minHeight: 620)
+        }
     }
 }
 
@@ -2315,7 +2321,7 @@ struct LocationRow: View {
 
 // MARK: - ContentView
 struct ContentView: View {
-    @StateObject private var runner = BackupRunner()
+    @EnvironmentObject private var runner: BackupRunner
     @StateObject private var volumes = VolumeMonitor()
     @State private var showCompletion = false
     @State private var showSettings = false
