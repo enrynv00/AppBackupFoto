@@ -275,20 +275,22 @@ final class FileSyncer {
     func cancel() { cancelled = true }
 
     // MARK: - Dry-run preview (solo stat, nessuna copia)
-    func previewSync(from src: URL, to dst: URL, deep: Bool) async -> (toAdd: Int, toSkip: Int, estimatedSec: Int) {
+    func previewSync(from src: URL, to dst: URL, deep: Bool) async
+        -> (toAdd: Int, toSkip: Int, toAddBytes: Int64, estimatedSec: Int) {
         return await withCheckedContinuation { [self] cont in
             DispatchQueue.global(qos: .userInitiated).async {
                 self.cancelled = false
                 var toAdd = 0
                 var toSkip = 0
-                self.previewDir(src: src, dst: dst, deep: deep, toAdd: &toAdd, toSkip: &toSkip)
+                var toAddBytes: Int64 = 0
+                self.previewDir(src: src, dst: dst, deep: deep, toAdd: &toAdd, toSkip: &toSkip, toAddBytes: &toAddBytes)
                 let estimatedSec = toAdd > 0 ? max(1, toAdd / 50) : 0
-                cont.resume(returning: (toAdd: toAdd, toSkip: toSkip, estimatedSec: estimatedSec))
+                cont.resume(returning: (toAdd: toAdd, toSkip: toSkip, toAddBytes: toAddBytes, estimatedSec: estimatedSec))
             }
         }
     }
 
-    private func previewDir(src: URL, dst: URL, deep: Bool, toAdd: inout Int, toSkip: inout Int) {
+    private func previewDir(src: URL, dst: URL, deep: Bool, toAdd: inout Int, toSkip: inout Int, toAddBytes: inout Int64) {
         if cancelled { return }
         guard let items = try? fm.contentsOfDirectory(
             at: src,
@@ -300,19 +302,21 @@ final class FileSyncer {
             let vals = try? item.resourceValues(forKeys: [.isRegularFileKey, .isDirectoryKey])
             let destItem = dst.appendingPathComponent(item.lastPathComponent)
             if vals?.isDirectory == true {
-                previewDir(src: item, dst: destItem, deep: deep, toAdd: &toAdd, toSkip: &toSkip)
+                previewDir(src: item, dst: destItem, deep: deep, toAdd: &toAdd, toSkip: &toSkip, toAddBytes: &toAddBytes)
             } else if vals?.isRegularFile == true {
-                previewFile(src: item, dst: destItem, toAdd: &toAdd, toSkip: &toSkip)
+                previewFile(src: item, dst: destItem, toAdd: &toAdd, toSkip: &toSkip, toAddBytes: &toAddBytes)
             }
         }
     }
 
-    private func previewFile(src: URL, dst: URL, toAdd: inout Int, toSkip: inout Int) {
+    private func previewFile(src: URL, dst: URL, toAdd: inout Int, toSkip: inout Int, toAddBytes: inout Int64) {
         // Zero-overwrite rule: se il file esiste gia a destinazione sara sempre skippato
         if fm.fileExists(atPath: dst.path) {
             toSkip += 1
         } else {
             toAdd += 1
+            let size = (try? src.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+            toAddBytes += Int64(size)
         }
     }
 

@@ -19,6 +19,7 @@
 		4D0C1BB6D5D73ADA0369EF7D /* RunBoundedTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C4C02713A9555629C0942E51 /* RunBoundedTests.swift */; };
 		6C597DA7E20CFAA06F848C60 /* ValidateEndpointTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 05DF2C8E2DAFF230D56A7405 /* ValidateEndpointTests.swift */; };
 		FEF9EFD07E9D2F7A0C7206CC /* ReviewEngineDeepMirrorFreshnessTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 20046092572858D18FAAFDDB /* ReviewEngineDeepMirrorFreshnessTests.swift */; };
+		66E184233E560408CE9B1F9A /* FileSyncerPreviewBytesTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 51940FAD04DD64F802E07C9A /* FileSyncerPreviewBytesTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -46,6 +47,7 @@
 		C4C02713A9555629C0942E51 /* RunBoundedTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = RunBoundedTests.swift; sourceTree = "<group>"; };
 		05DF2C8E2DAFF230D56A7405 /* ValidateEndpointTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ValidateEndpointTests.swift; sourceTree = "<group>"; };
 		20046092572858D18FAAFDDB /* ReviewEngineDeepMirrorFreshnessTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ReviewEngineDeepMirrorFreshnessTests.swift; sourceTree = "<group>"; };
+		51940FAD04DD64F802E07C9A /* FileSyncerPreviewBytesTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = FileSyncerPreviewBytesTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -99,6 +101,7 @@
 				C4C02713A9555629C0942E51 /* RunBoundedTests.swift */,
 				05DF2C8E2DAFF230D56A7405 /* ValidateEndpointTests.swift */,
 				20046092572858D18FAAFDDB /* ReviewEngineDeepMirrorFreshnessTests.swift */,
+				51940FAD04DD64F802E07C9A /* FileSyncerPreviewBytesTests.swift */,
 			);
 			name = AppBackupFotoTests;
 			path = AppBackupFotoTests;
@@ -240,6 +243,7 @@
 				4D0C1BB6D5D73ADA0369EF7D /* RunBoundedTests.swift in Sources */,
 				6C597DA7E20CFAA06F848C60 /* ValidateEndpointTests.swift in Sources */,
 				FEF9EFD07E9D2F7A0C7206CC /* ReviewEngineDeepMirrorFreshnessTests.swift in Sources */,
+				66E184233E560408CE9B1F9A /* FileSyncerPreviewBytesTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
