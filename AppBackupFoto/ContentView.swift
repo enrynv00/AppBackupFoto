@@ -12,7 +12,7 @@ struct BackupFotoEnricoApp: App {
     @StateObject private var runner = BackupRunner()
 
     var body: some Scene {
-        WindowGroup {
+        WindowGroup(id: "main") {
             RootView()
                 .environmentObject(runner)
                 .frame(minWidth: 960, minHeight: 620)
@@ -23,6 +23,49 @@ struct BackupFotoEnricoApp: App {
         }
         .defaultSize(width: 640, height: 640)
         .windowResizability(.contentSize)
+
+        MenuBarExtra {
+            MenuBarContent()
+                .environmentObject(runner)
+        } label: {
+            MenuBarIcon()
+                .environmentObject(runner)
+        }
+        .menuBarExtraStyle(.menu)
+    }
+}
+
+private struct MenuBarIcon: View {
+    @EnvironmentObject private var runner: BackupRunner
+    var body: some View {
+        Image(systemName: "photo.stack")
+            .symbolEffect(.pulse, isActive: runner.isRunning)
+    }
+}
+
+private struct MenuBarContent: View {
+    @EnvironmentObject private var runner: BackupRunner
+    @Environment(\.openWindow) private var openWindow
+    private let dateFormatter: DateFormatter = {
+        let f = DateFormatter(); f.dateStyle = .medium; f.timeStyle = .short
+        return f
+    }()
+
+    private var statusText: String {
+        if runner.isRunning { return "Backup in corso" }
+        if let last = JobHistoryStore.load() {
+            return "Ultimo backup: \(dateFormatter.string(from: last.date))"
+        }
+        return "Nessun backup ancora"
+    }
+
+    var body: some View {
+        Text(statusText)
+        Divider()
+        Button("Apri AppBackupFoto") {
+            openWindow(id: "main")
+            NSApp.activate(ignoringOtherApps: true)
+        }
     }
 }
 
