@@ -18,6 +18,7 @@
 		255A3AA71DDFE641F9C6F2AE /* FileChunkReaderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5F270C13D1A381946DF4E81B /* FileChunkReaderTests.swift */; };
 		4D0C1BB6D5D73ADA0369EF7D /* RunBoundedTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C4C02713A9555629C0942E51 /* RunBoundedTests.swift */; };
 		6C597DA7E20CFAA06F848C60 /* ValidateEndpointTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 05DF2C8E2DAFF230D56A7405 /* ValidateEndpointTests.swift */; };
+		FEF9EFD07E9D2F7A0C7206CC /* ReviewEngineDeepMirrorFreshnessTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 20046092572858D18FAAFDDB /* ReviewEngineDeepMirrorFreshnessTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -44,6 +45,7 @@
 		5F270C13D1A381946DF4E81B /* FileChunkReaderTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = FileChunkReaderTests.swift; sourceTree = "<group>"; };
 		C4C02713A9555629C0942E51 /* RunBoundedTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = RunBoundedTests.swift; sourceTree = "<group>"; };
 		05DF2C8E2DAFF230D56A7405 /* ValidateEndpointTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ValidateEndpointTests.swift; sourceTree = "<group>"; };
+		20046092572858D18FAAFDDB /* ReviewEngineDeepMirrorFreshnessTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ReviewEngineDeepMirrorFreshnessTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -96,6 +98,7 @@
 				5F270C13D1A381946DF4E81B /* FileChunkReaderTests.swift */,
 				C4C02713A9555629C0942E51 /* RunBoundedTests.swift */,
 				05DF2C8E2DAFF230D56A7405 /* ValidateEndpointTests.swift */,
+				20046092572858D18FAAFDDB /* ReviewEngineDeepMirrorFreshnessTests.swift */,
 			);
 			name = AppBackupFotoTests;
 			path = AppBackupFotoTests;
@@ -236,6 +239,7 @@
 				255A3AA71DDFE641F9C6F2AE /* FileChunkReaderTests.swift in Sources */,
 				4D0C1BB6D5D73ADA0369EF7D /* RunBoundedTests.swift in Sources */,
 				6C597DA7E20CFAA06F848C60 /* ValidateEndpointTests.swift in Sources */,
+				FEF9EFD07E9D2F7A0C7206CC /* ReviewEngineDeepMirrorFreshnessTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

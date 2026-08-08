@@ -1745,7 +1745,9 @@ final class ReviewEngine {
     }
 
     func runConfigChecks() -> [ReviewFinding] {
-        checkBookmarkRoots() + [checkRcloneConfPermissions(), checkS3Endpoint()]
+        let deepMirrorFinding = checkDeepMirrorFreshness(hddConfigured: bm.urls[.hdd] != nil)
+        return checkBookmarkRoots() + [checkRcloneConfPermissions(), checkS3Endpoint()]
+            + [deepMirrorFinding].compactMap { $0 }
     }
 
     func findOrphanedMultipartUploads() async throws -> [S3Syncer.OrphanedMultipartUpload] {
@@ -1792,6 +1794,23 @@ final class ReviewEngine {
         } catch {
             return ReviewFinding(title: "Endpoint S3", ok: false, detail: error.localizedDescription)
         }
+    }
+
+    func checkDeepMirrorFreshness(hddConfigured: Bool,
+                                   defaults: UserDefaults = .standard,
+                                   now: Date = Date()) -> ReviewFinding? {
+        guard hddConfigured else { return nil }
+        guard let lastDeep = defaults.object(forKey: "lastDeepMirrorDate") as? Date else {
+            return ReviewFinding(title: "Deep mirror SSD → HDD", ok: false,
+                detail: "Mai eseguito — collega l'HDD ed esegui SSD → HDD per avviarlo")
+        }
+        let days = Int(now.timeIntervalSince(lastDeep) / 86400)
+        if days > 45 {
+            return ReviewFinding(title: "Deep mirror SSD → HDD", ok: false,
+                detail: "Ultimo deep mirror \(days) giorni fa — collega l'HDD per farlo ripartire")
+        }
+        return ReviewFinding(title: "Deep mirror SSD → HDD", ok: true,
+            detail: "Ultimo deep mirror \(days) giorni fa")
     }
 }
 
