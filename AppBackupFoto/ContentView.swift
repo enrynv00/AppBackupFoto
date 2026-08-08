@@ -17,6 +17,12 @@ struct BackupFotoEnricoApp: App {
                 .environmentObject(runner)
                 .frame(minWidth: 960, minHeight: 620)
         }
+        Window("Diagnostica", id: "tools") {
+            ToolsSheet()
+                .environmentObject(runner)
+        }
+        .defaultSize(width: 640, height: 640)
+        .windowResizability(.contentSize)
     }
 }
 
@@ -2372,7 +2378,7 @@ struct ContentView: View {
                     .zIndex(9)
                     .transition(.opacity)
 
-                HamburgerPanel(isVisible: $showHamburger, showSettings: $showSettings, isJobRunning: runner.isRunning, onShowLog: {
+                HamburgerPanel(isVisible: $showHamburger, showSettings: $showSettings, onShowLog: {
                     activeSpeedTab = .log
                     withAnimation(.easeInOut(duration: 0.22)) { showHamburger = false }
                 })
@@ -2606,15 +2612,14 @@ struct OpsButton: View {
 struct HamburgerPanel: View {
     @Binding var isVisible: Bool
     @Binding var showSettings: Bool
-    var isJobRunning: Bool = false
     var onShowLog: (() -> Void)? = nil
     private let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
     private let profileName = "Enrico Nanni Vicenzi"
     private let profileEmail = "enrynv@gmail.com"
 
+    @Environment(\.openWindow) private var openWindow
     @ObservedObject private var appearance = AppearanceManager.shared
     @State private var showAppearance = false
-    @State private var showTools = false
     @State private var showRestore = false
 
     private var initials: String {
@@ -2661,7 +2666,7 @@ struct HamburgerPanel: View {
                             showSettings = true; close()
                         }
                         HamburgerRow(icon: "wrench.and.screwdriver.fill", label: "Tools", iconColor: .purple) {
-                            showTools = true
+                            openWindow(id: "tools")
                         }
 
                         HamburgerSectionLabel("Preferenze").padding(.top, 6)
@@ -2689,7 +2694,6 @@ struct HamburgerPanel: View {
         .background(.windowBackground)
         .shadow(color: .black.opacity(0.18), radius: 12, x: 5, y: 0)
         .sheet(isPresented: $showAppearance) { AppearanceSheet() }
-        .sheet(isPresented: $showTools)      { ToolsSheet(isJobRunning: isJobRunning) }
         .sheet(isPresented: $showRestore)    { RestoreView() }
     }
 
@@ -3018,9 +3022,9 @@ struct AppearanceSheet: View {
 
 // MARK: - Tools / Diagnostics Sheet
 struct ToolsSheet: View {
-    @Environment(\.dismiss) private var dismiss
+    @Environment(\.dismissWindow) private var dismissWindow
+    @EnvironmentObject private var runner: BackupRunner
     @ObservedObject private var bm = BookmarkManager.shared
-    var isJobRunning: Bool = false
     @State private var showSecret = false
     @State private var reviewFindings: [ReviewFinding] = []
     @State private var lastJob: JobSummary? = JobHistoryStore.load()
@@ -3229,7 +3233,7 @@ struct ToolsSheet: View {
 
                     Divider()
 
-                    if isJobRunning {
+                    if runner.isRunning {
                         Text("Controllo upload incompleti disponibile a job fermo")
                             .font(.caption).foregroundStyle(.secondary)
                     } else if !orphanedUploads.isEmpty {
@@ -3276,7 +3280,7 @@ struct ToolsSheet: View {
             }
             .onAppear {
                 reviewFindings = reviewEngine.runConfigChecks()
-                guard !isJobRunning, !orphanedUploadsChecked else { return }
+                guard !runner.isRunning, !orphanedUploadsChecked else { return }
                 orphanedUploadsChecked = true
                 Task {
                     let found = (try? await reviewEngine.findOrphanedMultipartUploads()) ?? []
@@ -3286,10 +3290,10 @@ struct ToolsSheet: View {
 
             HStack {
                 Spacer()
-                Button("Chiudi") { dismiss() }.buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
+                Button("Chiudi") { dismissWindow() }.buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
             }
         }
-        .padding(28).frame(minWidth: 560)
+        .padding(28).frame(minWidth: 560, minHeight: 480)
     }
 }
 
