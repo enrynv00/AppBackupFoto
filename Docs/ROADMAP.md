@@ -12,7 +12,9 @@ Versione visiva (con link alle fonti): vedi artifact pubblicato in sessione, opp
 
 **#5 (cifratura lato client) valutato e deciso esplicitamente contro, per ora** (2026-08-02): rischio di perdita permanente dei dati (password/chiave persa = foto perse per sempre, nessun recupero) giudicato non accettabile rispetto al beneficio, in tensione diretta con la regola "zero delete, zero overwrite" del progetto. Nessuna implementazione, nessuna spec di design — solo la domanda di go/no-go, con risposta "no". Vedi sotto per i dettagli del trade-off presentato.
 
-**Ancora aperto, con bozza di ricerca pronta in `Docs/superpowers/specs/2026-07-30-next-steps-briefing.md`**: #7 scheduling.
+**Ancora aperto, con bozza di ricerca pronta in `Docs/superpowers/specs/2026-07-30-next-steps-briefing.md`**: #7 scheduling (nota: già parzialmente fatto per Mac→SSD, vedi sotto).
+
+**Fatto (2026-08-08)**: alert deep mirror stantio (obiettivo futuro #1 di `Docs/CLAUDE.md`) — nuovo finding in Revisione se il deep mirror SSD→HDD non gira da più di 45 giorni. Vedi `Docs/superpowers/specs/2026-08-08-deep-mirror-staleness-design.md`.
 
 ---
 

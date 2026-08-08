@@ -128,6 +128,7 @@ Presenta sempre l'output della revisione insieme al codice.
 ### ReviewEngine (pannello "Revisione", in `ToolsSheet`)
 
 - `runConfigChecks() -> [ReviewFinding]` — sincrono, nessun accesso ai volumi: valida che i bookmark SSD/HDD puntino alla root del volume, i permessi di `rclone.conf`, l'endpoint S3 (via `S3Syncer.readConfig()`)
+- `checkDeepMirrorFreshness(hddConfigured:defaults:now:)` — nuovo finding (2026-08-08) che segnala se il deep mirror SSD→HDD non gira da più di 45 giorni, o non è mai girato (`lastDeepMirrorDate` assente). Nessun finding se l'HDD non è configurato. Solo passivo: visibile aprendo Tools → Revisione, nessuna notifica di sistema.
 - `runIntegritySample(sampleSize:onProgress:) async -> [IntegrityCheckResult]` — su richiesta (bottone dedicato): ricampiona 20 file a caso per coppia (Mac↔SSD, SSD↔HDD, SSD↔S3), ricalcola SHA256 e confronta; per S3 scarica il campione in un file temporaneo e lo cancella subito dopo l'hash. Salta (non fallisce) le coppie i cui bookmark non sono accessibili
 - `sampleLocalPair(...)` usa `realpath()` (non `URL.resolvingSymlinksInPath()`, che lascia `/var`/`/tmp` non risolti di proposito su macOS) per calcolare correttamente i path relativi quando confronta directory temporanee — dettaglio scoperto scrivendo i test, importante se si tocca di nuovo questa logica
 - `JobSummary`/`JobHistoryStore` — riepilogo dell'ultimo job (data, label, copiati/skippati/errori/hash-mismatch), persistito in UserDefaults (`defaults` parametrizzato per testabilità), sopravvive al riavvio dell'app
@@ -203,9 +204,7 @@ Se emergono nuovi bug, documentarli qui con: sintomo osservato, causa, fix appli
 
 ## Obiettivi futuri (non ancora iniziati)
 
-In ordine di priorità:
-
-1. Valutare se serve un meccanismo di notifica/alert se il deep mirror SSD→HDD non gira da troppo tempo (es. oltre 45 giorni) per segnalare che l'HDD non viene collegato abbastanza spesso
+Nessun obiettivo futuro aperto al momento.
 
 **Verifica manuale ancora da fare** (non eseguibile in ambiente headless, serve l'app in mano con volumi montati): controllo visivo della sezione "Revisione" in Tools, funzionamento reale di `runIntegritySample` su Mac↔SSD/SSD↔HDD/SSD↔S3, conferma che i file temporanei scaricati da S3 per il confronto vengano effettivamente cancellati.
 
