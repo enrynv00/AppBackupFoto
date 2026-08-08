@@ -490,10 +490,6 @@ final class S3Syncer {
          kSecAttrAccount as String: remoteName]
     }
 
-    static func hasKeychainCredentials(remoteName: String = "Cubbit") -> Bool {
-        readFromKeychain(remoteName: remoteName) != nil
-    }
-
     private static func readFromKeychain(remoteName: String) -> KeychainCredentials? {
         var query = keychainQuery(remoteName: remoteName)
         query[kSecReturnData as String] = true
@@ -604,14 +600,23 @@ final class S3Syncer {
     func cancel() { cancelled = true }
 
     static func readConfig(remoteName: String = "Cubbit", bucket: String = "backupfoto") throws -> S3Config {
+        try readConfigWithSource(remoteName: remoteName, bucket: bucket).config
+    }
+
+    // Come readConfig, ma segnala anche se il risultato viene dal Keychain o da rclone.conf,
+    // in un'unica lettura Keychain: usata dove serve entrambe le informazioni (findings di
+    // Revisione + card credenziali in ToolsSheet) per evitare letture Keychain ridondanti —
+    // ognuna può richiedere una propria autorizzazione interattiva dell'utente.
+    static func readConfigWithSource(remoteName: String = "Cubbit",
+                                      bucket: String = "backupfoto") throws -> (config: S3Config, fromKeychain: Bool) {
         if let creds = readFromKeychain(remoteName: remoteName) {
             let cleanEp = try validateEndpoint(creds.endpoint)
-            return S3Config(accessKeyId: creds.accessKeyId, secretAccessKey: creds.secretAccessKey,
-                            endpoint: cleanEp, region: creds.region, bucket: bucket)
+            return (S3Config(accessKeyId: creds.accessKeyId, secretAccessKey: creds.secretAccessKey,
+                            endpoint: cleanEp, region: creds.region, bucket: bucket), true)
         }
         let config = try readConfigFromFile(remoteName: remoteName, bucket: bucket)
         try? writeToKeychain(config: config, remoteName: remoteName)
-        return config
+        return (config, false)
     }
 
     // Non private: deve restare richiamabile dal bottone "Aggiorna da rclone.conf" in ToolsSheet.
@@ -1191,6 +1196,33 @@ final class VolumeMonitor: ObservableObject {
 // MARK: - BackupRunner
 @MainActor
 final class BackupRunner: ObservableObject {
+    // Config S3/Keychain condivisa da TUTTA l'app (Tools e Ripristina) tramite loadS3ConfigIfNeeded():
+    // una sola lettura Keychain per avvio dell'app, non una per finestra. Letta dalla finestra
+    // principale se possibile: il Keychain, quando serve un'autorizzazione interattiva, la ottiene
+    // in modo affidabile solo se la finestra key/frontmost al momento della richiesta è quella
+    // principale (verificato empiricamente: la stessa identica chiamata funziona sempre se
+    // triggerata dalla finestra principale, e va in loop se triggerata da dentro la Window
+    // Diagnostica indipendente). "Aggiorna da rclone.conf" in Tools resta il modo esplicito per
+    // forzare un refresh manuale delle credenziali.
+    @Published var s3ConfigLoaded = false
+    @Published var s3Config: S3Syncer.S3Config? = nil
+    @Published var s3ConfigFromKeychain: Bool = false
+    @Published var s3ConfigError: Error? = nil
+
+    func loadS3ConfigIfNeeded() async {
+        guard !s3ConfigLoaded else { return }
+        s3ConfigLoaded = true
+        do {
+            let result = try S3Syncer.readConfigWithSource()
+            s3Config = result.config
+            s3ConfigFromKeychain = result.fromKeychain
+        } catch {
+            s3ConfigError = error
+        }
+    }
+
+    @Published var toolsReviewFindings: [ReviewFinding] = []
+    @Published var toolsOrphanedUploads: [S3Syncer.OrphanedMultipartUpload] = []
     @Published var output = ""
     @Published var phase: JobPhase = .idle
     @Published var stats = JobStats()
@@ -1756,15 +1788,22 @@ final class ReviewEngine {
         return results
     }
 
-    func runConfigChecks() -> [ReviewFinding] {
+    // s3Config/s3ConfigFromKeychain/s3ConfigError vanno letti UNA SOLA VOLTA dal chiamante
+    // (S3Syncer.readConfigWithSource()) e passati qui — ogni lettura Keychain indipendente può
+    // richiedere una propria autorizzazione interattiva dell'utente, quindi ripeterla per ogni
+    // singolo controllo (come faceva la versione precedente, con una lettura per check) genera
+    // più prompt in sequenza invece di uno solo.
+    func runConfigChecks(s3Config: S3Syncer.S3Config?, s3ConfigFromKeychain: Bool,
+                          s3ConfigError: Error?) -> [ReviewFinding] {
         let deepMirrorFinding = checkDeepMirrorFreshness(hddConfigured: bm.urls[.hdd] != nil)
-        return checkBookmarkRoots() + [checkRcloneConfPermissions(), checkS3Endpoint()]
+        return checkBookmarkRoots()
+            + [checkRcloneConfPermissions(fromKeychain: s3ConfigFromKeychain),
+               checkS3Endpoint(config: s3Config, error: s3ConfigError)]
             + [deepMirrorFinding].compactMap { $0 }
     }
 
-    func findOrphanedMultipartUploads() async throws -> [S3Syncer.OrphanedMultipartUpload] {
-        let config = try S3Syncer.readConfig()
-        return try await s3Syncer.listMultipartUploads(config: config)
+    func findOrphanedMultipartUploads(config: S3Syncer.S3Config) async throws -> [S3Syncer.OrphanedMultipartUpload] {
+        try await s3Syncer.listMultipartUploads(config: config)
     }
 
     private func checkBookmarkRoots() -> [ReviewFinding] {
@@ -1780,8 +1819,8 @@ final class ReviewEngine {
         }
     }
 
-    private func checkRcloneConfPermissions() -> ReviewFinding {
-        if S3Syncer.hasKeychainCredentials(remoteName: "Cubbit") {
+    private func checkRcloneConfPermissions(fromKeychain: Bool) -> ReviewFinding {
+        if fromKeychain {
             return ReviewFinding(title: "Credenziali S3", ok: true,
                 detail: "Salvate nel Keychain — rclone.conf non è più necessario")
         }
@@ -1799,13 +1838,12 @@ final class ReviewEngine {
             detail: "0600 — solo il proprietario può leggere/scrivere")
     }
 
-    private func checkS3Endpoint() -> ReviewFinding {
-        do {
-            let cfg = try S3Syncer.readConfig()
+    private func checkS3Endpoint(config: S3Syncer.S3Config?, error: Error?) -> ReviewFinding {
+        if let cfg = config {
             return ReviewFinding(title: "Endpoint S3", ok: true, detail: "\(cfg.endpoint) · bucket \(cfg.bucket)")
-        } catch {
-            return ReviewFinding(title: "Endpoint S3", ok: false, detail: error.localizedDescription)
         }
+        return ReviewFinding(title: "Endpoint S3", ok: false,
+            detail: error?.localizedDescription ?? "Configurazione S3 non disponibile")
     }
 
     func checkDeepMirrorFreshness(hddConfigured: Bool,
@@ -1985,6 +2023,7 @@ final class RestoreEngine: ObservableObject {
 
 struct RestoreView: View {
     @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var runner: BackupRunner
     @ObservedObject private var bm = BookmarkManager.shared
     @StateObject private var volumes = VolumeMonitor()
     @StateObject private var engine = RestoreEngine()
@@ -2107,14 +2146,14 @@ struct RestoreView: View {
     }
 
     private func checkS3Reachability() async {
-        do {
-            let cfg = try S3Syncer.readConfig()
-            s3Config = cfg
-            let reachable = await s3Syncer.checkReachable(config: cfg)
-            s3Status = reachable ? .available : .unavailable("non raggiungibile in questo momento")
-        } catch {
+        await runner.loadS3ConfigIfNeeded()
+        guard let cfg = runner.s3Config else {
             s3Status = .unavailable("configurazione mancante")
+            return
         }
+        s3Config = cfg
+        let reachable = await s3Syncer.checkReachable(config: cfg)
+        s3Status = reachable ? .available : .unavailable("non raggiungibile in questo momento")
     }
 
     private func proceedToFolders(rootURL: URL?) {
@@ -2618,9 +2657,12 @@ struct HamburgerPanel: View {
     private let profileEmail = "enrynv@gmail.com"
 
     @Environment(\.openWindow) private var openWindow
+    @EnvironmentObject private var runner: BackupRunner
     @ObservedObject private var appearance = AppearanceManager.shared
     @State private var showAppearance = false
     @State private var showRestore = false
+    @State private var toolsLoading = false
+    private let reviewEngine = ReviewEngine()
 
     private var initials: String {
         profileName.split(separator: " ").prefix(2).compactMap { $0.first.map(String.init) }.joined()
@@ -2666,7 +2708,27 @@ struct HamburgerPanel: View {
                             showSettings = true; close()
                         }
                         HamburgerRow(icon: "wrench.and.screwdriver.fill", label: "Tools", iconColor: .purple) {
-                            openWindow(id: "tools")
+                            guard !toolsLoading else { return }
+                            toolsLoading = true
+                            let skipOrphanedCheck = runner.isRunning
+                            Task {
+                                await runner.loadS3ConfigIfNeeded()
+                                let findings = reviewEngine.runConfigChecks(
+                                    s3Config: runner.s3Config, s3ConfigFromKeychain: runner.s3ConfigFromKeychain,
+                                    s3ConfigError: runner.s3ConfigError)
+                                let orphaned: [S3Syncer.OrphanedMultipartUpload]
+                                if !skipOrphanedCheck, let cfg = runner.s3Config {
+                                    orphaned = (try? await reviewEngine.findOrphanedMultipartUploads(config: cfg)) ?? []
+                                } else {
+                                    orphaned = []
+                                }
+                                await MainActor.run {
+                                    runner.toolsReviewFindings = findings
+                                    runner.toolsOrphanedUploads = orphaned
+                                    toolsLoading = false
+                                    openWindow(id: "tools")
+                                }
+                            }
                         }
 
                         HamburgerSectionLabel("Preferenze").padding(.top, 6)
@@ -3026,13 +3088,10 @@ struct ToolsSheet: View {
     @EnvironmentObject private var runner: BackupRunner
     @ObservedObject private var bm = BookmarkManager.shared
     @State private var showSecret = false
-    @State private var reviewFindings: [ReviewFinding] = []
     @State private var lastJob: JobSummary? = JobHistoryStore.load()
     @State private var integrityResults: [IntegrityCheckResult] = []
     @State private var integrityRunning = false
     @State private var integrityStatus = ""
-    @State private var orphanedUploads: [S3Syncer.OrphanedMultipartUpload] = []
-    @State private var orphanedUploadsChecked = false
     private let reviewEngine = ReviewEngine()
 
     private let jobDateFormatter: DateFormatter = {
@@ -3087,8 +3146,8 @@ struct ToolsSheet: View {
 
             GroupBox("S3 — Cubbit") {
                 VStack(alignment: .leading, spacing: 6) {
-                    if let cfg = try? S3Syncer.readConfig() {
-                        Text(S3Syncer.hasKeychainCredentials() ? "Origine: Keychain" : "Origine: rclone.conf")
+                    if let cfg = runner.s3Config {
+                        Text(runner.s3ConfigFromKeychain ? "Origine: Keychain" : "Origine: rclone.conf")
                             .font(.caption2).foregroundStyle(.secondary)
                         DiagRow(label: "Endpoint",  value: cfg.endpoint)
                         DiagRow(label: "Bucket",    value: cfg.bucket)
@@ -3165,7 +3224,7 @@ struct ToolsSheet: View {
 
             GroupBox("Revisione") {
                 VStack(alignment: .leading, spacing: 10) {
-                    ForEach(reviewFindings) { finding in
+                    ForEach(runner.toolsReviewFindings) { finding in
                         HStack(alignment: .top, spacing: 8) {
                             Image(systemName: finding.ok ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
                                 .foregroundStyle(finding.ok ? Color.green : Color.orange)
@@ -3236,9 +3295,9 @@ struct ToolsSheet: View {
                     if runner.isRunning {
                         Text("Controllo upload incompleti disponibile a job fermo")
                             .font(.caption).foregroundStyle(.secondary)
-                    } else if !orphanedUploads.isEmpty {
+                    } else if !runner.toolsOrphanedUploads.isEmpty {
                         Text("Upload incompleti trovati").font(.caption).fontWeight(.medium)
-                        ForEach(orphanedUploads) { upload in
+                        ForEach(runner.toolsOrphanedUploads) { upload in
                             HStack(alignment: .top, spacing: 8) {
                                 VStack(alignment: .leading, spacing: 1) {
                                     Text((upload.key as NSString).lastPathComponent).font(.caption2)
@@ -3256,11 +3315,14 @@ struct ToolsSheet: View {
                                     guard a.runModal() == .alertFirstButtonReturn else { return }
                                     Task {
                                         do {
-                                            let config = try S3Syncer.readConfig()
+                                            guard let config = runner.s3Config else {
+                                                throw NSError(domain: "S3", code: 1, userInfo: [NSLocalizedDescriptionKey:
+                                                    "Configurazione S3 non disponibile — chiudi e riapri Tools."])
+                                            }
                                             try await S3Syncer().abortMultipartUpload(
                                                 key: upload.key, uploadId: upload.uploadId, config: config)
                                             await MainActor.run {
-                                                orphanedUploads.removeAll { $0.id == upload.id }
+                                                runner.toolsOrphanedUploads.removeAll { $0.id == upload.id }
                                             }
                                         } catch {
                                             await MainActor.run {
@@ -3277,15 +3339,6 @@ struct ToolsSheet: View {
                         }
                     }
                 }.padding(4)
-            }
-            .onAppear {
-                reviewFindings = reviewEngine.runConfigChecks()
-                guard !runner.isRunning, !orphanedUploadsChecked else { return }
-                orphanedUploadsChecked = true
-                Task {
-                    let found = (try? await reviewEngine.findOrphanedMultipartUploads()) ?? []
-                    await MainActor.run { orphanedUploads = found }
-                }
             }
 
             HStack {
