@@ -47,8 +47,7 @@ Versione visiva (con link alle fonti): vedi artifact pubblicato in sessione, opp
 7. ✅ **Fatto (2026-08-02) — Zero automazione.** Backup Mac→SSD automatico al collegamento dell'SSD, solo ad app aperta (toggle on/off in Impostazioni). Scope ridotto rispetto all'idea originale dopo discussione con l'utente: niente LaunchAgent/avvio ad app chiusa (dipende dalla modalità menu bar, punto #11, non fatta), niente orario fisso, solo Mac→SSD (non SSD→HDD/S3). Vedi `Docs/superpowers/specs/2026-08-02-ssd-connect-auto-backup-design.md`.
    *Fonte: confronto funzionalità CCC / ChronoSync / Arq*
 
-8. **Nessun controllo di spazio libero prima di partire** — se HDD si riempie a metà copia, l'errore arriva a job già a metà.
-   *Effort: basso · `resourceValues(.volumeAvailableCapacityKey)` prima di `run()`*
+8. ✅ **Fatto (2026-08-09) — Nessun controllo di spazio libero prima di partire.** `runMacToSSD()`/`runSSDToHDD()` ora controllano lo spazio libero sul volume di destinazione prima di avviare (margine 5%/min 500MB), bloccando con un alert se insufficiente. SSD→S3 escluso (nessun limite pratico su Cubbit). Vedi `Docs/superpowers/specs/2026-08-09-free-space-check-design.md`.
 
 9. ✅ **Fatto (2026-08-02) — Anteprima dry-run assente per SSD → S3.** `S3Syncer.previewUpload` + `previewSyncS3()`, stesso stile delle anteprime già esistenti per Mac→SSD e SSD→HDD.
 
@@ -76,7 +75,7 @@ Versione visiva (con link alle fonti): vedi artifact pubblicato in sessione, opp
 
 ## Da dove partire (aggiornato 2026-08-02)
 
-Fatti: #1 restore, #2 race stop/successo, #3 retry S3, #4 cleanup multipart, #6 upload paralleli, #7 scheduling (Mac→SSD su collegamento SSD), #9 anteprima S3, #10 Keychain. #5 (cifratura lato client) valutato e deciso esplicitamente contro, per ora — non riproporre senza un motivo nuovo, vedi sopra. Nessun punto critico/alto resta aperto nella lista originale: quello che rimane sono i punti "valore aggiunto" (8, 11-20), ordinabili in base al tempo che si vuole investirci — punto #11 (modalità menu bar/background) è il prerequisito naturale se in futuro si vorrà estendere lo scheduling anche ad app chiusa.
+Fatti: #1 restore, #2 race stop/successo, #3 retry S3, #4 cleanup multipart, #6 upload paralleli, #7 scheduling (Mac→SSD su collegamento SSD), #8 controllo spazio, #9 anteprima S3, #10 Keychain. #5 (cifratura lato client) valutato e deciso esplicitamente contro, per ora — non riproporre senza un motivo nuovo, vedi sopra. Nessun punto critico/alto resta aperto nella lista originale: quello che rimane sono i punti "valore aggiunto" (8, 11-20), ordinabili in base al tempo che si vuole investirci — punto #11 (modalità menu bar/background) è il prerequisito naturale se in futuro si vorrà estendere lo scheduling anche ad app chiusa.
 
 ## Stato aggiornato (2026-08-09)
 

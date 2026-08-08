@@ -118,6 +118,7 @@ Presenta sempre l'output della revisione insieme al codice.
 
 - Coordina `FileSyncer` e `S3Syncer`, pubblica `phase`/`stats`/`output`/`speedHistory` per la UI
 - `runMacToSSD()` / `runSSDToHDD()` / `runSyncS3()` — ciascuno valida gli accessi bookmark, poi valida **che il bookmark punti alla root del volume** (`isLikelyVolumeRoot`: `pathComponents.count <= 3`) prima di avviare, con alert esplicito se il path non è la root (fix del vecchio BUG-1)
+- **Controllo spazio libero (2026-08-09)**: `runMacToSSD()` e `runSSDToHDD()` calcolano i byte da copiare (`FileSyncer.previewSync`, esteso con `toAddBytes`) e li confrontano con lo spazio libero reale sul volume di destinazione (`hasSufficientSpace`, margine 5%/min 500MB) prima di chiamare `run()` — se insufficiente, alert bloccante e il job non parte mai. SSD→S3 non è coperto (nessun limite pratico su Cubbit).
 - `previewMacToSSD()` / `previewSSDToHDD()` — dry-run: mostrano un `NSAlert` con conteggio file/tempo stimato senza avviare la copia
 - Deep mode SSD→HDD ogni 30 giorni (UserDefaults `lastDeepMirrorDate`), aggiornato solo se il job deep è terminato senza errori
 - `speedHistory`/`speedUnit` alimentano `SpeedChartView` — MB/s per S3, file/s per FileSyncer, "scan/s" durante la fase di conteggio
