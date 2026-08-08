@@ -24,6 +24,13 @@ struct BackupFotoEnricoApp: App {
         .defaultSize(width: 640, height: 640)
         .windowResizability(.contentSize)
 
+        Window("Catalogo", id: "catalog") {
+            CatalogView()
+                .environmentObject(runner)
+        }
+        .defaultSize(width: 720, height: 520)
+        .windowResizability(.contentSize)
+
         MenuBarExtra {
             MenuBarContent()
                 .environmentObject(runner)
@@ -65,6 +72,140 @@ private struct MenuBarContent: View {
         Button("Apri AppBackupFoto") {
             openWindow(id: "main")
             NSApp.activate(ignoringOtherApps: true)
+        }
+    }
+}
+
+struct CatalogView: View {
+    enum CatalogDestination: String, CaseIterable, Identifiable {
+        case ssd = "SSD", hdd = "HDD", s3 = "Cubbit S3"
+        var id: String { rawValue }
+    }
+    enum LoadState {
+        case idle, loading, loaded([CatalogEntry]), failed(String)
+    }
+
+    @EnvironmentObject private var runner: BackupRunner
+    @ObservedObject private var bm = BookmarkManager.shared
+    @StateObject private var volumes = VolumeMonitor()
+    @State private var destination: CatalogDestination = .ssd
+    @State private var searchText = ""
+    @State private var loadState: LoadState = .idle
+    private let reviewEngine = ReviewEngine()
+
+    private let byteFormatter: ByteCountFormatter = {
+        let f = ByteCountFormatter(); f.countStyle = .file
+        return f
+    }()
+    private let dateFormatter: DateFormatter = {
+        let f = DateFormatter(); f.dateStyle = .medium; f.timeStyle = .short
+        return f
+    }()
+
+    private func isAvailable(_ d: CatalogDestination) -> Bool {
+        switch d {
+        case .ssd: return volumes.ssdMounted
+        case .hdd: return volumes.hddMounted
+        case .s3: return runner.s3Config != nil
+        }
+    }
+
+    private var filteredEntries: [CatalogEntry] {
+        guard case .loaded(let entries) = loadState else { return [] }
+        return filterCatalogEntries(entries, matching: searchText)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Catalogo").font(.title2).fontWeight(.semibold)
+
+            Picker("Destinazione", selection: $destination) {
+                ForEach(CatalogDestination.allCases) { d in
+                    Text(isAvailable(d) ? d.rawValue : "\(d.rawValue) (non disponibile)").tag(d)
+                }
+            }
+            .pickerStyle(.segmented)
+            .onChange(of: destination) { _, _ in loadCurrentDestination() }
+
+            TextField("Cerca per nome o cartella", text: $searchText)
+                .textFieldStyle(.roundedBorder)
+
+            Group {
+                switch loadState {
+                case .idle:
+                    Color.clear.onAppear { loadCurrentDestination() }
+                case .loading:
+                    ProgressView("Sto leggendo \(destination.rawValue)…")
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                case .failed(let message):
+                    Text(message).foregroundStyle(.red)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                case .loaded:
+                    if filteredEntries.isEmpty {
+                        Text(searchText.isEmpty ? "Nessun file trovato" : "Nessun risultato per \"\(searchText)\"")
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    } else {
+                        Table(filteredEntries) {
+                            TableColumn("Nome") { Text($0.name) }
+                            TableColumn("Cartella") { Text($0.relativePath) }
+                            TableColumn("Dimensione") { entry in
+                                Text(byteFormatter.string(fromByteCount: entry.sizeBytes))
+                            }
+                            TableColumn("Data") { entry in
+                                Text(entry.modified.map { dateFormatter.string(from: $0) } ?? "—")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .padding(20)
+        .frame(minWidth: 640, minHeight: 480)
+    }
+
+    private func loadCurrentDestination() {
+        guard isAvailable(destination) else {
+            loadState = .failed("\(destination.rawValue) non disponibile al momento")
+            return
+        }
+        loadState = .loading
+        let dest = destination
+        Task {
+            do {
+                let entries: [CatalogEntry]
+                switch dest {
+                case .ssd:
+                    guard let url = bm.startAccessing(.ssd) else {
+                        throw NSError(domain: "Catalog", code: 1,
+                            userInfo: [NSLocalizedDescriptionKey: "Accesso all'SSD non disponibile"])
+                    }
+                    defer { bm.stopAccessing(.ssd) }
+                    entries = reviewEngine.scanLocalCatalog(rootURL: url)
+                case .hdd:
+                    guard let url = bm.startAccessing(.hdd) else {
+                        throw NSError(domain: "Catalog", code: 2,
+                            userInfo: [NSLocalizedDescriptionKey: "Accesso all'HDD non disponibile"])
+                    }
+                    defer { bm.stopAccessing(.hdd) }
+                    entries = reviewEngine.scanLocalCatalog(rootURL: url)
+                case .s3:
+                    guard let cfg = runner.s3Config else {
+                        throw NSError(domain: "Catalog", code: 3,
+                            userInfo: [NSLocalizedDescriptionKey: "Configurazione Cubbit non disponibile"])
+                    }
+                    entries = try await S3Syncer().listAllWithDates(config: cfg)
+                }
+                await MainActor.run {
+                    guard dest == destination else { return }
+                    loadState = .loaded(entries)
+                }
+            } catch {
+                await MainActor.run {
+                    guard dest == destination else { return }
+                    loadState = .failed(error.localizedDescription)
+                }
+            }
         }
     }
 }
@@ -2927,6 +3068,13 @@ struct HamburgerPanel: View {
                                     toolsLoading = false
                                     openWindow(id: "tools")
                                 }
+                            }
+                        }
+
+                        HamburgerRow(icon: "magnifyingglass", label: "Catalogo", iconColor: .indigo) {
+                            Task {
+                                await runner.loadS3ConfigIfNeeded()
+                                await MainActor.run { openWindow(id: "catalog") }
                             }
                         }
 
