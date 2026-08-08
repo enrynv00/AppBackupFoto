@@ -884,6 +884,69 @@ final class S3Syncer {
         return (objs, nextToken)
     }
 
+    // Come listPage, ma per il Catalogo (roadmap #12): estrae anche LastModified, non solo
+    // Key/Size. Funzione separata per non toccare listPage/listAll esistenti, usati da
+    // preview/restore/orphaned-uploads.
+    func parseCatalogEntries(fromListObjectsXML xml: String) -> [CatalogEntry] {
+        let keys = xmlAll(xml, tag: "Key")
+        let dates = xmlAll(xml, tag: "LastModified")
+        let sizes = xmlAll(xml, tag: "Size").compactMap { Int64($0) }
+        let fmt = ISO8601DateFormatter()
+        fmt.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let count = min(keys.count, dates.count, sizes.count)
+        var entries: [CatalogEntry] = []
+        for i in 0..<count {
+            let key = keys[i]
+            entries.append(CatalogEntry(
+                name: (key as NSString).lastPathComponent,
+                relativePath: key,
+                sizeBytes: sizes[i],
+                modified: fmt.date(from: dates[i])))
+        }
+        return entries
+    }
+
+    private func listPageWithDates(config: S3Config, token: String?) async throws -> ([CatalogEntry], String?) {
+        guard var comps = URLComponents(string: "\(config.endpoint)/\(config.bucket)") else {
+            throw NSError(domain: "S3", code: 8,
+                userInfo: [NSLocalizedDescriptionKey: "URL non valido per il bucket: \(config.bucket)"])
+        }
+        var qi = [URLQueryItem(name: "list-type", value: "2"),
+                  URLQueryItem(name: "max-keys", value: "1000")]
+        if let t = token { qi.append(URLQueryItem(name: "continuation-token", value: t)) }
+        comps.queryItems = qi
+        guard let url = comps.url else {
+            throw NSError(domain: "S3", code: 8,
+                userInfo: [NSLocalizedDescriptionKey: "URL non valido per list"])
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        sign(&req, config: config, body: Data(), date: Date())
+        let (data, resp) = try await session.data(for: req)
+        guard (resp as? HTTPURLResponse)?.statusCode == 200 else {
+            let body = String(data: data, encoding: .utf8) ?? ""
+            throw NSError(domain: "S3", code: 3,
+                userInfo: [NSLocalizedDescriptionKey: "Errore lista S3: \(body.prefix(300))"])
+        }
+        let xml = String(data: data, encoding: .utf8) ?? ""
+        let entries = parseCatalogEntries(fromListObjectsXML: xml)
+        let isTruncated = xmlFirst(xml, tag: "IsTruncated") == "true"
+        let nextToken = isTruncated ? xmlFirst(xml, tag: "NextContinuationToken") : nil
+        return (entries, nextToken)
+    }
+
+    func listAllWithDates(config: S3Config) async throws -> [CatalogEntry] {
+        var entries: [CatalogEntry] = []
+        var token: String? = nil
+        repeat {
+            if cancelled || Task.isCancelled { break }
+            let (page, next) = try await listPageWithDates(config: config, token: token)
+            entries.append(contentsOf: page)
+            token = next
+        } while token != nil
+        return entries
+    }
+
     private func retrying<T>(key: String, maxAttempts: Int = 3,
                               onStatus: @escaping (String) -> Void,
                               operation: () async throws -> T) async throws -> T {
@@ -1738,6 +1801,24 @@ struct IntegrityCheckResult: Identifiable {
     var mismatches: [String] = []
     var skippedNoSource: Int = 0
     var error: String? = nil
+}
+
+// Voce del catalogo backup (roadmap #12) — alimentata sia da ReviewEngine.scanLocalCatalog
+// (SSD/HDD) sia da S3Syncer.listAllWithDates (Cubbit), sola lettura, nessuna azione associata.
+struct CatalogEntry: Identifiable {
+    let id = UUID()
+    let name: String
+    let relativePath: String
+    let sizeBytes: Int64
+    let modified: Date?
+}
+
+// Filtro di ricerca puro sul catalogo (nome o cartella, case-insensitive) — nessuna dipendenza
+// da rete o disco, applicato in memoria sui CatalogEntry già caricati.
+func filterCatalogEntries(_ entries: [CatalogEntry], matching query: String) -> [CatalogEntry] {
+    guard !query.isEmpty else { return entries }
+    let q = query.lowercased()
+    return entries.filter { $0.name.lowercased().contains(q) || $0.relativePath.lowercased().contains(q) }
 }
 
 final class ReviewEngine {
