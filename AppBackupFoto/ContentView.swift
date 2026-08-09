@@ -1862,6 +1862,8 @@ final class BackupRunner: ObservableObject {
                     guard !self.wasStopped else { return }
                     self.stats.elapsed = self.makeElapsed()
                     self.phase = .failed("Errore: \(error.localizedDescription)")
+                    Notifier.send(self.phase.label,
+                        "Copiati \(self.stats.copied) · Skippati \(self.stats.skipped) · Errori \(self.stats.errors)")
                     self.completionSnapshot = (self.phase, self.stats)
                     JobHistoryStore.save(JobSummary(date: Date(), label: label, copied: self.stats.copied,
                         skipped: self.stats.skipped, errors: self.stats.errors,
