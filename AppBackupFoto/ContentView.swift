@@ -435,6 +435,7 @@ final class FileSyncer {
     struct SyncResult {
         var total = 0; var done = 0; var copied = 0; var skipped = 0; var errors = 0
         var hashErrors = 0   // file con SHA256 mismatch dopo la copia
+        var changedSkipped = 0   // file esistente ma diverso dalla sorgente, skippato per zero-overwrite (roadmap #13)
         var startDate = Date()
         var percent: Int { total > 0 ? min(100, done * 100 / total) : 0 }
         var elapsedSec: Int { Int(Date().timeIntervalSince(startDate)) }
@@ -606,6 +607,7 @@ final class FileSyncer {
             if fm.fileExists(atPath: dst.path) {
                 // destination exists but differs — zero-overwrite rule: skip
                 result.skipped += 1
+                result.changedSkipped += 1
             } else {
                 let snap = result
                 DispatchQueue.main.async {
