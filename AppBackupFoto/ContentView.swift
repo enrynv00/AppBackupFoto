@@ -2828,7 +2828,7 @@ struct ContentView: View {
                         .padding(.horizontal, 18).padding(.top, 14).padding(.bottom, 10)
                     if runner.phase != .idle {
                         Divider()
-                        StatsPanel(stats: runner.stats, phase: runner.phase, currentStatus: runner.currentStatus)
+                        StatsPanel(stats: runner.stats, phase: runner.phase, currentStatus: runner.currentStatus, currentThumbnail: runner.currentThumbnail)
                             .padding(18)
                     }
                     Divider()
@@ -3273,6 +3273,22 @@ struct PhaseIndicator: View {
     }
 }
 
+struct CurrentFileThumbnail: View {
+    let image: NSImage?
+    var body: some View {
+        Group {
+            if let image {
+                Image(nsImage: image).resizable().aspectRatio(contentMode: .fill)
+            } else {
+                Color.clear
+            }
+        }
+        .frame(width: 44, height: 44)
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(.secondary.opacity(0.2), lineWidth: 1))
+    }
+}
+
 struct StatusBar: View {
     let status: String; let phase: JobPhase
     var body: some View {
@@ -3292,10 +3308,13 @@ struct StatusBar: View {
 
 // MARK: - Stats Panel
 struct StatsPanel: View {
-    let stats: JobStats; let phase: JobPhase; let currentStatus: String
+    let stats: JobStats; let phase: JobPhase; let currentStatus: String; let currentThumbnail: NSImage?
     var body: some View {
         VStack(spacing: 14) {
-            StatusBar(status: currentStatus, phase: phase)
+            HStack(spacing: 10) {
+                CurrentFileThumbnail(image: currentThumbnail)
+                StatusBar(status: currentStatus, phase: phase)
+            }
             VStack(spacing: 6) {
                 HStack {
                     Text("Avanzamento").font(.caption).foregroundStyle(.secondary)
