@@ -199,6 +199,10 @@ Qualsiasi subprocess (rsync, bash, rclone, Process()) lanciato da un'app GUI **n
 
 ## Bug aperti
 
+**BUG-3 (2026-08-09, trovato e risolto nella stessa sessione) — S3Syncer sovrascriveva silenziosamente su Cubbit i file cambiati.**
+
+Trovato leggendo il codice durante il brainstorming di roadmap #13 (versioning), non durante un incidente reale segnalato dall'utente. `S3Syncer.sync()` decideva cosa caricare con `existing[key] != size` — includeva sia le key nuove sia le key già presenti su S3 con dimensione locale diversa, e queste ultime venivano ricaricate via `PUT` senza nessun controllo di esistenza, sovrascrivendo l'oggetto già presente. Contraddiceva sia la regola assoluta del progetto sia quanto documentato per `S3Syncer` ("mai DELETE/overwrite remoto") — e si comportava diversamente da `FileSyncer` (Mac→SSD, SSD→HDD), che per lo stesso scenario salta sempre. Fix: nuova `S3Syncer.shouldUpload(key:existingKeys:)`, la dimensione locale non influenza più quali key vengono caricate — solo le key assenti da S3 vengono caricate, esattamente come il comportamento già corretto di `FileSyncer`. Vedi `Docs/superpowers/specs/2026-08-09-s3-zero-overwrite-fix-design.md`. Nessuna verifica retroattiva possibile su oggetti eventualmente già sovrascritti in passato (bucket senza versioning S3 nativo).
+
 **BUG-2 (2026-08-08, risolto 2026-08-09) — Aprire Diagnostica poteva bloccare/uccidere l'app; poi, dopo il primo fix, il Keychain veniva richiesto ripetutamente.**
 
 *Percorso della diagnosi (tre fix successivi, ciascuno verificato empiricamente con `log stream`/`log show` su `securityd` mentre l'utente riproduceva dal vivo — mai un fix "a occhio"):*
