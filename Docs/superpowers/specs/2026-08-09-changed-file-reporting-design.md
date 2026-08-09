@@ -25,7 +25,7 @@ Durante il brainstorming, trovato e già risolto separatamente **BUG-3**: `S3Syn
 - `FileSyncer.SyncResult` (`ContentView.swift:435`): aggiungere `var changedSkipped = 0`.
 - `S3Syncer.SyncResult` (`ContentView.swift:718`): aggiungere `var changedSkipped: Int = 0`.
 - `JobStats` (`ContentView.swift:258`): aggiungere `var changedSkipped: Int = 0`.
-- `JobSummary` (`ContentView.swift:1912`, `Codable`): aggiungere `let changedSkipped: Int` (persistito, visibile in Tools → ultimo job, stesso trattamento degli altri contatori).
+- `JobSummary` (`ContentView.swift:1912`, `Codable`): aggiungere `var changedSkipped: Int = 0` (persistito, visibile in Tools → ultimo job, stesso trattamento degli altri contatori). Deve essere `var`, non `let`: una `let` con valore iniziale viene esclusa sia dal memberwise init sia dalla decodifica Codable in Swift.
 
 ### 2. `FileSyncer.syncFile` incrementa `changedSkipped`
 

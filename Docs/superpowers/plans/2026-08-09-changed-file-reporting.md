@@ -531,7 +531,7 @@ struct JobSummary: Codable {
     let errors: Int
     let hashErrors: Int
     let succeeded: Bool
-    let changedSkipped: Int = 0   // default: i JobSummary persistiti prima di questo campo restano decodificabili nei test che li costruiscono senza specificarlo
+    var changedSkipped: Int = 0   // deve essere "var", non "let": una "let" con valore iniziale viene esclusa sia dal memberwise init (i call site esistenti nei test smetterebbero di compilare) sia dalla decodifica Codable (verrebbe sempre 0, mai letta dal JSON persistito) — comportamento reale di Swift, verificato in questa sessione
 
     var isClean: Bool { succeeded && errors == 0 && hashErrors == 0 }
 }
