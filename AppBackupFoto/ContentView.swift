@@ -927,7 +927,8 @@ final class S3Syncer {
 
     func sync(from localURL: URL, config: S3Config,
               onStatus: @escaping (String) -> Void,
-              onProgress: @escaping (SyncResult) -> Void) async throws -> SyncResult {
+              onProgress: @escaping (SyncResult) -> Void,
+              onCurrentFile: @escaping (URL) -> Void = { _ in }) async throws -> SyncResult {
         cancelled = false
         var result = SyncResult()
 
@@ -976,7 +977,10 @@ final class S3Syncer {
             isCancelled: { self.cancelled },
             operation: { [self] item -> (url: URL, size: Int64, ok: Bool) in
                 if self.cancelled || Task.isCancelled { return (item.url, item.size, false) }
-                DispatchQueue.main.async { onStatus("Carico: \(item.url.lastPathComponent)") }
+                DispatchQueue.main.async {
+                    onStatus("Carico: \(item.url.lastPathComponent)")
+                    onCurrentFile(item.url)
+                }
                 do {
                     try await self.upload(url: item.url, key: item.key, config: config, onStatus: onStatus)
                     return (item.url, item.size, true)
