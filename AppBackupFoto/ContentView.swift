@@ -521,7 +521,8 @@ final class FileSyncer {
 
     func sync(from src: URL, to dst: URL, deep: Bool,
               onStatus: @escaping (String) -> Void,
-              onProgress: @escaping (SyncResult) -> Void) async throws -> SyncResult {
+              onProgress: @escaping (SyncResult) -> Void,
+              onCurrentFile: @escaping (URL) -> Void = { _ in }) async throws -> SyncResult {
         try await withCheckedThrowingContinuation { [self] cont in
             DispatchQueue.global(qos: .userInitiated).async {
                 self.cancelled = false
@@ -548,7 +549,8 @@ final class FileSyncer {
                         try self.fm.createDirectory(at: dst, withIntermediateDirectories: true)
                     }
                     try self.syncDir(src: src, dst: dst, base: src, deep: deep,
-                                     result: &result, onStatus: onStatus, onProgress: onProgress)
+                                     result: &result, onStatus: onStatus, onProgress: onProgress,
+                                     onCurrentFile: onCurrentFile)
                     cont.resume(returning: result)
                 } catch {
                     cont.resume(throwing: error)
@@ -572,7 +574,8 @@ final class FileSyncer {
     private func syncDir(src: URL, dst: URL, base: URL, deep: Bool,
                          result: inout SyncResult,
                          onStatus: @escaping (String) -> Void,
-                         onProgress: @escaping (SyncResult) -> Void) throws {
+                         onProgress: @escaping (SyncResult) -> Void,
+                         onCurrentFile: @escaping (URL) -> Void) throws {
         if cancelled { return }
         if !fm.fileExists(atPath: dst.path) {
             try fm.createDirectory(at: dst, withIntermediateDirectories: true)
@@ -589,10 +592,12 @@ final class FileSyncer {
             let destItem = dst.appendingPathComponent(item.lastPathComponent)
             if vals?.isDirectory == true {
                 try syncDir(src: item, dst: destItem, base: base, deep: deep,
-                            result: &result, onStatus: onStatus, onProgress: onProgress)
+                            result: &result, onStatus: onStatus, onProgress: onProgress,
+                            onCurrentFile: onCurrentFile)
             } else if vals?.isRegularFile == true {
                 syncFile(src: item, dst: destItem, deep: deep,
-                         result: &result, onStatus: onStatus, onProgress: onProgress)
+                         result: &result, onStatus: onStatus, onProgress: onProgress,
+                         onCurrentFile: onCurrentFile)
             }
         }
     }
@@ -600,7 +605,8 @@ final class FileSyncer {
     private func syncFile(src: URL, dst: URL, deep: Bool,
                           result: inout SyncResult,
                           onStatus: @escaping (String) -> Void,
-                          onProgress: @escaping (SyncResult) -> Void) {
+                          onProgress: @escaping (SyncResult) -> Void,
+                          onCurrentFile: @escaping (URL) -> Void) {
         let needs: Bool
         if !fm.fileExists(atPath: dst.path) {
             needs = true
@@ -626,6 +632,7 @@ final class FileSyncer {
                 let snap = result
                 DispatchQueue.main.async {
                     onStatus("Copia (\(snap.done + 1)/\(snap.total) — \(snap.percent)%): \(src.lastPathComponent)")
+                    onCurrentFile(src)
                 }
                 do {
                     let parent = dst.deletingLastPathComponent()
