@@ -267,6 +267,7 @@ struct JobStats {
     var speed: String = "—"
     var verifiedOk: Int = 0   // file copiati con SHA256 verificato con successo
     var hashErrors: Int = 0   // file con SHA256 mismatch dopo la copia
+    var changedSkipped: Int = 0   // file esistente ma diverso dalla sorgente, skippato per zero-overwrite (roadmap #13)
 }
 
 struct SpeedSample: Identifiable {
@@ -1652,6 +1653,7 @@ final class BackupRunner: ObservableObject {
                         self.stats.done = snap.done; self.stats.total = snap.total
                         self.stats.copied = snap.uploaded; self.stats.skipped = snap.skipped
                         self.stats.errors = snap.errors
+                        self.stats.changedSkipped = snap.changedSkipped
                         self.stats.elapsed = S3Syncer.SyncResult.hms(snap.elapsedSec)
                         self.stats.eta = snap.etaSec > 0 ? self.smoothEta(raw: snap.etaSec) : "—"
                         let elapsed = max(0.1, Date().timeIntervalSince(snap.startDate))
@@ -1667,6 +1669,7 @@ final class BackupRunner: ObservableObject {
                 var fr = FileSyncer.SyncResult()
                 fr.copied = r.uploaded; fr.skipped = r.skipped
                 fr.errors = r.errors; fr.done = r.done; fr.total = r.total
+                fr.changedSkipped = r.changedSkipped
                 return fr
             }
         } catch {
@@ -1798,7 +1801,8 @@ final class BackupRunner: ObservableObject {
         phase = .failed("Interrotto dall'utente")
         completionSnapshot = (phase, stats)
         JobHistoryStore.save(JobSummary(date: Date(), label: jobLabel, copied: stats.copied,
-            skipped: stats.skipped, errors: stats.errors, hashErrors: stats.hashErrors, succeeded: false))
+            skipped: stats.skipped, errors: stats.errors, hashErrors: stats.hashErrors,
+            succeeded: false, changedSkipped: stats.changedSkipped))
     }
 
     private func run(label: String, work: @escaping () async throws -> FileSyncer.SyncResult?) {
@@ -1834,6 +1838,7 @@ final class BackupRunner: ObservableObject {
                         self.stats.elapsed = FileSyncer.SyncResult.hms(r.elapsedSec)
                         self.stats.hashErrors = r.hashErrors          // mismatch SHA256
                         self.stats.verifiedOk = r.copied              // tutti i copied sono verified ok
+                        self.stats.changedSkipped = r.changedSkipped  // file cambiati, non copiati (roadmap #13)
                     }
                     self.phase = .success("Completato: \(label)")
                     Notifier.send(self.phase.label,
@@ -1841,7 +1846,8 @@ final class BackupRunner: ObservableObject {
                     self.completionSnapshot = (self.phase, self.stats)
                     JobHistoryStore.save(JobSummary(date: Date(), label: label, copied: self.stats.copied,
                         skipped: self.stats.skipped, errors: self.stats.errors,
-                        hashErrors: self.stats.hashErrors, succeeded: true))
+                        hashErrors: self.stats.hashErrors, succeeded: true,
+                        changedSkipped: self.stats.changedSkipped))
                 }
             } catch {
                 await MainActor.run {
@@ -1853,7 +1859,8 @@ final class BackupRunner: ObservableObject {
                     self.completionSnapshot = (self.phase, self.stats)
                     JobHistoryStore.save(JobSummary(date: Date(), label: label, copied: self.stats.copied,
                         skipped: self.stats.skipped, errors: self.stats.errors,
-                        hashErrors: self.stats.hashErrors, succeeded: false))
+                        hashErrors: self.stats.hashErrors, succeeded: false,
+                        changedSkipped: self.stats.changedSkipped))
                 }
             }
         }
@@ -1873,6 +1880,7 @@ final class BackupRunner: ObservableObject {
             self.stats.copied = r.copied; self.stats.skipped = r.skipped; self.stats.errors = r.errors
             self.stats.elapsed = FileSyncer.SyncResult.hms(r.elapsedSec)
             self.stats.hashErrors = r.hashErrors          // mismatch SHA256 in tempo reale
+            self.stats.changedSkipped = r.changedSkipped  // file cambiati, non copiati (roadmap #13)
             self.stats.verifiedOk = r.copied              // tutti i copied sono verified ok
             self.stats.eta = (r.copied > 0 && r.etaSec > 0) ? self.smoothEta(raw: r.etaSec) : "—"
             if r.elapsedSec > 0 {
@@ -1931,6 +1939,7 @@ struct JobSummary: Codable {
     let errors: Int
     let hashErrors: Int
     let succeeded: Bool
+    var changedSkipped: Int = 0   // default: i JobSummary persistiti prima di questo campo restano decodificabili nei test che li costruiscono senza specificarlo
 
     var isClean: Bool { succeeded && errors == 0 && hashErrors == 0 }
 }
@@ -2865,6 +2874,11 @@ struct CompletionSheet: View {
             if stats.hashErrors > 0 {
                 Label("\(stats.hashErrors) hash mismatch — controlla il log",
                       systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption).foregroundStyle(.orange).multilineTextAlignment(.center)
+            }
+            if stats.changedSkipped > 0 {
+                Label("\(stats.changedSkipped) file locali cambiati, non copiati (regola zero-overwrite)",
+                      systemImage: "arrow.triangle.2.circlepath")
                     .font(.caption).foregroundStyle(.orange).multilineTextAlignment(.center)
             }
             if stats.errors > 0 {
