@@ -5,6 +5,7 @@ import UserNotifications
 import UniformTypeIdentifiers
 import CryptoKit
 import Charts
+import ImageIO
 
 // MARK: - App entry
 @main
@@ -1527,6 +1528,8 @@ final class BackupRunner: ObservableObject {
     @Published var startTime: Date? = nil
     @Published var completionSnapshot: (phase: JobPhase, stats: JobStats)? = nil
     @Published var currentStatus = ""
+    @Published var currentThumbnail: NSImage?
+    private var thumbnailRequestID = UUID()
     @Published var speedHistory: [SpeedSample] = []
     @Published var speedUnit: String = "file/s"
 
@@ -1590,7 +1593,8 @@ final class BackupRunner: ObservableObject {
                 defer { self?.bm.stopAccessing(.photos); self?.bm.stopAccessing(.ssd) }
                 return try await self?.syncer.sync(from: photosURL, to: dst, deep: false,
                     onStatus: { self?.publishStatus($0) },
-                    onProgress: { self?.publishProgress($0) })
+                    onProgress: { self?.publishProgress($0) },
+                    onCurrentFile: { self?.publishCurrentFile($0) })
             }
         }
     }
@@ -1642,7 +1646,8 @@ final class BackupRunner: ObservableObject {
                 defer { self?.bm.stopAccessing(.ssd); self?.bm.stopAccessing(.hdd) }
                 let r = try await self?.syncer.sync(from: ssdURL, to: hddURL, deep: deep,
                     onStatus: { self?.publishStatus($0) },
-                    onProgress: { self?.publishProgress($0) })
+                    onProgress: { self?.publishProgress($0) },
+                    onCurrentFile: { self?.publishCurrentFile($0) })
                 if deep, (r?.errors ?? 1) == 0 {
                     UserDefaults.standard.set(Date(), forKey: self?.lastDeepKey ?? "")
                 }
@@ -1689,7 +1694,8 @@ final class BackupRunner: ObservableObject {
                             let fps = Double(snap.done) / elapsed
                             self.stats.speed = String(format: "%.0f elem/s", fps)
                         }
-                    })
+                    },
+                    onCurrentFile: { self?.publishCurrentFile($0) })
                 var fr = FileSyncer.SyncResult()
                 fr.copied = r.uploaded; fr.skipped = r.skipped
                 fr.errors = r.errors; fr.done = r.done; fr.total = r.total
@@ -1831,7 +1837,7 @@ final class BackupRunner: ObservableObject {
 
     private func run(label: String, work: @escaping () async throws -> FileSyncer.SyncResult?) {
         guard !isRunning else { return }
-        output = ""; stats = JobStats(); currentStatus = ""
+        output = ""; stats = JobStats(); currentStatus = ""; currentThumbnail = nil
         wasStopped = false
         let now = Date()
         completionSnapshot = nil; startTime = now
@@ -1920,6 +1926,33 @@ final class BackupRunner: ObservableObject {
                 }
             }
         }
+    }
+
+    func publishCurrentFile(_ url: URL) {
+        let requestID = UUID()
+        thumbnailRequestID = requestID
+        if FileKind.isImage(url: url) {
+            Task.detached(priority: .utility) { [weak self] in
+                let thumb = Self.makeThumbnail(url: url, maxPixelSize: 88)
+                await MainActor.run {
+                    guard let self, self.thumbnailRequestID == requestID else { return }
+                    self.currentThumbnail = thumb
+                }
+            }
+        } else {
+            currentThumbnail = NSWorkspace.shared.icon(forFile: url.path)
+        }
+    }
+
+    nonisolated private static func makeThumbnail(url: URL, maxPixelSize: Int) -> NSImage? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
+            kCGImageSourceCreateThumbnailWithTransform: true
+        ]
+        guard let cgThumb = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
+        return NSImage(cgImage: cgThumb, size: .zero)
     }
 
     private func appendSpeedSample(_ value: Double) {
