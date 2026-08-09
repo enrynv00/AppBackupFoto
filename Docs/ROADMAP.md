@@ -82,7 +82,7 @@ Fatti: #1 restore, #2 race stop/successo, #3 retry S3, #4 cleanup multipart, #6 
 
 **#19 (notarization/Developer ID) resta la causa di fondo non risolta**: la firma ad-hoc instabile è ancora la ragione per cui, se si ricompila l'app, la voce Keychain può tornare a chiedere due volte (kcacl + XARA) finché non viene ricreata pulita — vedi la nota in `Docs/CLAUDE.md` su BUG-2. Non bloccante per l'uso quotidiano (build stabile, non ricompilata di continuo), ma resta il fix duraturo se il problema si ripresenta spesso. Richiede Developer ID Application ($99/anno), da confermare con l'utente prima di procedere (costo ricorrente) — non ancora deciso.
 
-Il resto dei punti "valore aggiunto" (8, 11-18, 20) resta nell'ordine libero già indicato sopra, nessuna urgenza nuova rispetto al 2026-08-02.
+Il resto dei punti "valore aggiunto" (15-18, 20) resta nell'ordine libero già indicato sopra, nessuna urgenza nuova rispetto al 2026-08-02. #19 (notarization) resta la causa di fondo non risolta di BUG-2, vedi sopra.
 
 ## Fonti consultate
 
