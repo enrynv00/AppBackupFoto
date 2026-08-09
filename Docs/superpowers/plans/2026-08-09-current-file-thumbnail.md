@@ -409,7 +409,7 @@ Aggiungere, vicino agli altri metodi privati di supporto della classe (es. accan
         }
     }
 
-    private static func makeThumbnail(url: URL, maxPixelSize: Int) -> NSImage? {
+    nonisolated private static func makeThumbnail(url: URL, maxPixelSize: Int) -> NSImage? {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
         let options: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
@@ -420,6 +420,8 @@ Aggiungere, vicino agli altri metodi privati di supporto della classe (es. accan
         return NSImage(cgImage: cgThumb, size: .zero)
     }
 ```
+
+**Nota tecnica — `nonisolated` non è opzionale**: `BackupRunner` è `@MainActor` (dichiarazione della classe), e l'isolamento si propaga per inferenza a tutti i membri inclusi i metodi `static`. Senza `nonisolated`, `makeThumbnail` sarebbe MainActor-isolated e la chiamata `Self.makeThumbnail(...)` dentro `Task.detached` (che gira fuori dal MainActor) non compilerebbe senza `await` — e mettere `await` lì vanificherebbe lo scopo di generare la miniatura in background, riportando il lavoro sul MainActor esattamente come si voleva evitare. `nonisolated` è corretto qui perché la funzione è pura (nessun accesso a stato dell'attore).
 
 - [ ] **Step 5: Azzerare `currentThumbnail` a inizio job, stesso punto di `currentStatus`**
 
