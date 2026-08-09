@@ -47,6 +47,12 @@ private struct MenuBarIcon: View {
     var body: some View {
         Image(systemName: "photo.stack")
             .symbolEffect(.pulse, isActive: runner.isRunning)
+            .onChange(of: runner.stats.percent) { _, _ in updateDockBadge() }
+            .onChange(of: runner.isRunning) { _, _ in updateDockBadge() }
+    }
+
+    private func updateDockBadge() {
+        NSApp.dockTile.badgeLabel = runner.isRunning ? "\(runner.stats.percent)%" : nil
     }
 }
 
