@@ -645,6 +645,13 @@ final class FileSyncer {
 // MARK: - S3Syncer (native Swift, no rclone subprocess)
 final class S3Syncer {
 
+    // BUG-3: una key già presente su S3 non va mai ricaricata, indipendentemente
+    // dalla dimensione locale — ricaricare sovrascriverebbe l'oggetto esistente via
+    // PUT, violando zero-overwrite. Solo le key davvero assenti vengono caricate.
+    static func shouldUpload(key: String, existingKeys: Set<String>) -> Bool {
+        !existingKeys.contains(key)
+    }
+
     struct S3Config {
         let accessKeyId: String
         let secretAccessKey: String
@@ -917,7 +924,8 @@ final class S3Syncer {
             files.append((url: f, key: rel, size: Int64(v?.fileSize ?? 0)))
         }
 
-        let toUpload = files.filter { existing[$0.key] != $0.size }
+        let existingKeys = Set(existing.keys)
+        let toUpload = files.filter { S3Syncer.shouldUpload(key: $0.key, existingKeys: existingKeys) }
         result.total = files.count
         result.toUploadCount = toUpload.count
         result.skipped = files.count - toUpload.count
