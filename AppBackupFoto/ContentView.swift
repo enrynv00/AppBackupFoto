@@ -654,6 +654,14 @@ final class S3Syncer {
         !existingKeys.contains(key)
     }
 
+    // Conteggio informativo per roadmap #13 (segnalazione, non azione): una key già
+    // presente su S3 con dimensione diversa da quella locale. Non influenza in alcun
+    // modo shouldUpload/la decisione di caricare.
+    static func isChangedExistingKey(key: String, size: Int64, existing: [String: Int64]) -> Bool {
+        guard let existingSize = existing[key] else { return false }
+        return existingSize != size
+    }
+
     struct S3Config {
         let accessKeyId: String
         let secretAccessKey: String
@@ -722,6 +730,7 @@ final class S3Syncer {
         var total = 0; var done = 0; var startDate = Date()
         var uploadedBytes: Int64 = 0
         var toUploadCount: Int = 0
+        var changedSkipped = 0   // key esistente con dimensione diversa (roadmap #13)
         var percent: Int { total > 0 ? min(100, done * 100 / total) : 0 }
         var elapsedSec: Int { Int(Date().timeIntervalSince(startDate)) }
         // ETA basato sugli upload effettivi (non sui file già presenti su S3)
@@ -930,6 +939,9 @@ final class S3Syncer {
         let toUpload = files.filter { S3Syncer.shouldUpload(key: $0.key, existingKeys: existingKeys) }
         result.total = files.count
         result.toUploadCount = toUpload.count
+        result.changedSkipped = files.filter {
+            S3Syncer.isChangedExistingKey(key: $0.key, size: $0.size, existing: existing)
+        }.count
         result.skipped = files.count - toUpload.count
         result.done = result.skipped
         let initSnap = result
