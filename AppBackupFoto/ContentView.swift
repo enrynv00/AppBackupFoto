@@ -314,6 +314,13 @@ func isLikelyVolumeRoot(_ url: URL) -> Bool {
     url.pathComponents.count <= 3
 }
 
+enum FileKind {
+    static func isImage(url: URL) -> Bool {
+        guard let type = UTType(filenameExtension: url.pathExtension) else { return false }
+        return type.conforms(to: .image)
+    }
+}
+
 func sha256(of url: URL) -> String? {
     // I/O POSIX a basso livello (open/read/close) invece di FileHandle.readData(ofLength:):
     // su file molto grandi (decine di GB), FileHandle/NSData tende a mantenere le pagine
