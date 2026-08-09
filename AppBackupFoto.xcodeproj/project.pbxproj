@@ -209,10 +209,10 @@
 				};
 			};
 			buildConfigurationList = 695F43322EB019B300509478 /* Build configuration list for PBXProject "AppBackupFoto" */;
-			developmentRegion = en;
+			developmentRegion = it;
 			hasScannedForEncodings = 0;
 			knownRegions = (
-				en,
+				it,
 				Base,
 			);
 			mainGroup = 695F432E2EB019B300509478;

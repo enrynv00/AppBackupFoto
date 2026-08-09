@@ -1,0 +1,327 @@
+{
+  "sourceLanguage" : "it",
+  "strings" : {
+    "" : {
+
+    },
+    "%@ · Copiati %lld · Skippati %lld · Errori %lld · Hash-mismatch %lld" : {
+      "localizations" : {
+        "it" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$@ · Copiati %2$lld · Skippati %3$lld · Errori %4$lld · Hash-mismatch %5$lld"
+          }
+        }
+      }
+    },
+    "%@: %lld mismatch su %lld verificati — %@" : {
+      "localizations" : {
+        "it" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$@: %2$lld mismatch su %3$lld verificati — %4$@"
+          }
+        }
+      }
+    },
+    "%@: %lld/%lld verificati, 0 problemi" : {
+      "localizations" : {
+        "it" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$@: %2$lld/%3$lld verificati, 0 problemi"
+          }
+        }
+      }
+    },
+    "%@: saltato — %@" : {
+      "localizations" : {
+        "it" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$@: saltato — %2$@"
+          }
+        }
+      }
+    },
+    "%lld / %lld file" : {
+      "localizations" : {
+        "it" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$lld / %2$lld file"
+          }
+        }
+      }
+    },
+    "%lld file locali cambiati, non copiati (regola zero-overwrite)" : {
+
+    },
+    "%lld file non è stato possibile recuperare" : {
+
+    },
+    "%lld file verificati con SHA256 ✓" : {
+
+    },
+    "%lld hash mismatch — controlla il log" : {
+
+    },
+    "%lld%%" : {
+
+    },
+    "AccessKey" : {
+
+    },
+    "Aggiorna da rclone.conf" : {
+
+    },
+    "Annulla" : {
+
+    },
+    "Anteprima: mostra quanti file verranno copiati senza avviare il backup" : {
+
+    },
+    "Appena colleghi l'SSD, se l'app è aperta, parte da sola l'aggiornamento da Foto a SSD." : {
+
+    },
+    "Appena selezioni la Libreria Foto l'app si apre — SSD e HDD puoi configurarli quando vuoi, anche più avanti da Impostazioni." : {
+
+    },
+    "Apri AppBackupFoto" : {
+
+    },
+    "Apri cartella" : {
+
+    },
+    "Apri rclone.conf in TextEdit" : {
+
+    },
+    "Aspetto Interfaccia" : {
+
+    },
+    "Avanzamento" : {
+
+    },
+    "Avviato alle" : {
+
+    },
+    "Backup Foto" : {
+
+    },
+    "Backup automatico Mac → SSD quando colleghi l'SSD" : {
+
+    },
+    "Backup completato" : {
+
+    },
+    "Backup fallito" : {
+
+    },
+    "Cambia" : {
+
+    },
+    "Cambia cartella…" : {
+
+    },
+    "Cartella" : {
+
+    },
+    "Cartelle Configurate" : {
+
+    },
+    "Catalogo" : {
+
+    },
+    "Cerca per nome o cartella" : {
+
+    },
+    "Chiudi" : {
+
+    },
+    "Configurazione Backup Foto" : {
+
+    },
+    "Continua" : {
+
+    },
+    "Controlla il log per i dettagli sugli errori." : {
+
+    },
+    "Controllo upload incompleti disponibile a job fermo" : {
+
+    },
+    "Copia" : {
+
+    },
+    "Cosa vuoi ripristinare?" : {
+
+    },
+    "Da dove vuoi ripristinare?" : {
+
+    },
+    "Data" : {
+
+    },
+    "Destinazione" : {
+
+    },
+    "Diagnostica" : {
+
+    },
+    "Dimensione" : {
+
+    },
+    "Dopo potrai trascinarle nell'app Foto quando vuoi." : {
+
+    },
+    "Dove vuoi salvare le foto?" : {
+
+    },
+    "Elimina" : {
+
+    },
+    "Enrico Nanni Vicenzi" : {
+
+    },
+    "Esci" : {
+
+    },
+    "Fatto! Le tue foto sono qui" : {
+
+    },
+    "Ho già un backup, voglio ripristinare" : {
+
+    },
+    "Il grafico velocità appare quando avvii un'operazione" : {
+
+    },
+    "Impostazioni" : {
+
+    },
+    "Indietro" : {
+
+    },
+    "Interrompi" : {
+
+    },
+    "Log" : {
+
+    },
+    "Modifica le cartelle selezionate" : {
+
+    },
+    "Mostra" : {
+
+    },
+    "Nascondi" : {
+
+    },
+    "Nessun file trovato" : {
+
+    },
+    "Nessun job registrato" : {
+
+    },
+    "Nessun risultato per \"%@\"" : {
+
+    },
+    "Nome" : {
+
+    },
+    "OK" : {
+
+    },
+    "Operazioni" : {
+
+    },
+    "Origine: Keychain" : {
+
+    },
+    "Origine: rclone.conf" : {
+
+    },
+    "Prima di scaricare da Cubbit" : {
+
+    },
+    "Recuperate %lld di %lld foto" : {
+      "localizations" : {
+        "it" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Recuperate %1$lld di %2$lld foto"
+          }
+        }
+      }
+    },
+    "Revisione" : {
+
+    },
+    "Ripristina" : {
+
+    },
+    "S3 — Cubbit" : {
+
+    },
+    "Salva" : {
+
+    },
+    "Scegli cartella…" : {
+
+    },
+    "SecretKey" : {
+
+    },
+    "Seleziona" : {
+
+    },
+    "Seleziona le cartelle una volta sola — l'app le ricorderà automaticamente." : {
+
+    },
+    "Sono già tutte selezionate — deseleziona solo quello che non ti serve." : {
+
+    },
+    "Sto leggendo %@…" : {
+
+    },
+    "Sync Info" : {
+
+    },
+    "Tempo" : {
+
+    },
+    "Tempo stimato: %@" : {
+
+    },
+    "Ultimo job: %@" : {
+
+    },
+    "Upload incompleti trovati" : {
+
+    },
+    "Verifica Cubbit in corso…" : {
+
+    },
+    "Verifica in corso…" : {
+
+    },
+    "Verifica integrità campione (20 file per coppia)" : {
+
+    },
+    "Versione %@" : {
+
+    },
+    "Volumi" : {
+
+    },
+    "iniziato il %@" : {
+
+    },
+    "rclone.conf non trovato o credenziali mancanti" : {
+
+    },
+    "velocita %@" : {
+
+    }
+  },
+  "version" : "1.0"
+}
