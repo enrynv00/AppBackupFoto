@@ -64,7 +64,7 @@ Versione visiva (con link alle fonti): vedi artifact pubblicato in sessione, opp
 16. ✅ **Fatto in parte (2026-08-09) — Notifiche non azionabili.** Scoperto durante il brainstorming che non esisteva nessuna notifica di errore (solo di successo) — aggiunta quella, senza bottone "Riprova": deciso esplicitamente contro, complessità (categoria + delegate + routing per job) sproporzionata per un'app single-user usata quasi sempre con la finestra a portata di mano. Vedi `Docs/superpowers/specs/2026-08-09-error-notification-design.md`.
 17. ✅ **Fatto (2026-08-09) — Nessuna miniatura dell'ultimo file backuppato.** Miniatura live in `StatsPanel` durante un job (foto vera via ImageIO per le immagini, icona di sistema per il resto, es. gli zip nella cartella "Zip") — solo live, non nel riepilogo finale. Vedi `Docs/superpowers/specs/2026-08-09-current-file-thumbnail-design.md`.
     *Fonte: ricerca su pattern UX di Mylio Photos*
-18. **Nessun auto-update** — ogni build richiede Archive→Distribute→Copy a mano. Sparkle è lo standard open-source, con verifica EdDSA integrata.
+18. ✅ **Fatto (2026-08-10) — Nessun auto-update.** `SPUStandardUpdaterController` (Sparkle 2.x via SPM), check automatico in background + voce manuale, installazione sempre dietro click esplicito. `Script/release.sh` automatizza build→firma EdDSA→GitHub Release→appcast.xml. Repo GitHub pubblico da creare (placeholder username ancora da sostituire) prima della prima release reale. Vedi `Docs/superpowers/specs/2026-08-10-sparkle-auto-update-design.md`.
     *Fonte: ricerca su Sparkle, documentazione ufficiale e best practice code signing 2026*
 19. **Firma "ad-hoc", nessuna notarization** — necessario solo se l'app esce dal Mac attuale. Richiede Developer ID Application ($99/anno) e Hardened Runtime.
     *Fonte: ricerca su requisiti Developer ID/notarization macOS 2026*
@@ -74,7 +74,7 @@ Versione visiva (con link alle fonti): vedi artifact pubblicato in sessione, opp
 
 ## Da dove partire (aggiornato 2026-08-02)
 
-Fatti: #1 restore, #2 race stop/successo, #3 retry S3, #4 cleanup multipart, #6 upload paralleli, #7 scheduling (Mac→SSD su collegamento SSD), #8 controllo spazio, #9 anteprima S3, #10 Keychain, #11 icona menu bar (scorciatoia), #12 catalogo backup, #13 segnalazione file cambiati, #14 String Catalog, #15 badge Dock, #16 notifica errore, #17 miniatura live. #5 (cifratura lato client) valutato e deciso esplicitamente contro, per ora — non riproporre senza un motivo nuovo, vedi sopra. Nessun punto critico/alto resta aperto nella lista originale: quello che rimane sono i punti "valore aggiunto" 18-20 (auto-update, notarization, pannello Revisione periodico), ordinabili in base al tempo che si vuole investirci. #11 è stato scoperto avere obiettivo reale "solo scorciatoia" (non modalità background) — se in futuro si vorrà davvero estendere lo scheduling anche ad app chiusa, quella è una decisione nuova da riaprire, non coperta da #11 così com'è stato fatto.
+Fatti: #1 restore, #2 race stop/successo, #3 retry S3, #4 cleanup multipart, #6 upload paralleli, #7 scheduling (Mac→SSD su collegamento SSD), #8 controllo spazio, #9 anteprima S3, #10 Keychain, #11 icona menu bar (scorciatoia), #12 catalogo backup, #13 segnalazione file cambiati, #14 String Catalog, #15 badge Dock, #16 notifica errore, #17 miniatura live, #18 auto-update (Sparkle). #5 (cifratura lato client) valutato e deciso esplicitamente contro, per ora — non riproporre senza un motivo nuovo, vedi sopra. Nessun punto critico/alto resta aperto nella lista originale: quello che rimane sono i punti "valore aggiunto" 19-20 (notarization, pannello Revisione periodico), ordinabili in base al tempo che si vuole investirci. #11 è stato scoperto avere obiettivo reale "solo scorciatoia" (non modalità background) — se in futuro si vorrà davvero estendere lo scheduling anche ad app chiusa, quella è una decisione nuova da riaprire, non coperta da #11 così com'è stato fatto.
 
 ## Stato aggiornato (2026-08-09)
 
@@ -82,7 +82,7 @@ Fatti: #1 restore, #2 race stop/successo, #3 retry S3, #4 cleanup multipart, #6 
 
 **#19 (notarization/Developer ID) resta la causa di fondo non risolta**: la firma ad-hoc instabile è ancora la ragione per cui, se si ricompila l'app, la voce Keychain può tornare a chiedere due volte (kcacl + XARA) finché non viene ricreata pulita — vedi la nota in `Docs/CLAUDE.md` su BUG-2. Non bloccante per l'uso quotidiano (build stabile, non ricompilata di continuo), ma resta il fix duraturo se il problema si ripresenta spesso. Richiede Developer ID Application ($99/anno), da confermare con l'utente prima di procedere (costo ricorrente) — non ancora deciso.
 
-Il resto dei punti "valore aggiunto" (18, 20) resta nell'ordine libero già indicato sopra, nessuna urgenza nuova rispetto al 2026-08-02. #19 (notarization) resta la causa di fondo non risolta di BUG-2, vedi sopra.
+**#18 (auto-update) fatto (2026-08-10)**: Sparkle 2.x integrato, vedi punto 18 sopra e `Docs/CLAUDE.md`. Il resto dei punti "valore aggiunto" (20) resta nell'ordine libero già indicato sopra, nessuna urgenza nuova rispetto al 2026-08-02. #19 (notarization) resta la causa di fondo non risolta di BUG-2, vedi sopra.
 
 ## Fonti consultate
 
