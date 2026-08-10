@@ -3107,6 +3107,7 @@ struct HamburgerPanel: View {
 
     @Environment(\.openWindow) private var openWindow
     @EnvironmentObject private var runner: BackupRunner
+    @EnvironmentObject private var updater: UpdaterViewModel
     @ObservedObject private var appearance = AppearanceManager.shared
     @State private var showAppearance = false
     @State private var showRestore = false
@@ -3185,6 +3186,9 @@ struct HamburgerPanel: View {
                                 await runner.loadS3ConfigIfNeeded()
                                 await MainActor.run { openWindow(id: "catalog") }
                             }
+                        }
+                        HamburgerRow(icon: "arrow.triangle.2.circlepath", label: "Controlla aggiornamenti", iconColor: .cyan) {
+                            updater.controller.checkForUpdates(nil)
                         }
 
                         HamburgerSectionLabel("Preferenze").padding(.top, 6)
