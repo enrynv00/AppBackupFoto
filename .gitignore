@@ -10,6 +10,7 @@ DerivedData/
 Log/
 Script/*.log
 Script/*.csv
+Script/*.rtf
 
 # Auto-update (roadmap #18): chiave privata EdDSA, tool CLI Sparkle scaricati, output di release — mai in git
 eddsa-private-key-backup.txt
