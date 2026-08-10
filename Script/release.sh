@@ -2,16 +2,16 @@
 # Uso: Script/release.sh <versione, es. 1.1.0>
 # Build → archive → firma EdDSA → pubblica su GitHub Releases → aggiorna appcast.xml.
 # Richiede: repo GitHub pubblico già esistente (vedi Docs/superpowers/plans/2026-08-10-sparkle-auto-update.md Task 8),
-# `gh` autenticato, PLACEHOLDER-github-username già sostituito con lo username reale in Info.plist/appcast.xml/questo script.
+# `gh` autenticato, enrynv00 già sostituito con lo username reale in Info.plist/appcast.xml/questo script.
 set -euo pipefail
 
 VERSION="${1:?Uso: Script/release.sh <versione, es. 1.1.0>}"
-GITHUB_REPO="PLACEHOLDER-github-username/AppBackupFoto"
+GITHUB_REPO="enrynv00/AppBackupFoto"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 if [[ "$GITHUB_REPO" == PLACEHOLDER-* ]]; then
-  echo "ERRORE: sostituisci PLACEHOLDER-github-username in Script/release.sh con lo username GitHub reale prima di rilasciare." >&2
+  echo "ERRORE: sostituisci enrynv00 in Script/release.sh con lo username GitHub reale prima di rilasciare." >&2
   exit 1
 fi
 

@@ -23,7 +23,7 @@
 	<key>NSHumanReadableCopyright</key>
 	<string></string>
 	<key>SUFeedURL</key>
-	<string>https://raw.githubusercontent.com/PLACEHOLDER-github-username/AppBackupFoto/main/appcast.xml</string>
+	<string>https://raw.githubusercontent.com/enrynv00/AppBackupFoto/main/appcast.xml</string>
 	<key>SUPublicEDKey</key>
 	<string>AtAKSgFl5/Ks9s2ZNLZUIA55OdhBKUvLL88XQd/d4eE=</string>
 	<key>SUEnableAutomaticChecks</key>
