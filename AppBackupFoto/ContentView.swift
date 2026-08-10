@@ -6,16 +6,30 @@ import UniformTypeIdentifiers
 import CryptoKit
 import Charts
 import ImageIO
+import Sparkle
 
 // MARK: - App entry
+final class UpdaterViewModel: ObservableObject {
+    let controller: SPUStandardUpdaterController
+    init() {
+        controller = SPUStandardUpdaterController(
+            startingUpdater: true,
+            updaterDelegate: nil,
+            userDriverDelegate: nil
+        )
+    }
+}
+
 @main
 struct BackupFotoEnricoApp: App {
     @StateObject private var runner = BackupRunner()
+    @StateObject private var updater = UpdaterViewModel()
 
     var body: some Scene {
         WindowGroup(id: "main") {
             RootView()
                 .environmentObject(runner)
+                .environmentObject(updater)
                 .frame(minWidth: 960, minHeight: 620)
         }
         Window("Diagnostica", id: "tools") {
