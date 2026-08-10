@@ -67,7 +67,7 @@ gh release create "v$VERSION" "$ZIP_PATH" --repo "$GITHUB_REPO" --title "v$VERSI
 
 echo "==> Aggiorno appcast.xml..."
 ENCLOSURE_URL="https://github.com/$GITHUB_REPO/releases/download/v$VERSION/AppBackupFoto-$VERSION.zip"
-PUBDATE="$(date -u +"%a, %d %b %Y %H:%M:%S %z")"
+PUBDATE="$(LC_TIME=C date -u +"%a, %d %b %Y %H:%M:%S %z")"
 python3 - "$ROOT_DIR/appcast.xml" "$VERSION" "$NEXT_BUILD" "$ZIP_LENGTH" "$SIGNATURE" "$ENCLOSURE_URL" "$PUBDATE" <<'PYEOF'
 import sys
 path, version, build, length, signature, url, pubdate = sys.argv[1:8]
