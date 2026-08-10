@@ -2996,7 +2996,7 @@ struct SidebarView: View {
 
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Backup Foto").font(.title2).fontWeight(.semibold)
-                    Text("Enrico Nanni Vicenzi").font(.caption).foregroundStyle(.secondary)
+                    Text("Backup personale").font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
             }
@@ -3102,8 +3102,8 @@ struct HamburgerPanel: View {
     @Binding var showSettings: Bool
     var onShowLog: (() -> Void)? = nil
     private let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
-    private let profileName = "Enrico Nanni Vicenzi"
-    private let profileEmail = "enrynv@gmail.com"
+    private let profileName = "Backup Foto"
+    private let profileEmail = ""
 
     @Environment(\.openWindow) private var openWindow
     @EnvironmentObject private var runner: BackupRunner
