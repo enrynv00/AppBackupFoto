@@ -5,5 +5,13 @@
         <link>https://raw.githubusercontent.com/enrynv00/AppBackupFoto/main/appcast.xml</link>
         <description>Aggiornamenti di AppBackupFoto</description>
         <language>it</language>
+        <item>
+            <title>Versione 1.1.0</title>
+            <pubDate>lun, 10 ago 2026 22:46:05 +0000</pubDate>
+            <sparkle:version>2</sparkle:version>
+            <sparkle:shortVersionString>1.1.0</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>15.6</sparkle:minimumSystemVersion>
+            <enclosure url="https://github.com/enrynv00/AppBackupFoto/releases/download/v1.1.0/AppBackupFoto-1.1.0.zip" length="1889561" type="application/octet-stream" sparkle:edSignature="eFuik0QF9s/qGPWZFr0lGsZrxvs7vf9QPQVdIIpyacau6HON6+9ExTRxqH8RrjBk36J07DWB9cRIU3pT40y9Cw=="/>
+        </item>
     </channel>
 </rss>
