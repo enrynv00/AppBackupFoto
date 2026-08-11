@@ -6,6 +6,14 @@
         <description>Aggiornamenti di AppBackupFoto</description>
         <language>it</language>
         <item>
+            <title>Versione 1.1.1</title>
+            <pubDate>Tue, 11 Aug 2026 09:56:15 +0000</pubDate>
+            <sparkle:version>3</sparkle:version>
+            <sparkle:shortVersionString>1.1.1</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>15.6</sparkle:minimumSystemVersion>
+            <enclosure url="https://github.com/enrynv00/AppBackupFoto/releases/download/v1.1.1/AppBackupFoto-1.1.1.zip" length="1889550" type="application/octet-stream" sparkle:edSignature="rbIIhAXjNaGD0RjNQg50CvsG3eegmBD4V/2e1lSFYYNWH3nBGJQK78xxM8UWfTz+dnaDdFhLyaDDA7RcJ4JrCQ=="/>
+        </item>
+        <item>
             <title>Versione 1.1.0</title>
             <pubDate>Mon, 10 Aug 2026 22:46:05 +0000</pubDate>
             <sparkle:version>2</sparkle:version>
