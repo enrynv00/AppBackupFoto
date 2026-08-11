@@ -1,3 +1,16 @@
 {
-  "model": "claude-sonnet-5"
+  "model": "claude-sonnet-5",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /Users/enriconannivicenzi/Desktop/AppBackupFoto/.claude/hooks/protect_log_dir.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
 }
