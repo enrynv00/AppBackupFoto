@@ -11,6 +11,17 @@
           }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /Users/enriconannivicenzi/Desktop/AppBackupFoto/.claude/hooks/require_recent_build.py",
+            "timeout": 10
+          }
+        ]
+      }
     ]
   }
 }
