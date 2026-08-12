@@ -2890,7 +2890,7 @@ struct ContentView: View {
                             }.buttonStyle(.bordered).controlSize(.small).tint(AppColor.error)
                         }
                     }
-                    .padding(.horizontal, AppSpacing.lg).padding(.vertical, AppSpacing.sm).background(.bar)
+                    .padding(.horizontal, AppSpacing.lg).padding(.vertical, AppSpacing.sm).background(.regularMaterial)
                     Divider()
                     SpeedLogPanel(history: runner.speedHistory, output: runner.output, speedUnit: runner.speedUnit, activeTab: $activeSpeedTab)
                         .padding(.horizontal, AppSpacing.lg).padding(.top, AppSpacing.md).padding(.bottom, AppSpacing.sm)
