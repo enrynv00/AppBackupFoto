@@ -59,6 +59,19 @@ enum AppIconSize {
     static let heroLarge: CGFloat = 48
 }
 
+/// Sfondo "card" riusato in tutta l'app: stesso corner radius/opacità ovunque.
+struct CardBackground: ViewModifier {
+    func body(content: Content) -> some View {
+        content
+            .background(.quaternary.opacity(AppSpacing.cardOpacity))
+            .clipShape(RoundedRectangle(cornerRadius: AppSpacing.cardCornerRadius))
+    }
+}
+
+extension View {
+    func cardBackground() -> some View { modifier(CardBackground()) }
+}
+
 // MARK: - App entry
 final class UpdaterViewModel: ObservableObject {
     let controller: SPUStandardUpdaterController
@@ -2598,7 +2611,7 @@ struct RestoreView: View {
                 Spacer()
                 Image(systemName: "chevron.right").font(.caption).foregroundStyle(.secondary)
             }
-            .padding(AppSpacing.md).background(.quaternary.opacity(0.4)).clipShape(RoundedRectangle(cornerRadius: 8))
+            .padding(AppSpacing.md).cardBackground()
         }
         .buttonStyle(.plain)
         .disabled(!available)
@@ -2613,7 +2626,7 @@ struct RestoreView: View {
                     ProgressView().controlSize(.small)
                     Text("Verifica Cubbit in corso…").font(AppFont.body).foregroundStyle(.secondary)
                     Spacer()
-                }.padding(AppSpacing.md).background(.quaternary.opacity(0.4)).clipShape(RoundedRectangle(cornerRadius: 8))
+                }.padding(AppSpacing.md).cardBackground()
             case .available:
                 Button {
                     selectedSource = .s3
@@ -2624,7 +2637,7 @@ struct RestoreView: View {
                         Spacer()
                         Image(systemName: "chevron.right").font(.caption).foregroundStyle(.secondary)
                     }
-                    .padding(AppSpacing.md).background(.quaternary.opacity(0.4)).clipShape(RoundedRectangle(cornerRadius: 8))
+                    .padding(AppSpacing.md).cardBackground()
                 }.buttonStyle(.plain)
             case .unavailable(let reason):
                 HStack {
@@ -2634,7 +2647,7 @@ struct RestoreView: View {
                     }
                     Spacer()
                 }
-                .padding(AppSpacing.md).background(.quaternary.opacity(0.4)).clipShape(RoundedRectangle(cornerRadius: 8))
+                .padding(AppSpacing.md).cardBackground()
                 .opacity(0.45)
             }
         }
@@ -2690,7 +2703,7 @@ struct RestoreView: View {
                                 Text(folder).font(AppFont.body)
                                 Spacer()
                             }
-                            .padding(AppSpacing.md).background(.quaternary.opacity(AppSpacing.cardOpacity)).clipShape(RoundedRectangle(cornerRadius: AppSpacing.cardCornerRadius))
+                            .padding(AppSpacing.md).cardBackground()
                         }.buttonStyle(.plain)
                     }
                 }
@@ -2855,7 +2868,7 @@ struct LocationRow: View {
             Button(bm.urls[location] != nil ? "Cambia" : "Seleziona", action: onSelect)
                 .buttonStyle(.bordered).controlSize(.small)
         }
-        .padding(12).background(.quaternary.opacity(0.4)).clipShape(RoundedRectangle(cornerRadius: 8))
+        .padding(12).cardBackground()
     }
 }
 
@@ -3618,7 +3631,7 @@ struct AppearanceSheet: View {
                     .buttonStyle(.plain)
                 }
             }
-            .padding(AppSpacing.sm).background(.quaternary.opacity(AppSpacing.cardOpacity)).clipShape(RoundedRectangle(cornerRadius: AppSpacing.cardCornerRadius))
+            .padding(AppSpacing.sm).cardBackground()
             Button("OK") { dismiss() }
                 .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
         }
