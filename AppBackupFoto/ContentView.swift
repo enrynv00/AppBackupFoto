@@ -2590,7 +2590,7 @@ struct RestoreView: View {
         } label: {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(source.displayName).font(.system(size: 14, weight: .medium))
+                    Text(source.displayName).font(AppFont.body)
                     if !available {
                         Text(unavailableReason).font(.caption).foregroundStyle(.secondary)
                     }
@@ -2611,7 +2611,7 @@ struct RestoreView: View {
             case .checking:
                 HStack {
                     ProgressView().controlSize(.small)
-                    Text("Verifica Cubbit in corso…").font(.system(size: 14)).foregroundStyle(.secondary)
+                    Text("Verifica Cubbit in corso…").font(AppFont.body).foregroundStyle(.secondary)
                     Spacer()
                 }.padding(14).background(.quaternary.opacity(0.4)).clipShape(RoundedRectangle(cornerRadius: 8))
             case .available:
@@ -2620,7 +2620,7 @@ struct RestoreView: View {
                     proceedToFolders(rootURL: nil)
                 } label: {
                     HStack {
-                        Text(RestoreSource.s3.displayName).font(.system(size: 14, weight: .medium))
+                        Text(RestoreSource.s3.displayName).font(AppFont.body)
                         Spacer()
                         Image(systemName: "chevron.right").font(.caption).foregroundStyle(.secondary)
                     }
@@ -2629,7 +2629,7 @@ struct RestoreView: View {
             case .unavailable(let reason):
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(RestoreSource.s3.displayName).font(.system(size: 14, weight: .medium))
+                        Text(RestoreSource.s3.displayName).font(AppFont.body)
                         Text(reason).font(.caption).foregroundStyle(.secondary)
                     }
                     Spacer()
@@ -2687,7 +2687,7 @@ struct RestoreView: View {
                             HStack {
                                 Image(systemName: selectedFolders.contains(folder) ? "checkmark.square.fill" : "square")
                                     .foregroundStyle(selectedFolders.contains(folder) ? Color.accentColor : Color.secondary)
-                                Text(folder).font(.system(size: 14))
+                                Text(folder).font(AppFont.body)
                                 Spacer()
                             }
                             .padding(10).background(.quaternary.opacity(0.3)).clipShape(RoundedRectangle(cornerRadius: 6))
@@ -2747,7 +2747,7 @@ struct RestoreView: View {
                 ProgressView(value: Double(engine.progress.percent), total: 100)
                     .progressViewStyle(.linear).frame(maxWidth: 320)
                 Text("Recuperate \(engine.progress.done) di \(engine.progress.total) foto")
-                    .font(.system(size: 15, weight: .medium))
+                    .font(AppFont.body)
                 if engine.progress.etaSec > 0 {
                     Text("Tempo stimato: \(FileSyncer.SyncResult.hms(engine.progress.etaSec))")
                         .font(.caption).foregroundStyle(.secondary)
@@ -2767,7 +2767,7 @@ struct RestoreView: View {
                 Button("Chiudi") { dismiss() }.buttonStyle(.borderedProminent)
             case .failed(let msg):
                 Image(systemName: "exclamationmark.triangle.fill").font(.system(size: 48)).foregroundStyle(AppColor.warning)
-                Text(msg).font(.system(size: 14)).multilineTextAlignment(.center)
+                Text(msg).font(AppFont.body).multilineTextAlignment(.center)
                 Button("Chiudi") { dismiss() }.buttonStyle(.borderedProminent)
             case .idle:
                 ProgressView()
@@ -2842,12 +2842,12 @@ struct LocationRow: View {
             Image(systemName: bm.urls[location] != nil ? "checkmark.circle.fill" : "circle")
                 .foregroundStyle(bm.urls[location] != nil ? AppColor.success : .secondary).font(.system(size: 18))
             VStack(alignment: .leading, spacing: 2) {
-                Text(location.displayName).font(.system(size: 13, weight: .medium))
+                Text(location.displayName).font(AppFont.body)
                 if let url = bm.urls[location] {
-                    Text(url.path).font(.caption2).foregroundStyle(.secondary)
+                    Text(url.path).font(AppFont.caption).foregroundStyle(.secondary)
                         .lineLimit(1).truncationMode(.middle)
                 } else {
-                    Text(location.hint).font(.caption2).foregroundStyle(.secondary)
+                    Text(location.hint).font(AppFont.caption).foregroundStyle(.secondary)
                         .lineLimit(1).truncationMode(.tail)
                 }
             }
@@ -3092,7 +3092,7 @@ struct SidebarView: View {
                 Divider()
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Avviato alle").font(.caption2).foregroundStyle(.secondary)
+                        Text("Avviato alle").font(AppFont.caption).foregroundStyle(.secondary)
                         Text(start, style: .time).font(.caption).monospacedDigit()
                     }
                     Spacer()
@@ -3109,7 +3109,7 @@ struct VolumeRow: View {
             Image(systemName: icon).font(.system(size: 13))
                 .foregroundStyle(mounted ? (alwaysOn ? AppColor.ssdToCubbit : Color.primary) : Color.secondary.opacity(0.4))
                 .frame(width: 20)
-            Text(name).font(.system(size: 13)).foregroundStyle(mounted ? Color.primary : Color.secondary)
+            Text(name).font(AppFont.body).foregroundStyle(mounted ? Color.primary : Color.secondary)
             Spacer()
             Circle().fill(mounted ? (alwaysOn ? AppColor.ssdToCubbit : AppColor.success) : Color.secondary.opacity(0.3))
                 .frame(width: 7, height: 7)
@@ -3128,9 +3128,9 @@ struct OpsButton: View {
                     Image(systemName: icon).font(.system(size: 14, weight: .medium))
                         .foregroundStyle(enabled ? color : Color.secondary).frame(width: 22)
                     VStack(alignment: .leading, spacing: 1) {
-                        Text(title).font(.system(size: 13, weight: .medium))
+                        Text(title).font(AppFont.body)
                             .foregroundStyle(enabled ? Color.primary : Color.secondary)
-                        Text(subtitle).font(.system(size: 11)).foregroundStyle(Color.secondary)
+                        Text(subtitle).font(AppFont.caption).foregroundStyle(Color.secondary)
                     }
                     Spacer()
                 }.padding(.horizontal, 16).padding(.vertical, 8).contentShape(Rectangle())
@@ -3188,8 +3188,8 @@ struct HamburgerPanel: View {
                         Text(initials).font(.system(size: 16, weight: .semibold)).foregroundStyle(Color.accentColor)
                     }
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(profileName).font(.system(size: 13, weight: .semibold))
-                        Text(profileEmail).font(.caption2).foregroundStyle(.secondary)
+                        Text(profileName).font(AppFont.body)
+                        Text(profileEmail).font(AppFont.caption).foregroundStyle(.secondary)
                     }
                     Spacer()
                     Button {
@@ -3265,8 +3265,8 @@ struct HamburgerPanel: View {
                 Spacer()
                 Divider()
                 HStack(spacing: 6) {
-                    Image(systemName: "info.circle").font(.caption2).foregroundStyle(.secondary)
-                    Text("Versione \(version)").font(.caption2).foregroundStyle(.secondary)
+                    Image(systemName: "info.circle").font(AppFont.caption).foregroundStyle(.secondary)
+                    Text("Versione \(version)").font(AppFont.caption).foregroundStyle(.secondary)
                 }
                 .padding(.horizontal, 16).padding(.vertical, 10)
             }
@@ -3312,7 +3312,7 @@ struct HamburgerRow: View {
                     .clipShape(RoundedRectangle(cornerRadius: 7))
 
                 Text(label)
-                    .font(.system(size: 13))
+                    .font(AppFont.body)
                     .foregroundStyle(Color.primary)
 
                 Spacer()
@@ -3322,7 +3322,7 @@ struct HamburgerRow: View {
                 }
                 if let badge {
                     Text(badge)
-                        .font(.caption2)
+                        .font(AppFont.caption)
                         .foregroundStyle(.secondary)
                 }
                 Image(systemName: "chevron.right")
@@ -3344,10 +3344,10 @@ struct PhaseIndicator: View {
             if case .running = phase {
                 ProgressView().controlSize(.small)
                 Text(percent >= 100 ? "Finalizzando..." : phase.label)
-                    .font(.system(size: 13, weight: .medium)).foregroundStyle(phase.color)
+                    .font(AppFont.body).foregroundStyle(phase.color)
             } else {
                 Image(systemName: phase.icon).foregroundStyle(phase.color)
-                Text(phase.label).font(.system(size: 13, weight: .medium)).foregroundStyle(phase.color)
+                Text(phase.label).font(AppFont.body).foregroundStyle(phase.color)
             }
         }
     }
@@ -3405,9 +3405,9 @@ struct StatsPanel: View {
                     .tint(phase == .idle ? .secondary : (stats.errors > 0 ? AppColor.error : AppColor.inProgress))
                 HStack {
                     Text("\(stats.done) / \(stats.total) file")
-                        .font(.caption2).monospacedDigit().foregroundStyle(.secondary)
+                        .font(AppFont.caption).monospacedDigit().foregroundStyle(.secondary)
                     Spacer()
-                    Text("velocita \(stats.speed)").font(.caption2).monospacedDigit().foregroundStyle(.secondary)
+                    Text("velocita \(stats.speed)").font(AppFont.caption).monospacedDigit().foregroundStyle(.secondary)
                 }
             }
             HStack(spacing: 10) {
@@ -3506,7 +3506,7 @@ struct SpeedChartView: View {
                                 .font(.system(size: 18))
                                 .foregroundStyle(.secondary.opacity(0.4))
                             Text("Il grafico velocità appare quando avvii un'operazione")
-                                .font(.caption2).foregroundStyle(.secondary)
+                                .font(AppFont.caption).foregroundStyle(.secondary)
                                 .multilineTextAlignment(.center)
                         }
                     )
@@ -3573,7 +3573,7 @@ struct LogContentView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 Text(output.isEmpty ? "Nessun output." : output)
-                    .font(.system(.caption2, design: .monospaced)).textSelection(.enabled)
+                    .font(AppFont.caption).textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading).padding(10).id("bottom")
             }
             .frame(minHeight: 190, maxHeight: .infinity)
@@ -3676,7 +3676,7 @@ struct ToolsSheet: View {
                                 .font(.system(size: 12))
                             Text(loc.displayName).font(.caption).frame(width: 140, alignment: .leading)
                             Text(bm.urls[loc]?.path ?? "Non configurato")
-                                .font(.system(.caption2, design: .monospaced))
+                                .font(AppFont.caption)
                                 .foregroundStyle(bm.urls[loc] != nil ? Color.secondary : AppColor.error)
                                 .lineLimit(1).truncationMode(.middle)
                             Spacer()
@@ -3689,7 +3689,7 @@ struct ToolsSheet: View {
                 VStack(alignment: .leading, spacing: 6) {
                     if let cfg = runner.s3Config {
                         Text(runner.s3ConfigFromKeychain ? "Origine: Keychain" : "Origine: rclone.conf")
-                            .font(.caption2).foregroundStyle(.secondary)
+                            .font(AppFont.caption).foregroundStyle(.secondary)
                         DiagRow(label: "Endpoint",  value: cfg.endpoint)
                         DiagRow(label: "Bucket",    value: cfg.bucket)
                         DiagRow(label: "Region",    value: cfg.region)
@@ -3772,7 +3772,7 @@ struct ToolsSheet: View {
                                 .font(.system(size: 12))
                             VStack(alignment: .leading, spacing: 1) {
                                 Text(finding.title).font(.caption).fontWeight(.medium)
-                                Text(finding.detail).font(.caption2).foregroundStyle(.secondary)
+                                Text(finding.detail).font(AppFont.caption).foregroundStyle(.secondary)
                             }
                         }
                     }
@@ -3787,7 +3787,7 @@ struct ToolsSheet: View {
                             VStack(alignment: .leading, spacing: 1) {
                                 Text("Ultimo job: \(lastJob.label)").font(.caption).fontWeight(.medium)
                                 Text("\(jobDateFormatter.string(from: lastJob.date)) · Copiati \(lastJob.copied) · Skippati \(lastJob.skipped) · Errori \(lastJob.errors) · Hash-mismatch \(lastJob.hashErrors)")
-                                    .font(.caption2).foregroundStyle(.secondary)
+                                    .font(AppFont.caption).foregroundStyle(.secondary)
                             }
                         }
                     } else {
@@ -3813,20 +3813,20 @@ struct ToolsSheet: View {
                     .buttonStyle(.bordered).controlSize(.small).disabled(integrityRunning)
 
                     if integrityRunning {
-                        Text(integrityStatus).font(.caption2).foregroundStyle(.secondary)
+                        Text(integrityStatus).font(AppFont.caption).foregroundStyle(.secondary)
                     }
 
                     ForEach(integrityResults) { result in
                         VStack(alignment: .leading, spacing: 1) {
                             if let error = result.error {
                                 Text("\(result.pairName): saltato — \(error)")
-                                    .font(.caption2).foregroundStyle(AppColor.warning)
+                                    .font(AppFont.caption).foregroundStyle(AppColor.warning)
                             } else if result.mismatches.isEmpty {
                                 Text("\(result.pairName): \(result.matched)/\(result.checked) verificati, 0 problemi")
-                                    .font(.caption2).foregroundStyle(AppColor.success)
+                                    .font(AppFont.caption).foregroundStyle(AppColor.success)
                             } else {
                                 Text("\(result.pairName): \(result.mismatches.count) mismatch su \(result.checked) verificati — \(result.mismatches.prefix(3).joined(separator: ", "))")
-                                    .font(.caption2).foregroundStyle(AppColor.error)
+                                    .font(AppFont.caption).foregroundStyle(AppColor.error)
                             }
                         }
                     }
@@ -3841,9 +3841,9 @@ struct ToolsSheet: View {
                         ForEach(runner.toolsOrphanedUploads) { upload in
                             HStack(alignment: .top, spacing: 8) {
                                 VStack(alignment: .leading, spacing: 1) {
-                                    Text((upload.key as NSString).lastPathComponent).font(.caption2)
+                                    Text((upload.key as NSString).lastPathComponent).font(AppFont.caption)
                                     Text("iniziato il \(uploadDateFormatter.string(from: upload.initiated))")
-                                        .font(.caption2).foregroundStyle(.secondary)
+                                        .font(AppFont.caption).foregroundStyle(.secondary)
                                 }
                                 Spacer()
                                 Button("Elimina") {
