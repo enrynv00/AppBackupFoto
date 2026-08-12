@@ -210,7 +210,7 @@ struct CatalogView: View {
                     ProgressView("Sto leggendo \(destination.rawValue)…")
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 case .failed(let message):
-                    Text(message).foregroundStyle(.red)
+                    Text(message).foregroundStyle(AppColor.error)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 case .loaded:
                     if filteredEntries.isEmpty {
@@ -358,8 +358,8 @@ enum JobPhase: Equatable {
     }
     var color: Color {
         switch self {
-        case .idle: return .secondary; case .running: return .blue
-        case .success: return .green; case .failed: return .red
+        case .idle: return .secondary; case .running: return AppColor.inProgress
+        case .success: return AppColor.success; case .failed: return AppColor.error
         }
     }
     var icon: String {
@@ -2752,9 +2752,9 @@ struct RestoreView: View {
                     Text("Tempo stimato: \(FileSyncer.SyncResult.hms(engine.progress.etaSec))")
                         .font(.caption).foregroundStyle(.secondary)
                 }
-                Button("Interrompi") { engine.stop() }.buttonStyle(.bordered).tint(.red)
+                Button("Interrompi") { engine.stop() }.buttonStyle(.bordered).tint(AppColor.error)
             case .success:
-                Image(systemName: "checkmark.circle.fill").font(.system(size: 48)).foregroundStyle(.green)
+                Image(systemName: "checkmark.circle.fill").font(.system(size: 48)).foregroundStyle(AppColor.success)
                 Text("Fatto! Le tue foto sono qui").font(.title3).fontWeight(.semibold)
                 if let destinationURL {
                     Button("Apri cartella") { NSWorkspace.shared.activateFileViewerSelecting([destinationURL]) }
@@ -2762,11 +2762,11 @@ struct RestoreView: View {
                 }
                 if !engine.progress.problems.isEmpty {
                     Text("\(engine.progress.problems.count) file non è stato possibile recuperare")
-                        .font(.caption).foregroundStyle(.orange)
+                        .font(.caption).foregroundStyle(AppColor.warning)
                 }
                 Button("Chiudi") { dismiss() }.buttonStyle(.borderedProminent)
             case .failed(let msg):
-                Image(systemName: "exclamationmark.triangle.fill").font(.system(size: 48)).foregroundStyle(.orange)
+                Image(systemName: "exclamationmark.triangle.fill").font(.system(size: 48)).foregroundStyle(AppColor.warning)
                 Text(msg).font(.system(size: 14)).multilineTextAlignment(.center)
                 Button("Chiudi") { dismiss() }.buttonStyle(.borderedProminent)
             case .idle:
@@ -2840,7 +2840,7 @@ struct LocationRow: View {
     var body: some View {
         HStack(spacing: 12) {
             Image(systemName: bm.urls[location] != nil ? "checkmark.circle.fill" : "circle")
-                .foregroundStyle(bm.urls[location] != nil ? .green : .secondary).font(.system(size: 18))
+                .foregroundStyle(bm.urls[location] != nil ? AppColor.success : .secondary).font(.system(size: 18))
             VStack(alignment: .leading, spacing: 2) {
                 Text(location.displayName).font(.system(size: 13, weight: .medium))
                 if let url = bm.urls[location] {
@@ -2885,7 +2885,7 @@ struct ContentView: View {
                         if runner.isRunning {
                             Button(role: .destructive) { runner.stop() } label: {
                                 Label("Interrompi", systemImage: "stop.fill")
-                            }.buttonStyle(.bordered).controlSize(.small).tint(.red)
+                            }.buttonStyle(.bordered).controlSize(.small).tint(AppColor.error)
                         }
                     }
                     .padding(.horizontal, 20).padding(.vertical, 10).background(.bar)
@@ -2989,36 +2989,36 @@ struct CompletionSheet: View {
     var body: some View {
         VStack(spacing: 22) {
             Image(systemName: ok ? "checkmark.circle.fill" : "xmark.circle.fill")
-                .font(.system(size: 60)).foregroundStyle(ok ? .green : .red).symbolRenderingMode(.hierarchical)
+                .font(.system(size: 60)).foregroundStyle(ok ? AppColor.success : AppColor.error).symbolRenderingMode(.hierarchical)
             Text(ok ? "Backup completato" : "Backup fallito").font(.title2).fontWeight(.semibold)
             Text(phase.label).font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center)
             HStack(spacing: 14) {
-                CStat(label: "Copiati",  value: "\(stats.copied)",  color: .blue)
+                CStat(label: "Copiati",  value: "\(stats.copied)",  color: AppColor.inProgress)
                 CStat(label: "Skippati", value: "\(stats.skipped)", color: .secondary)
-                CStat(label: "Errori",   value: "\(stats.errors)",  color: stats.errors > 0 ? .red : .secondary)
+                CStat(label: "Errori",   value: "\(stats.errors)",  color: stats.errors > 0 ? AppColor.error : .secondary)
                 CStat(label: "Durata",   value: stats.elapsed,      color: .secondary)
             }
             if stats.verifiedOk > 0 {
                 Label("\(stats.verifiedOk) file verificati con SHA256 ✓",
                       systemImage: "checkmark.shield.fill")
-                    .font(.caption).foregroundStyle(.green).multilineTextAlignment(.center)
+                    .font(.caption).foregroundStyle(AppColor.success).multilineTextAlignment(.center)
             }
             if stats.hashErrors > 0 {
                 Label("\(stats.hashErrors) hash mismatch — controlla il log",
                       systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption).foregroundStyle(.orange).multilineTextAlignment(.center)
+                    .font(.caption).foregroundStyle(AppColor.warning).multilineTextAlignment(.center)
             }
             if stats.changedSkipped > 0 {
                 Label("\(stats.changedSkipped) file locali cambiati, non copiati (regola zero-overwrite)",
                       systemImage: "arrow.triangle.2.circlepath")
-                    .font(.caption).foregroundStyle(.orange).multilineTextAlignment(.center)
+                    .font(.caption).foregroundStyle(AppColor.warning).multilineTextAlignment(.center)
             }
             if stats.errors > 0 {
                 Label("Controlla il log per i dettagli sugli errori.", systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption).foregroundStyle(.orange).multilineTextAlignment(.center)
+                    .font(.caption).foregroundStyle(AppColor.warning).multilineTextAlignment(.center)
             }
             Button(action: onDismiss) { Text("OK").frame(minWidth: 120) }
-                .buttonStyle(.borderedProminent).tint(ok ? .green : .red).keyboardShortcut(.defaultAction)
+                .buttonStyle(.borderedProminent).tint(ok ? AppColor.success : AppColor.error).keyboardShortcut(.defaultAction)
         }.padding(38).frame(minWidth: 380)
     }
 }
@@ -3404,7 +3404,7 @@ struct StatsPanel: View {
                     Text("\(stats.percent)%").font(.caption).monospacedDigit().foregroundStyle(.secondary)
                 }
                 ProgressView(value: Double(stats.percent), total: 100).progressViewStyle(.linear)
-                    .tint(phase == .idle ? .secondary : (stats.errors > 0 ? .red : .blue))
+                    .tint(phase == .idle ? .secondary : (stats.errors > 0 ? AppColor.error : AppColor.inProgress))
                 HStack {
                     Text("\(stats.done) / \(stats.total) file")
                         .font(.caption2).monospacedDigit().foregroundStyle(.secondary)
@@ -3413,9 +3413,9 @@ struct StatsPanel: View {
                 }
             }
             HStack(spacing: 10) {
-                StatCard(label: "Copiati",   value: "\(stats.copied)",  accent: .blue)
+                StatCard(label: "Copiati",   value: "\(stats.copied)",  accent: AppColor.inProgress)
                 StatCard(label: "Skippati",  value: "\(stats.skipped)", accent: .secondary)
-                StatCard(label: "Errori",    value: "\(stats.errors)",  accent: stats.errors > 0 ? .red : .secondary)
+                StatCard(label: "Errori",    value: "\(stats.errors)",  accent: stats.errors > 0 ? AppColor.error : .secondary)
                 StatCard(label: "Trascorso", value: stats.elapsed,      accent: .secondary)
                 StatCard(label: "ETA",       value: stats.eta,           accent: .secondary)
             }
@@ -3519,7 +3519,7 @@ struct SpeedChartView: View {
                         x: .value("Tempo", sample.time),
                         y: .value(unit, sample.value)
                     )
-                    .foregroundStyle(Color.blue)
+                    .foregroundStyle(AppColor.inProgress)
                     .interpolationMethod(.catmullRom)
                     .lineStyle(StrokeStyle(lineWidth: 2))
 
@@ -3529,7 +3529,7 @@ struct SpeedChartView: View {
                     )
                     .foregroundStyle(
                         LinearGradient(
-                            colors: [Color.blue.opacity(0.22), Color.blue.opacity(0.0)],
+                            colors: [AppColor.inProgress.opacity(0.22), AppColor.inProgress.opacity(0.0)],
                             startPoint: .top, endPoint: .bottom
                         )
                     )
@@ -3674,12 +3674,12 @@ struct ToolsSheet: View {
                     ForEach(BookmarkManager.Location.allCases) { loc in
                         HStack(spacing: 8) {
                             Image(systemName: bm.urls[loc] != nil ? "checkmark.circle.fill" : "xmark.circle.fill")
-                                .foregroundStyle(bm.urls[loc] != nil ? Color.green : Color.red)
+                                .foregroundStyle(bm.urls[loc] != nil ? AppColor.success : AppColor.error)
                                 .font(.system(size: 12))
                             Text(loc.displayName).font(.caption).frame(width: 140, alignment: .leading)
                             Text(bm.urls[loc]?.path ?? "Non configurato")
                                 .font(.system(.caption2, design: .monospaced))
-                                .foregroundStyle(bm.urls[loc] != nil ? Color.secondary : Color.red)
+                                .foregroundStyle(bm.urls[loc] != nil ? Color.secondary : AppColor.error)
                                 .lineLimit(1).truncationMode(.middle)
                             Spacer()
                         }
@@ -3753,7 +3753,7 @@ struct ToolsSheet: View {
                         }.buttonStyle(.bordered).controlSize(.small).padding(.top, 2)
                     } else {
                         Label("rclone.conf non trovato o credenziali mancanti",
-                              systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange).font(.caption)
+                              systemImage: "exclamationmark.triangle.fill").foregroundStyle(AppColor.warning).font(.caption)
                     }
                 }.padding(4)
             }
@@ -3770,7 +3770,7 @@ struct ToolsSheet: View {
                     ForEach(runner.toolsReviewFindings) { finding in
                         HStack(alignment: .top, spacing: 8) {
                             Image(systemName: finding.ok ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                                .foregroundStyle(finding.ok ? Color.green : Color.orange)
+                                .foregroundStyle(finding.ok ? AppColor.success : AppColor.warning)
                                 .font(.system(size: 12))
                             VStack(alignment: .leading, spacing: 1) {
                                 Text(finding.title).font(.caption).fontWeight(.medium)
@@ -3784,7 +3784,7 @@ struct ToolsSheet: View {
                     if let lastJob {
                         HStack(alignment: .top, spacing: 8) {
                             Image(systemName: lastJob.isClean ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                                .foregroundStyle(lastJob.isClean ? Color.green : Color.orange)
+                                .foregroundStyle(lastJob.isClean ? AppColor.success : AppColor.warning)
                                 .font(.system(size: 12))
                             VStack(alignment: .leading, spacing: 1) {
                                 Text("Ultimo job: \(lastJob.label)").font(.caption).fontWeight(.medium)
@@ -3822,13 +3822,13 @@ struct ToolsSheet: View {
                         VStack(alignment: .leading, spacing: 1) {
                             if let error = result.error {
                                 Text("\(result.pairName): saltato — \(error)")
-                                    .font(.caption2).foregroundStyle(.orange)
+                                    .font(.caption2).foregroundStyle(AppColor.warning)
                             } else if result.mismatches.isEmpty {
                                 Text("\(result.pairName): \(result.matched)/\(result.checked) verificati, 0 problemi")
-                                    .font(.caption2).foregroundStyle(.green)
+                                    .font(.caption2).foregroundStyle(AppColor.success)
                             } else {
                                 Text("\(result.pairName): \(result.mismatches.count) mismatch su \(result.checked) verificati — \(result.mismatches.prefix(3).joined(separator: ", "))")
-                                    .font(.caption2).foregroundStyle(.red)
+                                    .font(.caption2).foregroundStyle(AppColor.error)
                             }
                         }
                     }
