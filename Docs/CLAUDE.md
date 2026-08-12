@@ -6,7 +6,7 @@ Questo file definisce regole, architettura e obiettivi del progetto. Leggilo int
 
 ## Identità del progetto
 
-App macOS nativa (SwiftUI, Swift 5.x, target macOS 13+) per il backup automatico delle foto di **Enrico Nanni Vicenzi** su tre destinazioni:
+App macOS nativa (SwiftUI, Swift 5.x, target macOS 26+) per il backup automatico delle foto di **Enrico Nanni Vicenzi** su tre destinazioni:
 
 - **Mac → SSD** — copia Photos Library originals in `/Volumes/SSD - Enri/Foto iPhone`
 - **SSD → HDD** — mirror locale (deep checksum automatico ogni 30 giorni)
