@@ -3113,7 +3113,7 @@ struct VolumeRow: View {
                 .frame(width: 20)
             Text(name).font(.system(size: 13)).foregroundStyle(mounted ? Color.primary : Color.secondary)
             Spacer()
-            Circle().fill(mounted ? (alwaysOn ? AppColor.ssdToCubbit : Color.green) : Color.secondary.opacity(0.3))
+            Circle().fill(mounted ? (alwaysOn ? AppColor.ssdToCubbit : AppColor.success) : Color.secondary.opacity(0.3))
                 .frame(width: 7, height: 7)
         }.padding(.horizontal, 16).padding(.vertical, 5)
     }
