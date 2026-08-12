@@ -3412,6 +3412,8 @@ struct PhaseIndicator: View {
                     .font(AppFont.body).foregroundStyle(phase.color)
             } else {
                 Image(systemName: phase.icon).foregroundStyle(phase.color)
+                    .contentTransition(.symbolEffect(.replace))
+                    .animation(.default, value: phase)
                 Text(phase.label).font(AppFont.body).foregroundStyle(phase.color)
             }
         }
