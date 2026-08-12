@@ -16,3 +16,5 @@ Script/*.rtf
 eddsa-private-key-backup.txt
 Script/sparkle-tools/
 build/
+
+.superpowers/
