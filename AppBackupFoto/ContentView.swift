@@ -3068,6 +3068,8 @@ struct StatTile: View {
         VStack(spacing: AppSpacing.xs) {
             Text(value).font(AppFont.heroNumber)
                 .foregroundStyle(accent).lineLimit(1).minimumScaleFactor(0.6).textSelection(.enabled)
+                .contentTransition(.numericText())
+                .animation(.default, value: value)
             Text(label).font(.caption2).foregroundStyle(.secondary)
         }
         .frame(minWidth: compact ? 58 : nil, maxWidth: compact ? nil : .infinity)
@@ -3463,6 +3465,8 @@ struct StatsPanel: View {
                     Text("Avanzamento").font(.caption).foregroundStyle(.secondary)
                     Spacer()
                     Text("\(stats.percent)%").font(.caption).monospacedDigit().foregroundStyle(.secondary)
+                        .contentTransition(.numericText())
+                        .animation(.default, value: stats.percent)
                 }
                 ProgressView(value: Double(stats.percent), total: 100).progressViewStyle(.linear)
                     .tint(phase == .idle ? .secondary : (stats.errors > 0 ? AppColor.error : AppColor.inProgress))
@@ -3471,6 +3475,8 @@ struct StatsPanel: View {
                         .font(AppFont.caption).monospacedDigit().foregroundStyle(.secondary)
                     Spacer()
                     Text("velocita \(stats.speed)").font(AppFont.caption).monospacedDigit().foregroundStyle(.secondary)
+                        .contentTransition(.numericText())
+                        .animation(.default, value: stats.speed)
                 }
             }
             HStack(spacing: AppSpacing.md) {
