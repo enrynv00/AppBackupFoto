@@ -3240,6 +3240,7 @@ struct HamburgerRow: View {
     let label: String
     let iconColor: Color
     var badge: String? = nil
+    var alert: Bool = false
     let action: () -> Void
 
     var body: some View {
@@ -3258,6 +3259,9 @@ struct HamburgerRow: View {
 
                 Spacer()
 
+                if alert {
+                    Circle().fill(Color.red).frame(width: 7, height: 7)
+                }
                 if let badge {
                     Text(badge)
                         .font(.caption2)
