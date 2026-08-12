@@ -2874,6 +2874,7 @@ struct ContentView: View {
             HSplitView {
                 SidebarView(volumes: volumes, runner: runner, showHamburger: $showHamburger)
                     .frame(minWidth: 220, maxWidth: 260)
+                    .frame(maxHeight: .infinity)
                 VStack(spacing: 0) {
                     HStack(spacing: AppSpacing.sm) {
                         PhaseIndicator(phase: runner.phase, percent: runner.stats.percent)
@@ -2904,6 +2905,7 @@ struct ContentView: View {
                     }
                     .padding(.horizontal, AppSpacing.lg).padding(.vertical, 8)
                 }
+                .frame(maxHeight: .infinity)
             }
 
             if showHamburger {
