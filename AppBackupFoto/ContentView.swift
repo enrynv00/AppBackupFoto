@@ -3009,10 +3009,10 @@ struct CompletionSheet: View {
             Text(ok ? "Backup completato" : "Backup fallito").font(AppFont.title)
             Text(phase.label).font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center)
             HStack(spacing: AppSpacing.md) {
-                CStat(label: "Copiati",  value: "\(stats.copied)",  color: AppColor.inProgress)
-                CStat(label: "Skippati", value: "\(stats.skipped)", color: .secondary)
-                CStat(label: "Errori",   value: "\(stats.errors)",  color: stats.errors > 0 ? AppColor.error : .secondary)
-                CStat(label: "Durata",   value: stats.elapsed,      color: .secondary)
+                StatTile(label: "Copiati",  value: "\(stats.copied)",  accent: AppColor.inProgress, compact: true)
+                StatTile(label: "Skippati", value: "\(stats.skipped)", accent: .secondary, compact: true)
+                StatTile(label: "Errori",   value: "\(stats.errors)",  accent: stats.errors > 0 ? AppColor.error : .secondary, compact: true)
+                StatTile(label: "Durata",   value: stats.elapsed,      accent: .secondary, compact: true)
             }
             if stats.verifiedOk > 0 {
                 Label("\(stats.verifiedOk) file verificati con SHA256 ✓",
@@ -3039,15 +3039,19 @@ struct CompletionSheet: View {
     }
 }
 
-struct CStat: View {
-    let label: String; let value: String; let color: Color
+struct StatTile: View {
+    let label: String; let value: String; let accent: Color
+    var compact: Bool = false
     var body: some View {
         VStack(spacing: AppSpacing.xs) {
-            Text(value).font(AppFont.heroNumber).foregroundStyle(color)
+            Text(value).font(AppFont.heroNumber)
+                .foregroundStyle(accent).lineLimit(1).minimumScaleFactor(0.6).textSelection(.enabled)
             Text(label).font(.caption2).foregroundStyle(.secondary)
         }
-        .frame(minWidth: 58).padding(.vertical, AppSpacing.sm).padding(.horizontal, 8)
-        .background(.quaternary.opacity(AppSpacing.cardOpacity)).clipShape(RoundedRectangle(cornerRadius: AppSpacing.cardCornerRadius))
+        .frame(minWidth: compact ? 58 : nil, maxWidth: compact ? nil : .infinity)
+        .padding(.vertical, AppSpacing.sm)
+        .padding(.horizontal, compact ? 8 : 0)
+        .cardBackground()
     }
 }
 
@@ -3427,27 +3431,16 @@ struct StatsPanel: View {
                 }
             }
             HStack(spacing: AppSpacing.md) {
-                StatCard(label: "Copiati",   value: "\(stats.copied)",  accent: AppColor.inProgress)
-                StatCard(label: "Skippati",  value: "\(stats.skipped)", accent: .secondary)
-                StatCard(label: "Errori",    value: "\(stats.errors)",  accent: stats.errors > 0 ? AppColor.error : .secondary)
-                StatCard(label: "Trascorso", value: stats.elapsed,      accent: .secondary)
-                StatCard(label: "ETA",       value: stats.eta,           accent: .secondary)
+                StatTile(label: "Copiati",   value: "\(stats.copied)",  accent: AppColor.inProgress)
+                StatTile(label: "Skippati",  value: "\(stats.skipped)", accent: .secondary)
+                StatTile(label: "Errori",    value: "\(stats.errors)",  accent: stats.errors > 0 ? AppColor.error : .secondary)
+                StatTile(label: "Trascorso", value: stats.elapsed,      accent: .secondary)
+                StatTile(label: "ETA",       value: stats.eta,           accent: .secondary)
             }
         }
     }
 }
 
-struct StatCard: View {
-    let label: String; let value: String; let accent: Color
-    var body: some View {
-        VStack(spacing: AppSpacing.xs) {
-            Text(value).font(AppFont.heroNumber)
-                .foregroundStyle(accent).lineLimit(1).minimumScaleFactor(0.6).textSelection(.enabled)
-            Text(label).font(.caption2).foregroundStyle(.secondary)
-        }.frame(maxWidth: .infinity).padding(.vertical, AppSpacing.sm)
-        .background(.quaternary.opacity(AppSpacing.cardOpacity)).clipShape(RoundedRectangle(cornerRadius: AppSpacing.cardCornerRadius))
-    }
-}
 
 // MARK: - Speed / Log Panel
 enum SpeedLogTab: String, CaseIterable {
