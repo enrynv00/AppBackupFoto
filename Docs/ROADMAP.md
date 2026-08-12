@@ -68,13 +68,13 @@ Versione visiva (con link alle fonti): vedi artifact pubblicato in sessione, opp
     *Fonte: ricerca su Sparkle, documentazione ufficiale e best practice code signing 2026*
 19. 🚫 **Valutato e deciso esplicitamente contro (2026-08-11) — Firma "ad-hoc", nessuna notarization.** Richiederebbe Developer ID Application ($99/anno) e Hardened Runtime. L'utente ha risposto "fuori questione" al costo ricorrente — decisione presa dopo aver toccato con mano il costo reale del non farlo (BUG-4: `ENABLE_HARDENED_RUNTIME` disattivato per far funzionare #18 senza notarization). Stesso tipo di decisione ponderata già presa per #5 (cifratura) — non riproporre senza un motivo nuovo e concreto.
     *Fonte: ricerca su requisiti Developer ID/notarization macOS 2026*
-20. **Il pannello Revisione resta solo su richiesta** — scelta esplicita in fase di design; renderlo periodico con badge discreto lo trasformerebbe da strumento diagnostico a guardiano silenzioso.
+20. ✅ **Fatto (2026-08-11) — Il pannello Revisione era solo su richiesta.** Ora i controlli economici (`runConfigChecks`, che include `checkDeepMirrorFreshness`) girano una volta all'avvio; un pallino discreto sulla voce "Tools" del menu hamburger segnala se trovano qualcosa. Campione di integrità e upload orfani restano manuali (troppo costosi per un check automatico). Vedi `Docs/superpowers/specs/2026-08-11-review-launch-badge-design.md`.
 
 ---
 
 ## Da dove partire (aggiornato 2026-08-02)
 
-Fatti: #1 restore, #2 race stop/successo, #3 retry S3, #4 cleanup multipart, #6 upload paralleli, #7 scheduling (Mac→SSD su collegamento SSD), #8 controllo spazio, #9 anteprima S3, #10 Keychain, #11 icona menu bar (scorciatoia), #12 catalogo backup, #13 segnalazione file cambiati, #14 String Catalog, #15 badge Dock, #16 notifica errore, #17 miniatura live, #18 auto-update (Sparkle, verificato end-to-end). #5 (cifratura lato client) e #19 (notarization/Developer ID) valutati e decisi esplicitamente contro — non riproporre senza un motivo nuovo, vedi sopra. Nessun punto critico/alto resta aperto nella lista originale: resta solo #20 (pannello Revisione periodico), "valore aggiunto" libero. #11 è stato scoperto avere obiettivo reale "solo scorciatoia" (non modalità background) — se in futuro si vorrà davvero estendere lo scheduling anche ad app chiusa, quella è una decisione nuova da riaprire, non coperta da #11 così com'è stato fatto.
+Fatti: #1 restore, #2 race stop/successo, #3 retry S3, #4 cleanup multipart, #6 upload paralleli, #7 scheduling (Mac→SSD su collegamento SSD), #8 controllo spazio, #9 anteprima S3, #10 Keychain, #11 icona menu bar (scorciatoia), #12 catalogo backup, #13 segnalazione file cambiati, #14 String Catalog, #15 badge Dock, #16 notifica errore, #17 miniatura live, #18 auto-update (Sparkle, verificato end-to-end), #20 badge di Revisione all'avvio. #5 (cifratura lato client) e #19 (notarization/Developer ID) valutati e decisi esplicitamente contro — non riproporre senza un motivo nuovo, vedi sopra. Roadmap completa: nessun punto critico/alto/valore-aggiunto resta aperto nella lista originale. #11 è stato scoperto avere obiettivo reale "solo scorciatoia" (non modalità background) — se in futuro si vorrà davvero estendere lo scheduling anche ad app chiusa, quella è una decisione nuova da riaprire, non coperta da #11 così com'è stato fatto.
 
 ## Stato aggiornato (2026-08-09)
 
@@ -82,7 +82,9 @@ Fatti: #1 restore, #2 race stop/successo, #3 retry S3, #4 cleanup multipart, #6 
 
 **#19 (notarization/Developer ID) valutato e deciso esplicitamente contro (2026-08-11)**: la firma ad-hoc instabile resta la ragione di fondo sia di BUG-2 (Keychain che richiede due volte dopo un rebuild) sia di BUG-4 (Hardened Runtime che rompeva l'auto-update di Sparkle) — ma l'utente ha rifiutato il costo ricorrente ($99/anno) senza ambiguità. Mitigazione applicata per BUG-4: `ENABLE_HARDENED_RUNTIME = NO` (nessuna protezione reale persa, dato che serviva solo da prerequisito alla notarization che non si farà). BUG-2 resta latente (si ripresenta solo se la voce Keychain corrotta viene ricreata dopo un rebuild — fix noto, vedi `Docs/CLAUDE.md`), non bloccante per l'uso quotidiano.
 
-**#18 (auto-update) fatto e verificato end-to-end (2026-08-10/11)**: Sparkle 2.x integrato e testato con due release reali pubblicate (v1.1.0, che ha rivelato BUG-4; v1.1.1, che ne ha confermato il fix), vedi punto 18 sopra e `Docs/CLAUDE.md`. Resta solo #20 come punto "valore aggiunto" libero, nessuna urgenza nuova rispetto al 2026-08-02.
+**#18 (auto-update) fatto e verificato end-to-end (2026-08-10/11)**: Sparkle 2.x integrato e testato con due release reali pubblicate (v1.1.0, che ha rivelato BUG-4; v1.1.1, che ne ha confermato il fix), vedi punto 18 sopra e `Docs/CLAUDE.md`.
+
+**#20 (badge di Revisione all'avvio) fatto (2026-08-11)**: i controlli economici di `ReviewEngine` girano una volta all'avvio, con un pallino discreto sulla voce "Tools" del menu hamburger se trovano qualcosa — vedi punto 20 sopra. Roadmap completa: nessun punto resta aperto.
 
 ## Fonti consultate
 
