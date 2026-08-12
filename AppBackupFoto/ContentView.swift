@@ -3055,6 +3055,17 @@ struct StatTile: View {
     }
 }
 
+struct CardGroupBoxStyle: GroupBoxStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        VStack(alignment: .leading, spacing: AppSpacing.sm) {
+            configuration.label
+            configuration.content
+        }
+        .padding(AppSpacing.md)
+        .cardBackground()
+    }
+}
+
 // MARK: - Sidebar
 struct SidebarView: View {
     @ObservedObject var volumes: VolumeMonitor
@@ -3897,6 +3908,7 @@ struct ToolsSheet: View {
             }
         }
         .padding(AppSpacing.xxl).frame(minWidth: 560, minHeight: 480)
+        .groupBoxStyle(CardGroupBoxStyle())
     }
 }
 
