@@ -102,7 +102,6 @@ Storico bug (risolti e aperti): vedi `.claude/rules/bug-history.md`.
 
 **Verifica manuale ancora da fare**:
 
-- **Roadmap #18, auto-update**: dopo aver creato il repo GitHub pubblico e sostituito `PLACEHOLDER-github-username` in `Info.plist`/`appcast.xml`/`Script/release.sh`, pubblicare una prima release reale con `Script/release.sh` e verificare che una build precedente installata trovi/scarichi/installi correttamente l'update, con la firma EdDSA verificata da Sparkle.
 - Non eseguibile in ambiente headless, serve l'app in mano con volumi montati: controllo visivo della sezione "Revisione" in Tools, funzionamento reale di `runIntegritySample` su Mac↔SSD/SSD↔HDD/SSD↔S3, conferma che i file temporanei scaricati da S3 per il confronto vengano effettivamente cancellati.
 - **Roadmap #20, badge di Revisione**: aprire l'app con un problema di configurazione noto (es. `rclone.conf` con permessi troppo aperti, o deep mirror SSD→HDD non eseguito da >45 giorni) e verificare che il pallino compaia sulla voce "Tools" aprendo il menu hamburger; verificare che sparisca al riavvio successivo se il problema è stato risolto nel frattempo.
 
