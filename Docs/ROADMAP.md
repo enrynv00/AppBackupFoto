@@ -86,6 +86,24 @@ Fatti: #1 restore, #2 race stop/successo, #3 retry S3, #4 cleanup multipart, #6 
 
 **#20 (badge di Revisione all'avvio) fatto (2026-08-11)**: i controlli economici di `ReviewEngine` girano una volta all'avvio, con un pallino discreto sulla voce "Tools" del menu hamburger se trovano qualcosa — vedi punto 20 sopra. Roadmap completa: nessun punto resta aperto.
 
+---
+
+## Design polish — da "funziona" a "cutting edge" (2026-08-12)
+
+Nuovo capitolo aperto dopo la chiusura della roadmap tecnica originale (punti 1-20 sopra). Motivazione: l'app è funzionalmente solida ma visivamente "ok, non polished" — audit UI completo (Architect agent) e ricerca su best practice macOS 2025-2026 (Researcher agent) in `Docs/superpowers/specs/` (spec da aggiungere per ciascuna fase). Target macOS alzato a 26 (Tahoe) — Enrico lo usa già, quindi Liquid Glass è disponibile senza vincoli di compatibilità.
+
+**Audit sintetico**: nessuna palette (13 blu, 13 rossi, 12 verdi hardcoded senza semantica), 14 `NSAlert` AppKit mescolati a 2 `.alert` SwiftUI, zero `onHover` su elementi cliccabili custom, zero materials/vibrancy, `HSplitView` invece di `NavigationSplitView`, card copiaincollata 9 volte con 3 opacità/4 corner radius diversi, 16 dimensioni di font numeriche sovrapposte a stili semantici, nessuna griglia di spacing coerente.
+
+Lavoro diviso in 5 fasi indipendenti, ciascuna con il proprio ciclo spec → piano → implementazione (non una mega-spec unica, per restare verificabile e revertibile fase per fase):
+
+21. 🔲 **Fase 1 — Fondamenta design**: palette semantica (successo/errore/warning + accent blu di sistema), scala tipografica coerente, griglia di spacing 4/8/12/16. Nessun rischio strutturale. *In corso — prima fase scelta da Enrico.*
+22. 🔲 **Fase 2 — Struttura**: `HSplitView` → `NavigationSplitView`, adozione material Liquid Glass (`.glassEffect()`) su sidebar/toolbar. Cambio più rischioso, da fare dopo le fondamenta.
+23. 🔲 **Fase 3 — Componenti**: sistema card unificato (padding/opacità/corner radius coerenti), merge `StatCard`/`CStat` duplicati, `GroupBox` vs card manuali allineati.
+24. 🔲 **Fase 4 — Micro-interazioni**: `onHover` su righe/liste, `contentTransition(.numericText())` sui contatori (MB/s, percentuali), `symbolEffect` su icone di stato, skeleton/`.redacted(reason: .placeholder)` al posto di spinner nudi.
+25. 🔲 **Fase 5 — Dialoghi**: migrazione dei 14 `NSAlert` AppKit a `.alert`/`.confirmationDialog` SwiftUI, per un linguaggio visivo coerente.
+
+---
+
 ## Fonti consultate
 
 - [7 Best Backup Software for macOS: Top Picks for 2026 — MacObserver](https://www.macobserver.com/tips/round-ups/7-best-backup-software-for-macos/)
