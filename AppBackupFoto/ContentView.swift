@@ -3101,7 +3101,7 @@ struct SidebarView: View {
                     Spacer()
                 }.padding(.horizontal, 16).padding(.vertical, AppSpacing.sm)
             }
-        }.background(.windowBackground)
+        }
     }
 }
 
