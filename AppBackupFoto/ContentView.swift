@@ -232,7 +232,7 @@ struct CatalogView: View {
                 }
             }
         }
-        .padding(20)
+        .padding(AppSpacing.lg)
         .frame(minWidth: 640, minHeight: 480)
     }
 
@@ -2598,7 +2598,7 @@ struct RestoreView: View {
                 Spacer()
                 Image(systemName: "chevron.right").font(.caption).foregroundStyle(.secondary)
             }
-            .padding(14).background(.quaternary.opacity(0.4)).clipShape(RoundedRectangle(cornerRadius: 8))
+            .padding(AppSpacing.md).background(.quaternary.opacity(0.4)).clipShape(RoundedRectangle(cornerRadius: 8))
         }
         .buttonStyle(.plain)
         .disabled(!available)
@@ -2613,7 +2613,7 @@ struct RestoreView: View {
                     ProgressView().controlSize(.small)
                     Text("Verifica Cubbit in corso…").font(AppFont.body).foregroundStyle(.secondary)
                     Spacer()
-                }.padding(14).background(.quaternary.opacity(0.4)).clipShape(RoundedRectangle(cornerRadius: 8))
+                }.padding(AppSpacing.md).background(.quaternary.opacity(0.4)).clipShape(RoundedRectangle(cornerRadius: 8))
             case .available:
                 Button {
                     selectedSource = .s3
@@ -2624,7 +2624,7 @@ struct RestoreView: View {
                         Spacer()
                         Image(systemName: "chevron.right").font(.caption).foregroundStyle(.secondary)
                     }
-                    .padding(14).background(.quaternary.opacity(0.4)).clipShape(RoundedRectangle(cornerRadius: 8))
+                    .padding(AppSpacing.md).background(.quaternary.opacity(0.4)).clipShape(RoundedRectangle(cornerRadius: 8))
                 }.buttonStyle(.plain)
             case .unavailable(let reason):
                 HStack {
@@ -2634,7 +2634,7 @@ struct RestoreView: View {
                     }
                     Spacer()
                 }
-                .padding(14).background(.quaternary.opacity(0.4)).clipShape(RoundedRectangle(cornerRadius: 8))
+                .padding(AppSpacing.md).background(.quaternary.opacity(0.4)).clipShape(RoundedRectangle(cornerRadius: 8))
                 .opacity(0.45)
             }
         }
@@ -2690,7 +2690,7 @@ struct RestoreView: View {
                                 Text(folder).font(AppFont.body)
                                 Spacer()
                             }
-                            .padding(10).background(.quaternary.opacity(0.3)).clipShape(RoundedRectangle(cornerRadius: 6))
+                            .padding(AppSpacing.md).background(.quaternary.opacity(0.3)).clipShape(RoundedRectangle(cornerRadius: 6))
                         }.buttonStyle(.plain)
                     }
                 }
@@ -2822,13 +2822,13 @@ struct SetupView: View {
                 ForEach(BookmarkManager.Location.allCases) { loc in
                     LocationRow(location: loc) { bm.selectAndSave(loc) { _ in } }
                 }
-            }.padding(.horizontal, 20)
+            }.padding(.horizontal, AppSpacing.xl)
             Text("Appena selezioni la Libreria Foto l'app si apre — SSD e HDD puoi configurarli quando vuoi, anche più avanti da Impostazioni.")
                 .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
             Button("Ho già un backup, voglio ripristinare") { showRestore = true }
                 .buttonStyle(.plain).font(.caption).foregroundStyle(.secondary)
         }
-        .padding(40).frame(minWidth: 500, minHeight: 420)
+        .padding(AppSpacing.xxl).frame(minWidth: 500, minHeight: 420)
         .sheet(isPresented: $showRestore) { RestoreView() }
     }
 }
@@ -2888,21 +2888,21 @@ struct ContentView: View {
                             }.buttonStyle(.bordered).controlSize(.small).tint(AppColor.error)
                         }
                     }
-                    .padding(.horizontal, 20).padding(.vertical, 10).background(.bar)
+                    .padding(.horizontal, AppSpacing.lg).padding(.vertical, AppSpacing.sm).background(.bar)
                     Divider()
                     SpeedLogPanel(history: runner.speedHistory, output: runner.output, speedUnit: runner.speedUnit, activeTab: $activeSpeedTab)
-                        .padding(.horizontal, 18).padding(.top, 14).padding(.bottom, 10)
+                        .padding(.horizontal, AppSpacing.lg).padding(.top, AppSpacing.md).padding(.bottom, AppSpacing.sm)
                     if runner.phase != .idle {
                         Divider()
                         StatsPanel(stats: runner.stats, phase: runner.phase, currentStatus: runner.currentStatus, currentThumbnail: runner.currentThumbnail)
-                            .padding(18)
+                            .padding(AppSpacing.lg)
                     }
                     Divider()
                     HStack {
                         Spacer()
                         Button("Esci") { confirmQuit() }.buttonStyle(.bordered).controlSize(.small)
                     }
-                    .padding(.horizontal, 20).padding(.vertical, 8)
+                    .padding(.horizontal, AppSpacing.lg).padding(.vertical, 8)
                 }
             }
 
@@ -2971,14 +2971,14 @@ struct SettingsSheet: View {
                 Toggle("Backup automatico Mac → SSD quando colleghi l'SSD", isOn: $autoBackupEnabled)
                 Text("Appena colleghi l'SSD, se l'app è aperta, parte da sola l'aggiornamento da Foto a SSD.")
                     .font(.caption).foregroundStyle(.secondary)
-            }.padding(.horizontal, 20)
+            }.padding(.horizontal, AppSpacing.xl)
             VStack(spacing: AppSpacing.md) {
                 ForEach(BookmarkManager.Location.allCases) { loc in
                     LocationRow(location: loc) { bm.selectAndSave(loc) { _ in } }
                 }
-            }.padding(.horizontal, 20)
+            }.padding(.horizontal, AppSpacing.xl)
             Button("Chiudi") { dismiss() }.buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
-        }.padding(36).frame(minWidth: 480)
+        }.padding(AppSpacing.xxl).frame(minWidth: 480)
     }
 }
 
@@ -3019,7 +3019,7 @@ struct CompletionSheet: View {
             }
             Button(action: onDismiss) { Text("OK").frame(minWidth: 120) }
                 .buttonStyle(.borderedProminent).tint(ok ? AppColor.success : AppColor.error).keyboardShortcut(.defaultAction)
-        }.padding(38).frame(minWidth: 380)
+        }.padding(AppSpacing.xxl).frame(minWidth: 380)
     }
 }
 
@@ -3030,7 +3030,7 @@ struct CStat: View {
             Text(value).font(AppFont.heroNumber).foregroundStyle(color)
             Text(label).font(.caption2).foregroundStyle(.secondary)
         }
-        .frame(minWidth: 58).padding(.vertical, 10).padding(.horizontal, 8)
+        .frame(minWidth: 58).padding(.vertical, AppSpacing.sm).padding(.horizontal, 8)
         .background(.quaternary.opacity(0.5)).clipShape(RoundedRectangle(cornerRadius: 10))
     }
 }
@@ -3059,7 +3059,7 @@ struct SidebarView: View {
                 }
                 Spacer()
             }
-            .padding(.horizontal, 16).padding(.top, 20).padding(.bottom, 16)
+            .padding(.horizontal, 16).padding(.top, AppSpacing.lg).padding(.bottom, 16)
 
             Divider()
             VStack(alignment: .leading, spacing: AppSpacing.xs) {
@@ -3067,7 +3067,7 @@ struct SidebarView: View {
                 VolumeRow(name: "SSD - Enri",  icon: "internaldrive.fill",  mounted: volumes.ssdMounted)
                 VolumeRow(name: "BackupHDD",   icon: "externaldrive.fill",  mounted: volumes.hddMounted)
                 VolumeRow(name: "Cubbit S3",   icon: "cloud.fill",          mounted: true, alwaysOn: true)
-            }.padding(.bottom, 10)
+            }.padding(.bottom, AppSpacing.sm)
             Divider()
             VStack(alignment: .leading, spacing: AppSpacing.xs) {
                 HamburgerSectionLabel("Operazioni")
@@ -3096,7 +3096,7 @@ struct SidebarView: View {
                         Text(start, style: .time).font(.caption).monospacedDigit()
                     }
                     Spacer()
-                }.padding(.horizontal, 16).padding(.vertical, 10)
+                }.padding(.horizontal, 16).padding(.vertical, AppSpacing.sm)
             }
         }.background(.windowBackground)
     }
@@ -3113,7 +3113,7 @@ struct VolumeRow: View {
             Spacer()
             Circle().fill(mounted ? (alwaysOn ? AppColor.ssdToCubbit : AppColor.success) : Color.secondary.opacity(0.3))
                 .frame(width: 7, height: 7)
-        }.padding(.horizontal, 16).padding(.vertical, 5)
+        }.padding(.horizontal, 16).padding(.vertical, AppSpacing.xs)
     }
 }
 
@@ -3198,7 +3198,7 @@ struct HamburgerPanel: View {
                         Image(systemName: "xmark.circle.fill").font(.system(size: 16)).foregroundStyle(.secondary)
                     }.buttonStyle(.borderless)
                 }
-                .padding(.horizontal, 16).padding(.top, 20).padding(.bottom, 14)
+                .padding(.horizontal, 16).padding(.top, AppSpacing.lg).padding(.bottom, AppSpacing.md)
 
                 Divider()
 
@@ -3249,7 +3249,7 @@ struct HamburgerPanel: View {
                             updater.controller.checkForUpdates(nil)
                         }
 
-                        HamburgerSectionLabel("Preferenze").padding(.top, 6)
+                        HamburgerSectionLabel("Preferenze").padding(.top, AppSpacing.xs)
                         HamburgerRow(icon: "paintbrush.fill", label: "Aspetto", iconColor: .orange, badge: appearance.mode) {
                             showAppearance = true
                         }
@@ -3268,7 +3268,7 @@ struct HamburgerPanel: View {
                     Image(systemName: "info.circle").font(AppFont.caption).foregroundStyle(.secondary)
                     Text("Versione \(version)").font(AppFont.caption).foregroundStyle(.secondary)
                 }
-                .padding(.horizontal, 16).padding(.vertical, 10)
+                .padding(.horizontal, 16).padding(.vertical, AppSpacing.sm)
             }
         .frame(width: 252)
         .background(.windowBackground)
@@ -3289,7 +3289,7 @@ struct HamburgerSectionLabel: View {
         Text(text.uppercased())
             .font(AppFont.sectionHeader)
             .foregroundStyle(.secondary)
-            .padding(.horizontal, 16).padding(.top, 6).padding(.bottom, 2)
+            .padding(.horizontal, 16).padding(.top, AppSpacing.xs).padding(.bottom, 2)
     }
 }
 
@@ -3428,7 +3428,7 @@ struct StatCard: View {
             Text(value).font(AppFont.heroNumber)
                 .foregroundStyle(accent).lineLimit(1).minimumScaleFactor(0.6).textSelection(.enabled)
             Text(label).font(.caption2).foregroundStyle(.secondary)
-        }.frame(maxWidth: .infinity).padding(.vertical, 10)
+        }.frame(maxWidth: .infinity).padding(.vertical, AppSpacing.md)
         .background(.quaternary.opacity(0.5)).clipShape(RoundedRectangle(cornerRadius: 10))
     }
 }
@@ -3574,7 +3574,7 @@ struct LogContentView: View {
             ScrollView {
                 Text(output.isEmpty ? "Nessun output." : output)
                     .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading).padding(10).id("bottom")
+                    .frame(maxWidth: .infinity, alignment: .leading).padding(AppSpacing.sm).id("bottom")
             }
             .frame(minHeight: 190, maxHeight: .infinity)
             .background(Color(NSColor.textBackgroundColor))
@@ -3619,7 +3619,7 @@ struct AppearanceSheet: View {
             Button("OK") { dismiss() }
                 .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
         }
-        .padding(28).frame(width: 300)
+        .padding(AppSpacing.xxl).frame(width: 300)
     }
 }
 
@@ -3887,7 +3887,7 @@ struct ToolsSheet: View {
                 Button("Chiudi") { dismissWindow() }.buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
             }
         }
-        .padding(28).frame(minWidth: 560, minHeight: 480)
+        .padding(AppSpacing.xxl).frame(minWidth: 560, minHeight: 480)
     }
 }
 
