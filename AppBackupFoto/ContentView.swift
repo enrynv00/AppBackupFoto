@@ -2817,6 +2817,7 @@ struct ContentView: View {
     @State private var showHamburger = false
     @State private var activeSpeedTab: SpeedLogTab = .speed
     @AppStorage("autoBackupOnSSDConnect") private var autoBackupEnabled: Bool = true
+    private let reviewEngine = ReviewEngine()
     var body: some View {
         ZStack(alignment: .leading) {
             HSplitView {
@@ -2872,6 +2873,13 @@ struct ContentView: View {
             }
         }
         .onAppear { Notifier.requestAuthorization() }
+        .task {
+            await runner.loadS3ConfigIfNeeded()
+            runner.toolsReviewFindings = reviewEngine.runConfigChecks(
+                s3Config: runner.s3Config,
+                s3ConfigFromKeychain: runner.s3ConfigFromKeychain,
+                s3ConfigError: runner.s3ConfigError)
+        }
         .onChange(of: runner.completionSnapshot?.phase) { _, p in
             if let p, p.isTerminal { showCompletion = true }
         }
@@ -3157,7 +3165,8 @@ struct HamburgerPanel: View {
                         HamburgerRow(icon: "gearshape.fill", label: "Configurazione", iconColor: Color(NSColor.systemGray)) {
                             showSettings = true; close()
                         }
-                        HamburgerRow(icon: "wrench.and.screwdriver.fill", label: "Tools", iconColor: .purple) {
+                        HamburgerRow(icon: "wrench.and.screwdriver.fill", label: "Tools", iconColor: .purple,
+                                     alert: !runner.toolsReviewFindings.isEmpty) {
                             guard !toolsLoading else { return }
                             toolsLoading = true
                             let skipOrphanedCheck = runner.isRunning
