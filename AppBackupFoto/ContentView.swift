@@ -189,7 +189,7 @@ struct CatalogView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Catalogo").font(.title2).fontWeight(.semibold)
+            Text("Catalogo").font(AppFont.title)
 
             Picker("Destinazione", selection: $destination) {
                 ForEach(CatalogDestination.allCases) { d in
@@ -2556,7 +2556,7 @@ struct RestoreView: View {
         VStack(spacing: 18) {
             VStack(spacing: 6) {
                 Image(systemName: "arrow.down.doc").font(.system(size: 40)).foregroundStyle(.blue)
-                Text("Da dove vuoi ripristinare?").font(.title2).fontWeight(.semibold)
+                Text("Da dove vuoi ripristinare?").font(AppFont.title)
             }
             VStack(spacing: 10) {
                 restoreSourceRow(.ssd, available: volumes.ssdMounted,
@@ -2673,7 +2673,7 @@ struct RestoreView: View {
         VStack(spacing: 18) {
             VStack(spacing: 6) {
                 Image(systemName: "folder").font(.system(size: 36)).foregroundStyle(.blue)
-                Text("Cosa vuoi ripristinare?").font(.title2).fontWeight(.semibold)
+                Text("Cosa vuoi ripristinare?").font(AppFont.title)
                 Text("Sono già tutte selezionate — deseleziona solo quello che non ti serve.")
                     .font(.caption).foregroundStyle(.secondary)
             }
@@ -2709,7 +2709,7 @@ struct RestoreView: View {
         VStack(spacing: 18) {
             VStack(spacing: 6) {
                 Image(systemName: "tray.and.arrow.down").font(.system(size: 36)).foregroundStyle(.blue)
-                Text("Dove vuoi salvare le foto?").font(.title2).fontWeight(.semibold)
+                Text("Dove vuoi salvare le foto?").font(AppFont.title)
                 Text("Dopo potrai trascinarle nell'app Foto quando vuoi.")
                     .font(.caption).foregroundStyle(.secondary)
             }
@@ -2755,7 +2755,7 @@ struct RestoreView: View {
                 Button("Interrompi") { engine.stop() }.buttonStyle(.bordered).tint(AppColor.error)
             case .success:
                 Image(systemName: "checkmark.circle.fill").font(.system(size: 48)).foregroundStyle(AppColor.success)
-                Text("Fatto! Le tue foto sono qui").font(.title3).fontWeight(.semibold)
+                Text("Fatto! Le tue foto sono qui").font(AppFont.title)
                 if let destinationURL {
                     Button("Apri cartella") { NSWorkspace.shared.activateFileViewerSelecting([destinationURL]) }
                         .buttonStyle(.bordered)
@@ -2814,7 +2814,7 @@ struct SetupView: View {
                 Image(systemName: "folder.badge.gearshape")
                     .font(.system(size: 52)).foregroundStyle(.blue)
                 Text("Configurazione Backup Foto")
-                    .font(.title2).fontWeight(.semibold)
+                    .font(AppFont.title)
                 Text("Seleziona le cartelle una volta sola — l'app le ricorderà automaticamente.")
                     .font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center)
             }
@@ -2965,7 +2965,7 @@ struct SettingsSheet: View {
     @AppStorage("autoBackupOnSSDConnect") private var autoBackupEnabled: Bool = true
     var body: some View {
         VStack(spacing: 20) {
-            Text("Impostazioni").font(.title2).fontWeight(.semibold)
+            Text("Impostazioni").font(AppFont.title)
             Text("Modifica le cartelle selezionate").font(.subheadline).foregroundStyle(.secondary)
             VStack(alignment: .leading, spacing: 4) {
                 Toggle("Backup automatico Mac → SSD quando colleghi l'SSD", isOn: $autoBackupEnabled)
@@ -2990,7 +2990,7 @@ struct CompletionSheet: View {
         VStack(spacing: 22) {
             Image(systemName: ok ? "checkmark.circle.fill" : "xmark.circle.fill")
                 .font(.system(size: 60)).foregroundStyle(ok ? AppColor.success : AppColor.error).symbolRenderingMode(.hierarchical)
-            Text(ok ? "Backup completato" : "Backup fallito").font(.title2).fontWeight(.semibold)
+            Text(ok ? "Backup completato" : "Backup fallito").font(AppFont.title)
             Text(phase.label).font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center)
             HStack(spacing: 14) {
                 CStat(label: "Copiati",  value: "\(stats.copied)",  color: AppColor.inProgress)
@@ -3054,7 +3054,7 @@ struct SidebarView: View {
                 .foregroundStyle(showHamburger ? Color.accentColor : Color.primary)
 
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("Backup Foto").font(.title2).fontWeight(.semibold)
+                    Text("Backup Foto").font(AppFont.title)
                     Text("Backup personale").font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
@@ -3063,16 +3063,14 @@ struct SidebarView: View {
 
             Divider()
             VStack(alignment: .leading, spacing: 4) {
-                Text("Volumi").font(.caption).fontWeight(.medium).foregroundStyle(.secondary)
-                    .padding(.horizontal, 16).padding(.top, 10)
+                HamburgerSectionLabel("Volumi")
                 VolumeRow(name: "SSD - Enri",  icon: "internaldrive.fill",  mounted: volumes.ssdMounted)
                 VolumeRow(name: "BackupHDD",   icon: "externaldrive.fill",  mounted: volumes.hddMounted)
                 VolumeRow(name: "Cubbit S3",   icon: "cloud.fill",          mounted: true, alwaysOn: true)
             }.padding(.bottom, 10)
             Divider()
             VStack(alignment: .leading, spacing: 4) {
-                Text("Operazioni").font(.caption).fontWeight(.medium).foregroundStyle(.secondary)
-                    .padding(.horizontal, 16).padding(.top, 10)
+                HamburgerSectionLabel("Operazioni")
                 OpsButton(title: "MAC -> SSD", subtitle: "Photos originals → SSD",
                           icon: "photo.on.rectangle.angled", color: AppColor.macToSSD,
                           enabled: !runner.isRunning && volumes.ssdMounted,
@@ -3289,7 +3287,7 @@ struct HamburgerSectionLabel: View {
     init(_ text: String) { self.text = text }
     var body: some View {
         Text(text.uppercased())
-            .font(.system(size: 10, weight: .semibold))
+            .font(AppFont.sectionHeader)
             .foregroundStyle(.secondary)
             .padding(.horizontal, 16).padding(.top, 6).padding(.bottom, 2)
     }
@@ -3596,7 +3594,7 @@ struct AppearanceSheet: View {
 
     var body: some View {
         VStack(spacing: 24) {
-            Text("Aspetto Interfaccia").font(.title2).fontWeight(.semibold)
+            Text("Aspetto Interfaccia").font(AppFont.title)
             VStack(alignment: .leading, spacing: 6) {
                 ForEach(Array(zip(modes, icons)), id: \.0) { mode, icon in
                     Button {
@@ -3667,7 +3665,7 @@ struct ToolsSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
-            Text("Diagnostica").font(.title2).fontWeight(.semibold)
+            Text("Diagnostica").font(AppFont.title)
 
             GroupBox("Cartelle Configurate") {
                 VStack(alignment: .leading, spacing: 8) {
