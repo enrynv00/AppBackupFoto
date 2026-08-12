@@ -3152,6 +3152,7 @@ struct OpsButton: View {
     let title: String; let subtitle: String; let icon: String
     let color: Color; let enabled: Bool; let action: () -> Void
     var onPreview: (() -> Void)? = nil
+    @State private var isHovering = false
     var body: some View {
         HStack(spacing: 0) {
             Button(action: action) {
@@ -3165,7 +3166,11 @@ struct OpsButton: View {
                     }
                     Spacer()
                 }.padding(.horizontal, 16).padding(.vertical, 8).contentShape(Rectangle())
+                .background(Color.primary.opacity(isHovering && enabled ? 0.05 : 0))
             }.buttonStyle(.plain).disabled(!enabled).opacity(enabled ? 1 : 0.45)
+            .onHover { hovering in
+                withAnimation(.easeInOut(duration: 0.1)) { isHovering = hovering }
+            }
             if let onPreview {
                 Button(action: onPreview) {
                     Image(systemName: "eye")
