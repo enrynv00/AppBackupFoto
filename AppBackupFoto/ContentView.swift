@@ -3289,7 +3289,7 @@ struct HamburgerSectionLabel: View {
         Text(text.uppercased())
             .font(AppFont.sectionHeader)
             .foregroundStyle(.secondary)
-            .padding(.horizontal, 16).padding(.top, AppSpacing.xs).padding(.bottom, 2)
+            .padding(.horizontal, 16).padding(.top, AppSpacing.xs).padding(.bottom, AppSpacing.xs)
     }
 }
 
@@ -3428,7 +3428,7 @@ struct StatCard: View {
             Text(value).font(AppFont.heroNumber)
                 .foregroundStyle(accent).lineLimit(1).minimumScaleFactor(0.6).textSelection(.enabled)
             Text(label).font(.caption2).foregroundStyle(.secondary)
-        }.frame(maxWidth: .infinity).padding(.vertical, AppSpacing.md)
+        }.frame(maxWidth: .infinity).padding(.vertical, AppSpacing.sm)
         .background(.quaternary.opacity(AppSpacing.cardOpacity)).clipShape(RoundedRectangle(cornerRadius: AppSpacing.cardCornerRadius))
     }
 }
@@ -3726,7 +3726,7 @@ struct ToolsSheet: View {
                                 let path = NSHomeDirectory() + "/.config/rclone/rclone.conf"
                                 NSWorkspace.shared.open(URL(fileURLWithPath: path))
                             }
-                        }.buttonStyle(.bordered).controlSize(.small).padding(.top, 2)
+                        }.buttonStyle(.bordered).controlSize(.small).padding(.top, AppSpacing.xs)
                         Button("Aggiorna da rclone.conf") {
                             let a = NSAlert()
                             a.messageText = "Sovrascrivere le credenziali salvate?"
@@ -3748,7 +3748,7 @@ struct ToolsSheet: View {
                                 err.alertStyle = .critical
                                 err.runModal()
                             }
-                        }.buttonStyle(.bordered).controlSize(.small).padding(.top, 2)
+                        }.buttonStyle(.bordered).controlSize(.small).padding(.top, AppSpacing.xs)
                     } else {
                         Label("rclone.conf non trovato o credenziali mancanti",
                               systemImage: "exclamationmark.triangle.fill").foregroundStyle(AppColor.warning).font(.caption)
