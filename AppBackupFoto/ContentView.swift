@@ -2550,6 +2550,7 @@ struct RestoreView: View {
     @State private var destinationURL: URL?
     @State private var showS3EstimateAlert = false
     @State private var s3EstimateText = ""
+    @State private var hoveredRow: String? = nil
 
     var body: some View {
         VStack(spacing: AppSpacing.xl) {
@@ -2612,8 +2613,15 @@ struct RestoreView: View {
                 Image(systemName: "chevron.right").font(.caption).foregroundStyle(.secondary)
             }
             .padding(AppSpacing.md).cardBackground()
+            .overlay(
+                RoundedRectangle(cornerRadius: AppSpacing.cardCornerRadius)
+                    .fill(Color.primary.opacity(hoveredRow == source.rawValue ? 0.05 : 0))
+            )
         }
         .buttonStyle(.plain)
+        .onHover { hovering in
+            withAnimation(.easeInOut(duration: 0.1)) { hoveredRow = hovering ? source.rawValue : nil }
+        }
         .disabled(!available)
         .opacity(available ? 1 : 0.45)
     }
@@ -2638,7 +2646,14 @@ struct RestoreView: View {
                         Image(systemName: "chevron.right").font(.caption).foregroundStyle(.secondary)
                     }
                     .padding(AppSpacing.md).cardBackground()
+                    .overlay(
+                        RoundedRectangle(cornerRadius: AppSpacing.cardCornerRadius)
+                            .fill(Color.primary.opacity(hoveredRow == "s3" ? 0.05 : 0))
+                    )
                 }.buttonStyle(.plain)
+                .onHover { hovering in
+                    withAnimation(.easeInOut(duration: 0.1)) { hoveredRow = hovering ? "s3" : nil }
+                }
             case .unavailable(let reason):
                 HStack {
                     VStack(alignment: .leading, spacing: AppSpacing.xs) {
@@ -2704,7 +2719,14 @@ struct RestoreView: View {
                                 Spacer()
                             }
                             .padding(AppSpacing.md).cardBackground()
+                            .overlay(
+                                RoundedRectangle(cornerRadius: AppSpacing.cardCornerRadius)
+                                    .fill(Color.primary.opacity(hoveredRow == folder ? 0.05 : 0))
+                            )
                         }.buttonStyle(.plain)
+                        .onHover { hovering in
+                            withAnimation(.easeInOut(duration: 0.1)) { hoveredRow = hovering ? folder : nil }
+                        }
                     }
                 }
             }
