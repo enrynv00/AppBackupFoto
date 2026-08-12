@@ -2871,10 +2871,11 @@ struct ContentView: View {
     private let reviewEngine = ReviewEngine()
     var body: some View {
         ZStack(alignment: .leading) {
-            HSplitView {
+            NavigationSplitView {
                 SidebarView(volumes: volumes, runner: runner, showHamburger: $showHamburger)
-                    .frame(minWidth: 220, maxWidth: 260)
+                    .navigationSplitViewColumnWidth(min: 220, ideal: 240, max: 260)
                     .frame(maxHeight: .infinity)
+            } detail: {
                 VStack(spacing: 0) {
                     HStack(spacing: AppSpacing.sm) {
                         PhaseIndicator(phase: runner.phase, percent: runner.stats.percent)
