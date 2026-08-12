@@ -113,6 +113,8 @@ Rileggendo il codice durante il brainstorming per gli upload paralleli, `multipa
 
 `AppColor`/`AppSpacing`/`AppFont`/`AppIconSize` (inizio `ContentView.swift`, subito dopo gli import): palette semantica (stato: successo/errore/warning/in-corso; identità destinazione: Mac→SSD/SSD→HDD/SSD→Cubbit; utility: Tools/Configurazione), griglia di spacing 4/8/12/16/24/32, 5 ruoli di testo (titolo/intestazione/corpo/didascalia/numero-hero), 2 taglie icona hero (36/48). Migrazione completa dei valori hardcoded preesistenti — nessun colore/font/spacing arbitrario rimasto fuori dai token, salvo 2 eccezioni documentate nel codice: l'etichetta `.caption2` sotto il numero in `CStat`/`StatCard` (contesto card compatta) e i 6 colori decorativi delle voci `HamburgerRow` diverse da Tools (fuori scope, non fanno parte della palette semantica a 7 token). Nessun cambio strutturale alle view — solo valori. Vedi `Docs/superpowers/specs/2026-08-12-design-foundations-design.md`.
 
+**Componenti unificati (2026-08-12, roadmap #23, Fase 3)**: `.cardBackground()` (ViewModifier) consolida le 9 occorrenze del pattern card in un solo punto. `StatCard`/`CStat` (duplicati, differivano solo per `frame`) uniti in `StatTile` con parametro `compact: Bool`. I 4 `GroupBox` di `ToolsSheet` usano `CardGroupBoxStyle` (applicato una volta sul contenitore radice del `body`, si propaga via environment) per lo stesso linguaggio visivo delle altre card — nessun cambio al contenuto interno dei blocchi. Nessuna resa visiva diversa da prima in nessuno dei tre casi, solo consolidamento di codice duplicato.
+
 ---
 
 ## Wireframe UI (da Excalidraw)
