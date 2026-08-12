@@ -115,6 +115,8 @@ Rileggendo il codice durante il brainstorming per gli upload paralleli, `multipa
 
 **Componenti unificati (2026-08-12, roadmap #23, Fase 3)**: `.cardBackground()` (ViewModifier) consolida le 9 occorrenze del pattern card in un solo punto. `StatCard`/`CStat` (duplicati, differivano solo per `frame`) uniti in `StatTile` con parametro `compact: Bool`. I 4 `GroupBox` di `ToolsSheet` usano `CardGroupBoxStyle` (applicato una volta sul contenitore radice del `body`, si propaga via environment) per lo stesso linguaggio visivo delle altre card — nessun cambio al contenuto interno dei blocchi. Nessuna resa visiva diversa da prima in nessuno dei tre casi, solo consolidamento di codice duplicato.
 
+**Micro-interazioni (2026-08-12, roadmap #24, Fase 4)**: hover feedback (tint di sfondo leggero) su `HamburgerRow`, `OpsButton` (bottone principale), e le righe del wizard Ripristina (`restoreSourceRow`, `s3SourceRow`, `chooseFoldersStep` — condividono un `@State` su `RestoreView` dato che non sono struct `View` indipendenti). `contentTransition(.numericText())` su `StatTile.value` e sui contatori percentuale/velocità di `StatsPanel`. `contentTransition(.symbolEffect(.replace))` sull'icona di stato in `PhaseIndicator`. `LocationRow` esclusa deliberatamente (non è una riga cliccabile a tutta larghezza, solo il bottone interno lo è, già con hover nativo). Nessuno skeleton/`.redacted` — nessun caso reale identificato nel codice attuale.
+
 ---
 
 ## Wireframe UI (da Excalidraw)
