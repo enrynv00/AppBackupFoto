@@ -3573,7 +3573,7 @@ struct LogContentView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 Text(output.isEmpty ? "Nessun output." : output)
-                    .font(AppFont.caption).textSelection(.enabled)
+                    .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading).padding(10).id("bottom")
             }
             .frame(minHeight: 190, maxHeight: .infinity)
