@@ -3320,7 +3320,7 @@ struct HamburgerRow: View {
                 Spacer()
 
                 if alert {
-                    Circle().fill(Color.red).frame(width: 7, height: 7)
+                    Circle().fill(AppColor.error).frame(width: 7, height: 7)
                 }
                 if let badge {
                     Text(badge)
