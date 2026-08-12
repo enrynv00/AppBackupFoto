@@ -3074,17 +3074,17 @@ struct SidebarView: View {
                 Text("Operazioni").font(.caption).fontWeight(.medium).foregroundStyle(.secondary)
                     .padding(.horizontal, 16).padding(.top, 10)
                 OpsButton(title: "MAC -> SSD", subtitle: "Photos originals → SSD",
-                          icon: "photo.on.rectangle.angled", color: .blue,
+                          icon: "photo.on.rectangle.angled", color: AppColor.macToSSD,
                           enabled: !runner.isRunning && volumes.ssdMounted,
                           action: { runner.runMacToSSD() },
                           onPreview: { runner.previewMacToSSD() })
                 OpsButton(title: "SSD -> HDD", subtitle: "Mirror locale (deep ogni 30gg)",
-                          icon: "externaldrive.badge.plus", color: .teal,
+                          icon: "externaldrive.badge.plus", color: AppColor.ssdToHDD,
                           enabled: !runner.isRunning && volumes.ssdMounted && volumes.hddMounted,
                           action: { runner.runSSDToHDD() },
                           onPreview: { runner.previewSSDToHDD() })
                 OpsButton(title: "SSD -> Cubbit S3", subtitle: "Cloud backup nativo Swift",
-                          icon: "icloud.and.arrow.up", color: .purple,
+                          icon: "icloud.and.arrow.up", color: AppColor.ssdToCubbit,
                           enabled: !runner.isRunning && volumes.ssdMounted,
                           action: { runner.runSyncS3() },
                           onPreview: { runner.previewSyncS3() })
@@ -3109,11 +3109,11 @@ struct VolumeRow: View {
     var body: some View {
         HStack(spacing: 10) {
             Image(systemName: icon).font(.system(size: 13))
-                .foregroundStyle(mounted ? (alwaysOn ? Color.purple : Color.primary) : Color.secondary.opacity(0.4))
+                .foregroundStyle(mounted ? (alwaysOn ? AppColor.ssdToCubbit : Color.primary) : Color.secondary.opacity(0.4))
                 .frame(width: 20)
             Text(name).font(.system(size: 13)).foregroundStyle(mounted ? Color.primary : Color.secondary)
             Spacer()
-            Circle().fill(mounted ? (alwaysOn ? Color.purple : Color.green) : Color.secondary.opacity(0.3))
+            Circle().fill(mounted ? (alwaysOn ? AppColor.ssdToCubbit : Color.green) : Color.secondary.opacity(0.3))
                 .frame(width: 7, height: 7)
         }.padding(.horizontal, 16).padding(.vertical, 5)
     }
@@ -3213,10 +3213,10 @@ struct HamburgerPanel: View {
                         HamburgerRow(icon: "arrow.down.doc.fill", label: "Ripristina", iconColor: .green) {
                             showRestore = true
                         }
-                        HamburgerRow(icon: "gearshape.fill", label: "Configurazione", iconColor: Color(NSColor.systemGray)) {
+                        HamburgerRow(icon: "gearshape.fill", label: "Configurazione", iconColor: AppColor.utility) {
                             showSettings = true; close()
                         }
-                        HamburgerRow(icon: "wrench.and.screwdriver.fill", label: "Tools", iconColor: .purple,
+                        HamburgerRow(icon: "wrench.and.screwdriver.fill", label: "Tools", iconColor: AppColor.utility,
                                      alert: !runner.toolsReviewFindings.isEmpty) {
                             guard !toolsLoading else { return }
                             toolsLoading = true
