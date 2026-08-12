@@ -2555,7 +2555,7 @@ struct RestoreView: View {
     private var chooseSourceStep: some View {
         VStack(spacing: 18) {
             VStack(spacing: 6) {
-                Image(systemName: "arrow.down.doc").font(.system(size: 40)).foregroundStyle(.blue)
+                Image(systemName: "arrow.down.doc").font(.system(size: AppIconSize.heroSmall)).foregroundStyle(.blue)
                 Text("Da dove vuoi ripristinare?").font(AppFont.title)
             }
             VStack(spacing: 10) {
@@ -2672,7 +2672,7 @@ struct RestoreView: View {
     private var chooseFoldersStep: some View {
         VStack(spacing: 18) {
             VStack(spacing: 6) {
-                Image(systemName: "folder").font(.system(size: 36)).foregroundStyle(.blue)
+                Image(systemName: "folder").font(.system(size: AppIconSize.heroSmall)).foregroundStyle(.blue)
                 Text("Cosa vuoi ripristinare?").font(AppFont.title)
                 Text("Sono già tutte selezionate — deseleziona solo quello che non ti serve.")
                     .font(.caption).foregroundStyle(.secondary)
@@ -2708,7 +2708,7 @@ struct RestoreView: View {
     private var chooseDestinationStep: some View {
         VStack(spacing: 18) {
             VStack(spacing: 6) {
-                Image(systemName: "tray.and.arrow.down").font(.system(size: 36)).foregroundStyle(.blue)
+                Image(systemName: "tray.and.arrow.down").font(.system(size: AppIconSize.heroSmall)).foregroundStyle(.blue)
                 Text("Dove vuoi salvare le foto?").font(AppFont.title)
                 Text("Dopo potrai trascinarle nell'app Foto quando vuoi.")
                     .font(.caption).foregroundStyle(.secondary)
@@ -2754,7 +2754,7 @@ struct RestoreView: View {
                 }
                 Button("Interrompi") { engine.stop() }.buttonStyle(.bordered).tint(AppColor.error)
             case .success:
-                Image(systemName: "checkmark.circle.fill").font(.system(size: 48)).foregroundStyle(AppColor.success)
+                Image(systemName: "checkmark.circle.fill").font(.system(size: AppIconSize.heroLarge)).foregroundStyle(AppColor.success)
                 Text("Fatto! Le tue foto sono qui").font(AppFont.title)
                 if let destinationURL {
                     Button("Apri cartella") { NSWorkspace.shared.activateFileViewerSelecting([destinationURL]) }
@@ -2766,7 +2766,7 @@ struct RestoreView: View {
                 }
                 Button("Chiudi") { dismiss() }.buttonStyle(.borderedProminent)
             case .failed(let msg):
-                Image(systemName: "exclamationmark.triangle.fill").font(.system(size: 48)).foregroundStyle(AppColor.warning)
+                Image(systemName: "exclamationmark.triangle.fill").font(.system(size: AppIconSize.heroLarge)).foregroundStyle(AppColor.warning)
                 Text(msg).font(AppFont.body).multilineTextAlignment(.center)
                 Button("Chiudi") { dismiss() }.buttonStyle(.borderedProminent)
             case .idle:
@@ -2812,7 +2812,7 @@ struct SetupView: View {
         VStack(spacing: 28) {
             VStack(spacing: 8) {
                 Image(systemName: "folder.badge.gearshape")
-                    .font(.system(size: 52)).foregroundStyle(.blue)
+                    .font(.system(size: AppIconSize.heroLarge)).foregroundStyle(.blue)
                 Text("Configurazione Backup Foto")
                     .font(AppFont.title)
                 Text("Seleziona le cartelle una volta sola — l'app le ricorderà automaticamente.")
@@ -2989,7 +2989,7 @@ struct CompletionSheet: View {
     var body: some View {
         VStack(spacing: 22) {
             Image(systemName: ok ? "checkmark.circle.fill" : "xmark.circle.fill")
-                .font(.system(size: 60)).foregroundStyle(ok ? AppColor.success : AppColor.error).symbolRenderingMode(.hierarchical)
+                .font(.system(size: AppIconSize.heroLarge)).foregroundStyle(ok ? AppColor.success : AppColor.error).symbolRenderingMode(.hierarchical)
             Text(ok ? "Backup completato" : "Backup fallito").font(AppFont.title)
             Text(phase.label).font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center)
             HStack(spacing: 14) {
@@ -3027,7 +3027,7 @@ struct CStat: View {
     let label: String; let value: String; let color: Color
     var body: some View {
         VStack(spacing: 4) {
-            Text(value).font(.system(size: 20, weight: .semibold, design: .monospaced)).foregroundStyle(color)
+            Text(value).font(AppFont.heroNumber).foregroundStyle(color)
             Text(label).font(.caption2).foregroundStyle(.secondary)
         }
         .frame(minWidth: 58).padding(.vertical, 10).padding(.horizontal, 8)
@@ -3425,7 +3425,7 @@ struct StatCard: View {
     let label: String; let value: String; let accent: Color
     var body: some View {
         VStack(spacing: 4) {
-            Text(value).font(.system(size: 18, weight: .semibold, design: .monospaced))
+            Text(value).font(AppFont.heroNumber)
                 .foregroundStyle(accent).lineLimit(1).minimumScaleFactor(0.6).textSelection(.enabled)
             Text(label).font(.caption2).foregroundStyle(.secondary)
         }.frame(maxWidth: .infinity).padding(.vertical, 10)
