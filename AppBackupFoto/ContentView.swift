@@ -2690,7 +2690,7 @@ struct RestoreView: View {
                                 Text(folder).font(AppFont.body)
                                 Spacer()
                             }
-                            .padding(AppSpacing.md).background(.quaternary.opacity(0.3)).clipShape(RoundedRectangle(cornerRadius: 6))
+                            .padding(AppSpacing.md).background(.quaternary.opacity(AppSpacing.cardOpacity)).clipShape(RoundedRectangle(cornerRadius: AppSpacing.cardCornerRadius))
                         }.buttonStyle(.plain)
                     }
                 }
@@ -3031,7 +3031,7 @@ struct CStat: View {
             Text(label).font(.caption2).foregroundStyle(.secondary)
         }
         .frame(minWidth: 58).padding(.vertical, AppSpacing.sm).padding(.horizontal, 8)
-        .background(.quaternary.opacity(0.5)).clipShape(RoundedRectangle(cornerRadius: 10))
+        .background(.quaternary.opacity(AppSpacing.cardOpacity)).clipShape(RoundedRectangle(cornerRadius: AppSpacing.cardCornerRadius))
     }
 }
 
@@ -3429,7 +3429,7 @@ struct StatCard: View {
                 .foregroundStyle(accent).lineLimit(1).minimumScaleFactor(0.6).textSelection(.enabled)
             Text(label).font(.caption2).foregroundStyle(.secondary)
         }.frame(maxWidth: .infinity).padding(.vertical, AppSpacing.md)
-        .background(.quaternary.opacity(0.5)).clipShape(RoundedRectangle(cornerRadius: 10))
+        .background(.quaternary.opacity(AppSpacing.cardOpacity)).clipShape(RoundedRectangle(cornerRadius: AppSpacing.cardCornerRadius))
     }
 }
 
@@ -3615,7 +3615,7 @@ struct AppearanceSheet: View {
                     .buttonStyle(.plain)
                 }
             }
-            .padding(8).background(.quaternary.opacity(0.4)).clipShape(RoundedRectangle(cornerRadius: 10))
+            .padding(AppSpacing.sm).background(.quaternary.opacity(AppSpacing.cardOpacity)).clipShape(RoundedRectangle(cornerRadius: AppSpacing.cardCornerRadius))
             Button("OK") { dismiss() }
                 .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
         }
