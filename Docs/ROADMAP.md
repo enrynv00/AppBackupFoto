@@ -96,7 +96,7 @@ Nuovo capitolo aperto dopo la chiusura della roadmap tecnica originale (punti 1-
 
 Lavoro diviso in 5 fasi indipendenti, ciascuna con il proprio ciclo spec → piano → implementazione (non una mega-spec unica, per restare verificabile e revertibile fase per fase):
 
-21. 🔲 **Fase 1 — Fondamenta design**: palette semantica (successo/errore/warning + accent blu di sistema), scala tipografica coerente, griglia di spacing 4/8/12/16. Nessun rischio strutturale. *In corso — prima fase scelta da Enrico.*
+21. ✅ **Fatto (2026-08-12) — Fase 1, fondamenta design.** 4 enum di design token (`AppColor`/`AppSpacing`/`AppFont`/`AppIconSize`) in `ContentView.swift`, migrazione completa di colori/tipografia/spacing/padding/corner-radius del pattern "card" verso i token. Vedi `Docs/superpowers/specs/2026-08-12-design-foundations-design.md` e `Docs/superpowers/plans/2026-08-12-design-foundations.md`.
 22. 🔲 **Fase 2 — Struttura**: `HSplitView` → `NavigationSplitView`, adozione material Liquid Glass (`.glassEffect()`) su sidebar/toolbar. Cambio più rischioso, da fare dopo le fondamenta.
 23. 🔲 **Fase 3 — Componenti**: sistema card unificato (padding/opacità/corner radius coerenti), merge `StatCard`/`CStat` duplicati, `GroupBox` vs card manuali allineati.
 24. 🔲 **Fase 4 — Micro-interazioni**: `onHover` su righe/liste, `contentTransition(.numericText())` sui contatori (MB/s, percentuali), `symbolEffect` su icone di stato, skeleton/`.redacted(reason: .placeholder)` al posto di spinner nudi.

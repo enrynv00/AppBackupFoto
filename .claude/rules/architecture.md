@@ -109,6 +109,10 @@ Rileggendo il codice durante il brainstorming per gli upload paralleli, `multipa
 - **SpeedLogPanel / SpeedChartView** — grafico velocità real-time (Charts framework) + tab Log con output testuale
 - **CompletionSheet / StatsPanel** — riepilogo copiati/skippati/errori/hash-mismatch a fine job
 
+### Design Tokens (2026-08-12, roadmap #21, Fase 1)
+
+`AppColor`/`AppSpacing`/`AppFont`/`AppIconSize` (inizio `ContentView.swift`, subito dopo gli import): palette semantica (stato: successo/errore/warning/in-corso; identità destinazione: Mac→SSD/SSD→HDD/SSD→Cubbit; utility: Tools/Configurazione), griglia di spacing 4/8/12/16/24/32, 5 ruoli di testo (titolo/intestazione/corpo/didascalia/numero-hero), 2 taglie icona hero (36/48). Migrazione completa dei valori hardcoded preesistenti — nessun colore/font/spacing arbitrario rimasto fuori dai token, salvo 2 eccezioni documentate nel codice: l'etichetta `.caption2` sotto il numero in `CStat`/`StatCard` (contesto card compatta) e i 6 colori decorativi delle voci `HamburgerRow` diverse da Tools (fuori scope, non fanno parte della palette semantica a 7 token). Nessun cambio strutturale alle view — solo valori. Vedi `Docs/superpowers/specs/2026-08-12-design-foundations-design.md`.
+
 ---
 
 ## Wireframe UI (da Excalidraw)
