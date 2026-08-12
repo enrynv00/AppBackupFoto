@@ -77,7 +77,9 @@ Subito dopo `@Published var s3ConfigError: Error? = nil` (le altre `@Published` 
 
 (le ~20 chiamate esistenti `alert("...", "...")`/`self.alert("...", "...")` sparse in `runMacToSSD`/`runSSDToHDD`/`runSyncS3` e le loro anteprime restano invariate come sintassi — cambia solo l'implementazione dell'helper)
 
-- [ ] **Step 5: Aggiungi `.alert(item:)` a `ContentView.body`**
+- [ ] **Step 5: Aggiungi `.alert(...)` a `ContentView.body`**
+
+**Nota tecnica (correzione post-piano)**: l'SDK di questo progetto (macOS 26.5) non espone `.alert(item:actions:message:)` a 3 argomenti senza titolo — solo le varianti con titolo esplicito (`.alert(_:isPresented:presenting:actions:message:)`) supportano `actions`/`message` separati con `SimpleAlert` non-optional dentro le closure. Verificato con `xcrun swiftc -typecheck` isolato durante l'esecuzione di questo task. Usa quindi questa forma (guidata da un `Binding<Bool>` derivato da `pendingAlert != nil`), non `.alert(item:)`.
 
 Trova la fine del `body` (dopo `.sheet(isPresented: $showSettings) { SettingsSheet() }`, subito prima della chiusura `}` del `body`):
 ```swift
@@ -86,7 +88,10 @@ Trova la fine del `body` (dopo `.sheet(isPresented: $showSettings) { SettingsShe
     }
 // Dopo:
         .sheet(isPresented: $showSettings) { SettingsSheet() }
-        .alert(item: $runner.pendingAlert) { a in
+        .alert(runner.pendingAlert?.title ?? "", isPresented: Binding(
+            get: { runner.pendingAlert != nil },
+            set: { if !$0 { runner.pendingAlert = nil } }
+        ), presenting: runner.pendingAlert) { a in
             Button(a.confirmTitle, role: a.isDestructive ? .destructive : nil) { a.onConfirm?() }
             if let cancelTitle = a.cancelTitle {
                 Button(cancelTitle, role: .cancel) {}
@@ -124,7 +129,7 @@ BackupRunner.pendingAlert (@Published) sostituisce le chiamate NSAlert
 dell'helper condiviso alert(_:_:) — usato da ~20 guardie di
 validazione in runMacToSSD/runSSDToHDD/runSyncS3 e anteprime, nessun
 call site toccato. ContentView presenta tutto con un solo
-.alert(item: $runner.pendingAlert).
+.alert(...) guidato da runner.pendingAlert.
 
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 EOF
@@ -309,7 +314,9 @@ Subito dopo `static let shared = BookmarkManager()`:
                     message: "Percorso: \(url.path)\n\nErrore: \(nsError.localizedDescription)\n(dominio \(nsError.domain), codice \(nsError.code))")
 ```
 
-- [ ] **Step 4: Aggiungi `.alert(item:)` a `RootView`**
+- [ ] **Step 4: Aggiungi `.alert(...)` a `RootView`**
+
+**Stessa nota tecnica del Task 1, Step 5**: usa `.alert(_:isPresented:presenting:actions:message:)`, non `.alert(item:)` (quest'ultimo non supporta `actions`/`message` separati in questo SDK).
 
 ```swift
 // Prima:
@@ -338,7 +345,10 @@ struct RootView: View {
             Notifier.requestAuthorization()
             AppearanceManager.shared.apply()
         }
-        .alert(item: $bm.pendingAlert) { a in
+        .alert(bm.pendingAlert?.title ?? "", isPresented: Binding(
+            get: { bm.pendingAlert != nil },
+            set: { if !$0 { bm.pendingAlert = nil } }
+        ), presenting: bm.pendingAlert) { a in
             Button(a.confirmTitle, role: a.isDestructive ? .destructive : nil) { a.onConfirm?() }
             if let cancelTitle = a.cancelTitle {
                 Button(cancelTitle, role: .cancel) {}
@@ -350,7 +360,7 @@ struct RootView: View {
 }
 ```
 
-- [ ] **Step 5: Aggiungi lo stesso `.alert(item:)` a `ToolsSheet`**
+- [ ] **Step 5: Aggiungi lo stesso `.alert(...)` a `ToolsSheet`**
 
 Trova la fine del `body` di `ToolsSheet` (dopo `.groupBoxStyle(CardGroupBoxStyle())`, subito prima della chiusura `}` del `body`):
 ```swift
@@ -362,7 +372,10 @@ Trova la fine del `body` di `ToolsSheet` (dopo `.groupBoxStyle(CardGroupBoxStyle
 // Dopo:
         .padding(AppSpacing.xxl).frame(minWidth: 560, minHeight: 480)
         .groupBoxStyle(CardGroupBoxStyle())
-        .alert(item: $bm.pendingAlert) { a in
+        .alert(bm.pendingAlert?.title ?? "", isPresented: Binding(
+            get: { bm.pendingAlert != nil },
+            set: { if !$0 { bm.pendingAlert = nil } }
+        ), presenting: bm.pendingAlert) { a in
             Button(a.confirmTitle, role: a.isDestructive ? .destructive : nil) { a.onConfirm?() }
             if let cancelTitle = a.cancelTitle {
                 Button(cancelTitle, role: .cancel) {}
@@ -374,7 +387,7 @@ Trova la fine del `body` di `ToolsSheet` (dopo `.groupBoxStyle(CardGroupBoxStyle
 }
 ```
 
-(sì, lo stesso identico blocco `.alert(item: $bm.pendingAlert) { ... }` in due posti — è la stessa fonte di stato osservata da due finestre indipendenti, come spiegato nella spec)
+(sì, lo stesso identico blocco `.alert(...)` in due posti — è la stessa fonte di stato osservata da due finestre indipendenti, come spiegato nella spec)
 
 - [ ] **Step 6: Build**
 
@@ -400,7 +413,7 @@ Migrate BookmarkManager's NSAlert, observed from 2 windows (roadmap #25)
 selectAndSave() può fallire sia da SetupView (RootView) sia dalla
 finestra Diagnostica separata (ToolsSheet, "Cartelle Configurate")
 — entrambe osservano lo stesso BookmarkManager.pendingAlert con lo
-stesso blocco .alert(item:), non un singolo punto di presentazione.
+stesso blocco .alert(...), non un singolo punto di presentazione.
 
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 EOF
@@ -418,7 +431,7 @@ EOF
 - Consumes: `SimpleAlert` (Task 1).
 - Produces: `ToolsSheet.pendingAlert: SimpleAlert?` (locale, `@State`) — usato dai Task 5 e 6.
 
-**Nota**: `ToolsSheet` ha già `.alert(item: $bm.pendingAlert)` dal Task 3 — questo task aggiunge un **secondo** `.alert(item:)`, per uno stato diverso (`pendingAlert` locale della sheet, non `bm.pendingAlert`). SwiftUI supporta più modificatori `.alert()` sulla stessa view: non sono mai presentati insieme nella pratica, dato che uno stato diventa non-nil alla volta.
+**Nota**: `ToolsSheet` ha già un `.alert(...)` guidato da `bm.pendingAlert` dal Task 3 — questo task aggiunge un **secondo** `.alert(...)`, per uno stato diverso (`pendingAlert` locale della sheet, non `bm.pendingAlert`). SwiftUI supporta più modificatori `.alert()` sulla stessa view: non sono mai presentati insieme nella pratica, dato che uno stato diventa non-nil alla volta. Stessa nota tecnica del Task 1/3: usa `.alert(_:isPresented:presenting:actions:message:)`, non `.alert(item:)`.
 
 - [ ] **Step 1: Verifica `confirmReveal` e aggiungi lo `@State`**
 
@@ -455,9 +468,9 @@ Subito dopo `@State private var integrityStatus = ""` (le altre `@State` esisten
     }
 ```
 
-- [ ] **Step 3: Aggiungi il secondo `.alert(item:)` per `pendingAlert` locale**
+- [ ] **Step 3: Aggiungi il secondo `.alert(...)` per `pendingAlert` locale**
 
-Subito dopo il blocco `.alert(item: $bm.pendingAlert) { ... }` aggiunto nel Task 3 (fine del `body` di `ToolsSheet`):
+Subito dopo il blocco `.alert(...)` guidato da `bm.pendingAlert` aggiunto nel Task 3 (fine del `body` di `ToolsSheet`):
 ```swift
 // Prima (fine del body, dopo il Task 3):
         } message: { a in
@@ -469,7 +482,10 @@ Subito dopo il blocco `.alert(item: $bm.pendingAlert) { ... }` aggiunto nel Task
         } message: { a in
             Text(a.message)
         }
-        .alert(item: $pendingAlert) { a in
+        .alert(pendingAlert?.title ?? "", isPresented: Binding(
+            get: { pendingAlert != nil },
+            set: { if !$0 { pendingAlert = nil } }
+        ), presenting: pendingAlert) { a in
             Button(a.confirmTitle, role: a.isDestructive ? .destructive : nil) { a.onConfirm?() }
             if let cancelTitle = a.cancelTitle {
                 Button(cancelTitle, role: .cancel) {}
@@ -773,7 +789,7 @@ Subito dopo `@AppStorage("autoBackupOnSSDConnect") private var autoBackupEnabled
 
 - [ ] **Step 3: Aggiungi l'alert al `body`**
 
-Subito dopo il blocco `.alert(item: $runner.pendingAlert) { ... } message: { ... }` aggiunto nel Task 1 (fine del `body` di `ContentView`):
+Subito dopo il blocco `.alert(...) { ... } message: { ... }` guidato da `runner.pendingAlert`, aggiunto nel Task 1 (fine del `body` di `ContentView`):
 ```swift
 // Dopo il blocco del Task 1:
         .alert("Chiudere l'app?", isPresented: $showQuitConfirm) {
