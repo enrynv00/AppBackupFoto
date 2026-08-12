@@ -188,7 +188,7 @@ struct CatalogView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: AppSpacing.md) {
             Text("Catalogo").font(AppFont.title)
 
             Picker("Destinazione", selection: $destination) {
@@ -2539,7 +2539,7 @@ struct RestoreView: View {
     @State private var s3EstimateText = ""
 
     var body: some View {
-        VStack(spacing: 20) {
+        VStack(spacing: AppSpacing.xl) {
             switch step {
             case .chooseSource: chooseSourceStep
             case .chooseFolders: chooseFoldersStep
@@ -2553,12 +2553,12 @@ struct RestoreView: View {
     }
 
     private var chooseSourceStep: some View {
-        VStack(spacing: 18) {
-            VStack(spacing: 6) {
+        VStack(spacing: AppSpacing.lg) {
+            VStack(spacing: AppSpacing.sm) {
                 Image(systemName: "arrow.down.doc").font(.system(size: AppIconSize.heroSmall)).foregroundStyle(.blue)
                 Text("Da dove vuoi ripristinare?").font(AppFont.title)
             }
-            VStack(spacing: 10) {
+            VStack(spacing: AppSpacing.md) {
                 restoreSourceRow(.ssd, available: volumes.ssdMounted,
                                   unavailableReason: "non collegato in questo momento")
                 restoreSourceRow(.hdd, available: volumes.hddMounted,
@@ -2589,7 +2589,7 @@ struct RestoreView: View {
             }
         } label: {
             HStack {
-                VStack(alignment: .leading, spacing: 2) {
+                VStack(alignment: .leading, spacing: AppSpacing.xs) {
                     Text(source.displayName).font(AppFont.body)
                     if !available {
                         Text(unavailableReason).font(.caption).foregroundStyle(.secondary)
@@ -2628,7 +2628,7 @@ struct RestoreView: View {
                 }.buttonStyle(.plain)
             case .unavailable(let reason):
                 HStack {
-                    VStack(alignment: .leading, spacing: 2) {
+                    VStack(alignment: .leading, spacing: AppSpacing.xs) {
                         Text(RestoreSource.s3.displayName).font(AppFont.body)
                         Text(reason).font(.caption).foregroundStyle(.secondary)
                     }
@@ -2670,15 +2670,15 @@ struct RestoreView: View {
     }
 
     private var chooseFoldersStep: some View {
-        VStack(spacing: 18) {
-            VStack(spacing: 6) {
+        VStack(spacing: AppSpacing.lg) {
+            VStack(spacing: AppSpacing.sm) {
                 Image(systemName: "folder").font(.system(size: AppIconSize.heroSmall)).foregroundStyle(.blue)
                 Text("Cosa vuoi ripristinare?").font(AppFont.title)
                 Text("Sono già tutte selezionate — deseleziona solo quello che non ti serve.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             ScrollView {
-                VStack(spacing: 8) {
+                VStack(spacing: AppSpacing.sm) {
                     ForEach(availableFolders, id: \.self) { folder in
                         Button {
                             if selectedFolders.contains(folder) { selectedFolders.remove(folder) }
@@ -2706,8 +2706,8 @@ struct RestoreView: View {
     }
 
     private var chooseDestinationStep: some View {
-        VStack(spacing: 18) {
-            VStack(spacing: 6) {
+        VStack(spacing: AppSpacing.lg) {
+            VStack(spacing: AppSpacing.sm) {
                 Image(systemName: "tray.and.arrow.down").font(.system(size: AppIconSize.heroSmall)).foregroundStyle(.blue)
                 Text("Dove vuoi salvare le foto?").font(AppFont.title)
                 Text("Dopo potrai trascinarle nell'app Foto quando vuoi.")
@@ -2741,7 +2741,7 @@ struct RestoreView: View {
     }
 
     private var runningStep: some View {
-        VStack(spacing: 20) {
+        VStack(spacing: AppSpacing.xl) {
             switch engine.phase {
             case .running:
                 ProgressView(value: Double(engine.progress.percent), total: 100)
@@ -2809,8 +2809,8 @@ struct SetupView: View {
     @ObservedObject private var bm = BookmarkManager.shared
     @State private var showRestore = false
     var body: some View {
-        VStack(spacing: 28) {
-            VStack(spacing: 8) {
+        VStack(spacing: AppSpacing.xxl) {
+            VStack(spacing: AppSpacing.sm) {
                 Image(systemName: "folder.badge.gearshape")
                     .font(.system(size: AppIconSize.heroLarge)).foregroundStyle(.blue)
                 Text("Configurazione Backup Foto")
@@ -2818,7 +2818,7 @@ struct SetupView: View {
                 Text("Seleziona le cartelle una volta sola — l'app le ricorderà automaticamente.")
                     .font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center)
             }
-            VStack(spacing: 10) {
+            VStack(spacing: AppSpacing.md) {
                 ForEach(BookmarkManager.Location.allCases) { loc in
                     LocationRow(location: loc) { bm.selectAndSave(loc) { _ in } }
                 }
@@ -2838,10 +2838,10 @@ struct LocationRow: View {
     let location: BookmarkManager.Location
     let onSelect: () -> Void
     var body: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: AppSpacing.md) {
             Image(systemName: bm.urls[location] != nil ? "checkmark.circle.fill" : "circle")
                 .foregroundStyle(bm.urls[location] != nil ? AppColor.success : .secondary).font(.system(size: 18))
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: AppSpacing.xs) {
                 Text(location.displayName).font(AppFont.body)
                 if let url = bm.urls[location] {
                     Text(url.path).font(AppFont.caption).foregroundStyle(.secondary)
@@ -2875,7 +2875,7 @@ struct ContentView: View {
                 SidebarView(volumes: volumes, runner: runner, showHamburger: $showHamburger)
                     .frame(minWidth: 220, maxWidth: 260)
                 VStack(spacing: 0) {
-                    HStack(spacing: 10) {
+                    HStack(spacing: AppSpacing.sm) {
                         PhaseIndicator(phase: runner.phase, percent: runner.stats.percent)
                         Spacer()
                         Button {
@@ -2964,15 +2964,15 @@ struct SettingsSheet: View {
     @ObservedObject private var bm = BookmarkManager.shared
     @AppStorage("autoBackupOnSSDConnect") private var autoBackupEnabled: Bool = true
     var body: some View {
-        VStack(spacing: 20) {
+        VStack(spacing: AppSpacing.xl) {
             Text("Impostazioni").font(AppFont.title)
             Text("Modifica le cartelle selezionate").font(.subheadline).foregroundStyle(.secondary)
-            VStack(alignment: .leading, spacing: 4) {
+            VStack(alignment: .leading, spacing: AppSpacing.xs) {
                 Toggle("Backup automatico Mac → SSD quando colleghi l'SSD", isOn: $autoBackupEnabled)
                 Text("Appena colleghi l'SSD, se l'app è aperta, parte da sola l'aggiornamento da Foto a SSD.")
                     .font(.caption).foregroundStyle(.secondary)
             }.padding(.horizontal, 20)
-            VStack(spacing: 10) {
+            VStack(spacing: AppSpacing.md) {
                 ForEach(BookmarkManager.Location.allCases) { loc in
                     LocationRow(location: loc) { bm.selectAndSave(loc) { _ in } }
                 }
@@ -2987,12 +2987,12 @@ struct CompletionSheet: View {
     let phase: JobPhase; let stats: JobStats; let onDismiss: () -> Void
     private var ok: Bool { if case .success = phase { return true }; return false }
     var body: some View {
-        VStack(spacing: 22) {
+        VStack(spacing: AppSpacing.xl) {
             Image(systemName: ok ? "checkmark.circle.fill" : "xmark.circle.fill")
                 .font(.system(size: AppIconSize.heroLarge)).foregroundStyle(ok ? AppColor.success : AppColor.error).symbolRenderingMode(.hierarchical)
             Text(ok ? "Backup completato" : "Backup fallito").font(AppFont.title)
             Text(phase.label).font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center)
-            HStack(spacing: 14) {
+            HStack(spacing: AppSpacing.md) {
                 CStat(label: "Copiati",  value: "\(stats.copied)",  color: AppColor.inProgress)
                 CStat(label: "Skippati", value: "\(stats.skipped)", color: .secondary)
                 CStat(label: "Errori",   value: "\(stats.errors)",  color: stats.errors > 0 ? AppColor.error : .secondary)
@@ -3026,7 +3026,7 @@ struct CompletionSheet: View {
 struct CStat: View {
     let label: String; let value: String; let color: Color
     var body: some View {
-        VStack(spacing: 4) {
+        VStack(spacing: AppSpacing.xs) {
             Text(value).font(AppFont.heroNumber).foregroundStyle(color)
             Text(label).font(.caption2).foregroundStyle(.secondary)
         }
@@ -3043,7 +3043,7 @@ struct SidebarView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 10) {
+            HStack(spacing: AppSpacing.sm) {
                 Button {
                     withAnimation(.easeInOut(duration: 0.22)) { showHamburger.toggle() }
                 } label: {
@@ -3053,7 +3053,7 @@ struct SidebarView: View {
                 .buttonStyle(.borderless)
                 .foregroundStyle(showHamburger ? Color.accentColor : Color.primary)
 
-                VStack(alignment: .leading, spacing: 3) {
+                VStack(alignment: .leading, spacing: AppSpacing.xs) {
                     Text("Backup Foto").font(AppFont.title)
                     Text("Backup personale").font(.caption).foregroundStyle(.secondary)
                 }
@@ -3062,14 +3062,14 @@ struct SidebarView: View {
             .padding(.horizontal, 16).padding(.top, 20).padding(.bottom, 16)
 
             Divider()
-            VStack(alignment: .leading, spacing: 4) {
+            VStack(alignment: .leading, spacing: AppSpacing.xs) {
                 HamburgerSectionLabel("Volumi")
                 VolumeRow(name: "SSD - Enri",  icon: "internaldrive.fill",  mounted: volumes.ssdMounted)
                 VolumeRow(name: "BackupHDD",   icon: "externaldrive.fill",  mounted: volumes.hddMounted)
                 VolumeRow(name: "Cubbit S3",   icon: "cloud.fill",          mounted: true, alwaysOn: true)
             }.padding(.bottom, 10)
             Divider()
-            VStack(alignment: .leading, spacing: 4) {
+            VStack(alignment: .leading, spacing: AppSpacing.xs) {
                 HamburgerSectionLabel("Operazioni")
                 OpsButton(title: "MAC -> SSD", subtitle: "Photos originals → SSD",
                           icon: "photo.on.rectangle.angled", color: AppColor.macToSSD,
@@ -3091,7 +3091,7 @@ struct SidebarView: View {
             if let start = runner.startTime {
                 Divider()
                 HStack {
-                    VStack(alignment: .leading, spacing: 2) {
+                    VStack(alignment: .leading, spacing: AppSpacing.xs) {
                         Text("Avviato alle").font(AppFont.caption).foregroundStyle(.secondary)
                         Text(start, style: .time).font(.caption).monospacedDigit()
                     }
@@ -3105,7 +3105,7 @@ struct SidebarView: View {
 struct VolumeRow: View {
     let name: String; let icon: String; let mounted: Bool; var alwaysOn = false
     var body: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: AppSpacing.sm) {
             Image(systemName: icon).font(.system(size: 13))
                 .foregroundStyle(mounted ? (alwaysOn ? AppColor.ssdToCubbit : Color.primary) : Color.secondary.opacity(0.4))
                 .frame(width: 20)
@@ -3124,10 +3124,10 @@ struct OpsButton: View {
     var body: some View {
         HStack(spacing: 0) {
             Button(action: action) {
-                HStack(spacing: 10) {
+                HStack(spacing: AppSpacing.sm) {
                     Image(systemName: icon).font(.system(size: 14, weight: .medium))
                         .foregroundStyle(enabled ? color : Color.secondary).frame(width: 22)
-                    VStack(alignment: .leading, spacing: 1) {
+                    VStack(alignment: .leading, spacing: AppSpacing.xs) {
                         Text(title).font(AppFont.body)
                             .foregroundStyle(enabled ? Color.primary : Color.secondary)
                         Text(subtitle).font(AppFont.caption).foregroundStyle(Color.secondary)
@@ -3182,12 +3182,12 @@ struct HamburgerPanel: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 12) {
+            HStack(spacing: AppSpacing.md) {
                     ZStack {
                         Circle().fill(Color.accentColor.opacity(0.15)).frame(width: 44, height: 44)
                         Text(initials).font(.system(size: 16, weight: .semibold)).foregroundStyle(Color.accentColor)
                     }
-                    VStack(alignment: .leading, spacing: 2) {
+                    VStack(alignment: .leading, spacing: AppSpacing.xs) {
                         Text(profileName).font(AppFont.body)
                         Text(profileEmail).font(AppFont.caption).foregroundStyle(.secondary)
                     }
@@ -3203,7 +3203,7 @@ struct HamburgerPanel: View {
                 Divider()
 
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 2) {
+                    VStack(alignment: .leading, spacing: AppSpacing.xs) {
                         HamburgerSectionLabel("Strumenti")
                         HamburgerRow(icon: "doc.text.magnifyingglass", label: "Report Log", iconColor: .blue) {
                             onShowLog?(); close()
@@ -3264,7 +3264,7 @@ struct HamburgerPanel: View {
 
                 Spacer()
                 Divider()
-                HStack(spacing: 6) {
+                HStack(spacing: AppSpacing.sm) {
                     Image(systemName: "info.circle").font(AppFont.caption).foregroundStyle(.secondary)
                     Text("Versione \(version)").font(AppFont.caption).foregroundStyle(.secondary)
                 }
@@ -3303,7 +3303,7 @@ struct HamburgerRow: View {
 
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 12) {
+            HStack(spacing: AppSpacing.md) {
                 Image(systemName: icon)
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(.white)
@@ -3340,7 +3340,7 @@ struct HamburgerRow: View {
 struct PhaseIndicator: View {
     let phase: JobPhase; let percent: Int
     var body: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: AppSpacing.sm) {
             if case .running = phase {
                 ProgressView().controlSize(.small)
                 Text(percent >= 100 ? "Finalizzando..." : phase.label)
@@ -3373,7 +3373,7 @@ struct StatusBar: View {
     let status: String; let phase: JobPhase
     var body: some View {
         if !status.isEmpty {
-            HStack(spacing: 8) {
+            HStack(spacing: AppSpacing.sm) {
                 Image(systemName: "info.circle.fill").font(.system(size: 11))
                     .foregroundStyle(phase.color.opacity(0.8))
                 Text(status).font(.system(size: 12)).lineLimit(2).fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
@@ -3390,12 +3390,12 @@ struct StatusBar: View {
 struct StatsPanel: View {
     let stats: JobStats; let phase: JobPhase; let currentStatus: String; let currentThumbnail: NSImage?
     var body: some View {
-        VStack(spacing: 14) {
-            HStack(spacing: 10) {
+        VStack(spacing: AppSpacing.lg) {
+            HStack(spacing: AppSpacing.sm) {
                 CurrentFileThumbnail(image: currentThumbnail)
                 StatusBar(status: currentStatus, phase: phase)
             }
-            VStack(spacing: 6) {
+            VStack(spacing: AppSpacing.sm) {
                 HStack {
                     Text("Avanzamento").font(.caption).foregroundStyle(.secondary)
                     Spacer()
@@ -3410,7 +3410,7 @@ struct StatsPanel: View {
                     Text("velocita \(stats.speed)").font(AppFont.caption).monospacedDigit().foregroundStyle(.secondary)
                 }
             }
-            HStack(spacing: 10) {
+            HStack(spacing: AppSpacing.md) {
                 StatCard(label: "Copiati",   value: "\(stats.copied)",  accent: AppColor.inProgress)
                 StatCard(label: "Skippati",  value: "\(stats.skipped)", accent: .secondary)
                 StatCard(label: "Errori",    value: "\(stats.errors)",  accent: stats.errors > 0 ? AppColor.error : .secondary)
@@ -3424,7 +3424,7 @@ struct StatsPanel: View {
 struct StatCard: View {
     let label: String; let value: String; let accent: Color
     var body: some View {
-        VStack(spacing: 4) {
+        VStack(spacing: AppSpacing.xs) {
             Text(value).font(AppFont.heroNumber)
                 .foregroundStyle(accent).lineLimit(1).minimumScaleFactor(0.6).textSelection(.enabled)
             Text(label).font(.caption2).foregroundStyle(.secondary)
@@ -3446,7 +3446,7 @@ struct SpeedLogPanel: View {
     @Binding var activeTab: SpeedLogTab
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: AppSpacing.sm) {
             HStack {
                 Picker("", selection: $activeTab) {
                     ForEach(SpeedLogTab.allCases, id: \.self) { tab in
@@ -3501,7 +3501,7 @@ struct SpeedChartView: View {
                 RoundedRectangle(cornerRadius: 8)
                     .fill(Color.primary.opacity(0.05))
                     .overlay(
-                        VStack(spacing: 6) {
+                        VStack(spacing: AppSpacing.sm) {
                             Image(systemName: "chart.line.uptrend.xyaxis")
                                 .font(.system(size: 18))
                                 .foregroundStyle(.secondary.opacity(0.4))
@@ -3593,14 +3593,14 @@ struct AppearanceSheet: View {
     private let icons = ["circle.lefthalf.filled", "sun.max.fill", "moon.fill"]
 
     var body: some View {
-        VStack(spacing: 24) {
+        VStack(spacing: AppSpacing.xl) {
             Text("Aspetto Interfaccia").font(AppFont.title)
-            VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: AppSpacing.sm) {
                 ForEach(Array(zip(modes, icons)), id: \.0) { mode, icon in
                     Button {
                         appearance.mode = mode
                     } label: {
-                        HStack(spacing: 12) {
+                        HStack(spacing: AppSpacing.md) {
                             Image(systemName: appearance.mode == mode ? "checkmark.circle.fill" : "circle")
                                 .foregroundStyle(appearance.mode == mode ? Color.accentColor : Color.secondary)
                             Image(systemName: icon).foregroundStyle(.secondary).frame(width: 16)
@@ -3664,13 +3664,13 @@ struct ToolsSheet: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
+        VStack(alignment: .leading, spacing: AppSpacing.lg) {
             Text("Diagnostica").font(AppFont.title)
 
             GroupBox("Cartelle Configurate") {
-                VStack(alignment: .leading, spacing: 8) {
+                VStack(alignment: .leading, spacing: AppSpacing.sm) {
                     ForEach(BookmarkManager.Location.allCases) { loc in
-                        HStack(spacing: 8) {
+                        HStack(spacing: AppSpacing.sm) {
                             Image(systemName: bm.urls[loc] != nil ? "checkmark.circle.fill" : "xmark.circle.fill")
                                 .foregroundStyle(bm.urls[loc] != nil ? AppColor.success : AppColor.error)
                                 .font(.system(size: 12))
@@ -3686,7 +3686,7 @@ struct ToolsSheet: View {
             }
 
             GroupBox("S3 — Cubbit") {
-                VStack(alignment: .leading, spacing: 6) {
+                VStack(alignment: .leading, spacing: AppSpacing.sm) {
                     if let cfg = runner.s3Config {
                         Text(runner.s3ConfigFromKeychain ? "Origine: Keychain" : "Origine: rclone.conf")
                             .font(AppFont.caption).foregroundStyle(.secondary)
@@ -3757,20 +3757,20 @@ struct ToolsSheet: View {
             }
 
             GroupBox("Sync Info") {
-                VStack(alignment: .leading, spacing: 6) {
+                VStack(alignment: .leading, spacing: AppSpacing.sm) {
                     DiagRow(label: "Ultimo deep", value: lastDeepDate)
                     DiagRow(label: "Log", value: "Visibile nella console principale (tab Log)")
                 }.padding(4)
             }
 
             GroupBox("Revisione") {
-                VStack(alignment: .leading, spacing: 10) {
+                VStack(alignment: .leading, spacing: AppSpacing.sm) {
                     ForEach(runner.toolsReviewFindings) { finding in
-                        HStack(alignment: .top, spacing: 8) {
+                        HStack(alignment: .top, spacing: AppSpacing.sm) {
                             Image(systemName: finding.ok ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
                                 .foregroundStyle(finding.ok ? AppColor.success : AppColor.warning)
                                 .font(.system(size: 12))
-                            VStack(alignment: .leading, spacing: 1) {
+                            VStack(alignment: .leading, spacing: AppSpacing.xs) {
                                 Text(finding.title).font(.caption).fontWeight(.medium)
                                 Text(finding.detail).font(AppFont.caption).foregroundStyle(.secondary)
                             }
@@ -3780,11 +3780,11 @@ struct ToolsSheet: View {
                     Divider()
 
                     if let lastJob {
-                        HStack(alignment: .top, spacing: 8) {
+                        HStack(alignment: .top, spacing: AppSpacing.sm) {
                             Image(systemName: lastJob.isClean ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
                                 .foregroundStyle(lastJob.isClean ? AppColor.success : AppColor.warning)
                                 .font(.system(size: 12))
-                            VStack(alignment: .leading, spacing: 1) {
+                            VStack(alignment: .leading, spacing: AppSpacing.xs) {
                                 Text("Ultimo job: \(lastJob.label)").font(.caption).fontWeight(.medium)
                                 Text("\(jobDateFormatter.string(from: lastJob.date)) · Copiati \(lastJob.copied) · Skippati \(lastJob.skipped) · Errori \(lastJob.errors) · Hash-mismatch \(lastJob.hashErrors)")
                                     .font(AppFont.caption).foregroundStyle(.secondary)
@@ -3817,7 +3817,7 @@ struct ToolsSheet: View {
                     }
 
                     ForEach(integrityResults) { result in
-                        VStack(alignment: .leading, spacing: 1) {
+                        VStack(alignment: .leading, spacing: AppSpacing.xs) {
                             if let error = result.error {
                                 Text("\(result.pairName): saltato — \(error)")
                                     .font(AppFont.caption).foregroundStyle(AppColor.warning)
@@ -3839,8 +3839,8 @@ struct ToolsSheet: View {
                     } else if !runner.toolsOrphanedUploads.isEmpty {
                         Text("Upload incompleti trovati").font(.caption).fontWeight(.medium)
                         ForEach(runner.toolsOrphanedUploads) { upload in
-                            HStack(alignment: .top, spacing: 8) {
-                                VStack(alignment: .leading, spacing: 1) {
+                            HStack(alignment: .top, spacing: AppSpacing.sm) {
+                                VStack(alignment: .leading, spacing: AppSpacing.xs) {
                                     Text((upload.key as NSString).lastPathComponent).font(AppFont.caption)
                                     Text("iniziato il \(uploadDateFormatter.string(from: upload.initiated))")
                                         .font(AppFont.caption).foregroundStyle(.secondary)
