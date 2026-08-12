@@ -3331,6 +3331,7 @@ struct HamburgerRow: View {
     var badge: String? = nil
     var alert: Bool = false
     let action: () -> Void
+    @State private var isHovering = false
 
     var body: some View {
         Button(action: action) {
@@ -3362,8 +3363,12 @@ struct HamburgerRow: View {
             }
             .padding(.horizontal, 16).padding(.vertical, 8)
             .contentShape(Rectangle())
+            .background(Color.primary.opacity(isHovering ? 0.05 : 0))
         }
         .buttonStyle(.plain)
+        .onHover { hovering in
+            withAnimation(.easeInOut(duration: 0.1)) { isHovering = hovering }
+        }
     }
 }
 
