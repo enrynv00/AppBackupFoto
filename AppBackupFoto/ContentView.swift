@@ -2906,7 +2906,7 @@ struct ContentView: View {
                     }
                     .padding(.horizontal, AppSpacing.lg).padding(.vertical, 8)
                 }
-                .frame(maxHeight: .infinity)
+                .frame(maxHeight: .infinity, alignment: .top)
             }
 
             if showHamburger {
