@@ -59,6 +59,18 @@ enum AppIconSize {
     static let heroLarge: CGFloat = 48
 }
 
+/// Alert semplice riusato ovunque: cancelTitle nil = solo un bottone (informativo),
+/// cancelTitle impostato = conferma a 2 bottoni con onConfirm eseguito sulla scelta primaria.
+struct SimpleAlert: Identifiable {
+    let id = UUID()
+    var title: String
+    var message: String = ""
+    var isDestructive: Bool = false
+    var confirmTitle: String = "OK"
+    var cancelTitle: String? = nil
+    var onConfirm: (() -> Void)? = nil
+}
+
 /// Sfondo "card" riusato in tutta l'app: stesso corner radius/opacità ovunque.
 struct CardBackground: ViewModifier {
     func body(content: Content) -> some View {
@@ -1585,6 +1597,7 @@ final class BackupRunner: ObservableObject {
     @Published var s3Config: S3Syncer.S3Config? = nil
     @Published var s3ConfigFromKeychain: Bool = false
     @Published var s3ConfigError: Error? = nil
+    @Published var pendingAlert: SimpleAlert? = nil
 
     func loadS3ConfigIfNeeded() async {
         guard !s3ConfigLoaded else { return }
@@ -2060,8 +2073,7 @@ final class BackupRunner: ObservableObject {
     }
 
     private func alert(_ title: String, _ msg: String) {
-        let a = NSAlert(); a.messageText = title; a.informativeText = msg
-        a.alertStyle = .warning; a.runModal()
+        pendingAlert = SimpleAlert(title: title, message: msg)
     }
 
 }
@@ -2983,6 +2995,17 @@ struct ContentView: View {
             }
         }
         .sheet(isPresented: $showSettings) { SettingsSheet() }
+        .alert(runner.pendingAlert?.title ?? "", isPresented: Binding(
+            get: { runner.pendingAlert != nil },
+            set: { if !$0 { runner.pendingAlert = nil } }
+        ), presenting: runner.pendingAlert) { a in
+            Button(a.confirmTitle, role: a.isDestructive ? .destructive : nil) { a.onConfirm?() }
+            if let cancelTitle = a.cancelTitle {
+                Button(cancelTitle, role: .cancel) {}
+            }
+        } message: { a in
+            Text(a.message)
+        }
     }
 
     private func confirmQuit() {
