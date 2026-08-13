@@ -3711,6 +3711,7 @@ struct ToolsSheet: View {
     @State private var integrityResults: [IntegrityCheckResult] = []
     @State private var integrityRunning = false
     @State private var integrityStatus = ""
+    @State private var pendingAlert: SimpleAlert? = nil
     private let reviewEngine = ReviewEngine()
 
     private let jobDateFormatter: DateFormatter = {
@@ -3732,13 +3733,12 @@ struct ToolsSheet: View {
     }()
 
     private func confirmReveal(_ action: @escaping () -> Void) {
-        let a = NSAlert()
-        a.messageText = "Rivelare le credenziali S3?"
-        a.informativeText = "Chiunque veda o registri lo schermo in questo momento potrà usarle per scrivere o cancellare file sul bucket. Continua solo se sei sicuro che nessuno stia guardando."
-        a.alertStyle = .warning
-        a.addButton(withTitle: "Continua")
-        a.addButton(withTitle: "Annulla")
-        if a.runModal() == .alertFirstButtonReturn { action() }
+        pendingAlert = SimpleAlert(
+            title: "Rivelare le credenziali S3?",
+            message: "Chiunque veda o registri lo schermo in questo momento potrà usarle per scrivere o cancellare file sul bucket. Continua solo se sei sicuro che nessuno stia guardando.",
+            confirmTitle: "Continua",
+            cancelTitle: "Annulla",
+            onConfirm: action)
     }
 
     var body: some View {
@@ -3971,6 +3971,17 @@ struct ToolsSheet: View {
             get: { bm.pendingAlert != nil },
             set: { if !$0 { bm.pendingAlert = nil } }
         ), presenting: bm.pendingAlert) { a in
+            Button(a.confirmTitle, role: a.isDestructive ? .destructive : nil) { a.onConfirm?() }
+            if let cancelTitle = a.cancelTitle {
+                Button(cancelTitle, role: .cancel) {}
+            }
+        } message: { a in
+            Text(a.message)
+        }
+        .alert(pendingAlert?.title ?? "", isPresented: Binding(
+            get: { pendingAlert != nil },
+            set: { if !$0 { pendingAlert = nil } }
+        ), presenting: pendingAlert) { a in
             Button(a.confirmTitle, role: a.isDestructive ? .destructive : nil) { a.onConfirm?() }
             if let cancelTitle = a.cancelTitle {
                 Button(cancelTitle, role: .cancel) {}
