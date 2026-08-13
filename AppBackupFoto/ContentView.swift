@@ -2910,6 +2910,7 @@ struct ContentView: View {
     @State private var showHamburger = false
     @State private var activeSpeedTab: SpeedLogTab = .speed
     @AppStorage("autoBackupOnSSDConnect") private var autoBackupEnabled: Bool = true
+    @State private var showQuitConfirm = false
     private let reviewEngine = ReviewEngine()
     var body: some View {
         ZStack(alignment: .leading) {
@@ -3001,16 +3002,19 @@ struct ContentView: View {
         } message: { a in
             Text(a.message)
         }
+        .alert("Chiudere l'app?", isPresented: $showQuitConfirm) {
+            Button("Esci", role: .destructive) {
+                if runner.isRunning { runner.stop() }
+                NSApp.terminate(nil)
+            }
+            Button("Annulla", role: .cancel) {}
+        } message: {
+            Text("I processi in corso verranno interrotti.")
+        }
     }
 
     private func confirmQuit() {
-        let a = NSAlert(); a.messageText = "Chiudere l'app?"
-        a.informativeText = "I processi in corso verranno interrotti."
-        a.alertStyle = .warning; a.addButton(withTitle: "Esci"); a.addButton(withTitle: "Annulla")
-        if a.runModal() == .alertFirstButtonReturn {
-            if runner.isRunning { runner.stop() }
-            NSApp.terminate(nil)
-        }
+        showQuitConfirm = true
     }
 }
 
