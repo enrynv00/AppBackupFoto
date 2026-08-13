@@ -318,6 +318,17 @@ struct RootView: View {
             Notifier.requestAuthorization()
             AppearanceManager.shared.apply()
         }
+        .alert(bm.pendingAlert?.title ?? "", isPresented: Binding(
+            get: { bm.pendingAlert != nil },
+            set: { if !$0 { bm.pendingAlert = nil } }
+        ), presenting: bm.pendingAlert) { a in
+            Button(a.confirmTitle, role: a.isDestructive ? .destructive : nil) { a.onConfirm?() }
+            if let cancelTitle = a.cancelTitle {
+                Button(cancelTitle, role: .cancel) {}
+            }
+        } message: { a in
+            Text(a.message)
+        }
     }
 }
 
@@ -444,6 +455,7 @@ func sha256(of url: URL) -> String? {
 // MARK: - BookmarkManager
 final class BookmarkManager: ObservableObject {
     static let shared = BookmarkManager()
+    @Published var pendingAlert: SimpleAlert? = nil
 
     enum Location: String, CaseIterable, Identifiable {
         case photos, ssd, hdd
@@ -524,11 +536,9 @@ final class BookmarkManager: ObservableObject {
                 // fix, un errore qui spariva senza traccia — vedi Docs/CLAUDE.md).
                 let nsError = error as NSError
                 print("selectAndSave(\(loc.rawValue)) bookmarkData FAILED for \(url.path): domain=\(nsError.domain) code=\(nsError.code) \(nsError.localizedDescription)")
-                let a = NSAlert()
-                a.messageText = "Impossibile salvare '\(loc.displayName)'"
-                a.informativeText = "Percorso: \(url.path)\n\nErrore: \(nsError.localizedDescription)\n(dominio \(nsError.domain), codice \(nsError.code))"
-                a.alertStyle = .critical
-                a.runModal()
+                self.pendingAlert = SimpleAlert(
+                    title: "Impossibile salvare '\(loc.displayName)'",
+                    message: "Percorso: \(url.path)\n\nErrore: \(nsError.localizedDescription)\n(dominio \(nsError.domain), codice \(nsError.code))")
                 completion(false)
             }
         }
@@ -3957,6 +3967,17 @@ struct ToolsSheet: View {
         }
         .padding(AppSpacing.xxl).frame(minWidth: 560, minHeight: 480)
         .groupBoxStyle(CardGroupBoxStyle())
+        .alert(bm.pendingAlert?.title ?? "", isPresented: Binding(
+            get: { bm.pendingAlert != nil },
+            set: { if !$0 { bm.pendingAlert = nil } }
+        ), presenting: bm.pendingAlert) { a in
+            Button(a.confirmTitle, role: a.isDestructive ? .destructive : nil) { a.onConfirm?() }
+            if let cancelTitle = a.cancelTitle {
+                Button(cancelTitle, role: .cancel) {}
+            }
+        } message: { a in
+            Text(a.message)
+        }
     }
 }
 
