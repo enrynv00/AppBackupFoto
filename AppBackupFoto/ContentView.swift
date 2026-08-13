@@ -3919,34 +3919,31 @@ struct ToolsSheet: View {
                                 }
                                 Spacer()
                                 Button("Elimina") {
-                                    let a = NSAlert()
-                                    a.messageText = "Eliminare questo upload incompleto?"
-                                    a.informativeText = "Rimuove definitivamente le parti già caricate su Cubbit per '\((upload.key as NSString).lastPathComponent)'. Non tocca file già completati né la sorgente."
-                                    a.alertStyle = .warning
-                                    a.addButton(withTitle: "Elimina")
-                                    a.addButton(withTitle: "Annulla")
-                                    guard a.runModal() == .alertFirstButtonReturn else { return }
-                                    Task {
-                                        do {
-                                            guard let config = runner.s3Config else {
-                                                throw NSError(domain: "S3", code: 1, userInfo: [NSLocalizedDescriptionKey:
-                                                    "Configurazione S3 non disponibile — chiudi e riapri Tools."])
+                                    pendingAlert = SimpleAlert(
+                                        title: "Eliminare questo upload incompleto?",
+                                        message: "Rimuove definitivamente le parti già caricate su Cubbit per '\((upload.key as NSString).lastPathComponent)'. Non tocca file già completati né la sorgente.",
+                                        isDestructive: true,
+                                        confirmTitle: "Elimina",
+                                        cancelTitle: "Annulla",
+                                        onConfirm: {
+                                            Task {
+                                                do {
+                                                    guard let config = runner.s3Config else {
+                                                        throw NSError(domain: "S3", code: 1, userInfo: [NSLocalizedDescriptionKey:
+                                                            "Configurazione S3 non disponibile — chiudi e riapri Tools."])
+                                                    }
+                                                    try await S3Syncer().abortMultipartUpload(
+                                                        key: upload.key, uploadId: upload.uploadId, config: config)
+                                                    await MainActor.run {
+                                                        runner.toolsOrphanedUploads.removeAll { $0.id == upload.id }
+                                                    }
+                                                } catch {
+                                                    await MainActor.run {
+                                                        pendingAlert = SimpleAlert(title: "Impossibile eliminare l'upload", message: error.localizedDescription)
+                                                    }
+                                                }
                                             }
-                                            try await S3Syncer().abortMultipartUpload(
-                                                key: upload.key, uploadId: upload.uploadId, config: config)
-                                            await MainActor.run {
-                                                runner.toolsOrphanedUploads.removeAll { $0.id == upload.id }
-                                            }
-                                        } catch {
-                                            await MainActor.run {
-                                                let errA = NSAlert()
-                                                errA.messageText = "Impossibile eliminare l'upload"
-                                                errA.informativeText = error.localizedDescription
-                                                errA.alertStyle = .critical
-                                                errA.runModal()
-                                            }
-                                        }
-                                    }
+                                        })
                                 }.buttonStyle(.bordered).controlSize(.small)
                             }
                         }
