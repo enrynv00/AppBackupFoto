@@ -3806,26 +3806,20 @@ struct ToolsSheet: View {
                             }
                         }.buttonStyle(.bordered).controlSize(.small).padding(.top, AppSpacing.xs)
                         Button("Aggiorna da rclone.conf") {
-                            let a = NSAlert()
-                            a.messageText = "Sovrascrivere le credenziali salvate?"
-                            a.informativeText = "Le credenziali attualmente nel Keychain verranno sostituite con quelle lette ora da rclone.conf."
-                            a.alertStyle = .warning
-                            a.addButton(withTitle: "Continua")
-                            a.addButton(withTitle: "Annulla")
-                            guard a.runModal() == .alertFirstButtonReturn else { return }
-                            do {
-                                let config = try S3Syncer.readConfigFromFile(remoteName: "Cubbit", bucket: "backupfoto")
-                                try S3Syncer.writeToKeychain(config: config, remoteName: "Cubbit")
-                                let ok = NSAlert()
-                                ok.messageText = "Credenziali aggiornate nel Keychain."
-                                ok.runModal()
-                            } catch {
-                                let err = NSAlert()
-                                err.messageText = "Errore"
-                                err.informativeText = error.localizedDescription
-                                err.alertStyle = .critical
-                                err.runModal()
-                            }
+                            pendingAlert = SimpleAlert(
+                                title: "Sovrascrivere le credenziali salvate?",
+                                message: "Le credenziali attualmente nel Keychain verranno sostituite con quelle lette ora da rclone.conf.",
+                                confirmTitle: "Continua",
+                                cancelTitle: "Annulla",
+                                onConfirm: {
+                                    do {
+                                        let config = try S3Syncer.readConfigFromFile(remoteName: "Cubbit", bucket: "backupfoto")
+                                        try S3Syncer.writeToKeychain(config: config, remoteName: "Cubbit")
+                                        pendingAlert = SimpleAlert(title: "Credenziali aggiornate nel Keychain.")
+                                    } catch {
+                                        pendingAlert = SimpleAlert(title: "Errore", message: error.localizedDescription)
+                                    }
+                                })
                         }.buttonStyle(.bordered).controlSize(.small).padding(.top, AppSpacing.xs)
                     } else {
                         Label("rclone.conf non trovato o credenziali mancanti",
