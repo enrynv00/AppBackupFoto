@@ -1670,13 +1670,10 @@ final class BackupRunner: ObservableObject {
             let space = self.hasSufficientSpace(bytesNeeded: preview.toAddBytes, atVolumeOf: ssdURL)
             guard space.ok else {
                 self.bm.stopAccessing(.photos); self.bm.stopAccessing(.ssd)
-                let a = NSAlert()
-                a.messageText = "Spazio insufficiente sull'SSD"
-                a.informativeText = "Servono circa \(ByteCountFormatter.string(fromByteCount: preview.toAddBytes, countStyle: .file)), "
-                    + "liberi \(ByteCountFormatter.string(fromByteCount: space.availableBytes, countStyle: .file)) su \(ssdURL.path)."
-                a.alertStyle = .warning
-                a.addButton(withTitle: "OK")
-                a.runModal()
+                pendingAlert = SimpleAlert(
+                    title: "Spazio insufficiente sull'SSD",
+                    message: "Servono circa \(ByteCountFormatter.string(fromByteCount: preview.toAddBytes, countStyle: .file)), "
+                        + "liberi \(ByteCountFormatter.string(fromByteCount: space.availableBytes, countStyle: .file)) su \(ssdURL.path).")
                 return
             }
             self.run(label: "MAC -> SSD") { [weak self] in
@@ -1723,13 +1720,10 @@ final class BackupRunner: ObservableObject {
             let space = self.hasSufficientSpace(bytesNeeded: preview.toAddBytes, atVolumeOf: hddURL)
             guard space.ok else {
                 self.bm.stopAccessing(.ssd); self.bm.stopAccessing(.hdd)
-                let a = NSAlert()
-                a.messageText = "Spazio insufficiente sull'HDD"
-                a.informativeText = "Servono circa \(ByteCountFormatter.string(fromByteCount: preview.toAddBytes, countStyle: .file)), "
-                    + "liberi \(ByteCountFormatter.string(fromByteCount: space.availableBytes, countStyle: .file)) su \(hddURL.path)."
-                a.alertStyle = .warning
-                a.addButton(withTitle: "OK")
-                a.runModal()
+                pendingAlert = SimpleAlert(
+                    title: "Spazio insufficiente sull'HDD",
+                    message: "Servono circa \(ByteCountFormatter.string(fromByteCount: preview.toAddBytes, countStyle: .file)), "
+                        + "liberi \(ByteCountFormatter.string(fromByteCount: space.availableBytes, countStyle: .file)) su \(hddURL.path).")
                 return
             }
             self.run(label: label) { [weak self] in
@@ -1825,12 +1819,9 @@ final class BackupRunner: ObservableObject {
             let eta = result.estimatedSec > 0
                 ? FileSyncer.SyncResult.hms(result.estimatedSec)
                 : "< 1s"
-            let a = NSAlert()
-            a.messageText = "Anteprima MAC -> SSD"
-            a.informativeText = "File da copiare: \(result.toAdd)\nFile gia presenti (skip): \(result.toSkip)\nTempo stimato: \(eta)\n\n(stima basata su 50 file/s - il tempo reale puo variare)"
-            a.alertStyle = .informational
-            a.addButton(withTitle: "OK")
-            a.runModal()
+            pendingAlert = SimpleAlert(
+                title: "Anteprima MAC -> SSD",
+                message: "File da copiare: \(result.toAdd)\nFile gia presenti (skip): \(result.toSkip)\nTempo stimato: \(eta)\n\n(stima basata su 50 file/s - il tempo reale puo variare)")
         }
     }
 
@@ -1868,12 +1859,9 @@ final class BackupRunner: ObservableObject {
                 ? FileSyncer.SyncResult.hms(result.estimatedSec)
                 : "< 1s"
             let modeLabel = deep ? "deep (confronto dimensioni)" : "normale (dimensioni + data)"
-            let a = NSAlert()
-            a.messageText = "Anteprima SSD -> HDD"
-            a.informativeText = "Modalita: \(modeLabel)\nFile da copiare: \(result.toAdd)\nFile gia presenti (skip): \(result.toSkip)\nTempo stimato: \(eta)\n\n(stima basata su 50 file/s - il tempo reale puo variare)"
-            a.alertStyle = .informational
-            a.addButton(withTitle: "OK")
-            a.runModal()
+            pendingAlert = SimpleAlert(
+                title: "Anteprima SSD -> HDD",
+                message: "Modalita: \(modeLabel)\nFile da copiare: \(result.toAdd)\nFile gia presenti (skip): \(result.toSkip)\nTempo stimato: \(eta)\n\n(stima basata su 50 file/s - il tempo reale puo variare)")
         }
     }
 
@@ -1896,12 +1884,9 @@ final class BackupRunner: ObservableObject {
                 do {
                     let result = try await self.s3Syncer.previewUpload(from: ssdURL, config: config)
                     let gb = Double(result.bytes) / 1_073_741_824
-                    let a = NSAlert()
-                    a.messageText = "Anteprima SSD -> Cubbit S3"
-                    a.informativeText = "File da caricare: \(result.toUpload) (~\(String(format: "%.1f", gb)) GB)\nFile già presenti (skip): \(result.toSkip)\n\n(il tempo dipende dalla velocità della tua connessione, non stimato qui)"
-                    a.alertStyle = .informational
-                    a.addButton(withTitle: "OK")
-                    a.runModal()
+                    pendingAlert = SimpleAlert(
+                        title: "Anteprima SSD -> Cubbit S3",
+                        message: "File da caricare: \(result.toUpload) (~\(String(format: "%.1f", gb)) GB)\nFile già presenti (skip): \(result.toSkip)\n\n(il tempo dipende dalla velocità della tua connessione, non stimato qui)")
                 } catch {
                     self.alert("Errore anteprima S3", error.localizedDescription)
                 }
