@@ -7,5 +7,5 @@
     </linearGradient>
   </defs>
   <rect x="4" y="4" width="172" height="172" rx="40" fill="url(#bgGrad)"/>
-  <path d="M90 32 L140 51 V97 C140 130 119 152 90 162 C61 152 40 130 40 97 V51 Z" fill="#ffffff" opacity="0.9"/>
+  <path d="M90 30 L145 68 L90 158 L35 68 Z" fill="#ffffff" opacity="0.92"/>
 </svg>

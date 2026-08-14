@@ -90,7 +90,7 @@ Contenuto esatto del file:
 </svg>
 ```
 
-- [ ] **Step 3: Creare `Docs/design/appicon/master-tiny.svg`** (usato solo per 16px — un'unica forma piena, nessuna suddivisione in facce: a 16px anche due facce si fondono in una macchia indistinta)
+- [ ] **Step 3: Creare `Docs/design/appicon/master-tiny.svg`** (usato solo per 16px — diamante geometrico semplificato, non il contorno a scudo con curve. **Corretto durante l'esecuzione del Task 2** (2026-08-14): la prima versione riusava il contorno a scudo di `master-full`/`master-small` riempito pieno, ma verificato empiricamente — rendering reale + ispezione visiva, non solo ipotesi — che a 16px le curve e le spalle dello scudo si perdono nell'anti-aliasing e il risultato si legge come una macchia ovale indistinta, senza punta riconoscibile. Confrontate 3 varianti via rendering diretto: contorno scudo pieno (bocciata), scudo a due facce come master-small ma più contrastato (leggibile ma forma a chevron poco chiara), diamante a 4 punti pieno (silhouette più netta e geometrica, scelta). Sostituisce la versione precedente di questo step.)
 
 ```xml
 <svg width="100%" height="100%" viewBox="0 0 180 180" xmlns="http://www.w3.org/2000/svg">
@@ -102,7 +102,7 @@ Contenuto esatto del file:
     </linearGradient>
   </defs>
   <rect x="4" y="4" width="172" height="172" rx="40" fill="url(#bgGrad)"/>
-  <path d="M90 32 L140 51 V97 C140 130 119 152 90 162 C61 152 40 130 40 97 V51 Z" fill="#ffffff" opacity="0.9"/>
+  <path d="M90 30 L145 68 L90 158 L35 68 Z" fill="#ffffff" opacity="0.92"/>
 </svg>
 ```
 
