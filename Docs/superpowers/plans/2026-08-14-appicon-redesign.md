@@ -206,7 +206,7 @@ Aprire in sequenza con il tool Read:
 - `/Users/enriconannivicenzi/Desktop/AppBackupFoto/AppBackupFoto/Assets.xcassets/AppIcon.appiconset/icon_128.png`
 - `/Users/enriconannivicenzi/Desktop/AppBackupFoto/AppBackupFoto/Assets.xcassets/AppIcon.appiconset/icon_16.png`
 
-Expected: a 1024px si vede lo scudo sfaccettato con gradiente blu→viola, luce dall'alto, bordo in vetro sulle due facce, ombra morbida sotto — coerente con la variante B approvata nel companion di brainstorming (`polish-v3.html`). A 128px stesso disegno, nitido. A 16px una forma piena bianca su sfondo blu/viola, ancora riconoscibile come scudo, nessun dettaglio illeggibile o "macchia" indistinta. Se una qualunque di queste condizioni non è soddisfatta, il task NON è completo — tornare al Task 1 e correggere l'SVG pertinente prima di proseguire.
+Expected: a 1024px si vede lo scudo sfaccettato con gradiente blu→viola, luce dall'alto, bordo in vetro sulle due facce, ombra morbida sotto — coerente con la variante B approvata nel companion di brainstorming (`polish-v3.html`). A 128px stesso disegno, nitido. A 16px una forma piena bianca su sfondo blu/viola, riconoscibile come diamante geometrico (non più scudo, vedi nota Task 1 Step 3), nessun dettaglio illeggibile o "macchia" indistinta. Se una qualunque di queste condizioni non è soddisfatta, il task NON è completo — tornare al Task 1 e correggere l'SVG pertinente prima di proseguire.
 
 - [ ] **Step 4: Commit**
 
