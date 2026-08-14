@@ -104,6 +104,12 @@ Lavoro diviso in 5 fasi indipendenti, ciascuna con il proprio ciclo spec → pia
 
 ---
 
+## Oltre il piano di design polish (2026-08-14)
+
+26. ✅ **Fatto (2026-08-14) — App Icon outdated, non rappresentativa del prodotto.** L'icona era la generica "foto+montagna in cornice" di Photos.app con un badge cloud che si leggeva come un disco volante. Sostituita con uno scudo geometrico sfaccettato in stile Liquid Glass (gradiente blu→viola, coerente con Fase 2 del design polish, #22), verificato leggibile da 1024px a 16px — a 16px il contorno a scudo si perdeva nell'anti-aliasing, corretto con una silhouette a diamante semplificata dopo verifica empirica su rendering reali, non solo ipotesi. Rimosso anche l'asset di brand orfano `appbackupfoto_icon.imageset`, mai referenziato dal codice. Sorgenti vettoriali riusabili in `Docs/design/appicon/` + script di rendering `Script/render-appicon.sh`. Vedi `Docs/superpowers/specs/2026-08-14-appicon-redesign-design.md` e `Docs/superpowers/plans/2026-08-14-appicon-redesign.md`.
+
+---
+
 ## Fonti consultate
 
 - [7 Best Backup Software for macOS: Top Picks for 2026 — MacObserver](https://www.macobserver.com/tips/round-ups/7-best-backup-software-for-macos/)
