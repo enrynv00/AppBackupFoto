@@ -115,11 +115,11 @@ Storico bug (risolti e aperti): vedi `.claude/rules/bug-history.md`.
 
 ---
 
-## Team di sviluppo (aggiornato 2026-08-11)
+## Team di sviluppo (aggiornato 2026-08-16)
 
 Questo progetto usa il workflow a ruoli espliciti descritto in `~/.claude/docs/specs/2026-08-11-agent-role-orchestration-design.md`: fase Architect (brainstorming → spec → piano, sempre con approvazione esplicita di Enrico) seguita da un team autonomo (Implementer + Code Reviewer + Security/Rules Auditor, ruoli globali in `~/.claude/agents/`) che esegue tutti i task del piano fino in fondo, con un solo checkpoint umano a fine intervento (eccetto blocchi reali che richiedono una decisione di Enrico).
 
-**Sostituisce la vecchia regola "Pattern Advisor"**: Code Reviewer e Security/Rules Auditor usano Fable 5 di default per ogni task (non più chiesto ogni volta) — il costo non è più un vincolo per Enrico. Non serve più chiedere conferma prima di ogni dispatch a Fable 5 su questo progetto.
+**Sostituisce la vecchia regola "Pattern Advisor"**: il costo non è più un vincolo per Enrico — non serve chiedere conferma prima di ogni dispatch. Dal 2026-08-16 Implementer, Code Reviewer e Security/Rules Auditor girano tutti su Opus 5 (non più Sonnet 5/Fable 5), solo Architect era già su Opus 5.
 
 Gate automatici attivi su questo progetto (vedi `.claude/settings.json`): un hook blocca la scrittura sotto `Log/`, un hook blocca la fine sessione se `ContentView.swift`/i test sono stati modificati senza un build/test verde successivo.
 
