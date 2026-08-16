@@ -110,6 +110,22 @@ Lavoro diviso in 5 fasi indipendenti, ciascuna con il proprio ciclo spec → pia
 
 ---
 
+## Nuovo capitolo — oltre il polish, verso più flessibilità (2026-08-16)
+
+Quattro punti aggiunti da Enrico dopo la chiusura della roadmap di design (punti 1-26 sopra). Non ancora passati dal ciclo brainstorming → spec → piano di questo progetto — registrati qui come promemoria, nessuna decisione di design ancora presa. Alcuni (in particolare #29) rappresentano un cambio di scope significativo rispetto alla filosofia attuale dell'app (SwiftUI nativa single-file, `FileManager` nativo, zero subprocess/server, single-user) — da affrontare con un go/no-go esplicito come già fatto per #5/#13/#14, non da dare per scontati.
+
+27. 🔲 **Sistema per collegare qualsiasi tipo di dispositivo per importazione o storage.** Oggi l'app è vincolata alle 3 destinazioni fisse configurate una volta in Setup (SSD/HDD/Cubbit S3). Da chiarire in brainstorming: cosa si intende per "qualsiasi dispositivo" (altre chiavette USB? fotocamere/schede SD per l'import diretto? NAS in rete? altri provider S3-compatible oltre a Cubbit?) — la risposta cambia molto la portata del lavoro.
+
+28. 🔲 **Formattazione e guida "anti-idiota" per primo collegamento o configurazione, anche a configurazione già in corso.** Onboarding/guida più robusta di `SetupView`. Da chiarire in brainstorming: cosa si intende per "formattazione" (formattare un disco dall'app stessa, o solo guidare l'utente a farlo in Utility Disco?) e cosa serve esattamente per "anche in corso" (poter rifare/correggere un singolo passo di configurazione senza dover ripartire da zero).
+
+29. 🔲 **Valutare Immich (server self-hosted foto/video) come possibile componente.** Segnato con "?" dallo stesso Enrico — decisione ancora aperta, non un impegno preso. Cambio di scope potenzialmente grande: introdurrebbe un server/servizio in esecuzione continua (tipicamente Docker), diverso dalla filosofia attuale "app nativa locale, nessun processo in background permanente, single-user". Da affrontare con ricerca (Researcher agent) su cosa offrirebbe rispetto al catalogo già esistente (#12) prima di qualunque go/no-go.
+
+30. 🔲 **Impronta digitale (Touch ID) per accedere all'app.** Autenticazione locale all'apertura — verosimilmente `LocalAuthentication`/`LAContext` di macOS. Feature contenuta rispetto agli altri 3 punti di questo capitolo.
+
+Nessuno dei 4 punti ha ancora una spec — si affronta uno alla volta quando Enrico decide di iniziarci, col ciclo normale (brainstorming one-question-at-a-time → spec → piano → implementazione).
+
+---
+
 ## Fonti consultate
 
 - [7 Best Backup Software for macOS: Top Picks for 2026 — MacObserver](https://www.macobserver.com/tips/round-ups/7-best-backup-software-for-macos/)
