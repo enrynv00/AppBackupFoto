@@ -855,9 +855,17 @@ extension ImmichManager {
         case commandFailed(command: String, status: Int32, output: String)
         case commandTimedOut(command: String)
         case startTimedOut
+        case checksumMismatch(asset: String, expected: String, actual: String)
 
         var errorDescription: String? {
             switch self {
+            case .checksumMismatch(let asset, let expected, let actual):
+                return """
+                Il file scaricato '\(asset)' non corrisponde alla versione attesa e non è stato installato.
+                Attesa:   \(expected)
+                Ottenuta: \(actual)
+                Riprova; se l'errore si ripete, non forzare l'installazione.
+                """
             case .downloadFailed(let what):
                 return "Download non riuscito: \(what)"
             case .commandFailed(let command, let status, let output):
@@ -880,6 +888,37 @@ extension ImmichManager {
     static let limaVersion = "2.2.0"
     static let dockerCLIVersion = "29.7.2"
     static let composePluginVersion = "v5.5.0"
+
+    // MARK: SHA256 attesi
+    // Ogni file scaricato viene verificato contro questi hash **prima** di essere reso
+    // eseguibile o estratto. Senza, l'app si fiderebbe di un HTTP 200 e poi eseguirebbe
+    // il risultato con i pieni privilegi dell'utente (app non sandboxata, Full Disk
+    // Access): se un asset di release venisse sostituito, non ce ne accorgeremmo.
+    // Vanno aggiornati insieme alle versioni qui sopra — un hash sbagliato blocca
+    // l'installazione con un errore esplicito, non la fa passare in silenzio.
+    //
+    // Fonte degli hash (verificati il 2026-08-17):
+    // - colima:  <release>/colima-Darwin-<arch>.sha256sum
+    // - lima:    <release>/SHA256SUMS
+    // - compose: <release>/docker-compose-darwin-<arch>.sha256
+    // - docker CLI: **nessun checksum ufficiale pubblicato da Docker** per i binari statici
+    //   macOS. Questi due valori sono stati calcolati a mano (`shasum -a 256`) sui tarball
+    //   scaricati il 2026-08-17. Attenzione al limite: pinnano *quel* file, ma non provano
+    //   nulla sulla sua autenticità all'origine (trust-on-first-use). Proteggono comunque
+    //   da una sostituzione successiva e da un download corrotto.
+
+    private static let colimaSHA256 = isARM
+        ? "980ad8bf61a4ca370243f4cb41401a61276dcd2c2502bee7b9b86f9250169f34"
+        : "3082737fe8a98afda11cba7d9a20b6e56fe80c6153464beda04bec630758770b"
+    private static let limaSHA256 = isARM
+        ? "bbdef91774885a0d05f7b048c4eb89ae2bcf3a0c252ae7ca7934e63df76d93c3"
+        : "0d6f99c19f6e4bc3c92730c4c29d929e6927f0cb0a0ba1a84383367135a8ff31"
+    private static let dockerCLISHA256 = isARM
+        ? "b8683ed19d1f06048a496f9b8429e2c71d0b088d475b7487c054ea3666c02a3c"
+        : "fb1f1aa7ac7af4364165b9eadfda92e96c8ced508fca74f53079719891367438"
+    private static let composePluginSHA256 = isARM
+        ? "6777710e5a5db5709e5f4b5985844e74b73cc1a6123e3a6690b6ababf2deaf51"
+        : "d0f0c867fd740953899a63d6d1a291dc60200b0961de9612a01bcc560e6e29a6"
 
     /// Web UI di Immich. Loopback, non raggiungibile dalla rete: il compose file pubblica la
     /// porta solo su `127.0.0.1` (vedi `composeFileContent`).
@@ -933,10 +972,17 @@ extension ImmichManager {
                 try fm.createDirectory(at: dir, withIntermediateDirectories: true)
             }
 
-            try await downloadExecutable(from: Self.colimaURL, to: colimaBinary)
-            try await downloadExecutable(from: Self.composePluginURL, to: composePluginPath)
+            // Ordine deliberato: prima gli archivi che si estraggono (Lima scompatta un intero
+            // albero dentro appSupportDir, quindi in teoria potrebbe scrivere su bin/colima o
+            // bin/docker), poi i singoli binari. Con la verifica SHA256 un archivio manomesso
+            // non arriva comunque mai a `tar`, ma così anche un eventuale buco futuro non
+            // lascerebbe un archivio sovrascrivere binari già verificati.
             try await downloadLima()
             try await downloadDockerCLI()
+            try await downloadExecutable(from: Self.colimaURL, to: colimaBinary,
+                                         expectedSHA256: Self.colimaSHA256)
+            try await downloadExecutable(from: Self.composePluginURL, to: composePluginPath,
+                                         expectedSHA256: Self.composePluginSHA256)
 
             let ok = detectInstalled()
             await MainActor.run { self.installed = ok }
@@ -950,45 +996,60 @@ extension ImmichManager {
         }
     }
 
-    /// Scarica un singolo binario e lo rende eseguibile.
+    /// Scarica un singolo binario, **ne verifica lo SHA256** e solo allora lo rende eseguibile.
     /// La `removeItem` qui tocca **solo** un file che questa stessa funzione ha scaricato dentro
     /// la cartella dell'app (mai foto, mai SSD/HDD): serve a rendere ripetibile un'installazione
     /// interrotta a metà.
-    private func downloadExecutable(from url: URL, to destination: URL) async throws {
-        let (tempURL, response) = try await URLSession.shared.download(from: url)
-        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-            throw Failure.downloadFailed(url.lastPathComponent)
-        }
+    private func downloadExecutable(from url: URL, to destination: URL, expectedSHA256: String) async throws {
+        let downloaded = try await downloadToTemporaryFile(url, expectedSHA256: expectedSHA256)
+        defer { try? FileManager.default.removeItem(at: downloaded) }
         let fm = FileManager.default
         if fm.fileExists(atPath: destination.path) { try fm.removeItem(at: destination) }
-        try fm.moveItem(at: tempURL, to: destination)
+        try fm.moveItem(at: downloaded, to: destination)
         try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: destination.path)
     }
 
     /// Il tarball di Lima si estrae in `bin/` + `share/`: scompattandolo dentro `appSupportDir`
     /// `limactl` finisce esattamente in `binDir` e trova da solo la sua `share/lima` accanto.
     private func downloadLima() async throws {
-        let archive = try await downloadToTemporaryFile(Self.limaURL)
+        let archive = try await downloadToTemporaryFile(Self.limaURL, expectedSHA256: Self.limaSHA256)
         defer { try? FileManager.default.removeItem(at: archive) }
         try await runTar(["-xzf", archive.path, "-C", appSupportDir.path])
     }
 
     /// Il tgz di Docker contiene `docker/docker`: `--strip-components=1` lo posa dritto in `binDir`.
     private func downloadDockerCLI() async throws {
-        let archive = try await downloadToTemporaryFile(Self.dockerCLIURL)
+        let archive = try await downloadToTemporaryFile(Self.dockerCLIURL, expectedSHA256: Self.dockerCLISHA256)
         defer { try? FileManager.default.removeItem(at: archive) }
         try await runTar(["-xzf", archive.path, "-C", binDir.path, "--strip-components=1", "docker/docker"])
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dockerBinary.path)
     }
 
-    private func downloadToTemporaryFile(_ url: URL) async throws -> URL {
+    /// Scarica in un file temporaneo e ne verifica l'integrità. Se l'hash non combacia il file
+    /// viene cancellato subito e l'errore risale: niente `chmod +x`, niente `tar`, niente
+    /// esecuzione — un binario che non è quello atteso non deve mai toccare `binDir`.
+    private func downloadToTemporaryFile(_ url: URL, expectedSHA256: String) async throws -> URL {
         let (tempURL, response) = try await URLSession.shared.download(from: url)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            try? FileManager.default.removeItem(at: tempURL)
             throw Failure.downloadFailed(url.lastPathComponent)
         }
         let destination = FileManager.default.temporaryDirectory
             .appendingPathComponent("\(UUID().uuidString)-\(url.lastPathComponent)")
         try FileManager.default.moveItem(at: tempURL, to: destination)
+
+        // `sha256(of:)` legge il file a blocchi con I/O POSIX: memoria costante anche su
+        // archivi grandi (stessa funzione e stessa ragione del fix di memoria del 2026-07-30).
+        guard let actual = sha256(of: destination) else {
+            try? FileManager.default.removeItem(at: destination)
+            throw Failure.downloadFailed("impossibile calcolare lo SHA256 di \(url.lastPathComponent)")
+        }
+        guard actual.caseInsensitiveCompare(expectedSHA256) == .orderedSame else {
+            try? FileManager.default.removeItem(at: destination)
+            throw Failure.checksumMismatch(asset: url.lastPathComponent,
+                                           expected: expectedSHA256.lowercased(),
+                                           actual: actual)
+        }
         return destination
     }
 
