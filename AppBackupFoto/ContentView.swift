@@ -3113,6 +3113,7 @@ struct ContentView: View {
 struct SettingsSheet: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject private var bm = BookmarkManager.shared
+    @ObservedObject private var gate = AuthGateManager.shared
     @AppStorage("autoBackupOnSSDConnect") private var autoBackupEnabled: Bool = true
     var body: some View {
         VStack(spacing: AppSpacing.xl) {
@@ -3121,6 +3122,11 @@ struct SettingsSheet: View {
             VStack(alignment: .leading, spacing: AppSpacing.xs) {
                 Toggle("Backup automatico Mac → SSD quando colleghi l'SSD", isOn: $autoBackupEnabled)
                 Text("Appena colleghi l'SSD, se l'app è aperta, parte da sola l'aggiornamento da Foto a SSD.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }.padding(.horizontal, AppSpacing.xl)
+            VStack(alignment: .leading, spacing: AppSpacing.xs) {
+                Toggle("Richiedi Touch ID all'avvio", isOn: $gate.touchIDEnabled)
+                Text("Se disattivato, l'app si apre senza chiedere l'autenticazione.")
                     .font(.caption).foregroundStyle(.secondary)
             }.padding(.horizontal, AppSpacing.xl)
             VStack(spacing: AppSpacing.md) {
