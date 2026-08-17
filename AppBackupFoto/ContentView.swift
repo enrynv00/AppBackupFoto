@@ -403,6 +403,10 @@ final class AuthGateManager: ObservableObject {
 
     private init() {
         touchIDEnabled = UserDefaults.standard.object(forKey: "touchIDEnabled") as? Bool ?? true
+        // Gate disattivato all'avvio ⇒ questa sessione è già autorizzata: riattivare il toggle
+        // a metà sessione vale dal prossimo lancio, non blocca di colpo l'app già aperta
+        // (il gate è "solo all'avvio", vedi spec 2026-08-17-touchid-auth-design.md).
+        unlocked = !touchIDEnabled
     }
 
     func authenticate() {
