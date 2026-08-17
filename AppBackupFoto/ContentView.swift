@@ -487,6 +487,77 @@ final class ImmichManager: ObservableObject {
     }
 }
 
+extension ImmichManager {
+    /// Racchiude un path in una stringa YAML fra virgolette doppie, con escape di `\` e `"`.
+    /// Serve perché il path della libreria arriva da un bookmark scelto dall'utente: senza
+    /// escape, un nome cartella con una virgoletta romperebbe (o altererebbe) il compose file.
+    static func yamlQuoted(_ value: String) -> String {
+        let escaped = value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        return "\"\(escaped)\""
+    }
+
+    /// Contenuto del `docker-compose.yml` di Immich, adattato dal file ufficiale
+    /// (`https://github.com/immich-app/immich/blob/main/docker/docker-compose.yml`,
+    /// riverificato il 2026-08-17) con tre differenze intenzionali, tutte vincolanti:
+    ///
+    /// 1. la porta del server è pubblicata **solo su `127.0.0.1:2283`**, mai `0.0.0.0` —
+    ///    l'accesso da rete/telefono è fuori scope e sarebbe un rischio inutile;
+    /// 2. tutti i volumi dati (upload, Postgres, cache modelli ML) stanno sotto `dataDir`,
+    ///    cioè sul disco interno del Mac, mai su SSD/HDD esterni;
+    /// 3. la cartella foto sull'SSD è montata **in sola lettura** (`:ro`) come External
+    ///    Library: Immich la indicizza dove già sta, non la copia e non ci scrive mai
+    ///    (coerente con zero-delete/zero-overwrite).
+    ///
+    /// Funzione pura (dipende solo da `dataDir` e dal parametro) proprio per poter essere
+    /// testata senza avviare nulla — stesso criterio di `checkDeepMirrorFreshness(...)`.
+    func composeFileContent(sourceLibraryPath: String) -> String {
+        let data = dataDir.path
+        return """
+        name: appbackupfoto-immich
+        services:
+          immich-server:
+            image: ghcr.io/immich-app/immich-server:release
+            ports:
+              - "127.0.0.1:2283:2283"
+            volumes:
+              - \(Self.yamlQuoted("\(data)/upload")):/data
+              - \(Self.yamlQuoted(sourceLibraryPath)):/external-ssd:ro
+              - /etc/localtime:/etc/localtime:ro
+            environment:
+              - DB_HOSTNAME=immich-database
+              - DB_USERNAME=postgres
+              - DB_PASSWORD=postgres
+              - DB_DATABASE_NAME=immich
+              - REDIS_HOSTNAME=immich-redis
+            depends_on:
+              - immich-redis
+              - immich-database
+            restart: unless-stopped
+          immich-machine-learning:
+            image: ghcr.io/immich-app/immich-machine-learning:release
+            volumes:
+              - \(Self.yamlQuoted("\(data)/model-cache")):/cache
+            restart: unless-stopped
+          immich-redis:
+            image: docker.io/valkey/valkey:9
+            restart: unless-stopped
+          immich-database:
+            image: ghcr.io/immich-app/postgres:14-vectorchord0.4.3-pgvectors0.2.0
+            environment:
+              - POSTGRES_PASSWORD=postgres
+              - POSTGRES_USER=postgres
+              - POSTGRES_DB=immich
+              - POSTGRES_INITDB_ARGS=--data-checksums
+            volumes:
+              - \(Self.yamlQuoted("\(data)/postgres")):/var/lib/postgresql/data
+            shm_size: 128mb
+            restart: unless-stopped
+        """
+    }
+}
+
 // MARK: - Models
 struct JobStats {
     var percent: Int = 0
