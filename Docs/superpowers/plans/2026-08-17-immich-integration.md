@@ -306,15 +306,17 @@ git commit -m "Document Immich integration architecture (roadmap #29, code compl
 
 - [ ] **Step 4: NON eseguire questo step via agente in background — richiede Enrico presente.** Riportare questo elenco a Enrico come "resta da fare, con te presente" invece di eseguirlo:
 
+**0. Test economico PRIMA di tutto il resto (deciso dopo la review, 2026-08-17)**: verificare che il conflitto con la regola `Docs/CLAUDE.md` → "Vincolo tecnico macOS Sequoia" (subprocess non ricevono permessi TCC sui volumi esterni) non si applichi anche a Colima. Installare **solo** Colima (poche decine di MB, non l'intero stack Immich), avviarlo con un mount di prova sul path SSD (`colima start --mount "<path SSD>:w"` o equivalente), poi `limactl shell` dentro la VM e `ls "<path SSD montato>"` — se la cartella è vuota o dà permission denied, il problema TCC si applica anche qui e l'intero approccio "External Library sull'SSD via VM" va rivisto con Enrico prima di procedere oltre (Task 5 Step 4 punti 1-10 sotto non hanno senso se questo fallisce). Se invece i file si vedono, procedere pure con gli altri punti.
+
 1. Aprire l'app, andare su hamburger → Foto.
 2. Schermata di setup: leggere la stima spazio/tempo, confermare esplicitamente "Installa".
 3. Seguire l'eventuale prompt admin del sistema per l'installazione di Colima (una tantum).
 4. Attendere il primo avvio reale (VM Colima + pull immagini Docker, probabilmente diversi minuti la prima volta).
 5. Al termine, l'app apre il browser di sistema sulla web UI di Immich (`http://127.0.0.1:2283`) per creare l'account.
 6. In Immich: Account Settings → API Keys → creare una nuova chiave, incollarla dove l'app la richiede.
-7. Configurare la External Library puntata sul path SSD (via API dall'app, o manualmente da Immich admin settings se il flusso automatico non fosse ancora rifinito) e avviare la prima scansione.
-8. Verificare che le foto dell'SSD compaiano nella griglia Immich, che la ricerca smart funzioni, che il riconoscimento facce produca risultati sensati su un campione.
+7. Configurare la External Library puntata sul path SSD, **con pattern di esclusione sulla cartella "Zip"** (decisione presa dopo la review — indicizzare tutto l'SSD tranne gli archivi zip da 40-50GB, vedi spec aggiornata) e avviare la prima scansione.
+8. Verificare che le foto dell'SSD compaiano nella griglia Immich (Zip escluso), che la ricerca smart funzioni, che il riconoscimento facce produca risultati sensati su un campione.
 9. Chiudere del tutto AppBackupFoto (non solo la finestra) → verificare (`docker ps`) che i container Immich si siano fermati.
 10. Riaprire l'app, andare su Foto con l'app bloccata da Touch ID (lock screen) → verificare che la finestra Foto mostri anch'essa la lock screen, non il contenuto.
 
-**Solo dopo che questi 10 punti sono stati verificati con successo**, tornare su `Docs/ROADMAP.md` e marcare #29 come fatto (stesso controllo incrociato già descritto sopra).
+**Solo dopo che questi punti (0 incluso) sono stati verificati con successo**, tornare su `Docs/ROADMAP.md` e marcare #29 come fatto (stesso controllo incrociato già descritto sopra).
