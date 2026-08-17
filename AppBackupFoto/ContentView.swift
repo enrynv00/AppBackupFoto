@@ -7,6 +7,7 @@ import CryptoKit
 import Charts
 import ImageIO
 import Sparkle
+import LocalAuthentication
 
 // MARK: - Design Tokens
 
@@ -309,9 +310,11 @@ struct CatalogView: View {
 
 struct RootView: View {
     @ObservedObject private var bm = BookmarkManager.shared
+    @ObservedObject private var gate = AuthGateManager.shared
     var body: some View {
         Group {
-            if bm.canEnterApp { ContentView() }
+            if gate.touchIDEnabled && !gate.unlocked { LockScreenView() }
+            else if bm.canEnterApp { ContentView() }
             else { SetupView() }
         }
         .onAppear {
@@ -359,6 +362,67 @@ final class AppearanceManager: ObservableObject {
             default:       NSApp.appearance = nil
             }
         }
+    }
+}
+
+// MARK: - AuthGateManager
+final class AuthGateManager: ObservableObject {
+    static let shared = AuthGateManager()
+    @Published var unlocked: Bool = false
+    @Published var isAuthenticating: Bool = false
+    @Published var lastError: String?
+
+    var touchIDEnabled: Bool {
+        get { UserDefaults.standard.object(forKey: "touchIDEnabled") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "touchIDEnabled") }
+    }
+
+    private init() {}
+
+    func authenticate() {
+        guard !isAuthenticating else { return }
+        isAuthenticating = true
+        lastError = nil
+        let context = LAContext()
+        context.evaluatePolicy(.deviceOwnerAuthentication,
+                                localizedReason: "Sblocca AppBackupFoto") { [weak self] success, error in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.isAuthenticating = false
+                if success {
+                    self.unlocked = true
+                } else {
+                    self.lastError = error?.localizedDescription ?? "Autenticazione non riuscita"
+                }
+            }
+        }
+    }
+}
+
+// MARK: - LockScreenView
+struct LockScreenView: View {
+    @ObservedObject private var gate = AuthGateManager.shared
+    var body: some View {
+        VStack(spacing: AppSpacing.xl) {
+            Image(systemName: "touchid")
+                .font(.system(size: AppIconSize.heroLarge))
+                .foregroundStyle(AppColor.utility)
+            Text("AppBackupFoto è bloccata").font(AppFont.title)
+            if let err = gate.lastError {
+                Text(err).font(.caption).foregroundStyle(AppColor.error).multilineTextAlignment(.center)
+            }
+            Button {
+                gate.authenticate()
+            } label: {
+                Text(gate.isAuthenticating ? "Autenticazione…" : "Sblocca con Touch ID")
+                    .frame(minWidth: 200)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(gate.isAuthenticating)
+        }
+        .padding(AppSpacing.xxl)
+        .frame(minWidth: 480, minHeight: 320)
+        .onAppear { gate.authenticate() }
     }
 }
 
