@@ -748,6 +748,25 @@ extension ImmichManager {
         return "\"\(escaped)\""
     }
 
+    /// Genera una entry di volume in **long syntax** (`type`/`source`/`target`/`read_only`).
+    ///
+    /// Non è una preferenza stilistica: la short syntax `- "src":"dst":ro` **non è YAML valido**
+    /// (uno scalare double-quoted non può essere seguito da altro testo sulla stessa riga in
+    /// block context) e `docker compose` rifiuterebbe il file al parsing. La long syntax regge
+    /// inoltre un path che contiene `:` — caso reale su macOS, dove una cartella che in Finder
+    /// si chiama "Foto/2020" ha path POSIX `Foto:2020` e romperebbe la short syntax `src:dst:mode`
+    /// anche se quotata.
+    ///
+    /// `indent` è il numero di spazi a cui la entry è ancorata nel template, necessario perché
+    /// l'interpolazione di una stringa multi-riga non re-indenta le righe successive alla prima.
+    static func bindMountYAML(source: String, target: String, readOnly: Bool, indent: Int) -> String {
+        var lines = ["- type: bind",
+                     "  source: \(yamlQuoted(source))",
+                     "  target: \(yamlQuoted(target))"]
+        if readOnly { lines.append("  read_only: true") }
+        return lines.joined(separator: "\n" + String(repeating: " ", count: indent))
+    }
+
     /// Contenuto del `docker-compose.yml` di Immich, adattato dal file ufficiale
     /// (`https://github.com/immich-app/immich/blob/main/docker/docker-compose.yml`,
     /// riverificato il 2026-08-17) con tre differenze intenzionali, tutte vincolanti:
@@ -756,12 +775,14 @@ extension ImmichManager {
     ///    l'accesso da rete/telefono è fuori scope e sarebbe un rischio inutile;
     /// 2. tutti i volumi dati (upload, Postgres, cache modelli ML) stanno sotto `dataDir`,
     ///    cioè sul disco interno del Mac, mai su SSD/HDD esterni;
-    /// 3. la cartella foto sull'SSD è montata **in sola lettura** (`:ro`) come External
-    ///    Library: Immich la indicizza dove già sta, non la copia e non ci scrive mai
-    ///    (coerente con zero-delete/zero-overwrite).
+    /// 3. la cartella foto sull'SSD è montata **in sola lettura** (`read_only: true`) come
+    ///    External Library: Immich la indicizza dove già sta, non la copia e non ci scrive
+    ///    mai (coerente con zero-delete/zero-overwrite).
     ///
     /// Funzione pura (dipende solo da `dataDir` e dal parametro) proprio per poter essere
     /// testata senza avviare nulla — stesso criterio di `checkDeepMirrorFreshness(...)`.
+    /// I test la ri-parsano con un parser YAML vero: verificare il testo con `contains(...)`
+    /// non intercetta un file sintatticamente rotto (lezione di una revisione del 2026-08-17).
     func composeFileContent(sourceLibraryPath: String) -> String {
         let data = dataDir.path
         return """
@@ -772,8 +793,8 @@ extension ImmichManager {
             ports:
               - "127.0.0.1:2283:2283"
             volumes:
-              - \(Self.yamlQuoted("\(data)/upload")):/data
-              - \(Self.yamlQuoted(sourceLibraryPath)):/external-ssd:ro
+              \(Self.bindMountYAML(source: "\(data)/upload", target: "/data", readOnly: false, indent: 6))
+              \(Self.bindMountYAML(source: sourceLibraryPath, target: "/external-ssd", readOnly: true, indent: 6))
               - /etc/localtime:/etc/localtime:ro
             environment:
               - DB_HOSTNAME=immich-database
@@ -788,7 +809,7 @@ extension ImmichManager {
           immich-machine-learning:
             image: ghcr.io/immich-app/immich-machine-learning:release
             volumes:
-              - \(Self.yamlQuoted("\(data)/model-cache")):/cache
+              \(Self.bindMountYAML(source: "\(data)/model-cache", target: "/cache", readOnly: false, indent: 6))
             restart: unless-stopped
           immich-redis:
             image: docker.io/valkey/valkey:9
@@ -801,7 +822,7 @@ extension ImmichManager {
               - POSTGRES_DB=immich
               - POSTGRES_INITDB_ARGS=--data-checksums
             volumes:
-              - \(Self.yamlQuoted("\(data)/postgres")):/var/lib/postgresql/data
+              \(Self.bindMountYAML(source: "\(data)/postgres", target: "/var/lib/postgresql/data", readOnly: false, indent: 6))
             shm_size: 128mb
             restart: unless-stopped
         """
