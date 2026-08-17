@@ -91,7 +91,7 @@ Qualsiasi subprocess (rsync, bash, rclone, Process()) lanciato da un'app GUI **n
 | Grafico velocità real-time | ✅ Implementato (Charts, MB/s per S3, file/s locale) |
 | Pannello Revisione (ToolsSheet) | ✅ Implementato — config checks, ultimo job persistito, campione integrità SHA256, pulizia upload multipart orfani |
 | Backup automatico Mac→SSD | ✅ Implementato — trigger su collegamento SSD, toggle on/off in Impostazioni, solo ad app aperta |
-| Test automatici | ✅ 79 test XCTest passano (`AppBackupFotoTests`: zero-overwrite, volume-root, persistenza job, campionamento locale, parsing cartelle S3 per il restore, correttezza sha256, classificazione retry S3, lettura file a blocchi, concorrenza limitata, validazione endpoint S3) |
+| Test automatici | ✅ 87 test XCTest passano (`AppBackupFotoTests`: zero-overwrite, volume-root, persistenza job, campionamento locale, parsing cartelle S3 per il restore, correttezza sha256, classificazione retry S3, lettura file a blocchi, concorrenza limitata, validazione endpoint S3, generazione docker-compose Immich) |
 | Build | ✅ `xcodebuild ... build` e `... test` verdi su questo stato |
 
 Storico bug (risolti e aperti): vedi `.claude/rules/bug-history.md`.
