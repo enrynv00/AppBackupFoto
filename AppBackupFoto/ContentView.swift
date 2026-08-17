@@ -482,8 +482,33 @@ final class ImmichManager: ObservableObject {
     var composeFilePath: URL { appSupportDir.appendingPathComponent("docker-compose.yml") }
     var dataDir: URL { appSupportDir.appendingPathComponent("data", isDirectory: true) }
 
+    /// `DOCKER_CONFIG` privato dell'app: qui dentro finiscono il plugin `docker compose`
+    /// (`cli-plugins/docker-compose`) e il context Docker creato da Colima. Non tocca mai
+    /// il `~/.docker` personale di Enrico.
+    var dockerConfigDir: URL { appSupportDir.appendingPathComponent("docker-config", isDirectory: true) }
+    /// `LIMA_HOME`/`COLIMA_HOME` privati: la VM e il suo stato non finiscono in `~/.lima`/`~/.colima`.
+    var limaHomeDir: URL { appSupportDir.appendingPathComponent("lima-home", isDirectory: true) }
+    var colimaHomeDir: URL { appSupportDir.appendingPathComponent("colima-home", isDirectory: true) }
+
+    var colimaBinary: URL { binDir.appendingPathComponent("colima") }
+    var limactlBinary: URL { binDir.appendingPathComponent("limactl") }
+    var dockerBinary: URL { binDir.appendingPathComponent("docker") }
+    var composePluginPath: URL {
+        dockerConfigDir.appendingPathComponent("cli-plugins", isDirectory: true)
+            .appendingPathComponent("docker-compose")
+    }
+
+    /// "Installato" = i quattro binari necessari sono già sul disco. Deliberatamente **non**
+    /// l'esistenza del compose file: quello viene (ri)scritto da `start(sourceLibraryPath:)`
+    /// a ogni avvio, quindi non dice nulla su cosa sia davvero installato.
+    func detectInstalled() -> Bool {
+        let fm = FileManager.default
+        return [colimaBinary, limactlBinary, dockerBinary, composePluginPath]
+            .allSatisfy { fm.fileExists(atPath: $0.path) }
+    }
+
     private init() {
-        installed = FileManager.default.fileExists(atPath: composeFilePath.path)
+        installed = detectInstalled()
     }
 }
 
@@ -555,6 +580,313 @@ extension ImmichManager {
             shm_size: 128mb
             restart: unless-stopped
         """
+    }
+}
+
+// MARK: - ImmichManager — ciclo di vita (Colima + Docker Compose)
+
+/// Buffer thread-safe per l'output di un `Process`: senza leggere la pipe *mentre* il processo
+/// gira, un comando verboso (`docker compose up` che scarica GB di immagini) riempie i 64KB di
+/// buffer del kernel e si blocca per sempre.
+private final class ProcessOutputBuffer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var data = Data()
+    func append(_ chunk: Data) { lock.lock(); data.append(chunk); lock.unlock() }
+    var text: String { lock.lock(); defer { lock.unlock() }; return String(data: data, encoding: .utf8) ?? "" }
+}
+
+/// Garantisce che una `CheckedContinuation` venga ripresa una volta sola: qui ci arrivano
+/// sia la terminazione del processo sia il timeout, e riprenderla due volte è un crash.
+private final class ContinuationGuard: @unchecked Sendable {
+    private let lock = NSLock()
+    private var used = false
+    func claim() -> Bool { lock.lock(); defer { lock.unlock() }; if used { return false }; used = true; return true }
+}
+
+extension ImmichManager {
+    enum Failure: LocalizedError {
+        case downloadFailed(String)
+        case commandFailed(command: String, status: Int32, output: String)
+        case commandTimedOut(command: String)
+        case startTimedOut
+
+        var errorDescription: String? {
+            switch self {
+            case .downloadFailed(let what):
+                return "Download non riuscito: \(what)"
+            case .commandFailed(let command, let status, let output):
+                let tail = output.suffix(500)
+                return "Comando '\(command)' fallito (codice \(status)).\n\(tail)"
+            case .commandTimedOut(let command):
+                return "Comando '\(command)' non ha risposto entro il tempo massimo."
+            case .startTimedOut:
+                return "Immich non è diventato raggiungibile entro il tempo massimo. Riprova, oppure controlla lo stato dei container."
+            }
+        }
+    }
+
+    // MARK: Versioni pinnate
+    // Pinnate a mano e non "latest": un aggiornamento a sorpresa di uno di questi quattro
+    // pezzi non deve poter rompere l'avvio senza che nessuno se ne accorga. Verificate il
+    // 2026-08-17; per aggiornarle basta cambiare qui e rifare l'installazione.
+
+    static let colimaVersion = "v0.10.3"
+    static let limaVersion = "2.2.0"
+    static let dockerCLIVersion = "29.7.2"
+    static let composePluginVersion = "v5.5.0"
+
+    /// Health-check pubblico di Immich: OpenAPI dichiara `servers: [/api]` + path `/server/ping`,
+    /// stabile dalla v2 (riverificato il 2026-08-17). Solo loopback, mai un host di rete.
+    static let healthCheckURL = URL(string: "http://127.0.0.1:2283/api/server/ping")!
+
+    /// Nomi degli asset: ogni progetto usa una convenzione diversa per la stessa architettura
+    /// (`arm64` per Colima/Lima, `aarch64` per Docker CLI e per il plugin compose).
+    private static var isARM: Bool {
+        #if arch(arm64)
+        return true
+        #else
+        return false
+        #endif
+    }
+
+    private static var colimaURL: URL {
+        URL(string: "https://github.com/abiosoft/colima/releases/download/\(colimaVersion)/colima-Darwin-\(isARM ? "arm64" : "x86_64")")!
+    }
+    private static var limaURL: URL {
+        URL(string: "https://github.com/lima-vm/lima/releases/download/v\(limaVersion)/lima-\(limaVersion)-Darwin-\(isARM ? "arm64" : "x86_64").tar.gz")!
+    }
+    private static var dockerCLIURL: URL {
+        URL(string: "https://download.docker.com/mac/static/stable/\(isARM ? "aarch64" : "x86_64")/docker-\(dockerCLIVersion).tgz")!
+    }
+    private static var composePluginURL: URL {
+        URL(string: "https://github.com/docker/compose/releases/download/\(composePluginVersion)/docker-compose-darwin-\(isARM ? "aarch64" : "x86_64")")!
+    }
+
+    // MARK: Installazione
+
+    /// Scarica in `binDir` i quattro pezzi necessari, **senza `sudo` e senza toccare nulla di
+    /// globale sul Mac** (niente `/usr/local/bin`, niente Homebrew): deviazione intenzionale
+    /// dalla guida ufficiale di Colima.
+    ///
+    /// Servono tutti e quattro, non solo Colima: `colima` è un wrapper su Lima e senza
+    /// `limactl` non parte; il tarball statico di Docker contiene solo la CLI, e `docker compose`
+    /// è un plugin distribuito a parte.
+    ///
+    /// Solo download: **non** avvia la VM e non scarica le immagini Docker di Immich (quelli
+    /// sono diversi GB e succedono al primo `start()`, dopo conferma esplicita).
+    func install() async throws {
+        await MainActor.run { self.lastError = nil }
+        do {
+            let fm = FileManager.default
+            for dir in [binDir, dataDir, dockerConfigDir, limaHomeDir, colimaHomeDir,
+                        composePluginPath.deletingLastPathComponent()] {
+                try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            }
+
+            try await downloadExecutable(from: Self.colimaURL, to: colimaBinary)
+            try await downloadExecutable(from: Self.composePluginURL, to: composePluginPath)
+            try await downloadLima()
+            try await downloadDockerCLI()
+
+            let ok = detectInstalled()
+            await MainActor.run { self.installed = ok }
+            if !ok { throw Failure.downloadFailed("uno dei binari non risulta presente al termine") }
+        } catch {
+            await MainActor.run {
+                self.installed = false
+                self.lastError = "Installazione non riuscita: \(error.localizedDescription)"
+            }
+            throw error
+        }
+    }
+
+    /// Scarica un singolo binario e lo rende eseguibile.
+    /// La `removeItem` qui tocca **solo** un file che questa stessa funzione ha scaricato dentro
+    /// la cartella dell'app (mai foto, mai SSD/HDD): serve a rendere ripetibile un'installazione
+    /// interrotta a metà.
+    private func downloadExecutable(from url: URL, to destination: URL) async throws {
+        let (tempURL, response) = try await URLSession.shared.download(from: url)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw Failure.downloadFailed(url.lastPathComponent)
+        }
+        let fm = FileManager.default
+        if fm.fileExists(atPath: destination.path) { try fm.removeItem(at: destination) }
+        try fm.moveItem(at: tempURL, to: destination)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: destination.path)
+    }
+
+    /// Il tarball di Lima si estrae in `bin/` + `share/`: scompattandolo dentro `appSupportDir`
+    /// `limactl` finisce esattamente in `binDir` e trova da solo la sua `share/lima` accanto.
+    private func downloadLima() async throws {
+        let archive = try await downloadToTemporaryFile(Self.limaURL)
+        defer { try? FileManager.default.removeItem(at: archive) }
+        try await runTar(["-xzf", archive.path, "-C", appSupportDir.path])
+    }
+
+    /// Il tgz di Docker contiene `docker/docker`: `--strip-components=1` lo posa dritto in `binDir`.
+    private func downloadDockerCLI() async throws {
+        let archive = try await downloadToTemporaryFile(Self.dockerCLIURL)
+        defer { try? FileManager.default.removeItem(at: archive) }
+        try await runTar(["-xzf", archive.path, "-C", binDir.path, "--strip-components=1", "docker/docker"])
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dockerBinary.path)
+    }
+
+    private func downloadToTemporaryFile(_ url: URL) async throws -> URL {
+        let (tempURL, response) = try await URLSession.shared.download(from: url)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw Failure.downloadFailed(url.lastPathComponent)
+        }
+        let destination = FileManager.default.temporaryDirectory
+            .appendingPathComponent("\(UUID().uuidString)-\(url.lastPathComponent)")
+        try FileManager.default.moveItem(at: tempURL, to: destination)
+        return destination
+    }
+
+    /// Unica eccezione consapevole alla regola "solo binari in `binDir`": `/usr/bin/tar` è una
+    /// utility di sistema di macOS usata soltanto per scompattare gli archivi appena scaricati.
+    private func runTar(_ arguments: [String]) async throws {
+        _ = try await runProcess(URL(fileURLWithPath: "/usr/bin/tar"), arguments, timeout: 300)
+    }
+
+    // MARK: Avvio / arresto
+
+    /// Scrive il compose file, avvia la VM Colima e lo stack Immich, poi aspetta che il server
+    /// risponda davvero prima di dichiararlo pronto (mai una WebView bianca su un server che
+    /// non è ancora su).
+    func start(sourceLibraryPath: String) async throws {
+        guard !isStarting else { return }
+        await MainActor.run { self.isStarting = true; self.lastError = nil }
+        defer { Task { @MainActor in self.isStarting = false } }
+
+        do {
+            let fm = FileManager.default
+            for dir in [dataDir, dockerConfigDir, limaHomeDir, colimaHomeDir] {
+                try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            }
+            try composeFileContent(sourceLibraryPath: sourceLibraryPath)
+                .write(to: composeFilePath, atomically: true, encoding: .utf8)
+
+            // I bind mount del compose funzionano solo se il path è visibile *dentro* la VM:
+            // Colima monta di suo solo `$HOME`/`/tmp/colima`, quindi entrambi i path vanno
+            // dichiarati esplicitamente. `:w` solo sui dati di Immich; la libreria foto è
+            // montata senza `:w`, cioè in sola lettura — secondo strato di protezione oltre
+            // al `:ro` del compose file.
+            var colimaArgs = ["start", "--cpus", "4", "--memory", "8",
+                              "--vm-type", "vz", "--mount-type", "virtiofs",
+                              "--mount", "\(dataDir.path):w"]
+            if !sourceLibraryPath.isEmpty {
+                colimaArgs += ["--mount", sourceLibraryPath]
+            }
+            _ = try await runProcess(colimaBinary, colimaArgs, timeout: 600)
+            _ = try await runProcess(dockerBinary,
+                                     ["compose", "-f", composeFilePath.path, "up", "-d"],
+                                     timeout: 1800)
+
+            // Polling: al primo avvio la VM, Postgres e il servizio ML ci mettono parecchio.
+            let deadline = Date().addingTimeInterval(120)
+            while Date() < deadline {
+                if await healthCheck() {
+                    await MainActor.run { self.isRunning = true }
+                    return
+                }
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+            }
+            throw Failure.startTimedOut
+        } catch {
+            await MainActor.run {
+                self.isRunning = false
+                self.lastError = error.localizedDescription
+            }
+            throw error
+        }
+    }
+
+    /// Ferma container e VM. Best-effort e non lancia: viene chiamata anche alla chiusura
+    /// dell'app, dove non c'è più nessuna UI a cui riportare un errore.
+    func stop() async {
+        _ = try? await runProcess(dockerBinary,
+                                  ["compose", "-f", composeFilePath.path, "down"],
+                                  timeout: 30)
+        _ = try? await runProcess(colimaBinary, ["stop"], timeout: 30)
+        await MainActor.run { self.isRunning = false }
+    }
+
+    func healthCheck() async -> Bool {
+        var request = URLRequest(url: Self.healthCheckURL)
+        request.timeoutInterval = 5
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        guard let (_, response) = try? await URLSession.shared.data(for: request) else { return false }
+        return (response as? HTTPURLResponse)?.statusCode == 200
+    }
+
+    // MARK: Esecuzione processi
+
+    /// Ambiente dei processi figli: PATH con `binDir` davanti (così `colima` trova il *nostro*
+    /// `limactl`/`docker` e non eventuali installazioni di sistema), e le tre home
+    /// (`DOCKER_CONFIG`/`LIMA_HOME`/`COLIMA_HOME`) dirottate dentro la cartella dell'app.
+    private func childEnvironment() -> [String: String] {
+        var env = ProcessInfo.processInfo.environment
+        let existingPath = env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
+        env["PATH"] = "\(binDir.path):\(existingPath)"
+        env["DOCKER_CONFIG"] = dockerConfigDir.path
+        env["LIMA_HOME"] = limaHomeDir.path
+        env["COLIMA_HOME"] = colimaHomeDir.path
+        return env
+    }
+
+    /// Esegue un comando raccogliendone l'output, con timeout: nessun comando può appendere
+    /// l'app per sempre (il processo viene terminato allo scadere).
+    @discardableResult
+    private func runProcess(_ executable: URL, _ arguments: [String], timeout: TimeInterval) async throws -> String {
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = arguments
+        process.environment = childEnvironment()
+
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+
+        let buffer = ProcessOutputBuffer()
+        let handle = pipe.fileHandleForReading
+        handle.readabilityHandler = { fh in
+            let chunk = fh.availableData
+            if chunk.isEmpty { fh.readabilityHandler = nil } else { buffer.append(chunk) }
+        }
+
+        let name = "\(executable.lastPathComponent) \(arguments.first ?? "")"
+        return try await withCheckedThrowingContinuation { continuation in
+            let resume = ContinuationGuard()
+
+            process.terminationHandler = { proc in
+                handle.readabilityHandler = nil
+                guard resume.claim() else { return }
+                let output = buffer.text
+                if proc.terminationStatus == 0 {
+                    continuation.resume(returning: output)
+                } else {
+                    continuation.resume(throwing: Failure.commandFailed(
+                        command: name, status: proc.terminationStatus, output: output))
+                }
+            }
+
+            do {
+                try process.run()
+            } catch {
+                handle.readabilityHandler = nil
+                if resume.claim() { continuation.resume(throwing: error) }
+                return
+            }
+
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
+                guard process.isRunning else { return }
+                process.terminate()
+                if resume.claim() {
+                    handle.readabilityHandler = nil
+                    continuation.resume(throwing: Failure.commandTimedOut(command: name))
+                }
+            }
+        }
     }
 }
 
