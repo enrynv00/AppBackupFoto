@@ -8,6 +8,7 @@ import Charts
 import ImageIO
 import Sparkle
 import LocalAuthentication
+import WebKit
 
 // MARK: - Design Tokens
 
@@ -454,6 +455,35 @@ struct LockScreenView: View {
         .padding(AppSpacing.xxl)
         .frame(minWidth: 480, minHeight: 320)
         .onAppear { gate.authenticate() }
+    }
+}
+
+// MARK: - ImmichManager
+/// Ciclo di vita dell'istanza Immich gestita dall'app (Colima + Docker Compose).
+/// Stesso stile di `BackupRunner`/`AuthGateManager`: singleton `ObservableObject`.
+///
+/// Tutto ciò che questa classe scrive vive sotto `~/Library/Application Support/AppBackupFoto/immich/`
+/// sul **disco interno** del Mac — mai su SSD/HDD esterni (Postgres vuole storage locale, e se
+/// l'SSD viene scollegato il server resta comunque in piedi). La libreria foto sull'SSD viene
+/// solo montata in sola lettura come External Library: Immich la legge, non la scrive mai.
+final class ImmichManager: ObservableObject {
+    static let shared = ImmichManager()
+    @Published var installed: Bool = false
+    @Published var isRunning: Bool = false
+    @Published var isStarting: Bool = false
+    @Published var lastError: String?
+
+    let appSupportDir: URL = {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        return base.appendingPathComponent("AppBackupFoto/immich", isDirectory: true)
+    }()
+
+    var binDir: URL { appSupportDir.appendingPathComponent("bin", isDirectory: true) }
+    var composeFilePath: URL { appSupportDir.appendingPathComponent("docker-compose.yml") }
+    var dataDir: URL { appSupportDir.appendingPathComponent("data", isDirectory: true) }
+
+    private init() {
+        installed = FileManager.default.fileExists(atPath: composeFilePath.path)
     }
 }
 
