@@ -20,6 +20,17 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>$(MACOSX_DEPLOYMENT_TARGET)</string>
+	<!-- Immich gira in locale su http://127.0.0.1:2283 (HTTP semplice, nessun certificato
+	     possibile per loopback): senza questa eccezione App Transport Security bloccherebbe
+	     sia la WKWebView della finestra Foto sia l'health check via URLSession.
+	     NSAllowsLocalNetworking allenta il vincolo SOLO per host locali/link-local.
+	     NON sostituirla con NSAllowsArbitraryLoads: quella disattiverebbe l'obbligo di HTTPS
+	     anche per il download dei binari Colima/Lima/Docker e per il feed Sparkle. -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
 	<key>NSHumanReadableCopyright</key>
 	<string></string>
 	<key>SUFeedURL</key>
