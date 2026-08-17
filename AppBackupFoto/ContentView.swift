@@ -98,8 +98,34 @@ final class UpdaterViewModel: ObservableObject {
     }
 }
 
+/// Chiude lo stack Immich prima che l'app termini davvero: non ha senso lasciare acceso
+/// un intero stack di container (diversi GB di RAM) con AppBackupFoto chiusa.
+///
+/// Usa `applicationShouldTerminate` + `.terminateLater` — non `applicationWillTerminate`,
+/// che è sincrono e uscirebbe prima che `stop()` abbia finito. C'è comunque una rete di
+/// sicurezza: se lo spegnimento si impianta, l'app si chiude lo stesso invece di restare
+/// appesa per sempre.
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    private static let shutdownSafetyNet: TimeInterval = 70
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        let immich = ImmichManager.shared
+        guard immich.isRunning || immich.isStarting else { return .terminateNow }
+
+        Task {
+            await immich.stop()
+            await MainActor.run { NSApp.reply(toApplicationShouldTerminate: true) }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.shutdownSafetyNet) {
+            NSApp.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
+}
+
 @main
 struct BackupFotoEnricoApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var runner = BackupRunner()
     @StateObject private var updater = UpdaterViewModel()
 
