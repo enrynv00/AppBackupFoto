@@ -167,6 +167,20 @@ final class ImmichComposeFileTests: XCTestCase {
         XCTAssertTrue(dataPath.contains("Application Support/AppBackupFoto/immich"))
     }
 
+    // MARK: - Validazione del path passato a Colima
+
+    func testLibraryPathWithColonIsRejected() {
+        // Colima fa SplitN(mount, ":", 3): un path con ":" verrebbe troncato, e uno che
+        // finisce per ":w" verrebbe montato in scrittura dentro la VM. Meglio fermarsi prima.
+        XCTAssertThrowsError(try ImmichManager.validateLibraryPath("/Volumes/SSD - Enri/Foto:2020"))
+        XCTAssertThrowsError(try ImmichManager.validateLibraryPath("/Volumes/SSD - Enri/Foto:w"))
+    }
+
+    func testNormalLibraryPathIsAccepted() {
+        XCTAssertNoThrow(try ImmichManager.validateLibraryPath(ssdPath))
+        XCTAssertNoThrow(try ImmichManager.validateLibraryPath("/Volumes/SSD - Enri"))
+    }
+
     // MARK: - Struttura
 
     func testAllFourServicesArePresent() throws {

@@ -117,14 +117,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // è il caso di chiunque non usi la finestra Foto.
         guard immich.detectInstalled() else { return .terminateNow }
 
-        // Volutamente **non** si guarda `isRunning`/`isStarting` in memoria: sono falsi in
-        // due casi reali — dopo un timeout di `start()` su uno stack in realtà partito, e al
-        // rilancio dopo un crash/force-quit con i container ancora accesi. Si chiede al
-        // sistema, e solo se non c'è davvero niente acceso si esce subito.
+        // Non ci si fida del solo `isRunning` in memoria (falso dopo un timeout dell'health
+        // check su uno stack in realtà partito, e al rilancio dopo un crash/force-quit): si
+        // chiede al sistema. Ma `isStarting` va guardato **comunque**, ed è l'unico segnale
+        // valido durante `colima start`: lì `detectRunning()` risponde false — la VM non è
+        // ancora su — e uscire con `.terminateNow` lascerebbe il processo figlio `colima
+        // start` a sopravvivere al padre (su macOS non muore con l'app), finire di accendere
+        // la VM e restare acceso senza più nessuno che lo spenga.
         Task {
-            if await immich.detectRunning() {
-                await immich.stop()
-            }
+            await immich.detectRunning()
+            let somethingToStop = await MainActor.run { immich.vmPossiblyUp || immich.isStarting }
+            if somethingToStop { await immich.stop() }
             await MainActor.run { NSApp.reply(toApplicationShouldTerminate: true) }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.shutdownSafetyNet) {
@@ -713,7 +716,14 @@ struct LockScreenView: View {
 final class ImmichManager: ObservableObject {
     static let shared = ImmichManager()
     @Published var installed: Bool = false
+    /// **Immich risponde davvero** (health check OK). È questo — e solo questo — a decidere
+    /// se mostrare la WebView: la VM accesa non basta, perché una WebView puntata su un
+    /// server che non risponde resta bianca e senza via d'uscita.
     @Published var isRunning: Bool = false
+    /// La VM Colima risulta accesa, **anche se Immich non risponde**. Serve solo a decidere
+    /// se c'è qualcosa da spegnere alla chiusura dell'app: tenerlo separato da `isRunning`
+    /// evita che "VM su, container giù" venga scambiato per "Immich pronto".
+    @Published var vmPossiblyUp: Bool = false
     @Published var isStarting: Bool = false
     @Published var lastError: String?
 
@@ -875,9 +885,16 @@ extension ImmichManager {
         case commandTimedOut(command: String)
         case startTimedOut
         case checksumMismatch(asset: String, expected: String, actual: String)
+        case unsupportedLibraryPath(String)
 
         var errorDescription: String? {
             switch self {
+            case .unsupportedLibraryPath(let path):
+                return """
+                Il percorso della libreria contiene un carattere non supportato (:) e non può essere usato da Immich.
+                Percorso: \(path)
+                Rinomina la cartella (in Finder il carattere appare come "/") e riprova.
+                """
             case .checksumMismatch(let asset, let expected, let actual):
                 return """
                 Il file scaricato '\(asset)' non corrisponde alla versione attesa e non è stato installato.
@@ -1080,6 +1097,25 @@ extension ImmichManager {
 
     // MARK: Avvio / arresto
 
+    /// Rifiuta un path di libreria che Colima non saprebbe interpretare.
+    ///
+    /// Colima fa `strings.SplitN(mount, ":", 3)` sul valore di `--mount` (sorgente upstream
+    /// v0.10.3, `cmd/start.go`): un path che contiene `:` verrebbe troncato al primo `:` —
+    /// monterebbe una cartella diversa o inesistente, con un errore di avvio poco chiaro — e
+    /// un path che finisce per `:w` verrebbe letto come il flag "writable", montando in
+    /// **scrittura** dentro la VM una cartella che deve restare in sola lettura.
+    ///
+    /// Il `read_only: true` del compose file resta come secondo strato e impedirebbe comunque
+    /// la scrittura reale, ma la protezione a livello di mount cadrebbe in silenzio: meglio
+    /// fermarsi con un messaggio comprensibile che affidarsi al parser di Colima.
+    ///
+    /// Non è un caso di scuola: su macOS una cartella che in Finder si chiama "Foto/2020" ha
+    /// path POSIX `Foto:2020` — la stessa classe di path del bug YAML corretto poco prima.
+    /// Funzione pura e testata, come `composeFileContent`.
+    static func validateLibraryPath(_ path: String) throws {
+        guard !path.contains(":") else { throw Failure.unsupportedLibraryPath(path) }
+    }
+
     /// Scrive il compose file, avvia la VM Colima e lo stack Immich, poi aspetta che il server
     /// risponda davvero prima di dichiararlo pronto (mai una WebView bianca su un server che
     /// non è ancora su).
@@ -1089,6 +1125,9 @@ extension ImmichManager {
         defer { Task { @MainActor in self.isStarting = false } }
 
         do {
+            // Prima di qualunque effetto collaterale: un path che Colima interpreterebbe male
+            // non deve nemmeno arrivare alla riga di comando (vedi `validateLibraryPath`).
+            try Self.validateLibraryPath(sourceLibraryPath)
             let fm = FileManager.default
             for dir in [dataDir, dockerConfigDir, limaHomeDir, colimaHomeDir] {
                 try fm.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -1142,17 +1181,30 @@ extension ImmichManager {
     @discardableResult
     func detectRunning() async -> Bool {
         guard detectInstalled() else {
-            await MainActor.run { self.isRunning = false }
+            await MainActor.run { self.isRunning = false; self.vmPossiblyUp = false }
             return false
         }
-        // L'health check è il segnale più forte (Immich risponde davvero); `colima status`
-        // copre il caso "VM accesa ma container giù", che consuma comunque risorse e va spento.
-        var running = await healthCheck()
-        if !running {
-            running = (try? await runProcess(colimaBinary, ["status"], timeout: 15)) != nil
+
+        // Due segnali distinti, di proposito. L'health check dice se Immich è **usabile**;
+        // `colima status` (exit 0 = VM accesa) copre il caso "VM su, container giù", che
+        // consuma comunque risorse e va spento alla chiusura ma **non** deve far comparire
+        // la WebView: caricherebbe una pagina bianca su un server che non risponde, senza
+        // retry e senza più il bottone "Avvia" (dipende da `!isRunning`) — vicolo cieco da
+        // cui si usciva solo chiudendo l'app. Scenario reale: sessione precedente chiusa
+        // con un `colima stop` fallito o scaduto.
+        let immichUp = await healthCheck()
+        // Se Immich risponde, la VM è ovviamente accesa: si evita un processo inutile.
+        // (Non si può usare `||`: il suo secondo operando è un autoclosure non async.)
+        var vmUp = immichUp
+        if !vmUp {
+            vmUp = (try? await runProcess(colimaBinary, ["status"], timeout: 15)) != nil
         }
-        await MainActor.run { self.isRunning = running }
-        return running
+
+        await MainActor.run {
+            self.isRunning = immichUp
+            self.vmPossiblyUp = vmUp
+        }
+        return immichUp
     }
 
     /// Ferma container e VM. Best-effort e non lancia: viene chiamata anche alla chiusura
@@ -1172,7 +1224,7 @@ extension ImmichManager {
                                   ["compose", "-f", composeFilePath.path, "down"],
                                   timeout: Self.stopCommandTimeout)
         _ = try? await runProcess(colimaBinary, ["stop"], timeout: Self.stopCommandTimeout)
-        await MainActor.run { self.isRunning = false }
+        await MainActor.run { self.isRunning = false; self.vmPossiblyUp = false }
     }
 
     func healthCheck() async -> Bool {
