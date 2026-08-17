@@ -155,6 +155,16 @@ struct BackupFotoEnricoApp: App {
         .windowResizability(.contentSize)
         .restorationBehavior(.disabled)
 
+        Window("Foto", id: "immich") {
+            ImmichView()
+                .environmentObject(runner)
+        }
+        .defaultSize(width: 1000, height: 700)
+        // Stessa regola stabilita per #30: ogni nuova Window scene di primo livello va gated
+        // (il gate vero è dentro ImmichView) e non deve essere riaperta dal ripristino
+        // automatico di macOS prima dello sblocco.
+        .restorationBehavior(.disabled)
+
         MenuBarExtra {
             MenuBarContent()
                 .environmentObject(runner)
@@ -349,6 +359,195 @@ struct CatalogView: View {
                 }
             }
         }
+    }
+}
+
+// MARK: - Immich (finestra "Foto")
+
+/// Finestra "Foto": la web UI di Immich incorporata, con il ciclo di vita dello stack
+/// gestito da `ImmichManager`.
+///
+/// Gate Touch ID anche qui, come per `CatalogView`/`ToolsSheet`: è una scena di primo
+/// livello apribile dal menu Finestra mentre la finestra principale è ancora bloccata, e
+/// senza gate mostrerebbe l'intera libreria foto senza autenticazione (roadmap #30).
+struct ImmichView: View {
+    @ObservedObject private var gate = AuthGateManager.shared
+    @ObservedObject private var immich = ImmichManager.shared
+    @ObservedObject private var bm = BookmarkManager.shared
+
+    /// La libreria da indicizzare è l'SSD già configurato in `BookmarkManager`: nessuna
+    /// nuova destinazione, nessun nuovo bookmark (vedi spec).
+    private var ssdPath: String? { bm.urls[.ssd]?.path }
+
+    var body: some View {
+        if gate.touchIDEnabled && !gate.unlocked {
+            LockScreenView()
+        } else {
+            content
+        }
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        if !immich.installed {
+            ImmichSetupPromptView()
+        } else if immich.isStarting {
+            ImmichMessageView(
+                icon: "hourglass",
+                title: "Avvio di Immich…",
+                message: "La prima volta richiede diversi minuti: viene avviata una macchina virtuale e scaricate le immagini dei container.",
+                showsProgress: true)
+        } else if immich.isRunning {
+            ImmichWebView(url: ImmichManager.webUIURL)
+        } else {
+            idle
+        }
+    }
+
+    @ViewBuilder
+    private var idle: some View {
+        if let path = ssdPath {
+            ImmichMessageView(
+                icon: "photo.on.rectangle.angled",
+                title: "Immich è fermo",
+                message: "Le foto vengono lette in sola lettura da:\n\(path)",
+                error: immich.lastError) {
+                    Button("Avvia Immich") {
+                        Task { try? await immich.start(sourceLibraryPath: path) }
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+        } else {
+            ImmichMessageView(
+                icon: "externaldrive.badge.questionmark",
+                title: "SSD non configurato",
+                message: "Configura prima l'SSD esterno nella schermata iniziale: è la cartella che Immich indicizzerà in sola lettura.")
+        }
+    }
+}
+
+/// Schermata neutra riusata dagli stati non-web della finestra Foto (fermo, in avvio, errore).
+struct ImmichMessageView<Actions: View>: View {
+    let icon: String
+    let title: String
+    var message: String = ""
+    var error: String? = nil
+    var showsProgress: Bool = false
+    @ViewBuilder var actions: () -> Actions
+
+    var body: some View {
+        VStack(spacing: AppSpacing.lg) {
+            Image(systemName: icon)
+                .font(.system(size: AppIconSize.heroLarge))
+                .foregroundStyle(AppColor.utility)
+            Text(title).font(AppFont.title)
+            if !message.isEmpty {
+                Text(message)
+                    .font(AppFont.caption)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+            if showsProgress { ProgressView() }
+            if let error {
+                Text(error)
+                    .font(AppFont.caption)
+                    .foregroundStyle(AppColor.error)
+                    .multilineTextAlignment(.center)
+                    .textSelection(.enabled)
+            }
+            actions()
+        }
+        .padding(AppSpacing.xxl)
+        .frame(maxWidth: 520, maxHeight: .infinity)
+        .frame(maxWidth: .infinity)
+    }
+}
+
+extension ImmichMessageView where Actions == EmptyView {
+    init(icon: String, title: String, message: String = "", error: String? = nil, showsProgress: Bool = false) {
+        self.init(icon: icon, title: title, message: message, error: error,
+                  showsProgress: showsProgress, actions: { EmptyView() })
+    }
+}
+
+/// Conferma esplicita prima di installare: niente installazioni silenziose, stessa
+/// disciplina già seguita per Keychain/rclone.conf. Qui l'utente vede *prima* cosa sta
+/// per succedere, quanto spazio serve e quanto ci vorrà.
+struct ImmichSetupPromptView: View {
+    @ObservedObject private var immich = ImmichManager.shared
+    @State private var isInstalling = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: AppSpacing.lg) {
+            HStack(spacing: AppSpacing.md) {
+                Image(systemName: "photo.stack")
+                    .font(.system(size: AppIconSize.heroSmall))
+                    .foregroundStyle(AppColor.utility)
+                Text("Configura Immich").font(AppFont.title)
+            }
+
+            Text("Immich è il motore che permette di sfogliare le foto per data, luogo e persone, con ricerca intelligente e riconoscimento dei volti.")
+                .font(AppFont.body)
+
+            VStack(alignment: .leading, spacing: AppSpacing.sm) {
+                bullet("arrow.down.circle", "Ora vengono scaricati circa 150 MB di strumenti (Colima, Docker, Lima).")
+                bullet("shippingbox", "Al primo avvio vengono scaricate le immagini dei container: diversi GB, può richiedere parecchi minuti.")
+                bullet("internaldrive", "Tutto viene salvato sul disco interno del Mac, mai sull'SSD o sull'HDD di backup.")
+                bullet("lock.shield", "Le tue foto sull'SSD vengono solo lette, mai modificate o copiate.")
+                bullet("wifi.slash", "Il servizio è raggiungibile solo da questo Mac, non dalla rete.")
+                bullet("memorychip", "Mentre è acceso occupa parecchia memoria; si spegne da solo quando chiudi l'app.")
+            }
+            .padding(AppSpacing.md)
+            .cardBackground()
+
+            if let error = immich.lastError {
+                Text(error)
+                    .font(AppFont.caption)
+                    .foregroundStyle(AppColor.error)
+                    .textSelection(.enabled)
+            }
+
+            HStack {
+                Spacer()
+                if isInstalling { ProgressView().controlSize(.small) }
+                Button(isInstalling ? "Installazione…" : "Installa") {
+                    guard !isInstalling else { return }
+                    isInstalling = true
+                    Task {
+                        try? await immich.install()
+                        await MainActor.run { isInstalling = false }
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(isInstalling)
+            }
+        }
+        .padding(AppSpacing.xl)
+        .frame(maxWidth: 620, maxHeight: .infinity, alignment: .top)
+        .frame(maxWidth: .infinity)
+    }
+
+    private func bullet(_ icon: String, _ text: String) -> some View {
+        HStack(alignment: .top, spacing: AppSpacing.sm) {
+            Image(systemName: icon)
+                .font(AppFont.caption)
+                .foregroundStyle(.secondary)
+                .frame(width: 16)
+            Text(text).font(AppFont.caption).foregroundStyle(.secondary)
+        }
+    }
+}
+
+/// Wrapper minimo attorno a `WKWebView` per mostrare la web UI di Immich.
+struct ImmichWebView: NSViewRepresentable {
+    let url: URL
+
+    func makeNSView(context: Context) -> WKWebView { WKWebView() }
+
+    func updateNSView(_ webView: WKWebView, context: Context) {
+        // Solo al primo passaggio: ricaricare a ogni update butterebbe via la navigazione
+        // dell'utente dentro Immich a ogni ridisegno della view.
+        if webView.url == nil { webView.load(URLRequest(url: url)) }
     }
 }
 
@@ -660,6 +859,10 @@ extension ImmichManager {
     static let limaVersion = "2.2.0"
     static let dockerCLIVersion = "29.7.2"
     static let composePluginVersion = "v5.5.0"
+
+    /// Web UI di Immich. Loopback, non raggiungibile dalla rete: il compose file pubblica la
+    /// porta solo su `127.0.0.1` (vedi `composeFileContent`).
+    static let webUIURL = URL(string: "http://127.0.0.1:2283")!
 
     /// Health-check pubblico di Immich: OpenAPI dichiara `servers: [/api]` + path `/server/ping`,
     /// stabile dalla v2 (riverificato il 2026-08-17). Solo loopback, mai un host di rete.
@@ -3886,6 +4089,9 @@ struct HamburgerPanel: View {
                                 await runner.loadS3ConfigIfNeeded()
                                 await MainActor.run { openWindow(id: "catalog") }
                             }
+                        }
+                        HamburgerRow(icon: "photo.stack", label: "Foto", iconColor: .pink) {
+                            openWindow(id: "immich")
                         }
                         HamburgerRow(icon: "arrow.triangle.2.circlepath", label: "Controlla aggiornamenti", iconColor: .cyan) {
                             updater.controller.checkForUpdates(nil)
