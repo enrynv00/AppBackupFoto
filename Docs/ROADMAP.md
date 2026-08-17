@@ -124,7 +124,7 @@ Quattro punti aggiunti da Enrico dopo la chiusura della roadmap di design (punti
 
     Scope originale (2026-08-17, brainstorming): richiesta solo all'avvio dell'app (non ogni volta che torna in primo piano, non solo su azioni sensibili), fallback automatico alla password del Mac se Touch ID fallisce/non disponibile (comportamento nativo `LocalAuthentication`), toggle disattivabile in Impostazioni (coerente con gli altri toggle già presenti, es. backup automatico). Il più contenuto dei 4 — nessun cambio architetturale, feature isolata.
 
-Dei 4 punti solo #30 ha una spec (e un'implementazione, 2026-08-17); #27, #28 e #29 non ne hanno ancora una — si affrontano uno alla volta quando Enrico decide di iniziarli, col ciclo normale (brainstorming one-question-at-a-time, già iniziato per tutti e 4 → spec → piano → implementazione).
+Dei 4 punti: #30 è fatto (spec + implementazione, 2026-08-17); #29 ha spec, piano e **codice completo e buildabile** (2026-08-17) ma resta 🔲 perché la verifica manuale end-to-end non è ancora stata eseguita — nessun container è mai stato avviato davvero, vedi Task 5 Step 4 di `Docs/superpowers/plans/2026-08-17-immich-integration.md`; #27 e #28 non hanno ancora una spec e si affrontano uno alla volta quando Enrico decide di iniziarli, col ciclo normale (brainstorming one-question-at-a-time, già iniziato per tutti e 4 → spec → piano → implementazione).
 
 ---
 
