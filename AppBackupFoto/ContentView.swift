@@ -115,6 +115,10 @@ struct BackupFotoEnricoApp: App {
         }
         .defaultSize(width: 640, height: 640)
         .windowResizability(.contentSize)
+        // Il ripristino automatico delle finestre di macOS riaprirebbe questa scena
+        // al rilancio prima dello sblocco: disabilitato come barriera aggiuntiva
+        // (il gate vero è dentro ToolsSheet/CatalogView).
+        .restorationBehavior(.disabled)
 
         Window("Catalogo", id: "catalog") {
             CatalogView()
@@ -122,6 +126,7 @@ struct BackupFotoEnricoApp: App {
         }
         .defaultSize(width: 720, height: 520)
         .windowResizability(.contentSize)
+        .restorationBehavior(.disabled)
 
         MenuBarExtra {
             MenuBarContent()
@@ -185,6 +190,7 @@ struct CatalogView: View {
 
     @EnvironmentObject private var runner: BackupRunner
     @ObservedObject private var bm = BookmarkManager.shared
+    @ObservedObject private var gate = AuthGateManager.shared
     @StateObject private var volumes = VolumeMonitor()
     @State private var destination: CatalogDestination = .ssd
     @State private var searchText = ""
@@ -213,7 +219,18 @@ struct CatalogView: View {
         return filterCatalogEntries(entries, matching: searchText)
     }
 
+    /// Gate Touch ID anche qui: "Catalogo" è una scena di primo livello, apribile dal menu
+    /// Finestra mentre la finestra principale è ancora bloccata — senza questo controllo
+    /// elencherebbe nomi/cartelle/date delle foto senza autenticazione (roadmap #30).
     var body: some View {
+        if gate.touchIDEnabled && !gate.unlocked {
+            LockScreenView()
+        } else {
+            content
+        }
+    }
+
+    private var content: some View {
         VStack(alignment: .leading, spacing: AppSpacing.md) {
             Text("Catalogo").font(AppFont.title)
 
@@ -372,18 +389,28 @@ final class AuthGateManager: ObservableObject {
     @Published var isAuthenticating: Bool = false
     @Published var lastError: String?
 
-    var touchIDEnabled: Bool {
-        get { UserDefaults.standard.object(forKey: "touchIDEnabled") as? Bool ?? true }
-        set { UserDefaults.standard.set(newValue, forKey: "touchIDEnabled") }
+    /// Persistito a mano in UserDefaults (stesso pattern di `AppearanceManager.mode`):
+    /// dev'essere `@Published` e non una computed su UserDefaults, altrimenti scriverlo
+    /// non emette `objectWillChange` e né il toggle in Impostazioni né `RootView` reagiscono.
+    @Published var touchIDEnabled: Bool {
+        didSet { UserDefaults.standard.set(touchIDEnabled, forKey: "touchIDEnabled") }
     }
 
-    private init() {}
+    /// Trattenuto per tutta la durata del prompt: se il `LAContext` viene rilasciato da ARC
+    /// mentre la callback è pending, il prompt sparisce (`LAError.appCancel`) e
+    /// `isAuthenticating` resterebbe bloccato su `true`.
+    private var context: LAContext?
+
+    private init() {
+        touchIDEnabled = UserDefaults.standard.object(forKey: "touchIDEnabled") as? Bool ?? true
+    }
 
     func authenticate() {
         guard !isAuthenticating else { return }
         isAuthenticating = true
         lastError = nil
         let context = LAContext()
+        self.context = context
         context.evaluatePolicy(.deviceOwnerAuthentication,
                                 localizedReason: "Sblocca AppBackupFoto") { [weak self] success, error in
             DispatchQueue.main.async {
@@ -3774,6 +3801,7 @@ struct ToolsSheet: View {
     @Environment(\.dismissWindow) private var dismissWindow
     @EnvironmentObject private var runner: BackupRunner
     @ObservedObject private var bm = BookmarkManager.shared
+    @ObservedObject private var gate = AuthGateManager.shared
     @State private var showSecret = false
     @State private var lastJob: JobSummary? = JobHistoryStore.load()
     @State private var integrityResults: [IntegrityCheckResult] = []
@@ -3809,7 +3837,17 @@ struct ToolsSheet: View {
             onConfirm: action)
     }
 
+    /// Stesso gate di `CatalogView`: "Diagnostica" è una scena di primo livello, apribile
+    /// dal menu Finestra mentre la finestra principale è ancora bloccata (roadmap #30).
     var body: some View {
+        if gate.touchIDEnabled && !gate.unlocked {
+            LockScreenView()
+        } else {
+            content
+        }
+    }
+
+    private var content: some View {
         VStack(alignment: .leading, spacing: AppSpacing.lg) {
             Text("Diagnostica").font(AppFont.title)
 
