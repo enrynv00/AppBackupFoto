@@ -106,14 +106,25 @@ final class UpdaterViewModel: ObservableObject {
 /// sicurezza: se lo spegnimento si impianta, l'app si chiude lo stesso invece di restare
 /// appesa per sempre.
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private static let shutdownSafetyNet: TimeInterval = 70
+    /// Deve stare sopra la somma dei due timeout di `stop()` (90s + 90s), altrimenti
+    /// scatterebbe la rete di sicurezza proprio mentre l'arresto sta ancora lavorando.
+    private static let shutdownSafetyNet: TimeInterval = 200
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         let immich = ImmichManager.shared
-        guard immich.isRunning || immich.isStarting else { return .terminateNow }
 
+        // Se Immich non è nemmeno installato non si paga nessun ritardo alla chiusura:
+        // è il caso di chiunque non usi la finestra Foto.
+        guard immich.detectInstalled() else { return .terminateNow }
+
+        // Volutamente **non** si guarda `isRunning`/`isStarting` in memoria: sono falsi in
+        // due casi reali — dopo un timeout di `start()` su uno stack in realtà partito, e al
+        // rilancio dopo un crash/force-quit con i container ancora accesi. Si chiede al
+        // sistema, e solo se non c'è davvero niente acceso si esce subito.
         Task {
-            await immich.stop()
+            if await immich.detectRunning() {
+                await immich.stop()
+            }
             await MainActor.run { NSApp.reply(toApplicationShouldTerminate: true) }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.shutdownSafetyNet) {
@@ -384,6 +395,14 @@ struct ImmichView: View {
             LockScreenView()
         } else {
             content
+                // Riallinea lo stato a com'è davvero il sistema: se i container sono rimasti
+                // accesi da una sessione precedente (crash, force-quit) o se lo stack è partito
+                // dopo un timeout di `start()`, la finestra mostra Immich invece di offrire un
+                // "Avvia" che ripartirebbe su qualcosa di già acceso.
+                .task {
+                    guard !immich.isStarting else { return }
+                    await immich.detectRunning()
+                }
         }
     }
 
@@ -1104,21 +1123,55 @@ extension ImmichManager {
             }
             throw Failure.startTimedOut
         } catch {
-            await MainActor.run {
-                self.isRunning = false
-                self.lastError = error.localizedDescription
-            }
+            // Mai dichiarare `isRunning = false` a scatola chiusa: se l'health check è scaduto
+            // ma lo stack è realmente su (probabile al primissimo avvio, tra migrazioni Postgres
+            // e caricamento del modello ML), quel `false` sarebbe una bugia — l'utente vedrebbe
+            // "fermo", chiuderebbe l'app e VM + 4 container resterebbero accesi a sua insaputa.
+            // Si chiede al sistema com'è messo davvero. Deliberatamente **non** si forza uno
+            // `stop()`: se lo stack sta solo finendo di partire, spegnerlo sarebbe peggio.
+            await detectRunning()
+            await MainActor.run { self.lastError = error.localizedDescription }
             throw error
         }
     }
 
+    /// Riallinea `isRunning` allo stato reale del sistema, invece di fidarsi di un flag in
+    /// memoria. Serve in due casi concreti: dopo un timeout di `start()` su uno stack che in
+    /// realtà è partito, e al rilancio dopo un crash/force-quit (dove `isRunning` ripartirebbe
+    /// da `false` con i container ancora accesi dalla sessione precedente).
+    @discardableResult
+    func detectRunning() async -> Bool {
+        guard detectInstalled() else {
+            await MainActor.run { self.isRunning = false }
+            return false
+        }
+        // L'health check è il segnale più forte (Immich risponde davvero); `colima status`
+        // copre il caso "VM accesa ma container giù", che consuma comunque risorse e va spento.
+        var running = await healthCheck()
+        if !running {
+            running = (try? await runProcess(colimaBinary, ["status"], timeout: 15)) != nil
+        }
+        await MainActor.run { self.isRunning = running }
+        return running
+    }
+
     /// Ferma container e VM. Best-effort e non lancia: viene chiamata anche alla chiusura
     /// dell'app, dove non c'è più nessuna UI a cui riportare un errore.
+    ///
+    /// Timeout generosi di proposito: fermare 4 container (Postgres incluso, che deve chiudere
+    /// il suo checkpoint) più l'arresto della VM può richiedere parecchio, e troncare a metà
+    /// un arresto di Postgres è il modo migliore per ritrovarsi un database da riparare.
+    /// Nel caso normale ritorna in pochi secondi — questi valori valgono solo per i casi patologici.
+    static let stopCommandTimeout: TimeInterval = 90
+
+    /// Attesa fra SIGTERM e SIGKILL per un processo che non risponde al timeout.
+    static let sigkillGracePeriod: TimeInterval = 10
+
     func stop() async {
         _ = try? await runProcess(dockerBinary,
                                   ["compose", "-f", composeFilePath.path, "down"],
-                                  timeout: 30)
-        _ = try? await runProcess(colimaBinary, ["stop"], timeout: 30)
+                                  timeout: Self.stopCommandTimeout)
+        _ = try? await runProcess(colimaBinary, ["stop"], timeout: Self.stopCommandTimeout)
         await MainActor.run { self.isRunning = false }
     }
 
@@ -1191,7 +1244,13 @@ extension ImmichManager {
 
             DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
                 guard process.isRunning else { return }
-                process.terminate()
+                process.terminate()   // SIGTERM: prima si chiede un'uscita pulita.
+                // Chi ignora SIGTERM resterebbe orfano per sempre, con la readability handler
+                // già staccata e nessuno più in ascolto: dopo la grazia si insiste con SIGKILL.
+                let pid = process.processIdentifier
+                DispatchQueue.global().asyncAfter(deadline: .now() + Self.sigkillGracePeriod) {
+                    if process.isRunning { kill(pid, SIGKILL) }
+                }
                 if resume.claim() {
                     handle.readabilityHandler = nil
                     continuation.resume(throwing: Failure.commandTimedOut(command: name))
