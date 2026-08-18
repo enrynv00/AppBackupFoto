@@ -1843,6 +1843,90 @@ final class S3Syncer {
         }
     }
 
+    // Non private: deve restare visibile a @testable import per i test unitari
+    // (stesso criterio già usato per validateEndpoint/isRetryable).
+    struct AdaptiveLimiterState: Equatable {
+        var limit: Int
+        var consecutiveSuccesses: Int
+    }
+
+    enum AdaptiveLimiterOutcome {
+        case success
+        case retryableFailure
+        case permanentFailure
+    }
+
+    // Logica pura AIMD (Additive Increase / Multiplicative Decrease), separata
+    // dall'actor sottostante per essere testabile senza rete/timer. Vedi
+    // Docs/superpowers/specs/2026-08-18-adaptive-s3-concurrency-design.md.
+    enum AdaptiveLimiter {
+        static let floor = 1
+        static let growthStep = 2
+        static let successesToGrow = 5
+
+        static func applying(_ outcome: AdaptiveLimiterOutcome, to state: AdaptiveLimiterState,
+                              ceiling: Int) -> AdaptiveLimiterState {
+            switch outcome {
+            case .success:
+                let successes = state.consecutiveSuccesses + 1
+                guard successes >= successesToGrow else {
+                    return AdaptiveLimiterState(limit: state.limit, consecutiveSuccesses: successes)
+                }
+                return AdaptiveLimiterState(limit: min(ceiling, state.limit + growthStep), consecutiveSuccesses: 0)
+            case .retryableFailure:
+                return AdaptiveLimiterState(limit: max(floor, state.limit / 2), consecutiveSuccesses: 0)
+            case .permanentFailure:
+                return state
+            }
+        }
+    }
+
+    // Gate di ammissione a capacità variabile: ogni unità di lavoro di rete (un file
+    // intero <64MB, o una singola parte multipart) acquisisce uno slot prima di essere
+    // letta/inviata, e lo rilascia (con l'esito) al proprio termine — inclusi eventuali
+    // retry interni, che restano nella stessa unità di lavoro. Nessun lock manuale:
+    // l'intero stato (limite corrente, contatore successi, slot attivi, task in attesa)
+    // è isolato dall'actor.
+    actor AdaptiveUploadGate {
+        private var state: AdaptiveLimiterState
+        private let ceiling: Int
+        private var active = 0
+        private var waiters: [CheckedContinuation<Void, Never>] = []
+
+        init(startingLimit: Int, ceiling: Int) {
+            self.state = AdaptiveLimiterState(limit: startingLimit, consecutiveSuccesses: 0)
+            self.ceiling = ceiling
+        }
+
+        func acquire() async {
+            if active < state.limit {
+                active += 1
+                return
+            }
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                waiters.append(continuation)
+            }
+            // Lo slot è già stato riservato (active incrementato) da release(),
+            // subito prima di risvegliare questo continuation — vedi sotto.
+        }
+
+        func release(outcome: AdaptiveLimiterOutcome) {
+            active -= 1
+            state = AdaptiveLimiter.applying(outcome, to: state, ceiling: ceiling)
+            while active < state.limit, !waiters.isEmpty {
+                active += 1
+                waiters.removeFirst().resume()
+            }
+        }
+    }
+
+    // Costanti condivise: ogni unità di lavoro (file <64MB, o parte multipart) ha corpo
+    // HTTP ≤ multipartChunkSize, quindi un tetto sul numero di slot è già equivalente a
+    // un tetto sui byte in volo — nessuna contabilità separata necessaria.
+    static let multipartChunkSize = 64 * 1024 * 1024
+    private static let adaptiveMemoryCeilingBytes = 2 * 1024 * 1024 * 1024
+    static let adaptiveConcurrencyCeiling = adaptiveMemoryCeilingBytes / multipartChunkSize
+
     // Solo il chiamante di onOutcome (il loop while sotto, a thread singolo) muta
     // stato condiviso: i task figli restituiscono un Outcome, non toccano nulla
     // di condiviso — nessun lock/actor necessario.
