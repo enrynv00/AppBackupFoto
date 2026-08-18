@@ -55,27 +55,36 @@ final class AdaptiveLimiterTests: XCTestCase {
         XCTAssertEqual(result.consecutiveSuccesses, 3)
     }
 
-    // Sanity-check best-effort (non una misura rigorosa: active/peak sono mutati da più
-    // Task concorrenti senza isolamento esplicito). Le unità di lavoro sono 4, non 10:
-    // con 10 il gate supera la soglia di crescita (5 successi consecutivi) e il limite
-    // sale legittimamente da 2 a 4 a metà corsa — picco 4 osservato in esecuzione, cioè
-    // il comportamento AIMD voluto, non un difetto del gate. Con 4 successi la crescita
-    // non può avvenire, quindi il picco deve restare entro startingLimit.
+    // Contatore race-free (a differenza di due `var` locali mutate da Task concorrenti,
+    // dove una lost update potrebbe solo abbassare il picco osservato e nascondere un
+    // gate rotto anziché rivelarlo).
+    private actor Counter {
+        private(set) var active = 0
+        private(set) var peak = 0
+        func enter() { active += 1; peak = max(peak, active) }
+        func leave() { active -= 1 }
+    }
+
+    // Le unità di lavoro sono 4, non 10: con 10 il gate supera la soglia di crescita
+    // (5 successi consecutivi) e il limite sale legittimamente da 2 a 4 a metà corsa —
+    // picco 4, cioè il comportamento AIMD voluto, non un difetto del gate. Con 4 successi
+    // la crescita non può avvenire, quindi il picco deve restare esattamente a
+    // startingLimit (deterministico, misurato su più run: non un limite superiore lasco).
     func testGate_acquireRelease_neverExceedsCurrentLimit() async {
         let gate = S3Syncer.AdaptiveUploadGate(startingLimit: 2, ceiling: 32)
-        var active = 0, peak = 0
+        let counter = Counter()
         await withTaskGroup(of: Void.self) { group in
             for _ in 0..<4 {
                 group.addTask {
                     await gate.acquire()
-                    active += 1
-                    peak = max(peak, active)
+                    await counter.enter()
                     try? await Task.sleep(nanoseconds: 5_000_000)
-                    active -= 1
+                    await counter.leave()
                     await gate.release(outcome: .success)
                 }
             }
         }
-        XCTAssertLessThanOrEqual(peak, 2)
+        let peak = await counter.peak
+        XCTAssertEqual(peak, 2)
     }
 }

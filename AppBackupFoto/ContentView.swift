@@ -1894,6 +1894,7 @@ final class S3Syncer {
         private var waiters: [CheckedContinuation<Void, Never>] = []
 
         init(startingLimit: Int, ceiling: Int) {
+            precondition(startingLimit >= 1, "startingLimit deve essere almeno 1")
             self.state = AdaptiveLimiterState(limit: startingLimit, consecutiveSuccesses: 0)
             self.ceiling = ceiling
         }
@@ -1911,6 +1912,7 @@ final class S3Syncer {
         }
 
         func release(outcome: AdaptiveLimiterOutcome) {
+            precondition(active > 0, "release() chiamato senza uno slot acquisito (doppio release?)")
             active -= 1
             state = AdaptiveLimiter.applying(outcome, to: state, ceiling: ceiling)
             while active < state.limit, !waiters.isEmpty {
