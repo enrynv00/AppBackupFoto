@@ -22,6 +22,10 @@ final class S3SyncerRetryTests: XCTestCase {
         XCTAssertTrue(S3Syncer.isRetryable(S3Syncer.S3HTTPError(statusCode: 503, message: "Unavailable")))
     }
 
+    func testHTTP429_isRetryable() {
+        XCTAssertTrue(S3Syncer.isRetryable(S3Syncer.S3HTTPError(statusCode: 429, message: "Too Many Requests")))
+    }
+
     func testGenericNSError_isNotRetryable() {
         let error = NSError(domain: "S3", code: 12, userInfo: [NSLocalizedDescriptionKey: "URL non valido"])
         XCTAssertFalse(S3Syncer.isRetryable(error))

@@ -2443,7 +2443,13 @@ final class S3Syncer {
 
     static func isRetryable(_ error: Error) -> Bool {
         if error is CancellationError { return false }
-        if let httpError = error as? S3HTTPError { return !(400...499).contains(httpError.statusCode) }
+        if let httpError = error as? S3HTTPError {
+            // 429 (Too Many Requests) è esattamente il segnale di congestione che il
+            // gate adattivo deve poter interpretare — vedi
+            // Docs/superpowers/specs/2026-08-18-adaptive-s3-concurrency-design.md.
+            if httpError.statusCode == 429 { return true }
+            return !(400...499).contains(httpError.statusCode)
+        }
         if error is URLError { return true }
         return false
     }
