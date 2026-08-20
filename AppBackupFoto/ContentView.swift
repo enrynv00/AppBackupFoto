@@ -2339,6 +2339,14 @@ final class S3Syncer {
         }
     }
 
+    // Registra solo il primo errore permanente incontrato tra le parti concorrenti di un
+    // multipart, per far fermare il loop di lettura al più presto (vedi multipart()).
+    private actor FirstFailureRecorder {
+        private var error: Error?
+        func record(_ error: Error) { if self.error == nil { self.error = error } }
+        func current() -> Error? { error }
+    }
+
     private func multipart(url: URL, key: String, config: S3Config, gate: AdaptiveUploadGate,
                             onStatus: @escaping (String) -> Void) async throws {
         let encKey = key.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? key
@@ -2365,14 +2373,27 @@ final class S3Syncer {
         let encId = uploadId.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? uploadId
 
         // Le parti si leggono in sequenza da disco (I/O locale, veloce) ma si inviano in
-        // parallelo: ogni parte acquisisce uno slot dal gate PRIMA di essere letta, così
-        // il loop di lettura resta naturalmente al passo con la capacità di rete corrente
-        // — nessun tracciamento separato dei byte in volo necessario (vedi spec).
+        // parallelo: ogni parte viene letta e poi acquisisce uno slot dal gate prima di
+        // essere spedita — il loop di lettura resta comunque al passo con la capacità di
+        // rete corrente (al più un chunk extra da 64MB oltre al limite corrente resta in
+        // memoria in attesa di uno slot libero, trascurabile sul tetto di 2GB — vedi spec).
         var parts: [(partNumber: Int, etag: String)] = []
         var pn = 1
 
         try await withThrowingTaskGroup(of: (partNumber: Int, etag: String).self) { group in
+            // Un errore permanente su una parte deve fermare la lettura al più presto,
+            // non solo essere rilanciato alla fine: senza questo flag il loop di lettura
+            // (che non chiama group.next() finché non ha finito) continuerebbe a leggere
+            // e caricare tutte le parti restanti di un file da decine di GB prima di
+            // accorgersi del fallimento — bug reale trovato in review, il vecchio codice
+            // sequenziale si fermava subito. Deve essere un throw, non un return: un
+            // return lascerebbe `parts` troncato e la guardia sotto (cancelled/
+            // Task.isCancelled) sarebbe falsa, ricreando l'oggetto troncato che la
+            // guardia stessa esiste per evitare.
+            let firstFailure = FirstFailureRecorder()
+
             try await S3Syncer.readFileInChunks(path: url.path, chunkSize: Self.multipartChunkSize) { chunk in
+                if let failure = await firstFailure.current() { throw failure }
                 guard !self.cancelled else { return }
                 await gate.acquire()
                 if self.cancelled || Task.isCancelled {
@@ -2403,6 +2424,7 @@ final class S3Syncer {
                         return (partNumber, etag)
                     } catch {
                         await gate.release(outcome: S3Syncer.isRetryable(error) ? .retryableFailure : .permanentFailure)
+                        await firstFailure.record(error)
                         throw error
                     }
                 }
