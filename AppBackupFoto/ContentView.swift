@@ -2091,23 +2091,48 @@ final class S3Syncer {
         // Docs/superpowers/specs/2026-08-18-adaptive-s3-concurrency-design.md.
         let gate = AdaptiveUploadGate(startingLimit: 4, ceiling: Self.adaptiveConcurrencyCeiling)
 
+        // Finestra sul numero di file "in corso" (dal prologo al completamento),
+        // separata dal budget adattivo del gate. Senza questa finestra TUTTI i file di
+        // toUpload partirebbero insieme (nessun cap, dato che runBounded è stato
+        // rimosso): ogni file ≥64MB alloca un buffer da 64MB e ne copia il contenuto in
+        // un'altra Data da 64MB PRIMA di acquisire il primo slot dal gate (multipart()
+        // inizia a leggere la prima parte prima che quella parte acquisisca uno slot) —
+        // su un job con centinaia di file grandi questo bypassa il tetto di memoria da
+        // 2GB del gate (bug reale trovato in review: 375 file >64MB misurati sull'SSD
+        // reale avrebbero prodotto ~48GB residenti). Il cap è lo stesso tetto del gate
+        // (adaptiveConcurrencyCeiling): oltre quel numero di file "in corso" il gate non
+        // farebbe comunque salire la concorrenza di rete effettiva, quindi non è un
+        // collo di bottiglia per il throughput.
         await withTaskGroup(of: (url: URL, size: Int64, ok: Bool).self) { group in
-            for item in toUpload {
+            var index = 0
+            func addNext() {
+                guard index < toUpload.count, !self.cancelled, !Task.isCancelled else { return }
+                let item = toUpload[index]; index += 1
                 group.addTask { [self] in
                     if self.cancelled || Task.isCancelled { return (item.url, item.size, false) }
-                    DispatchQueue.main.async {
-                        onStatus("Carico: \(item.url.lastPathComponent)")
-                        onCurrentFile(item.url)
-                    }
                     do {
-                        try await self.upload(url: item.url, key: item.key, config: config, gate: gate, onStatus: onStatus)
+                        // onStart annuncia "Carico: X" solo quando il file ottiene
+                        // davvero il primo slot di rete dal gate (vedi upload()/
+                        // multipart()), non appena il suo task parte — altrimenti, con
+                        // fino a `adaptiveConcurrencyCeiling` file avviati insieme, il
+                        // log/la miniatura corrente corrono avanti rispetto a quello che
+                        // sta davvero caricando.
+                        try await self.upload(url: item.url, key: item.key, config: config, gate: gate,
+                            onStart: {
+                                DispatchQueue.main.async {
+                                    onStatus("Carico: \(item.url.lastPathComponent)")
+                                    onCurrentFile(item.url)
+                                }
+                            },
+                            onStatus: onStatus)
                         return (item.url, item.size, true)
                     } catch {
                         return (item.url, item.size, false)
                     }
                 }
             }
-            for await outcome in group {
+            for _ in 0..<Self.adaptiveConcurrencyCeiling { addNext() }
+            while let outcome = await group.next() {
                 // Dopo un'interruzione tutti i task ancora in coda tornano subito con
                 // ok=false senza aver mai caricato nulla: contarli come errori (e
                 // ridisegnare la UI per ognuno) produrrebbe decine di migliaia di falsi
@@ -2119,6 +2144,7 @@ final class S3Syncer {
                 result.done += 1
                 let snap = result
                 DispatchQueue.main.async { onProgress(snap) }
+                addNext()
             }
         }
         return result
@@ -2280,16 +2306,18 @@ final class S3Syncer {
     }
 
     private func upload(url: URL, key: String, config: S3Config, gate: AdaptiveUploadGate,
+                         onStart: @escaping () -> Void,
                          onStatus: @escaping (String) -> Void) async throws {
         let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
         if size > Self.multipartChunkSize {
-            try await multipart(url: url, key: key, config: config, gate: gate, onStatus: onStatus)
+            try await multipart(url: url, key: key, config: config, gate: gate, onStart: onStart, onStatus: onStatus)
         } else {
             await gate.acquire()
             if cancelled || Task.isCancelled {
                 await gate.release(outcome: .permanentFailure)
                 throw CancellationError()
             }
+            onStart()
             do {
                 // La lettura del file sta DENTRO il do: se fallisce (file illeggibile,
                 // volume scollegato a metà job, permessi) lo slot già acquisito va
@@ -2334,6 +2362,7 @@ final class S3Syncer {
     }
 
     private func multipart(url: URL, key: String, config: S3Config, gate: AdaptiveUploadGate,
+                            onStart: @escaping () -> Void,
                             onStatus: @escaping (String) -> Void) async throws {
         let encKey = key.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? key
         guard let initURL = URL(string: "\(config.endpoint)/\(config.bucket)/\(encKey)?uploads") else {
@@ -2362,9 +2391,14 @@ final class S3Syncer {
         // parallelo: ogni parte viene letta e poi acquisisce uno slot dal gate prima di
         // essere spedita — il loop di lettura resta comunque al passo con la capacità di
         // rete corrente (al più un chunk extra da 64MB oltre al limite corrente resta in
-        // memoria in attesa di uno slot libero, trascurabile sul tetto di 2GB — vedi spec).
+        // memoria in attesa di uno slot libero). Il numero di file ≥64MB che possono
+        // essere qui contemporaneamente, ciascuno con questo margine, è a sua volta
+        // limitato dalla finestra di sync() (vedi commento lì) — senza quella finestra
+        // questo margine non sarebbe affatto trascurabile su un job con centinaia di
+        // file grandi.
         var parts: [(partNumber: Int, etag: String)] = []
         var pn = 1
+        var announced = false
 
         // Un fallimento (permanente o da cancellazione) fa uscire il blocco sotto con un
         // throw prima di raggiungere la guardia post-loop (righe sotto) — senza questo
@@ -2395,6 +2429,13 @@ final class S3Syncer {
                         await gate.release(outcome: .permanentFailure)
                         return
                     }
+                    // Annuncia il file solo ora che la sua prima parte ha davvero
+                    // ottenuto uno slot di rete, non quando il file entra in multipart()
+                    // (che parte prima di qualunque acquire, vedi sopra) — coerente con
+                    // onStart nel ramo file-singolo di upload(). `announced` è letto e
+                    // scritto solo da questa closure di lettura, mai dai task figli, che
+                    // gira sempre in sequenza: nessuna corsa critica.
+                    if !announced { announced = true; onStart() }
                     let partNumber = pn
                     pn += 1
                     guard let pURL = URL(string: "\(config.endpoint)/\(config.bucket)/\(encKey)?partNumber=\(partNumber)&uploadId=\(encId)") else {
