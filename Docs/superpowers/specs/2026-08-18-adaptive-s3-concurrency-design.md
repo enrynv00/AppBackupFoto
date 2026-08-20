@@ -81,3 +81,26 @@ Questo lavoro chiude anche un punto già pendente da roadmap #6 (2026-08-02): "v
 
 - **Rate-limit lato Cubbit sconosciuto**: non c'è documentazione pubblica su eventuali limiti per connessioni/secondo di Cubbit. Il design si autocorregge (403/429/5xx fanno scendere il limite), ma il primo minuto di un job molto grande potrebbe generare qualche errore/retry visibile nel log prima che il limite si assesti. Accettato: comportamento atteso e transitorio, non un errore bloccante del job.
 - **Nessun tetto assoluto indipendente dalla memoria**: se il tetto derivato dalla memoria (32 slot) si rivelasse comunque troppo aggressivo per Cubbit in pratica, il meccanismo di riduzione su errore lo riporta comunque a livelli sostenibili — non c'è un floor "duro" diverso da 1.
+
+---
+
+## Nota post-implementazione (2026-08-18) — il tetto di memoria reale è ~6GB, non 2GB
+
+*Aggiunta dopo l'implementazione e la revisione. Il testo sopra resta il documento di design originale, non riscritto: questa nota corregge il punto che la realtà ha smentito.*
+
+La sezione "Il tetto pratico: dalla memoria, non da un numero scelto a priori" afferma che **2GB (32 slot × 64MB) è il tetto**, sulla base dell'equivalenza "un limite sul numero di slot equivale a un limite sui byte in volo". L'equivalenza è vera per i corpi HTTP, ma **non descrive tutta la memoria del job**, e l'assunzione è caduta appena `runBounded` (cap fisso a 4 file) è stato rimosso: senza nessun limite esterno, ogni file di `toUpload` entra subito nel proprio task e, se è ≥64MB, alloca il buffer di lettura da 64MB e una copia `Data` da 64MB della prima parte **prima** di acquisire qualunque slot dal gate. La memoria finiva quindi per scalare col numero di file grandi del job, non col tetto del gate: misurato sull'SSD reale (375 file >64MB, 195,5GB) sarebbero stati ~48GB residenti — la stessa classe dell'incidente storico di `sha256(of:)` (41-43GB) che questa spec cita come cautela.
+
+Corretto in fase di implementazione (commit `e296f60`, bug mai arrivato in produzione — vedi `.claude/rules/bug-history.md`, BUG-5) reintroducendo in `sync()` una **finestra di schedulazione** sul numero di file "in corso", dimensionata a `Self.adaptiveConcurrencyCeiling` (32). Non è un secondo numero magico: è la minima finestra che non strozza il gate — con meno file avviati insieme la concorrenza di rete resterebbe sotto quella che il gate può concedere, con più file si spreca memoria senza guadagnare throughput, dato che il gate non ammette comunque mai più del proprio tetto.
+
+**Numero corretto da usare come riferimento (anche nella verifica manuale con Monitor Attività descritta sopra, punto 3):**
+
+- fino a 32 file grandi contemporaneamente in finestra × ~128MB già allocati prima del primo `acquire()` (buffer riutilizzabile da 64MB + copia `Data` da 64MB) ≈ **4GB**
+- più i corpi HTTP in volo del gate (32 slot × 64MB) = **2GB**
+- **totale di picco atteso nel caso peggiore ≈ 6GB** (non "poche centinaia di MB oltre il baseline", come stimato nel piano)
+
+Restano comunque due ordini di grandezza sotto l'incidente storico, e il valore è ricalcolabile: se un domani si cambia la finestra di `sync()` o `adaptiveConcurrencyCeiling`, vanno aggiornati **entrambi** i contributi, che sono indipendenti.
+
+### Altre due correzioni emerse in revisione (non previste da questa spec)
+
+- **Stop immediato su una parte fallita** (commit `f82b914`): il loop di lettura di `multipart()` non chiama `group.next()` finché non ha finito di leggere il file, quindi un errore permanente su una parte non veniva notato e tutto il resto di un file da 44GB veniva letto e caricato prima che l'errore emergesse — regressione rispetto al vecchio codice sequenziale, che si fermava subito. Risolta con un `actor FirstFailureRecorder` consultato a ogni chunk.
+- **Abort su qualunque fallimento, non solo su cancellazione** (commit `49352b3`): un `throw` dal task group scavalcava la guardia post-loop e quindi anche `AbortMultipartUpload`, lasciando orfane sul bucket tutte le parti già caricate. Ora l'abort è in un `catch` attorno all'intero gruppo. Nota collegata: la chiamata di abort emessa da un task **già cancellato** resta un problema aperto e pre-esistente, non introdotto da questo lavoro — vedi `.claude/rules/bug-history.md`, BUG-6.
