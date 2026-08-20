@@ -2119,7 +2119,9 @@ final class S3Syncer {
                     onCurrentFile(item.url)
                 }
                 do {
-                    try await self.upload(url: item.url, key: item.key, config: config, onStatus: onStatus)
+                    try await self.upload(url: item.url, key: item.key, config: config,
+                                          gate: AdaptiveUploadGate(startingLimit: 4, ceiling: Self.adaptiveConcurrencyCeiling),
+                                          onStatus: onStatus)
                     return (item.url, item.size, true)
                 } catch {
                     return (item.url, item.size, false)
@@ -2291,14 +2293,30 @@ final class S3Syncer {
         }
     }
 
-    private func upload(url: URL, key: String, config: S3Config, onStatus: @escaping (String) -> Void) async throws {
+    private func upload(url: URL, key: String, config: S3Config, gate: AdaptiveUploadGate,
+                         onStatus: @escaping (String) -> Void) async throws {
         let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-        if size > 64 * 1024 * 1024 {
-            try await multipart(url: url, key: key, config: config, onStatus: onStatus)
+        if size > Self.multipartChunkSize {
+            try await multipart(url: url, key: key, config: config, gate: gate, onStatus: onStatus)
         } else {
-            let data = try Data(contentsOf: url)
-            try await retrying(key: key, onStatus: onStatus) {
-                try await self.put(data: data, key: key, config: config)
+            await gate.acquire()
+            if cancelled || Task.isCancelled {
+                await gate.release(outcome: .permanentFailure)
+                throw CancellationError()
+            }
+            do {
+                // La lettura del file sta DENTRO il do: se fallisce (file illeggibile,
+                // volume scollegato a metà job, permessi) lo slot già acquisito va
+                // comunque rilasciato, altrimenti resta perso per sempre e la capacità
+                // del gate condiviso si riduce fino al blocco totale dei task in attesa.
+                let data = try Data(contentsOf: url)
+                try await retrying(key: key, onStatus: onStatus) {
+                    try await self.put(data: data, key: key, config: config)
+                }
+                await gate.release(outcome: .success)
+            } catch {
+                await gate.release(outcome: S3Syncer.isRetryable(error) ? .retryableFailure : .permanentFailure)
+                throw error
             }
         }
     }
@@ -2321,7 +2339,8 @@ final class S3Syncer {
         }
     }
 
-    private func multipart(url: URL, key: String, config: S3Config, onStatus: @escaping (String) -> Void) async throws {
+    private func multipart(url: URL, key: String, config: S3Config, gate: AdaptiveUploadGate,
+                            onStatus: @escaping (String) -> Void) async throws {
         let encKey = key.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? key
         guard let initURL = URL(string: "\(config.endpoint)/\(config.bucket)/\(encKey)?uploads") else {
             throw NSError(domain: "S3", code: 12,
@@ -2345,38 +2364,66 @@ final class S3Syncer {
         }
         let encId = uploadId.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? uploadId
 
-        let chunkSize = 64 * 1024 * 1024
-        var parts: [(Int, String)] = []
+        // Le parti si leggono in sequenza da disco (I/O locale, veloce) ma si inviano in
+        // parallelo: ogni parte acquisisce uno slot dal gate PRIMA di essere letta, così
+        // il loop di lettura resta naturalmente al passo con la capacità di rete corrente
+        // — nessun tracciamento separato dei byte in volo necessario (vedi spec).
+        var parts: [(partNumber: Int, etag: String)] = []
         var pn = 1
-        try await S3Syncer.readFileInChunks(path: url.path, chunkSize: chunkSize) { chunk in
-            guard !self.cancelled else { return }
-            guard let pURL = URL(string: "\(config.endpoint)/\(config.bucket)/\(encKey)?partNumber=\(pn)&uploadId=\(encId)") else {
-                throw NSError(domain: "S3", code: 12,
-                    userInfo: [NSLocalizedDescriptionKey: "URL non valido per parte \(pn) di \(key)"])
-            }
-            let partNumber = pn
-            let etag = try await self.retrying(key: "\(key) (parte \(partNumber))", onStatus: onStatus) { () async throws -> String in
-                var pReq = URLRequest(url: pURL)
-                pReq.httpMethod = "PUT"; pReq.httpBody = chunk
-                self.sign(&pReq, config: config, body: chunk, date: Date())
-                let (_, pResp) = try await self.session.data(for: pReq)
-                guard let pHttp = pResp as? HTTPURLResponse, (200...299).contains(pHttp.statusCode) else {
-                    let statusCode = (pResp as? HTTPURLResponse)?.statusCode ?? -1
-                    throw S3HTTPError(statusCode: statusCode, message: "Errore parte \(partNumber) di \(key)")
+
+        try await withThrowingTaskGroup(of: (partNumber: Int, etag: String).self) { group in
+            try await S3Syncer.readFileInChunks(path: url.path, chunkSize: Self.multipartChunkSize) { chunk in
+                guard !self.cancelled else { return }
+                await gate.acquire()
+                if self.cancelled || Task.isCancelled {
+                    await gate.release(outcome: .permanentFailure)
+                    return
                 }
-                return pHttp.value(forHTTPHeaderField: "Etag") ?? ""
+                let partNumber = pn
+                pn += 1
+                guard let pURL = URL(string: "\(config.endpoint)/\(config.bucket)/\(encKey)?partNumber=\(partNumber)&uploadId=\(encId)") else {
+                    await gate.release(outcome: .permanentFailure)
+                    throw NSError(domain: "S3", code: 12,
+                        userInfo: [NSLocalizedDescriptionKey: "URL non valido per parte \(partNumber) di \(key)"])
+                }
+                group.addTask {
+                    do {
+                        let etag = try await self.retrying(key: "\(key) (parte \(partNumber))", onStatus: onStatus) { () async throws -> String in
+                            var pReq = URLRequest(url: pURL)
+                            pReq.httpMethod = "PUT"; pReq.httpBody = chunk
+                            self.sign(&pReq, config: config, body: chunk, date: Date())
+                            let (_, pResp) = try await self.session.data(for: pReq)
+                            guard let pHttp = pResp as? HTTPURLResponse, (200...299).contains(pHttp.statusCode) else {
+                                let statusCode = (pResp as? HTTPURLResponse)?.statusCode ?? -1
+                                throw S3HTTPError(statusCode: statusCode, message: "Errore parte \(partNumber) di \(key)")
+                            }
+                            return pHttp.value(forHTTPHeaderField: "Etag") ?? ""
+                        }
+                        await gate.release(outcome: .success)
+                        return (partNumber, etag)
+                    } catch {
+                        await gate.release(outcome: S3Syncer.isRetryable(error) ? .retryableFailure : .permanentFailure)
+                        throw error
+                    }
+                }
             }
-            parts.append((partNumber, etag))
-            pn += 1
+
+            while let next = try await group.next() {
+                parts.append(next)
+            }
         }
 
-        if cancelled {
+        // Deve coprire ESATTAMENTE le stesse condizioni per cui il loop sopra salta una
+        // parte (`self.cancelled || Task.isCancelled`): se una parte è stata saltata, la
+        // lista è incompleta e completare il multipart scriverebbe su Cubbit un oggetto
+        // troncato sotto la key reale, contato come upload riuscito — un backup corrotto
+        // presentato come buono. Meglio abortire l'upload (non tocca dati già scritti).
+        if cancelled || Task.isCancelled {
             _ = try? await abortMultipartUpload(key: key, uploadId: uploadId, config: config)
             throw CancellationError()
         }
 
-        let partsXML = parts.map { "<Part><PartNumber>\($0.0)</PartNumber><ETag>\($0.1)</ETag></Part>" }.joined()
-        let completeXML = Data("<CompleteMultipartUpload>\(partsXML)</CompleteMultipartUpload>".utf8)
+        let completeXML = Data(S3Syncer.buildCompleteMultipartXML(parts: parts).utf8)
         guard let cURL = URL(string: "\(config.endpoint)/\(config.bucket)/\(encKey)?uploadId=\(encId)") else {
             throw NSError(domain: "S3", code: 12,
                 userInfo: [NSLocalizedDescriptionKey: "URL non valido per completamento multipart: \(key)"])
@@ -2391,6 +2438,16 @@ final class S3Syncer {
                 throw S3HTTPError(statusCode: statusCode, message: "Errore completamento multipart \(key)")
             }
         }
+    }
+
+    // AWS S3 richiede le parti in ordine crescente di PartNumber nel body di
+    // CompleteMultipartUpload — con l'esecuzione parallela l'ordine di completamento non
+    // coincide più con l'ordine di lettura, va quindi ordinato esplicitamente. Non
+    // private: testata direttamente da S3SyncerMultipartXMLTests.
+    static func buildCompleteMultipartXML(parts: [(partNumber: Int, etag: String)]) -> String {
+        let sorted = parts.sorted { $0.partNumber < $1.partNumber }
+        let partsXML = sorted.map { "<Part><PartNumber>\($0.partNumber)</PartNumber><ETag>\($0.etag)</ETag></Part>" }.joined()
+        return "<CompleteMultipartUpload>\(partsXML)</CompleteMultipartUpload>"
     }
 
     func abortMultipartUpload(key: String, uploadId: String, config: S3Config) async throws {
