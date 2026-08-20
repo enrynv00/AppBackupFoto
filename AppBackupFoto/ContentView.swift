@@ -2380,59 +2380,72 @@ final class S3Syncer {
         var parts: [(partNumber: Int, etag: String)] = []
         var pn = 1
 
-        try await withThrowingTaskGroup(of: (partNumber: Int, etag: String).self) { group in
-            // Un errore permanente su una parte deve fermare la lettura al più presto,
-            // non solo essere rilanciato alla fine: senza questo flag il loop di lettura
-            // (che non chiama group.next() finché non ha finito) continuerebbe a leggere
-            // e caricare tutte le parti restanti di un file da decine di GB prima di
-            // accorgersi del fallimento — bug reale trovato in review, il vecchio codice
-            // sequenziale si fermava subito. Deve essere un throw, non un return: un
-            // return lascerebbe `parts` troncato e la guardia sotto (cancelled/
-            // Task.isCancelled) sarebbe falsa, ricreando l'oggetto troncato che la
-            // guardia stessa esiste per evitare.
-            let firstFailure = FirstFailureRecorder()
+        // Un fallimento (permanente o da cancellazione) fa uscire il blocco sotto con un
+        // throw prima di raggiungere la guardia post-loop (righe sotto) — senza questo
+        // do/catch quel throw scavalcherebbe anche l'abort, lasciando orfane sul bucket
+        // tutte le parti già caricate invece delle sole poche in volo al momento
+        // dell'errore. Non tocca dati già scritti (AbortMultipartUpload è esente dalla
+        // regola zero-delete, vedi Docs/CLAUDE.md) e non sostituisce la guardia sotto,
+        // che resta necessaria per il caso "tutte le parti completate ma cancellazione
+        // richiesta subito dopo l'ultima".
+        do {
+            try await withThrowingTaskGroup(of: (partNumber: Int, etag: String).self) { group in
+                // Un errore permanente su una parte deve fermare la lettura al più presto,
+                // non solo essere rilanciato alla fine: senza questo flag il loop di lettura
+                // (che non chiama group.next() finché non ha finito) continuerebbe a leggere
+                // e caricare tutte le parti restanti di un file da decine di GB prima di
+                // accorgersi del fallimento — bug reale trovato in review, il vecchio codice
+                // sequenziale si fermava subito. Deve essere un throw, non un return: un
+                // return lascerebbe `parts` troncato e la guardia sotto (cancelled/
+                // Task.isCancelled) sarebbe falsa, ricreando l'oggetto troncato che la
+                // guardia stessa esiste per evitare.
+                let firstFailure = FirstFailureRecorder()
 
-            try await S3Syncer.readFileInChunks(path: url.path, chunkSize: Self.multipartChunkSize) { chunk in
-                if let failure = await firstFailure.current() { throw failure }
-                guard !self.cancelled else { return }
-                await gate.acquire()
-                if self.cancelled || Task.isCancelled {
-                    await gate.release(outcome: .permanentFailure)
-                    return
-                }
-                let partNumber = pn
-                pn += 1
-                guard let pURL = URL(string: "\(config.endpoint)/\(config.bucket)/\(encKey)?partNumber=\(partNumber)&uploadId=\(encId)") else {
-                    await gate.release(outcome: .permanentFailure)
-                    throw NSError(domain: "S3", code: 12,
-                        userInfo: [NSLocalizedDescriptionKey: "URL non valido per parte \(partNumber) di \(key)"])
-                }
-                group.addTask {
-                    do {
-                        let etag = try await self.retrying(key: "\(key) (parte \(partNumber))", onStatus: onStatus) { () async throws -> String in
-                            var pReq = URLRequest(url: pURL)
-                            pReq.httpMethod = "PUT"; pReq.httpBody = chunk
-                            self.sign(&pReq, config: config, body: chunk, date: Date())
-                            let (_, pResp) = try await self.session.data(for: pReq)
-                            guard let pHttp = pResp as? HTTPURLResponse, (200...299).contains(pHttp.statusCode) else {
-                                let statusCode = (pResp as? HTTPURLResponse)?.statusCode ?? -1
-                                throw S3HTTPError(statusCode: statusCode, message: "Errore parte \(partNumber) di \(key)")
+                try await S3Syncer.readFileInChunks(path: url.path, chunkSize: Self.multipartChunkSize) { chunk in
+                    if let failure = await firstFailure.current() { throw failure }
+                    guard !self.cancelled else { return }
+                    await gate.acquire()
+                    if self.cancelled || Task.isCancelled {
+                        await gate.release(outcome: .permanentFailure)
+                        return
+                    }
+                    let partNumber = pn
+                    pn += 1
+                    guard let pURL = URL(string: "\(config.endpoint)/\(config.bucket)/\(encKey)?partNumber=\(partNumber)&uploadId=\(encId)") else {
+                        await gate.release(outcome: .permanentFailure)
+                        throw NSError(domain: "S3", code: 12,
+                            userInfo: [NSLocalizedDescriptionKey: "URL non valido per parte \(partNumber) di \(key)"])
+                    }
+                    group.addTask {
+                        do {
+                            let etag = try await self.retrying(key: "\(key) (parte \(partNumber))", onStatus: onStatus) { () async throws -> String in
+                                var pReq = URLRequest(url: pURL)
+                                pReq.httpMethod = "PUT"; pReq.httpBody = chunk
+                                self.sign(&pReq, config: config, body: chunk, date: Date())
+                                let (_, pResp) = try await self.session.data(for: pReq)
+                                guard let pHttp = pResp as? HTTPURLResponse, (200...299).contains(pHttp.statusCode) else {
+                                    let statusCode = (pResp as? HTTPURLResponse)?.statusCode ?? -1
+                                    throw S3HTTPError(statusCode: statusCode, message: "Errore parte \(partNumber) di \(key)")
+                                }
+                                return pHttp.value(forHTTPHeaderField: "Etag") ?? ""
                             }
-                            return pHttp.value(forHTTPHeaderField: "Etag") ?? ""
+                            await gate.release(outcome: .success)
+                            return (partNumber, etag)
+                        } catch {
+                            await gate.release(outcome: S3Syncer.isRetryable(error) ? .retryableFailure : .permanentFailure)
+                            await firstFailure.record(error)
+                            throw error
                         }
-                        await gate.release(outcome: .success)
-                        return (partNumber, etag)
-                    } catch {
-                        await gate.release(outcome: S3Syncer.isRetryable(error) ? .retryableFailure : .permanentFailure)
-                        await firstFailure.record(error)
-                        throw error
                     }
                 }
-            }
 
-            while let next = try await group.next() {
-                parts.append(next)
+                while let next = try await group.next() {
+                    parts.append(next)
+                }
             }
+        } catch {
+            _ = try? await abortMultipartUpload(key: key, uploadId: uploadId, config: config)
+            throw error
         }
 
         // Deve coprire ESATTAMENTE le stesse condizioni per cui il loop sopra salta una
