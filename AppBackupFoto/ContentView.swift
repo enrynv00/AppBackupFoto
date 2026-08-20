@@ -1929,30 +1929,6 @@ final class S3Syncer {
     private static let adaptiveMemoryCeilingBytes = 2 * 1024 * 1024 * 1024
     static let adaptiveConcurrencyCeiling = adaptiveMemoryCeilingBytes / multipartChunkSize
 
-    // Solo il chiamante di onOutcome (il loop while sotto, a thread singolo) muta
-    // stato condiviso: i task figli restituiscono un Outcome, non toccano nulla
-    // di condiviso — nessun lock/actor necessario.
-    static func runBounded<Item, Outcome>(
-        items: [Item], maxConcurrent: Int,
-        isCancelled: @escaping () -> Bool,
-        operation: @escaping (Item) async -> Outcome,
-        onOutcome: (Outcome) -> Void
-    ) async {
-        await withTaskGroup(of: Outcome.self) { group in
-            var index = 0
-            func addNext() {
-                guard index < items.count, !isCancelled() else { return }
-                let item = items[index]; index += 1
-                group.addTask { await operation(item) }
-            }
-            for _ in 0..<maxConcurrent { addNext() }
-            while let outcome = await group.next() {
-                onOutcome(outcome)
-                addNext()
-            }
-        }
-    }
-
     private var cancelled = false
     private lazy var session: URLSession = {
         let cfg = URLSessionConfiguration.default
@@ -2109,32 +2085,42 @@ final class S3Syncer {
             onProgress(initSnap)
         }
 
-        await S3Syncer.runBounded(
-            items: toUpload, maxConcurrent: 4,
-            isCancelled: { self.cancelled },
-            operation: { [self] item -> (url: URL, size: Int64, ok: Bool) in
-                if self.cancelled || Task.isCancelled { return (item.url, item.size, false) }
-                DispatchQueue.main.async {
-                    onStatus("Carico: \(item.url.lastPathComponent)")
-                    onCurrentFile(item.url)
+        // Un solo gate condiviso tra tutti i file e tutte le parti multipart di questo
+        // job: file piccoli e grandi competono per lo stesso budget adattivo, invece di
+        // due meccanismi di concorrenza separati. Vedi
+        // Docs/superpowers/specs/2026-08-18-adaptive-s3-concurrency-design.md.
+        let gate = AdaptiveUploadGate(startingLimit: 4, ceiling: Self.adaptiveConcurrencyCeiling)
+
+        await withTaskGroup(of: (url: URL, size: Int64, ok: Bool).self) { group in
+            for item in toUpload {
+                group.addTask { [self] in
+                    if self.cancelled || Task.isCancelled { return (item.url, item.size, false) }
+                    DispatchQueue.main.async {
+                        onStatus("Carico: \(item.url.lastPathComponent)")
+                        onCurrentFile(item.url)
+                    }
+                    do {
+                        try await self.upload(url: item.url, key: item.key, config: config, gate: gate, onStatus: onStatus)
+                        return (item.url, item.size, true)
+                    } catch {
+                        return (item.url, item.size, false)
+                    }
                 }
-                do {
-                    try await self.upload(url: item.url, key: item.key, config: config,
-                                          gate: AdaptiveUploadGate(startingLimit: 4, ceiling: Self.adaptiveConcurrencyCeiling),
-                                          onStatus: onStatus)
-                    return (item.url, item.size, true)
-                } catch {
-                    return (item.url, item.size, false)
-                }
-            },
-            onOutcome: { outcome in
+            }
+            for await outcome in group {
+                // Dopo un'interruzione tutti i task ancora in coda tornano subito con
+                // ok=false senza aver mai caricato nulla: contarli come errori (e
+                // ridisegnare la UI per ognuno) produrrebbe decine di migliaia di falsi
+                // errori dopo lo stop. Il vecchio runBounded semplicemente non li
+                // schedulava — questa guardia ne conserva il comportamento.
+                if self.cancelled || Task.isCancelled { continue }
                 if outcome.ok { result.uploaded += 1; result.uploadedBytes += outcome.size }
                 else { result.errors += 1 }
                 result.done += 1
                 let snap = result
                 DispatchQueue.main.async { onProgress(snap) }
             }
-        )
+        }
         return result
     }
 
