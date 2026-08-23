@@ -2916,34 +2916,51 @@ enum DiskFormatter {
         return disks
     }
 
-    /// Identità dei volumi SSD/HDD già configurati: path risolto **e** UUID di volume persistito.
-    /// Mai il nome, che l'utente può cambiare in qualsiasi momento.
+    /// Identità dei volumi SSD/HDD/Libreria Foto già configurati: path risolto **e** UUID di
+    /// volume persistito. Mai il nome, che l'utente può cambiare in qualsiasi momento.
     ///
-    /// **Fail-closed**: se esiste un bookmark salvato che in questa sessione non si è risolto
-    /// (volume scollegato all'avvio dell'app — caso normale, `BookmarkManager` risolve i bookmark
-    /// solo in `init()` e non ci riprova più) l'elenco non viene prodotto affatto. Altrimenti quel
-    /// disco di backup risulterebbe semplicemente "non configurato" e comparirebbe tra i
-    /// formattabili. Vale anche quando l'UUID è disponibile: un disco che non si monta più —
-    /// filesystem danneggiato — non espone alcun UUID a `diskutil`, ed è esattamente il disco che
-    /// qualcuno sarebbe tentato di riformattare.
+    /// **Fail-closed**: se esiste un bookmark salvato che non è raggiungibile ADESSO — non solo
+    /// all'avvio dell'app — l'elenco non viene prodotto affatto. Non basta guardare
+    /// `BookmarkManager.urls`: è uno snapshot preso una sola volta in `init()` e mai più
+    /// aggiornato, quindi un volume presente all'avvio ma scollegato/danneggiato più tardi nella
+    /// stessa sessione (la modalità normale di quest'app, dato il backup automatico su
+    /// collegamento SSD) resterebbe considerato "raggiungibile" per tutta la sessione. Qui invece
+    /// si riverifica con `FileManager.fileExists` al momento della chiamata — cioè al momento in
+    /// cui si sta per autorizzare un `eraseDisk`. Vale anche quando l'UUID persistito ci sarebbe:
+    /// un disco che non si monta più (filesystem danneggiato) non espone alcun UUID a `diskutil`,
+    /// ed è esattamente il disco che qualcuno sarebbe tentato di riformattare. Verificato
+    /// empiricamente il 2026-08-23 (secondo giro di review) con un'immagine disco corrotta apposta:
+    /// senza questa riverifica, un disco di backup diventato irraggiungibile A METÀ SESSIONE
+    /// tornava candidabile alla formattazione.
     static func configuredBackupVolumes() throws -> ConfiguredBackupVolumes {
         let manager = BookmarkManager.shared
         let urls = manager.urls
-        return try configuredBackupVolumes(from: [BookmarkManager.Location.ssd, .hdd].map {
-            ConfiguredLocationInput(location: $0,
-                                    hasSavedBookmark: manager.hasSavedBookmark($0),
-                                    resolvedPath: urls[$0]?.path,
-                                    savedVolumeUUID: manager.savedVolumeUUID($0))
-        })
+        let fm = FileManager.default
+        let inputs: [ConfiguredLocationInput] = [BookmarkManager.Location.ssd, .hdd, .photos].map { loc in
+            let candidateURL = urls[loc]
+            let reachableNow = candidateURL.map { fm.fileExists(atPath: $0.path) } ?? false
+            let currentVolumeUUID: String? = reachableNow
+                ? (try? candidateURL!.resourceValues(forKeys: [.volumeUUIDStringKey]))?.volumeUUIDString
+                : nil
+            return ConfiguredLocationInput(location: loc,
+                                    hasSavedBookmark: manager.hasSavedBookmark(loc),
+                                    resolvedPath: reachableNow ? candidateURL?.path : nil,
+                                    savedVolumeUUID: manager.savedVolumeUUID(loc),
+                                    currentVolumeUUID: currentVolumeUUID)
+        }
+        return try configuredBackupVolumes(from: inputs)
     }
 
     /// Stato di una posizione configurata, letto dal `BookmarkManager` una volta sola: tenere la
     /// decisione in una funzione pura la rende testabile senza toccare i `UserDefaults` reali.
+    /// `resolvedPath`/`currentVolumeUUID` vanno calcolati dal chiamante **al momento della
+    /// chiamata** (non da uno snapshot vecchio) — è la funzione pura a decidere cosa farne.
     struct ConfiguredLocationInput {
         let location: BookmarkManager.Location
         let hasSavedBookmark: Bool
         let resolvedPath: String?
         let savedVolumeUUID: String?
+        var currentVolumeUUID: String? = nil
     }
 
     static func configuredBackupVolumes(from inputs: [ConfiguredLocationInput]) throws -> ConfiguredBackupVolumes {
@@ -2953,8 +2970,16 @@ enum DiskFormatter {
             guard let path = input.resolvedPath else {
                 throw Failure.unresolvedBookmark(location: input.location)
             }
+            // Un volume diverso rimontato nel frattempo esattamente sullo stesso path non deve
+            // fare da alibi al disco di backup vero: se avevamo un UUID persistito, quello
+            // attualmente montato lì deve coincidere.
+            if let savedUUID = normalizedUUID(input.savedVolumeUUID) {
+                guard let currentUUID = normalizedUUID(input.currentVolumeUUID), currentUUID == savedUUID else {
+                    throw Failure.unresolvedBookmark(location: input.location)
+                }
+                result.volumeUUIDs.insert(savedUUID)
+            }
             result.paths.append(path)
-            if let uuid = normalizedUUID(input.savedVolumeUUID) { result.volumeUUIDs.insert(uuid) }
         }
         return result
     }

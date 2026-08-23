@@ -109,8 +109,10 @@ final class DiskFormatterEligibilityTests: XCTestCase {
 
     func testVolumeUUIDComparisonIgnoresCaseAndSpaces() {
         XCTAssertFalse(isEligible(uuids: [ssdUUID.lowercased()], configured: configured(uuids: [ssdUUID])))
-        XCTAssertFalse(isEligible(uuids: [DiskFormatter.normalizedUUID("  \(ssdUUID)  ")!],
-                                  configured: configured(uuids: [ssdUUID])))
+        // Stringa grezza con spazi, non pre-normalizzata: deve essere isEligible stessa a
+        // normalizzarla internamente (altrimenti questa asserzione non testa nulla in più
+        // della precedente).
+        XCTAssertFalse(isEligible(uuids: ["  \(ssdUUID)  "], configured: configured(uuids: [ssdUUID])))
     }
 
     /// Un disco con più volumi: basta che uno solo abbia l'UUID configurato.
@@ -127,16 +129,23 @@ final class DiskFormatterEligibilityTests: XCTestCase {
 
     // MARK: - configuredBackupVolumes (fail-closed su bookmark non risolto)
 
+    // `currentUUID` è sempre esplicito, senza default: un default tipo `currentUUID ?? uuid`
+    // non potrebbe distinguere "non specificato" da "esplicitamente nil" (Swift risolve entrambi
+    // allo stesso valore nel corpo della funzione) — un bug reale trovato scrivendo
+    // `testConfiguredVolumes_currentVolumeUUIDMissingWhenSavedThrows` sotto, che con quel default
+    // non testava affatto lo scenario "nessun UUID leggibile adesso".
     private func input(_ location: BookmarkManager.Location, hasBookmark: Bool,
-                       path: String?, uuid: String?) -> DiskFormatter.ConfiguredLocationInput {
+                       path: String?, uuid: String?,
+                       currentUUID: String?) -> DiskFormatter.ConfiguredLocationInput {
         DiskFormatter.ConfiguredLocationInput(location: location, hasSavedBookmark: hasBookmark,
-                                              resolvedPath: path, savedVolumeUUID: uuid)
+                                              resolvedPath: path, savedVolumeUUID: uuid,
+                                              currentVolumeUUID: currentUUID)
     }
 
     func testConfiguredVolumes_collectsPathsAndUUIDs() throws {
         let result = try DiskFormatter.configuredBackupVolumes(from: [
-            input(.ssd, hasBookmark: true, path: ssd, uuid: ssdUUID.lowercased()),
-            input(.hdd, hasBookmark: true, path: hdd, uuid: nil)
+            input(.ssd, hasBookmark: true, path: ssd, uuid: ssdUUID.lowercased(), currentUUID: ssdUUID),
+            input(.hdd, hasBookmark: true, path: hdd, uuid: nil, currentUUID: nil)
         ])
         XCTAssertEqual(result.paths, [ssd, hdd])
         XCTAssertEqual(result.volumeUUIDs, [ssdUUID])
@@ -144,8 +153,8 @@ final class DiskFormatterEligibilityTests: XCTestCase {
 
     func testConfiguredVolumes_locationNeverConfiguredIsIgnored() throws {
         let result = try DiskFormatter.configuredBackupVolumes(from: [
-            input(.ssd, hasBookmark: true, path: ssd, uuid: nil),
-            input(.hdd, hasBookmark: false, path: nil, uuid: nil)
+            input(.ssd, hasBookmark: true, path: ssd, uuid: nil, currentUUID: nil),
+            input(.hdd, hasBookmark: false, path: nil, uuid: nil, currentUUID: nil)
         ])
         XCTAssertEqual(result.paths, [ssd])
     }
@@ -155,7 +164,7 @@ final class DiskFormatterEligibilityTests: XCTestCase {
     /// diventerebbe un no-op silenzioso e l'SSD di backup comparirebbe tra i formattabili.
     func testConfiguredVolumes_savedButUnresolvedBookmarkThrows() {
         XCTAssertThrowsError(try DiskFormatter.configuredBackupVolumes(from: [
-            input(.ssd, hasBookmark: true, path: nil, uuid: ssdUUID)
+            input(.ssd, hasBookmark: true, path: nil, uuid: ssdUUID, currentUUID: nil)
         ])) { error in
             guard case DiskFormatter.Failure.unresolvedBookmark(let location) = error else {
                 return XCTFail("Errore inatteso: \(error)")
@@ -169,7 +178,35 @@ final class DiskFormatterEligibilityTests: XCTestCase {
     /// verrebbe la tentazione di riformattare.
     func testConfiguredVolumes_unresolvedBookmarkThrowsEvenWithSavedUUID() {
         XCTAssertThrowsError(try DiskFormatter.configuredBackupVolumes(from: [
-            input(.hdd, hasBookmark: true, path: nil, uuid: hddUUID)
+            input(.hdd, hasBookmark: true, path: nil, uuid: hddUUID, currentUUID: nil)
+        ]))
+    }
+
+    /// Bug trovato nel secondo giro di review (2026-08-23): `BookmarkManager.urls` è uno
+    /// snapshot preso una sola volta in `init()`. Se un volume di backup diventa irraggiungibile
+    /// A METÀ SESSIONE (non solo all'avvio), il vecchio path risolto restava comunque presente
+    /// nello snapshot e il disco reale — corrotto/scollegato — non esponeva più né MountPoint né
+    /// VolumeUUID a `diskutil`, risultando quindi candidabile. Qui si simula esattamente il
+    /// disallineamento: un path che sembra ancora risolto ma il cui volume montato lì ora ha un
+    /// UUID diverso da quello persistito (un altro volume rimontato sullo stesso path non deve
+    /// fare da alibi al disco di backup vero).
+    func testConfiguredVolumes_currentVolumeUUIDMismatchThrows() {
+        XCTAssertThrowsError(try DiskFormatter.configuredBackupVolumes(from: [
+            input(.ssd, hasBookmark: true, path: ssd, uuid: ssdUUID, currentUUID: hddUUID)
+        ])) { error in
+            guard case DiskFormatter.Failure.unresolvedBookmark(let location) = error else {
+                return XCTFail("Errore inatteso: \(error)")
+            }
+            XCTAssertEqual(location, .ssd)
+        }
+    }
+
+    /// Stesso bug, variante "nessun UUID leggibile adesso": il volume che risponde al momento
+    /// della chiamata non espone alcun VolumeUUID (es. filesystem danneggiato), pur avendone uno
+    /// persistito da quando era stato configurato correttamente.
+    func testConfiguredVolumes_currentVolumeUUIDMissingWhenSavedThrows() {
+        XCTAssertThrowsError(try DiskFormatter.configuredBackupVolumes(from: [
+            input(.ssd, hasBookmark: true, path: ssd, uuid: ssdUUID, currentUUID: nil)
         ]))
     }
 
