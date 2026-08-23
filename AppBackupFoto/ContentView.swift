@@ -4708,6 +4708,7 @@ struct SettingsSheet: View {
     @ObservedObject private var bm = BookmarkManager.shared
     @ObservedObject private var gate = AuthGateManager.shared
     @AppStorage("autoBackupOnSSDConnect") private var autoBackupEnabled: Bool = true
+    @State private var showDiskPrep = false
     var body: some View {
         VStack(spacing: AppSpacing.xl) {
             Text("Impostazioni").font(AppFont.title)
@@ -4727,8 +4728,213 @@ struct SettingsSheet: View {
                     LocationRow(location: loc) { bm.selectAndSave(loc) { _ in } }
                 }
             }.padding(.horizontal, AppSpacing.xl)
+            Button("Prepara un disco nuovo…") { showDiskPrep = true }
+                .buttonStyle(.plain).font(.callout).foregroundStyle(.secondary)
             Button("Chiudi") { dismiss() }.buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
         }.padding(AppSpacing.xxl).frame(minWidth: 480)
+        .sheet(isPresented: $showDiskPrep) { DiskPrepView() }
+    }
+}
+
+// MARK: - DiskPrepView (roadmap #28)
+/// Formattazione guidata di un disco esterno nuovo, mai configurato prima come SSD/HDD di
+/// backup. Aperta da Impostazioni → "Prepara un disco nuovo…". `DiskFormatter` fa da sola tutte
+/// le verifiche di sicurezza (fail-closed sull'elenco, ri-verifica fresca in `erase()`) — questa
+/// view aggiunge solo la conferma umana: digitare il nome esatto del disco più un `.alert` di
+/// conferma esplicita prima di eseguire l'operazione irreversibile.
+struct DiskPrepView: View {
+    @Environment(\.dismiss) private var dismiss
+    private enum Step { case list, confirm, result }
+
+    @State private var step: Step = .list
+    @State private var candidates: [CandidateDisk] = []
+    @State private var isLoading = false
+    @State private var loadError: String? = nil
+
+    @State private var selectedDisk: CandidateDisk? = nil
+    @State private var filesystem: DiskFormatter.DiskFilesystem = .apfs
+    @State private var typedName = ""
+    @State private var showEraseConfirmation = false
+    @State private var isErasing = false
+    @State private var eraseError: String? = nil
+    @State private var eraseSucceeded = false
+
+    var body: some View {
+        Group {
+            switch step {
+            case .list: listStep
+            case .confirm: confirmStep
+            case .result: resultStep
+            }
+        }
+        .padding(AppSpacing.xxl)
+        .frame(minWidth: 480, minHeight: 380)
+        .onAppear { if candidates.isEmpty && loadError == nil { refresh() } }
+    }
+
+    private var listStep: some View {
+        VStack(spacing: AppSpacing.lg) {
+            Text("Prepara un disco nuovo").font(AppFont.title)
+            Text("Solo dischi esterni mai configurati come SSD o HDD di backup possono essere formattati qui — i tuoi dischi di backup non compaiono mai in questo elenco.")
+                .font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center)
+
+            if isLoading {
+                ProgressView().frame(maxHeight: .infinity)
+            } else if let loadError {
+                VStack(spacing: AppSpacing.sm) {
+                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(AppColor.warning)
+                    Text(loadError).font(.callout).multilineTextAlignment(.center)
+                }.frame(maxHeight: .infinity)
+            } else if candidates.isEmpty {
+                Text("Nessun disco candidabile trovato. Collega un disco esterno nuovo e premi Aggiorna.")
+                    .font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                    .frame(maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    VStack(spacing: AppSpacing.sm) {
+                        ForEach(candidates) { disk in
+                            Button {
+                                selectedDisk = disk
+                                typedName = ""
+                                eraseError = nil
+                                filesystem = .apfs
+                                step = .confirm
+                            } label: {
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(disk.name).font(.headline)
+                                        Text("\(disk.identifier) · \(disk.currentFilesystem) · "
+                                             + ByteCountFormatter.string(fromByteCount: disk.sizeBytes, countStyle: .file))
+                                            .font(.caption).foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    Image(systemName: "chevron.right").font(.caption).foregroundStyle(.secondary)
+                                }
+                                .padding(AppSpacing.md).cardBackground()
+                            }.buttonStyle(.plain)
+                        }
+                    }
+                }
+            }
+
+            HStack {
+                Button("Aggiorna") { refresh() }.disabled(isLoading)
+                Spacer()
+                Button("Chiudi") { dismiss() }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var confirmStep: some View {
+        if let disk = selectedDisk {
+            VStack(spacing: AppSpacing.lg) {
+                Text("Formatta \"\(disk.name)\"").font(AppFont.title)
+                Text("Cancella TUTTO il contenuto del disco. L'operazione è irreversibile.")
+                    .font(.subheadline).foregroundStyle(AppColor.error).multilineTextAlignment(.center)
+
+                Picker("Filesystem", selection: $filesystem) {
+                    ForEach(DiskFormatter.DiskFilesystem.allCases) { fs in
+                        Text(fs.rawValue).tag(fs)
+                    }
+                }.pickerStyle(.segmented).padding(.horizontal, AppSpacing.xl)
+
+                VStack(alignment: .leading, spacing: AppSpacing.xs) {
+                    Text("Per confermare, scrivi esattamente il nome del disco:")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Text(disk.name).font(.callout.weight(.semibold)).textSelection(.enabled)
+                    TextField("Nome disco", text: $typedName)
+                        .textFieldStyle(.roundedBorder)
+                        .disabled(isErasing)
+                }.padding(.horizontal, AppSpacing.xl)
+
+                if let eraseError {
+                    Text(eraseError).font(.callout).foregroundStyle(AppColor.error)
+                        .multilineTextAlignment(.center).padding(.horizontal, AppSpacing.xl)
+                }
+                if isErasing {
+                    ProgressView("Formattazione in corso…")
+                }
+
+                HStack {
+                    Button("Indietro") { step = .list; eraseError = nil }.disabled(isErasing)
+                    Spacer()
+                    Button("Formatta") { showEraseConfirmation = true }
+                        .buttonStyle(.borderedProminent).tint(.red)
+                        .disabled(isErasing || typedName != disk.name)
+                }
+            }
+            .alert("Formattare \"\(disk.name)\"?", isPresented: $showEraseConfirmation) {
+                Button("Formatta", role: .destructive) { performErase(disk: disk) }
+                Button("Annulla", role: .cancel) {}
+            } message: {
+                Text("Tutti i dati su questo disco verranno cancellati in modo permanente. Non è possibile recuperarli dopo.")
+            }
+        }
+    }
+
+    private var resultStep: some View {
+        VStack(spacing: AppSpacing.lg) {
+            if eraseSucceeded {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.system(size: AppIconSize.heroLarge)).foregroundStyle(AppColor.success)
+                Text("Disco formattato").font(AppFont.title)
+                Text("Ora vai in Impostazioni e seleziona questo disco come SSD o HDD.")
+                    .font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center)
+            } else {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: AppIconSize.heroLarge)).foregroundStyle(AppColor.error)
+                Text("Formattazione non eseguita").font(AppFont.title)
+                if let eraseError {
+                    Text(eraseError).font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                }
+            }
+            Button("Chiudi") { dismiss() }.buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
+        }
+    }
+
+    private func refresh() {
+        isLoading = true
+        loadError = nil
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                let disks = try DiskFormatter.listEligibleDisks()
+                DispatchQueue.main.async {
+                    candidates = disks
+                    isLoading = false
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    loadError = error.localizedDescription
+                    candidates = []
+                    isLoading = false
+                }
+            }
+        }
+    }
+
+    private func performErase(disk: CandidateDisk) {
+        isErasing = true
+        eraseError = nil
+        let fs = filesystem
+        let name = typedName
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                try DiskFormatter.erase(identifier: disk.identifier, filesystem: fs, newName: name)
+                DispatchQueue.main.async {
+                    isErasing = false
+                    eraseSucceeded = true
+                    step = .result
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    isErasing = false
+                    eraseError = error.localizedDescription
+                    eraseSucceeded = false
+                    step = .result
+                }
+            }
+        }
     }
 }
 
