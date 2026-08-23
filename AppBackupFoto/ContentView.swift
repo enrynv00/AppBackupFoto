@@ -1430,8 +1430,43 @@ final class BookmarkManager: ObservableObject {
 
     private init() {
         for loc in Location.allCases {
-            if let url = resolve(loc) { urls[loc] = url }
+            if let url = resolve(loc) {
+                urls[loc] = url
+                // Backfill dell'UUID di volume per i bookmark salvati prima che esistesse
+                // (roadmap #28): finché il volume è montato è l'unico momento in cui si può
+                // ricavare. Best-effort e silenzioso, stesso criterio dell'adozione Keychain
+                // di `S3Syncer.readConfig()`.
+                persistVolumeUUID(for: loc, url: url)
+            }
         }
+    }
+
+    static func bookmarkKey(_ loc: Location) -> String { "bk_\(loc.rawValue)" }
+    static func volumeUUIDKey(_ loc: Location) -> String { "bk_\(loc.rawValue)_volumeUUID" }
+
+    /// True se per questa posizione esiste un bookmark salvato, **anche se in questo momento non
+    /// si risolve** (volume scollegato, o collegato ma non montato). Serve a distinguere
+    /// "mai configurato" da "configurato ma non disponibile adesso": `urls[loc] == nil` da solo
+    /// non permette di distinguerli, e chi deve decidere qualcosa di distruttivo (roadmap #28,
+    /// `DiskFormatter`) non può trattare i due casi allo stesso modo.
+    func hasSavedBookmark(_ loc: Location) -> Bool {
+        UserDefaults.standard.data(forKey: Self.bookmarkKey(loc)) != nil
+    }
+
+    /// UUID del volume associato al bookmark, persistito accanto ad esso: a differenza del path
+    /// risolto sopravvive allo smontaggio del volume, e a differenza del nome non cambia se
+    /// l'utente rinomina il disco.
+    func savedVolumeUUID(_ loc: Location) -> String? {
+        UserDefaults.standard.string(forKey: Self.volumeUUIDKey(loc))
+    }
+
+    /// Verificato empiricamente il 2026-08-23: `volumeUUIDString` coincide esattamente con il
+    /// campo `VolumeUUID` del plist di `diskutil` (confrontato su `/Volumes/SSD - Enri` reale e
+    /// su un volume ExFAT di prova), ed è per questo che i due possono essere confrontati.
+    private func persistVolumeUUID(for loc: Location, url: URL) {
+        guard let uuid = (try? url.resourceValues(forKeys: [.volumeUUIDStringKey]))?.volumeUUIDString,
+              !uuid.isEmpty else { return }
+        UserDefaults.standard.set(uuid.uppercased(), forKey: Self.volumeUUIDKey(loc))
     }
 
     var allConfigured: Bool { Location.allCases.allSatisfy { urls[$0] != nil } }
@@ -1442,7 +1477,7 @@ final class BookmarkManager: ObservableObject {
     var canEnterApp: Bool { urls[.photos] != nil }
 
     private func resolve(_ loc: Location) -> URL? {
-        guard let data = UserDefaults.standard.data(forKey: "bk_\(loc.rawValue)") else { return nil }
+        guard let data = UserDefaults.standard.data(forKey: Self.bookmarkKey(loc)) else { return nil }
         var stale = false
         // Bookmark non security-scoped: l'app non è sandboxata (ENABLE_APP_SANDBOX = NO) e ha
         // Full Disk Access, quindi non serve il meccanismo di scope — che oltretutto fallisce
@@ -1478,8 +1513,12 @@ final class BookmarkManager: ObservableObject {
                 // senza bisogno del meccanismo di scope.
                 let data = try url.bookmarkData(options: [],
                                                  includingResourceValuesForKeys: nil, relativeTo: nil)
-                UserDefaults.standard.set(data, forKey: "bk_\(loc.rawValue)")
+                UserDefaults.standard.set(data, forKey: Self.bookmarkKey(loc))
                 self.urls[loc] = url
+                // L'UUID del volume viene salvato adesso, che è l'unico momento in cui il volume
+                // è certamente montato: è il secondo criterio con cui `DiskFormatter` esclude un
+                // disco di backup dalla formattazione anche quando non è montato (roadmap #28).
+                self.persistVolumeUUID(for: loc, url: url)
                 completion(true)
             } catch {
                 // Alert mantenuto per diagnosticare eventuali fallimenti futuri (prima di questo
@@ -2782,6 +2821,9 @@ enum DiskFormatter {
         case commandFailed(command: String, status: Int32, output: String)
         case commandTimedOut(command: String)
         case unreadableOutput(command: String)
+        case unresolvedBookmark(location: BookmarkManager.Location)
+        case unexpectedPlistShape(command: String)
+        case inconsistentListing(identifier: String)
 
         var errorDescription: String? {
             switch self {
@@ -2793,16 +2835,37 @@ enum DiskFormatter {
                 return "`\(command)` non ha risposto entro \(Int(DiskFormatter.commandTimeout)) secondi"
             case .unreadableOutput(let command):
                 return "Output di `\(command)` non interpretabile come plist"
+            case .unresolvedBookmark(let location):
+                return "'\(location.displayName)' risulta configurato ma non è raggiungibile adesso. "
+                     + "Collega e monta i dischi di backup configurati prima di preparare un disco nuovo: "
+                     + "senza, l'app non può garantire di riconoscerli ed escluderli dalla formattazione."
+            case .unexpectedPlistShape(let command):
+                return "Output di `\(command)` in un formato inatteso: elenco dischi non affidabile"
+            case .inconsistentListing(let identifier):
+                return "Il disco \(identifier) compare tra i dischi fisici ma non nell'elenco completo: "
+                     + "elenco dischi non affidabile"
             }
         }
+    }
+
+    /// Identità dei volumi di backup già configurati, con cui si escludono i dischi non
+    /// formattabili. Due criteri indipendenti perché nessuno dei due copre tutti i casi:
+    /// il path esiste solo mentre il volume è montato, l'UUID solo se è stato persistito.
+    struct ConfiguredBackupVolumes {
+        var paths: [String] = []
+        var volumeUUIDs: Set<String> = []
     }
 
     /// Topologia dei dischi esterni, ricavata da `diskutil list -plist external`.
     struct DiskTopology {
         /// disco fisico intero (es. "disk4") → path attualmente montati che gli appartengono
         var mountPaths: [String: [String]] = [:]
+        /// disco fisico intero → UUID dei volumi che ospita, montati **o no**
+        var volumeUUIDs: [String: Set<String>] = [:]
         /// dischi fisici che ospitano un container APFS
         var apfsHosts: Set<String> = []
+        /// tutti gli identificativi presenti nell'elenco (chiave `AllDisks` del plist)
+        var knownIdentifiers: Set<String> = []
     }
 
     // MARK: Elenco
@@ -2814,21 +2877,34 @@ enum DiskFormatter {
     /// chiuso dal watchdog (non riproducibile nelle esecuzioni successive, ~0,1s ciascuna). Sul
     /// main thread quella singola occorrenza sarebbe una finestra congelata.
     static func listEligibleDisks() throws -> [CandidateDisk] {
-        let configured = configuredBackupPaths()
+        let configured = try configuredBackupVolumes()
 
         let physicalArguments = ["list", "-plist", "external", "physical"]
-        let physical = try plistDictionary(from: try runDiskutil(physicalArguments),
-                                           command: commandDescription(physicalArguments))
+        let physicalCommand = commandDescription(physicalArguments)
+        let physical = try plistDictionary(from: try runDiskutil(physicalArguments), command: physicalCommand)
+        guard let physicalEntries = physical["AllDisksAndPartitions"] as? [[String: Any]] else {
+            throw Failure.unexpectedPlistShape(command: physicalCommand)
+        }
         // Il secondo elenco è SENZA `physical` apposta: vedi topology(fromListPlist:).
         let allArguments = ["list", "-plist", "external"]
-        let layout = topology(fromListPlist: try plistDictionary(from: try runDiskutil(allArguments),
-                                                                 command: commandDescription(allArguments)))
+        let layout = try topology(fromListPlist: try plistDictionary(from: try runDiskutil(allArguments),
+                                                                     command: commandDescription(allArguments)),
+                                  command: commandDescription(allArguments))
 
         var disks: [CandidateDisk] = []
-        for entry in (physical["AllDisksAndPartitions"] as? [[String: Any]]) ?? [] {
-            guard let identifier = entry["DeviceIdentifier"] as? String else { continue }
+        for entry in physicalEntries {
+            guard let identifier = entry["DeviceIdentifier"] as? String else {
+                throw Failure.unexpectedPlistShape(command: physicalCommand)
+            }
+            // Fail-closed: se il disco non compare nemmeno nel secondo elenco, i suoi mount e i
+            // suoi UUID non sono stati letti da nessuna parte — e "nessun dato" verrebbe scambiato
+            // per "nessun volume di backup", cioè per un disco formattabile.
+            guard layout.knownIdentifiers.contains(identifier) else {
+                throw Failure.inconsistentListing(identifier: identifier)
+            }
             guard isEligible(diskPaths: layout.mountPaths[identifier] ?? [],
-                             configuredPaths: configured) else { continue }
+                             diskVolumeUUIDs: layout.volumeUUIDs[identifier] ?? [],
+                             configured: configured) else { continue }
             let info = try? plistDictionary(from: try runDiskutil(["info", "-plist", identifier]),
                                             command: commandDescription(["info", "-plist", identifier]))
             disks.append(CandidateDisk(
@@ -2840,24 +2916,79 @@ enum DiskFormatter {
         return disks
     }
 
-    /// Path risolti dei bookmark SSD/HDD: sono **questi** — non i nomi, che si possono cambiare —
-    /// a decidere quali dischi non vanno mai proposti per la formattazione.
-    static func configuredBackupPaths() -> [String] {
-        let urls = BookmarkManager.shared.urls
-        return [BookmarkManager.Location.ssd, .hdd].compactMap { urls[$0]?.path }
+    /// Identità dei volumi SSD/HDD già configurati: path risolto **e** UUID di volume persistito.
+    /// Mai il nome, che l'utente può cambiare in qualsiasi momento.
+    ///
+    /// **Fail-closed**: se esiste un bookmark salvato che in questa sessione non si è risolto
+    /// (volume scollegato all'avvio dell'app — caso normale, `BookmarkManager` risolve i bookmark
+    /// solo in `init()` e non ci riprova più) l'elenco non viene prodotto affatto. Altrimenti quel
+    /// disco di backup risulterebbe semplicemente "non configurato" e comparirebbe tra i
+    /// formattabili. Vale anche quando l'UUID è disponibile: un disco che non si monta più —
+    /// filesystem danneggiato — non espone alcun UUID a `diskutil`, ed è esattamente il disco che
+    /// qualcuno sarebbe tentato di riformattare.
+    static func configuredBackupVolumes() throws -> ConfiguredBackupVolumes {
+        let manager = BookmarkManager.shared
+        let urls = manager.urls
+        return try configuredBackupVolumes(from: [BookmarkManager.Location.ssd, .hdd].map {
+            ConfiguredLocationInput(location: $0,
+                                    hasSavedBookmark: manager.hasSavedBookmark($0),
+                                    resolvedPath: urls[$0]?.path,
+                                    savedVolumeUUID: manager.savedVolumeUUID($0))
+        })
+    }
+
+    /// Stato di una posizione configurata, letto dal `BookmarkManager` una volta sola: tenere la
+    /// decisione in una funzione pura la rende testabile senza toccare i `UserDefaults` reali.
+    struct ConfiguredLocationInput {
+        let location: BookmarkManager.Location
+        let hasSavedBookmark: Bool
+        let resolvedPath: String?
+        let savedVolumeUUID: String?
+    }
+
+    static func configuredBackupVolumes(from inputs: [ConfiguredLocationInput]) throws -> ConfiguredBackupVolumes {
+        var result = ConfiguredBackupVolumes()
+        for input in inputs {
+            guard input.hasSavedBookmark else { continue }
+            guard let path = input.resolvedPath else {
+                throw Failure.unresolvedBookmark(location: input.location)
+            }
+            result.paths.append(path)
+            if let uuid = normalizedUUID(input.savedVolumeUUID) { result.volumeUUIDs.insert(uuid) }
+        }
+        return result
     }
 
     // MARK: Logica di esclusione (pura, testabile senza eseguire diskutil)
 
     /// Un disco è candidabile solo se **nessuno** dei suoi path montati coincide con — o sta
-    /// dentro, o contiene — un path già configurato come SSD/HDD di backup.
-    static func isEligible(diskPaths: [String], configuredPaths: [String]) -> Bool {
+    /// dentro, o contiene — un path configurato, **e** nessuno dei suoi volumi ha l'UUID di un
+    /// volume configurato.
+    ///
+    /// I due criteri non sono ridondanti: verificato empiricamente il 2026-08-23 che dopo un
+    /// `diskutil unmount` l'entry del volume perde `MountPoint` ma conserva `VolumeUUID`. Con il
+    /// solo confronto sui path, un disco di backup collegato ma non montato (espulso dal Finder
+    /// senza scollegarlo) risulterebbe formattabile.
+    static func isEligible(diskPaths: [String], diskVolumeUUIDs: Set<String>,
+                           configured: ConfiguredBackupVolumes) -> Bool {
+        // Normalizzati qui e non solo a monte: è la funzione che autorizza un'operazione
+        // distruttiva, non deve dipendere dal fatto che chi la chiama abbia normalizzato.
+        let diskUUIDs = Set(diskVolumeUUIDs.compactMap { normalizedUUID($0) })
+        let configuredUUIDs = Set(configured.volumeUUIDs.compactMap { normalizedUUID($0) })
+        if !diskUUIDs.isEmpty && !diskUUIDs.isDisjoint(with: configuredUUIDs) { return false }
         for diskPath in diskPaths {
-            for configuredPath in configuredPaths where pathsOverlap(diskPath, configuredPath) {
+            for configuredPath in configured.paths where pathsOverlap(diskPath, configuredPath) {
                 return false
             }
         }
         return true
+    }
+
+    /// UUID normalizzato per il confronto (maiuscolo, senza spazi); `nil` se vuoto o assente.
+    static func normalizedUUID(_ raw: String?) -> String? {
+        guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty else { return nil }
+        return trimmed.uppercased()
     }
 
     /// Confronto sui componenti del path, mai su `hasPrefix`: "/Volumes/SSD" non deve risultare
@@ -2889,15 +3020,24 @@ enum DiskFormatter {
         return digits.isEmpty ? identifier : "disk" + digits
     }
 
-    /// Costruisce la mappa "disco fisico → path montati".
+    /// Costruisce la mappa "disco fisico → path montati e UUID di volume".
     ///
     /// Va costruita sull'output **senza** `physical`: verificato empiricamente il 2026-08-23 che
     /// con `physical` i volumi APFS non compaiono affatto (il container APFS è un disco
     /// *sintetizzato*, che `physical` filtra via, e la partizione `Apple_APFS` del disco fisico non
     /// ha `MountPoint`). Un disco esterno formattato APFS — come `BackupHDD` — risulterebbe quindi
     /// senza alcun path montato e passerebbe indisturbato il filtro di esclusione.
-    static func topology(fromListPlist plist: [String: Any]) -> DiskTopology {
+    ///
+    /// **Lancia** se il plist non ha la forma attesa, invece di restituire una topologia vuota:
+    /// "non so niente di questi dischi" e "questi dischi non sono volumi di backup" devono restare
+    /// due risposte diverse, altrimenti un output inatteso di `diskutil` renderebbe formattabile
+    /// qualunque cosa.
+    static func topology(fromListPlist plist: [String: Any], command: String) throws -> DiskTopology {
+        guard let entries = plist["AllDisksAndPartitions"] as? [[String: Any]] else {
+            throw Failure.unexpectedPlistShape(command: command)
+        }
         var result = DiskTopology()
+        result.knownIdentifiers = Set((plist["AllDisks"] as? [String]) ?? [])
 
         func add(_ disk: String, _ rawPath: Any?) {
             guard let path = rawPath as? String,
@@ -2905,7 +3045,12 @@ enum DiskFormatter {
             result.mountPaths[disk, default: []].append(path)
         }
 
-        for entry in (plist["AllDisksAndPartitions"] as? [[String: Any]]) ?? [] {
+        func addUUID(_ disk: String, _ rawUUID: Any?) {
+            guard let uuid = normalizedUUID(rawUUID as? String) else { return }
+            result.volumeUUIDs[disk, default: []].insert(uuid)
+        }
+
+        for entry in entries {
             // Un container APFS sintetizzato non è un disco fisico: i suoi volumi vanno attribuiti
             // al disco che lo ospita davvero (APFSPhysicalStores → "disk4s2" → "disk4").
             let stores = (entry["APFSPhysicalStores"] as? [[String: Any]])?
@@ -2919,11 +3064,14 @@ enum DiskFormatter {
             }
             for owner in owners {
                 add(owner, entry["MountPoint"])
+                addUUID(owner, entry["VolumeUUID"])
                 for partition in (entry["Partitions"] as? [[String: Any]]) ?? [] {
                     add(owner, partition["MountPoint"])
+                    addUUID(owner, partition["VolumeUUID"])
                 }
                 for volume in (entry["APFSVolumes"] as? [[String: Any]]) ?? [] {
                     add(owner, volume["MountPoint"])
+                    addUUID(owner, volume["VolumeUUID"])
                 }
             }
         }
