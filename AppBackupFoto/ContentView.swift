@@ -2812,18 +2812,26 @@ struct CandidateDisk: Identifiable {
 /// dischi tramite il servizio di sistema, e non esiste un'API pubblica Swift equivalente.
 enum DiskFormatter {
     static let diskutilPath = "/usr/sbin/diskutil"
-    /// Un `diskutil` che non risponde non deve poter appendere per sempre il chiamante.
+    /// Un `diskutil` di sola lettura (`list`/`info`) che non risponde non deve poter appendere
+    /// per sempre il chiamante — normalmente risponde in decine di millisecondi.
     static let commandTimeout: TimeInterval = 20
     static let sigkillGracePeriod: TimeInterval = 5
+    /// Nota di review (2026-08-23, secondo giro): un `eraseDisk` NON usa questo timeout — vedi
+    /// `erase(identifier:filesystem:newName:)`, che passa `timeout: nil` a `runDiskutil` di
+    /// proposito. Uccidere un formattatore a metà lascerebbe il disco in uno stato peggiore che
+    /// aspettare: una partizione riscritta solo in parte è più difficile da recuperare di un
+    /// comando che semplicemente impiega più a lungo del previsto.
 
     enum Failure: LocalizedError {
         case launchFailed(command: String, underlying: Error)
         case commandFailed(command: String, status: Int32, output: String)
-        case commandTimedOut(command: String)
+        case commandTimedOut(command: String, timeout: TimeInterval)
         case unreadableOutput(command: String)
         case unresolvedBookmark(location: BookmarkManager.Location)
         case unexpectedPlistShape(command: String)
         case inconsistentListing(identifier: String)
+        case diskNoLongerEligible(identifier: String)
+        case nameConfirmationMismatch
 
         var errorDescription: String? {
             switch self {
@@ -2831,8 +2839,8 @@ enum DiskFormatter {
                 return "Impossibile eseguire `\(command)`: \(underlying.localizedDescription)"
             case .commandFailed(let command, let status, let output):
                 return "`\(command)` è fallito (codice \(status))" + (output.isEmpty ? "" : ": \(output)")
-            case .commandTimedOut(let command):
-                return "`\(command)` non ha risposto entro \(Int(DiskFormatter.commandTimeout)) secondi"
+            case .commandTimedOut(let command, let timeout):
+                return "`\(command)` non ha risposto entro \(Int(timeout)) secondi"
             case .unreadableOutput(let command):
                 return "Output di `\(command)` non interpretabile come plist"
             case .unresolvedBookmark(let location):
@@ -2844,6 +2852,12 @@ enum DiskFormatter {
             case .inconsistentListing(let identifier):
                 return "Il disco \(identifier) compare tra i dischi fisici ma non nell'elenco completo: "
                      + "elenco dischi non affidabile"
+            case .diskNoLongerEligible(let identifier):
+                return "Il disco \(identifier) non risulta più tra quelli formattabili (potrebbe essere "
+                     + "stato scollegato, o un disco di backup è cambiato di stato nel frattempo). "
+                     + "Aggiorna l'elenco e riprova — nessuna formattazione è stata eseguita."
+            case .nameConfirmationMismatch:
+                return "Il nome digitato non corrisponde esattamente al nome del disco selezionato."
             }
         }
     }
@@ -2914,6 +2928,47 @@ enum DiskFormatter {
                 currentFilesystem: filesystemLabel(diskEntry: entry, identifier: identifier, topology: layout)))
         }
         return disks
+    }
+
+    // MARK: Formattazione
+
+    enum DiskFilesystem: String, CaseIterable, Identifiable {
+        case apfs = "APFS", exfat = "ExFAT"
+        var id: String { rawValue }
+    }
+
+    /// Cancella e riformatta un disco esterno intero. **Operazione distruttiva e irreversibile**
+    /// su hardware vero — l'unica barriera prima di questa funzione è la UI che chiede all'utente
+    /// di ridigitare il nome esatto del disco, e quella barriera da sola non basta: non protegge
+    /// da una selezione rimasta valida in UI ma diventata pericolosa nel frattempo (un disco
+    /// diverso collegato con lo stesso identificativo di sistema riassegnato da macOS, o —
+    /// scenario più concreto — un disco che nel frattempo *è stato scelto* come nuovo SSD/HDD di
+    /// backup in un'altra finestra dell'app, es. Impostazioni aperta in una `Window` indipendente
+    /// mentre "Prepara disco nuovo" resta aperta con un elenco ormai stantio).
+    ///
+    /// Per questo `erase()` NON si fida della lista mostrata dal chiamante: rilancia da sola
+    /// `listEligibleDisks()` **subito prima** di eseguire `eraseDisk`, e procede solo se
+    /// `identifier` compare ancora tra i risultati freschi. Se `listEligibleDisks()` stessa lancia
+    /// (bookmark non raggiungibile, plist inatteso — vedi i fail-closed sopra), quell'errore si
+    /// propaga qui e blocca comunque l'erase: un elenco che non si può ricalcolare in modo
+    /// affidabile non è una base su cui autorizzare un'operazione irreversibile.
+    ///
+    /// `newName` deve coincidere esattamente (case-sensitive) con `name` del `CandidateDisk`
+    /// riletto fresco in questa stessa chiamata — non con quello mostrato dalla UI al momento
+    /// dell'apertura, che potrebbe essere stantio. Ridondante rispetto al controllo di conferma
+    /// già fatto in UI (l'utente ridigita il nome per abilitare il bottone), ma questa funzione
+    /// non deve dipendere dal fatto che la UI l'abbia fatto correttamente: è lei che autorizza
+    /// l'`eraseDisk`, quindi verifica da sola.
+    static func erase(identifier: String, filesystem: DiskFilesystem, newName: String) throws {
+        let freshlyEligible = try listEligibleDisks()
+        guard let disk = freshlyEligible.first(where: { $0.identifier == identifier }) else {
+            throw Failure.diskNoLongerEligible(identifier: identifier)
+        }
+        guard disk.name == newName else { throw Failure.nameConfirmationMismatch }
+        // Nessun timeout: vedi il doc-comment di runDiskutil. `eraseDisk` su un disco esterno
+        // grande può richiedere più dei 20s usati per list/info, e ucciderlo a metà lascerebbe
+        // il disco in uno stato peggiore che aspettare.
+        _ = try runDiskutil(["eraseDisk", filesystem.rawValue, newName, identifier], timeout: nil)
     }
 
     /// Identità dei volumi SSD/HDD/Libreria Foto già configurati: path risolto **e** UUID di
@@ -3167,8 +3222,15 @@ enum DiskFormatter {
     /// Esegue `diskutil` e restituisce lo stdout grezzo. Sincrona di proposito: `list`/`info`
     /// rispondono in decine di millisecondi e il loro output sta in pochi KB, ben sotto il buffer
     /// della pipe (stdout viene comunque letto fino in fondo *prima* di `waitUntilExit`, così non
-    /// esiste il deadlock classico). Il watchdog termina il processo se non risponde.
-    static func runDiskutil(_ arguments: [String]) throws -> Data {
+    /// esiste il deadlock classico).
+    ///
+    /// `timeout`: se non-nil, un watchdog termina il processo (SIGTERM, poi SIGKILL dopo
+    /// `sigkillGracePeriod`) se non risponde entro quel tempo — usato per `list`/`info`, che sono
+    /// sola lettura e non hanno alcun side-effect da poter interrompere a metà. Se `nil`, nessun
+    /// watchdog: il chiamante aspetta finché il processo non termina da solo, per quanto ci
+    /// metta — usato **solo** da `erase(identifier:filesystem:newName:)`, dove uccidere
+    /// `eraseDisk` a metà lascerebbe il disco in uno stato peggiore che aspettare.
+    static func runDiskutil(_ arguments: [String], timeout: TimeInterval? = commandTimeout) throws -> Data {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: diskutilPath)
         process.arguments = arguments
@@ -3184,14 +3246,17 @@ enum DiskFormatter {
             throw Failure.launchFailed(command: command, underlying: error)
         }
 
-        // Flag one-shot condiviso tra watchdog e chiamante: chi arriva primo "vince".
+        // Flag one-shot condiviso tra watchdog e chiamante: chi arriva primo "vince". Nessun
+        // watchdog schedulato affatto se timeout è nil.
         let watchdog = ContinuationGuard()
-        DispatchQueue.global().asyncAfter(deadline: .now() + commandTimeout) {
-            guard process.isRunning, watchdog.claim() else { return }
-            process.terminate()
-            let pid = process.processIdentifier
-            DispatchQueue.global().asyncAfter(deadline: .now() + sigkillGracePeriod) {
-                if process.isRunning { kill(pid, SIGKILL) }
+        if let timeout = timeout {
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
+                guard process.isRunning, watchdog.claim() else { return }
+                process.terminate()
+                let pid = process.processIdentifier
+                DispatchQueue.global().asyncAfter(deadline: .now() + sigkillGracePeriod) {
+                    if process.isRunning { kill(pid, SIGKILL) }
+                }
             }
         }
 
@@ -3200,7 +3265,9 @@ enum DiskFormatter {
         process.waitUntilExit()
 
         // Se `claim()` fallisce qui, il watchdog è già scattato: il processo è stato ucciso.
-        guard watchdog.claim() else { throw Failure.commandTimedOut(command: command) }
+        // Con timeout nil il watchdog non è mai stato schedulato, quindi claim() qui riesce
+        // sempre (nessun falso "timed out").
+        guard watchdog.claim() else { throw Failure.commandTimedOut(command: command, timeout: timeout ?? 0) }
         guard process.terminationStatus == 0 else {
             throw Failure.commandFailed(command: command, status: process.terminationStatus,
                                         output: errorText.trimmingCharacters(in: .whitespacesAndNewlines))
