@@ -100,10 +100,9 @@ Storico bug (risolti e aperti): vedi `.claude/rules/bug-history.md`.
 
 ## Obiettivi futuri (non ancora iniziati)
 
-**Verifica manuale ancora da fare**:
+**Verifica manuale — campione di integrità: fatta (2026-08-23)**. Eseguita da Enrico con SSD e HDD collegati: zero problemi su tutte e 3 le coppie (Mac↔SSD, SSD↔HDD, SSD↔S3). Confermato anche che `sampleS3Pair` cancella davvero i file temporanei scaricati da S3 per il confronto (`defer { try? fm.removeItem(at: tempURL) }`, nessun residuo trovato in `$TMPDIR` dopo il check). Badge di Revisione (#20) già confermato in una sessione precedente (2026-08-16).
 
-- Non eseguibile in ambiente headless, serve l'app in mano con volumi montati: controllo visivo della sezione "Revisione" in Tools, funzionamento reale di `runIntegritySample` su Mac↔SSD/SSD↔HDD/SSD↔S3, conferma che i file temporanei scaricati da S3 per il confronto vengano effettivamente cancellati.
-- **Roadmap #20, badge di Revisione**: aprire l'app con un problema di configurazione noto (es. `rclone.conf` con permessi troppo aperti, o deep mirror SSD→HDD non eseguito da >45 giorni) e verificare che il pallino compaia sulla voce "Tools" aprendo il menu hamburger; verificare che sparisca al riavvio successivo se il problema è stato risolto nel frattempo.
+**Verifiche manuali ancora pendenti**, in stand-by su richiesta esplicita di Enrico (2026-08-23) — vedi memoria di progetto: test TCC/formattazione reale per #28 (`Docs/superpowers/plans/2026-08-17-setup-guide-formatting.md`, Task 4 Step 5) e per #29/Immich (`Docs/superpowers/plans/2026-08-17-immich-integration.md`, Task 5 Step 4), verifica upload S3 reale con Monitor Attività, conferma Touch ID reale.
 
 ---
 
