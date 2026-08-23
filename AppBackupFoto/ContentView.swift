@@ -2753,6 +2753,289 @@ final class VolumeMonitor: ObservableObject {
     }
 }
 
+// MARK: - DiskFormatter (roadmap #28)
+
+/// Disco esterno fisico proposto per la preparazione di un disco nuovo.
+struct CandidateDisk: Identifiable {
+    var id: String { identifier }
+    let identifier: String        // es. "disk4"
+    let name: String
+    let sizeBytes: Int64
+    let currentFilesystem: String
+}
+
+/// Elenca i dischi esterni fisici che **non** risultano già configurati come SSD o HDD di backup.
+///
+/// Qui si eseguono soltanto comandi di **sola lettura** (`diskutil list`, `diskutil info`): nessuna
+/// formattazione. Il vincolo del progetto "mai subprocess per accedere ai volumi esterni"
+/// (`Docs/CLAUDE.md`) riguarda la lettura/scrittura di *file* su un volume, che per TCC deve passare
+/// da bookmark + `FileManager`: `diskutil` non apre file sui volumi, interroga la topologia dei
+/// dischi tramite il servizio di sistema, e non esiste un'API pubblica Swift equivalente.
+enum DiskFormatter {
+    static let diskutilPath = "/usr/sbin/diskutil"
+    /// Un `diskutil` che non risponde non deve poter appendere per sempre il chiamante.
+    static let commandTimeout: TimeInterval = 20
+    static let sigkillGracePeriod: TimeInterval = 5
+
+    enum Failure: LocalizedError {
+        case launchFailed(command: String, underlying: Error)
+        case commandFailed(command: String, status: Int32, output: String)
+        case commandTimedOut(command: String)
+        case unreadableOutput(command: String)
+
+        var errorDescription: String? {
+            switch self {
+            case .launchFailed(let command, let underlying):
+                return "Impossibile eseguire `\(command)`: \(underlying.localizedDescription)"
+            case .commandFailed(let command, let status, let output):
+                return "`\(command)` è fallito (codice \(status))" + (output.isEmpty ? "" : ": \(output)")
+            case .commandTimedOut(let command):
+                return "`\(command)` non ha risposto entro \(Int(DiskFormatter.commandTimeout)) secondi"
+            case .unreadableOutput(let command):
+                return "Output di `\(command)` non interpretabile come plist"
+            }
+        }
+    }
+
+    /// Topologia dei dischi esterni, ricavata da `diskutil list -plist external`.
+    struct DiskTopology {
+        /// disco fisico intero (es. "disk4") → path attualmente montati che gli appartengono
+        var mountPaths: [String: [String]] = [:]
+        /// dischi fisici che ospitano un container APFS
+        var apfsHosts: Set<String> = []
+    }
+
+    // MARK: Elenco
+
+    /// **Da chiamare fuori dal main thread**: sono processi esterni, e nel caso peggiore possono
+    /// arrivare fino a `commandTimeout`. Verificato empiricamente il 2026-08-23 dentro il processo
+    /// dell'app: normalmente l'intero elenco costa ~0,4s, ma una volta — al primissimo `diskutil
+    /// info` mai eseguito da questo binario — il comando è rimasto appeso oltre 20s ed è stato
+    /// chiuso dal watchdog (non riproducibile nelle esecuzioni successive, ~0,1s ciascuna). Sul
+    /// main thread quella singola occorrenza sarebbe una finestra congelata.
+    static func listEligibleDisks() throws -> [CandidateDisk] {
+        let configured = configuredBackupPaths()
+
+        let physicalArguments = ["list", "-plist", "external", "physical"]
+        let physical = try plistDictionary(from: try runDiskutil(physicalArguments),
+                                           command: commandDescription(physicalArguments))
+        // Il secondo elenco è SENZA `physical` apposta: vedi topology(fromListPlist:).
+        let allArguments = ["list", "-plist", "external"]
+        let layout = topology(fromListPlist: try plistDictionary(from: try runDiskutil(allArguments),
+                                                                 command: commandDescription(allArguments)))
+
+        var disks: [CandidateDisk] = []
+        for entry in (physical["AllDisksAndPartitions"] as? [[String: Any]]) ?? [] {
+            guard let identifier = entry["DeviceIdentifier"] as? String else { continue }
+            guard isEligible(diskPaths: layout.mountPaths[identifier] ?? [],
+                             configuredPaths: configured) else { continue }
+            let info = try? plistDictionary(from: try runDiskutil(["info", "-plist", identifier]),
+                                            command: commandDescription(["info", "-plist", identifier]))
+            disks.append(CandidateDisk(
+                identifier: identifier,
+                name: displayName(fromInfoPlist: info ?? [:], identifier: identifier),
+                sizeBytes: (entry["Size"] as? NSNumber)?.int64Value ?? 0,
+                currentFilesystem: filesystemLabel(diskEntry: entry, identifier: identifier, topology: layout)))
+        }
+        return disks
+    }
+
+    /// Path risolti dei bookmark SSD/HDD: sono **questi** — non i nomi, che si possono cambiare —
+    /// a decidere quali dischi non vanno mai proposti per la formattazione.
+    static func configuredBackupPaths() -> [String] {
+        let urls = BookmarkManager.shared.urls
+        return [BookmarkManager.Location.ssd, .hdd].compactMap { urls[$0]?.path }
+    }
+
+    // MARK: Logica di esclusione (pura, testabile senza eseguire diskutil)
+
+    /// Un disco è candidabile solo se **nessuno** dei suoi path montati coincide con — o sta
+    /// dentro, o contiene — un path già configurato come SSD/HDD di backup.
+    static func isEligible(diskPaths: [String], configuredPaths: [String]) -> Bool {
+        for diskPath in diskPaths {
+            for configuredPath in configuredPaths where pathsOverlap(diskPath, configuredPath) {
+                return false
+            }
+        }
+        return true
+    }
+
+    /// Confronto sui componenti del path, mai su `hasPrefix`: "/Volumes/SSD" non deve risultare
+    /// genitore di "/Volumes/SSD - Enri". Il confronto è case-insensitive e su forma Unicode
+    /// precomposta perché lo stesso volume può presentarsi con maiuscole/composizione diverse
+    /// (ExFAT è case-insensitive, i filesystem Apple restituiscono spesso forma decomposta):
+    /// nel dubbio si esclude, mai il contrario.
+    static func pathsOverlap(_ a: String, _ b: String) -> Bool {
+        let first = normalizedComponents(a)
+        let second = normalizedComponents(b)
+        // Un path vuoto (un disco non montato riporta `MountPoint` = "") non è parente di niente.
+        guard !first.isEmpty, !second.isEmpty else { return false }
+        let shared = min(first.count, second.count)
+        return Array(first.prefix(shared)) == Array(second.prefix(shared))
+    }
+
+    static func normalizedComponents(_ path: String) -> [String] {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+        return (trimmed as NSString).standardizingPath
+            .split(separator: "/")
+            .map { $0.precomposedStringWithCanonicalMapping.lowercased() }
+    }
+
+    /// "disk4s2" → "disk4"; "disk3s1s1" → "disk3"; "disk4" → "disk4".
+    static func wholeDiskIdentifier(for identifier: String) -> String {
+        guard identifier.hasPrefix("disk") else { return identifier }
+        let digits = identifier.dropFirst("disk".count).prefix { $0.isNumber }
+        return digits.isEmpty ? identifier : "disk" + digits
+    }
+
+    /// Costruisce la mappa "disco fisico → path montati".
+    ///
+    /// Va costruita sull'output **senza** `physical`: verificato empiricamente il 2026-08-23 che
+    /// con `physical` i volumi APFS non compaiono affatto (il container APFS è un disco
+    /// *sintetizzato*, che `physical` filtra via, e la partizione `Apple_APFS` del disco fisico non
+    /// ha `MountPoint`). Un disco esterno formattato APFS — come `BackupHDD` — risulterebbe quindi
+    /// senza alcun path montato e passerebbe indisturbato il filtro di esclusione.
+    static func topology(fromListPlist plist: [String: Any]) -> DiskTopology {
+        var result = DiskTopology()
+
+        func add(_ disk: String, _ rawPath: Any?) {
+            guard let path = rawPath as? String,
+                  !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+            result.mountPaths[disk, default: []].append(path)
+        }
+
+        for entry in (plist["AllDisksAndPartitions"] as? [[String: Any]]) ?? [] {
+            // Un container APFS sintetizzato non è un disco fisico: i suoi volumi vanno attribuiti
+            // al disco che lo ospita davvero (APFSPhysicalStores → "disk4s2" → "disk4").
+            let stores = (entry["APFSPhysicalStores"] as? [[String: Any]])?
+                .compactMap { $0["DeviceIdentifier"] as? String } ?? []
+            let owners: [String]
+            if stores.isEmpty {
+                owners = (entry["DeviceIdentifier"] as? String).map { [wholeDiskIdentifier(for: $0)] } ?? []
+            } else {
+                owners = stores.map { wholeDiskIdentifier(for: $0) }
+                for owner in owners { result.apfsHosts.insert(owner) }
+            }
+            for owner in owners {
+                add(owner, entry["MountPoint"])
+                for partition in (entry["Partitions"] as? [[String: Any]]) ?? [] {
+                    add(owner, partition["MountPoint"])
+                }
+                for volume in (entry["APFSVolumes"] as? [[String: Any]]) ?? [] {
+                    add(owner, volume["MountPoint"])
+                }
+            }
+        }
+        return result
+    }
+
+    /// Contenuti di partizione che non rappresentano il filesystem "utile" del disco: `diskutil
+    /// info` su una EFI risponde `FilesystemName` = "MS-DOS FAT32", e senza questo filtro un disco
+    /// APFS o ExFAT verrebbe etichettato FAT32.
+    static let auxiliaryPartitionContents: Set<String> = [
+        "EFI", "Apple_Boot", "Apple_APFS_ISC", "Apple_APFS_Recovery",
+        "Apple_partition_map", "Microsoft Reserved"
+    ]
+
+    static func dataPartitionIdentifiers(inDiskEntry entry: [String: Any]) -> [String] {
+        ((entry["Partitions"] as? [[String: Any]]) ?? []).compactMap { partition in
+            guard let identifier = partition["DeviceIdentifier"] as? String else { return nil }
+            let content = (partition["Content"] as? String) ?? ""
+            return auxiliaryPartitionContents.contains(content) ? nil : identifier
+        }
+    }
+
+    /// Nome mostrato all'utente: quello dell'**hardware** (`MediaName`, es. "PSSD T7"), non quello
+    /// del volume — un disco nuovo da formattare spesso non ha alcun volume montato, e nel passo di
+    /// conferma è questo nome che l'utente deve ridigitare.
+    static func displayName(fromInfoPlist info: [String: Any], identifier: String) -> String {
+        for key in ["MediaName", "IORegistryEntryName", "VolumeName"] {
+            if let value = (info[key] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !value.isEmpty {
+                return value
+            }
+        }
+        return identifier
+    }
+
+    /// Etichetta del filesystem attuale. Deliberatamente **non** si usa `Content` della partizione:
+    /// verificato empiricamente il 2026-08-23 che un volume ExFAT reale ("SSD - Enri") ha
+    /// `Content` = "Windows_NTFS" (il tipo MBR 0x07 copre sia NTFS sia ExFAT), mentre `diskutil
+    /// info` sulla stessa partizione riporta `FilesystemName` = "ExFAT".
+    static func filesystemLabel(diskEntry: [String: Any], identifier: String, topology: DiskTopology) -> String {
+        if topology.apfsHosts.contains(identifier) { return "APFS" }
+        for partition in dataPartitionIdentifiers(inDiskEntry: diskEntry) {
+            let arguments = ["info", "-plist", partition]
+            guard let data = try? runDiskutil(arguments),
+                  let info = try? plistDictionary(from: data, command: commandDescription(arguments)),
+                  let name = (info["FilesystemName"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !name.isEmpty else { continue }
+            return name
+        }
+        let hasPartitions = !(((diskEntry["Partitions"] as? [[String: Any]]) ?? []).isEmpty)
+        return hasPartitions ? "Sconosciuto" : "Non formattato"
+    }
+
+    // MARK: Esecuzione di diskutil
+
+    static func commandDescription(_ arguments: [String]) -> String {
+        (["diskutil"] + arguments).joined(separator: " ")
+    }
+
+    static func plistDictionary(from data: Data, command: String) throws -> [String: Any] {
+        guard let parsed = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil),
+              let dictionary = parsed as? [String: Any] else {
+            throw Failure.unreadableOutput(command: command)
+        }
+        return dictionary
+    }
+
+    /// Esegue `diskutil` e restituisce lo stdout grezzo. Sincrona di proposito: `list`/`info`
+    /// rispondono in decine di millisecondi e il loro output sta in pochi KB, ben sotto il buffer
+    /// della pipe (stdout viene comunque letto fino in fondo *prima* di `waitUntilExit`, così non
+    /// esiste il deadlock classico). Il watchdog termina il processo se non risponde.
+    static func runDiskutil(_ arguments: [String]) throws -> Data {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: diskutilPath)
+        process.arguments = arguments
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+
+        let command = commandDescription(arguments)
+        do {
+            try process.run()
+        } catch {
+            throw Failure.launchFailed(command: command, underlying: error)
+        }
+
+        // Flag one-shot condiviso tra watchdog e chiamante: chi arriva primo "vince".
+        let watchdog = ContinuationGuard()
+        DispatchQueue.global().asyncAfter(deadline: .now() + commandTimeout) {
+            guard process.isRunning, watchdog.claim() else { return }
+            process.terminate()
+            let pid = process.processIdentifier
+            DispatchQueue.global().asyncAfter(deadline: .now() + sigkillGracePeriod) {
+                if process.isRunning { kill(pid, SIGKILL) }
+            }
+        }
+
+        let output = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+        let errorText = String(data: stderrPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        process.waitUntilExit()
+
+        // Se `claim()` fallisce qui, il watchdog è già scattato: il processo è stato ucciso.
+        guard watchdog.claim() else { throw Failure.commandTimedOut(command: command) }
+        guard process.terminationStatus == 0 else {
+            throw Failure.commandFailed(command: command, status: process.terminationStatus,
+                                        output: errorText.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        return output
+    }
+}
+
 // MARK: - BackupRunner
 @MainActor
 final class BackupRunner: ObservableObject {

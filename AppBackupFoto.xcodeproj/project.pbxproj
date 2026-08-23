@@ -30,6 +30,7 @@
 		45A6E757F18B4077B03D1A90 /* ReviewEngineCatalogScanTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 439126F4971447F79AD91BAE /* ReviewEngineCatalogScanTests.swift */; };
 		00034BDF85EC40389491DD77 /* FilterCatalogEntriesTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6D9BE4DAD686422B9F8A78C9 /* FilterCatalogEntriesTests.swift */; };
 		4D9FB3F0B9FC4DD9A505052E /* FileKindIsImageTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E01BC49D9D8940B5B630B263 /* FileKindIsImageTests.swift */; };
+		A47F1B93C6D24E17BA0155D2 /* DiskFormatterEligibilityTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D15C0A28E4B14F0FB7A93C10 /* DiskFormatterEligibilityTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -58,6 +59,7 @@
 		8C016CC3A88A448190FFF793 /* AdaptiveLimiterTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = AdaptiveLimiterTests.swift; sourceTree = "<group>"; };
 		05DF2C8E2DAFF230D56A7405 /* ValidateEndpointTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ValidateEndpointTests.swift; sourceTree = "<group>"; };
 		490DC0213F7C42429174F118 /* ImmichComposeFileTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ImmichComposeFileTests.swift; sourceTree = "<group>"; };
+		D15C0A28E4B14F0FB7A93C10 /* DiskFormatterEligibilityTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = DiskFormatterEligibilityTests.swift; sourceTree = "<group>"; };
 		20046092572858D18FAAFDDB /* ReviewEngineDeepMirrorFreshnessTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ReviewEngineDeepMirrorFreshnessTests.swift; sourceTree = "<group>"; };
 		51940FAD04DD64F802E07C9A /* FileSyncerPreviewBytesTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = FileSyncerPreviewBytesTests.swift; sourceTree = "<group>"; };
 		56FD3AB1B5F24D8EA79FEFB3 /* S3SyncerCatalogParsingTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = S3SyncerCatalogParsingTests.swift; sourceTree = "<group>"; };
@@ -131,6 +133,7 @@
 				B67C5C0F95764B2981313525 /* S3SyncerChangedKeyTests.swift */,
 				E01BC49D9D8940B5B630B263 /* FileKindIsImageTests.swift */,
 				490DC0213F7C42429174F118 /* ImmichComposeFileTests.swift */,
+				D15C0A28E4B14F0FB7A93C10 /* DiskFormatterEligibilityTests.swift */,
 			);
 			name = AppBackupFotoTests;
 			path = AppBackupFotoTests;
@@ -288,6 +291,7 @@
 				34FFD73F7D614F9B912BFEDE /* FileSyncerChangedSkippedTests.swift in Sources */,
 				DF486EABC8F34CBDAC7A7910 /* S3SyncerChangedKeyTests.swift in Sources */,
 				4D9FB3F0B9FC4DD9A505052E /* FileKindIsImageTests.swift in Sources */,
+				A47F1B93C6D24E17BA0155D2 /* DiskFormatterEligibilityTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
