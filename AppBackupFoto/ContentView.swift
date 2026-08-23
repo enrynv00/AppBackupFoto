@@ -5659,6 +5659,13 @@ struct ToolsSheet: View {
         VStack(alignment: .leading, spacing: AppSpacing.lg) {
             Text("Diagnostica").font(AppFont.title)
 
+            // Bug reale trovato da Enrico (2026-08-23): senza ScrollView, il contenuto (in
+            // particolare "Revisione", che cresce con findings/upload incompleti) poteva superare
+            // l'altezza della finestra — nessun modo di scorrere, testo in basso tagliato via
+            // sotto il bordo dello schermo. Titolo e bottone "Chiudi" restano fissi fuori dallo
+            // ScrollView, solo le card scorrono.
+            ScrollView {
+            VStack(alignment: .leading, spacing: AppSpacing.lg) {
             GroupBox("Cartelle Configurate") {
                 VStack(alignment: .leading, spacing: AppSpacing.sm) {
                     ForEach(BookmarkManager.Location.allCases) { loc in
@@ -5864,6 +5871,8 @@ struct ToolsSheet: View {
                     }
                 }.padding(4)
             }
+            } // fine VStack interno allo ScrollView
+            } // fine ScrollView
 
             HStack {
                 Spacer()
