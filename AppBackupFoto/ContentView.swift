@@ -1548,6 +1548,67 @@ enum IndexableKind {
     }
 }
 
+/// Esito della valutazione di attendibilita' di una entry dell'indice.
+enum IndexEntryVerdict {
+    /// La entry e' attendibile: l'hash memorizzato vale.
+    case fresh
+    /// Il file e' certamente cambiato: rihashare.
+    case stale
+    /// Non possiamo escludere un cambiamento: rihashare prima di fidarci in un
+    /// percorso ad alto danno (skip in import); accettabile fidarsi in segnalazione.
+    case needsVerification
+    /// L'mtime e' spostato di esattamente un'ora (o mezz'ora) e la dimensione e'
+    /// identica: quasi certamente un cambio di fuso su ExFAT, non una modifica.
+    /// Lo scanner adotta il nuovo mtime SENZA rihashare.
+    ///
+    /// Verdetto SEPARATO da `.needsVerification` di proposito. Quando i due erano
+    /// lo stesso caso, la regola DST non faceva assolutamente nulla — entrambi
+    /// portavano al rehash — e quindi non evitava affatto il "rihash dell'intera
+    /// libreria due volte l'anno" che la spec le attribuisce come unico scopo.
+    /// Trovato dal Critic il 2026-08-25.
+    case timezoneShift
+}
+
+/// Decide se l'hash memorizzato per un file e' ancora attendibile.
+///
+/// La chiave (percorso, dimensione, mtime) NON e' una garanzia: `mtime` e' riscrivibile
+/// da userspace (exiftool, `rsync -t`, restore da Finder). restic e borg si irrobustiscono
+/// con inode e ctime, ma su ExFAT — il filesystem dell'SSD — l'inode non e' stabile
+/// (documentato da Apple DTS) e quel rinforzo non e' disponibile. Da qui le due difese:
+///
+/// 1. **Regola anti-racy**, presa da git e borg: se il file risulta modificato entro
+///    `racyMarginSeconds` da quando ne abbiamo calcolato l'hash, non possiamo escludere
+///    che sia cambiato subito dopo la lettura mantenendo lo stesso mtime.
+///    Margine 2s e non 10ms: la granularita' misurata su macOS/ExFAT e' 10ms, ma la
+///    spec ExFAT prevede 2 secondi e un'altra implementazione potrebbe esporli.
+/// 2. **Tolleranza DST**: ExFAT memorizza i timestamp in ora locale, e uno studio forense
+///    (DFRWS 2022) documenta divergenze fra implementazioni, macOS inclusa. Uno shift
+///    esatto di 3600s o 1800s e' quasi certamente un cambio di fuso, non una modifica:
+///    trattarlo come `stale` farebbe rihashare l'intera libreria due volte l'anno.
+///    NOTA: questa seconda regola non ha prior art — e' una scelta di questo progetto.
+func indexEntryVerdict(storedSize: Int64,
+                       storedMTime: Double,
+                       storedHashedAt: Double,
+                       currentSize: Int64,
+                       currentMTime: Double,
+                       racyMarginSeconds: Double = 2.0) -> IndexEntryVerdict {
+    // La dimensione ha sempre la precedenza: se cambia, il file e' cambiato.
+    guard storedSize == currentSize else { return .stale }
+
+    let delta = abs(currentMTime - storedMTime)
+    // Tolleranza sulla granularita' ExFAT (10ms), con margine.
+    let granularity = 0.05
+
+    if delta <= granularity {
+        // mtime invariato: resta solo il dubbio racy.
+        return currentMTime >= storedHashedAt - racyMarginSeconds ? .needsVerification : .fresh
+    }
+    if abs(delta - 3600) <= granularity || abs(delta - 1800) <= granularity {
+        return .timezoneShift
+    }
+    return .stale
+}
+
 func sha256(of url: URL) -> String? {
     // I/O POSIX a basso livello (open/read/close) invece di FileHandle.readData(ofLength:):
     // su file molto grandi (decine di GB), FileHandle/NSData tende a mantenere le pagine

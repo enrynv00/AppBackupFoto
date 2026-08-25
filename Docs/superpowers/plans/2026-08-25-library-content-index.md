@@ -189,7 +189,7 @@ Va prima dello store e dello scanner perché è la regola che entrambi consumano
 - Produce: `func indexEntryVerdict(storedSize: Int64, storedMTime: Double, storedHashedAt: Double, currentSize: Int64, currentMTime: Double, racyMarginSeconds: Double = 2.0) -> IndexEntryVerdict`
 - Consumato da: Task 4 (`LibraryIndexer`, aggiornamento incrementale) e Task 6 (dedup in import).
 
-- [ ] **Step 1: Scrivi il file di test**
+- [x] **Step 1: Scrivi il file di test**
 
 Crea `AppBackupFotoTests/IndexEntryVerdictTests.swift`:
 
@@ -279,16 +279,16 @@ final class IndexEntryVerdictTests: XCTestCase {
 }
 ```
 
-- [ ] **Step 2: Registra il file di test in `project.pbxproj`**
+- [x] **Step 2: Registra il file di test in `project.pbxproj`**
 
 Stessa procedura del Task 1 Step 2, con nome `IndexEntryVerdictTests.swift` e due ID nuovi generati con `uuidgen`.
 
-- [ ] **Step 3: Verifica il fallimento atteso**
+- [x] **Step 3: Verifica il fallimento atteso**
 
 Run: `xcodebuild -project AppBackupFoto.xcodeproj -scheme AppBackupFoto -destination 'platform=macOS' test -only-testing:AppBackupFotoTests/IndexEntryVerdictTests 2>&1 | tail -30`
 Expected: FAIL con `cannot find 'indexEntryVerdict' in scope`.
 
-- [ ] **Step 4: Implementa**
+- [x] **Step 4: Implementa**
 
 ```swift
 /// Esito della valutazione di attendibilita' di una entry dell'indice.
@@ -353,12 +353,12 @@ func indexEntryVerdict(storedSize: Int64,
 }
 ```
 
-- [ ] **Step 5: Verifica che i test passino**
+- [x] **Step 5: Verifica che i test passino**
 
 Run: `xcodebuild -project AppBackupFoto.xcodeproj -scheme AppBackupFoto -destination 'platform=macOS' test -only-testing:AppBackupFotoTests/IndexEntryVerdictTests 2>&1 | tail -20`
 Expected: `Executed 13 tests, with 0 failures`
 
-- [ ] **Step 6: Build, suite completa, commit**
+- [x] **Step 6: Build, suite completa, commit**
 
 Expected suite: **200 test** (187 + 13).
 
