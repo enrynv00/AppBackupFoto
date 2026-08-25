@@ -35,7 +35,7 @@ Sessione di grilling su questo piano **dopo** l'approvazione di spec e piano, pr
 - Build: `xcodebuild -project AppBackupFoto.xcodeproj -scheme AppBackupFoto -configuration Debug build`
 - Test: `xcodebuild -project AppBackupFoto.xcodeproj -scheme AppBackupFoto -destination 'platform=macOS' test`
 - **Il target `AppBackupFotoTests` non è file-system-synchronized**: ogni nuovo file di test va registrato a mano in `AppBackupFoto.xcodeproj/project.pbxproj` in 4 punti (`PBXBuildFile`, `PBXFileReference`, gruppo `AppBackupFotoTests`, `PBXSourcesBuildPhase`). Altrimenti compila ma non viene eseguito, e i test "passano" solo perché non girano. **Verificare sempre il conteggio totale atteso**, mai fidarsi del solo `** TEST SUCCEEDED **`.
-- **Baseline all'inizio di questo piano: 173 test verdi**, ultimo commit `037d028`.
+- **Baseline aggiornata: 187 test verdi** dopo il Task 1 e le correzioni post-review (ultimo commit `bd8751d`).
   (Era 162 su `c868cf4`. I due commit del 2026-08-25 nati dal grilling di questo piano
   hanno aggiunto 11 test: `79a4c2d` — nessuna etichetta di import puo' produrre una
   cartella nascosta, +6 — e `037d028` — `LibraryExclusions` come fonte unica, +5.)
@@ -185,7 +185,7 @@ Va prima dello store e dello scanner perché è la regola che entrambi consumano
 - Modify: `AppBackupFoto.xcodeproj/project.pbxproj`
 
 **Interfaces:**
-- Produce: `enum IndexEntryVerdict { case fresh, stale, needsVerification }`
+- Produce: `enum IndexEntryVerdict { case fresh, stale, needsVerification, timezoneShift }`
 - Produce: `func indexEntryVerdict(storedSize: Int64, storedMTime: Double, storedHashedAt: Double, currentSize: Int64, currentMTime: Double, racyMarginSeconds: Double = 2.0) -> IndexEntryVerdict`
 - Consumato da: Task 4 (`LibraryIndexer`, aggiornamento incrementale) e Task 6 (dedup in import).
 
@@ -242,25 +242,33 @@ final class IndexEntryVerdictTests: XCTestCase {
     // Tolleranza DST: uno shift esatto di un'ora (o mezz'ora, per i fusi a offset :30)
     // e' quasi certamente un cambio di fuso su ExFAT, non una modifica del file.
     // Non invalidare in blocco: riverificare.
-    func testDstShiftForward_needsVerification() {
-        XCTAssertEqual(verdict(mtime: mtime + 3600), .needsVerification)
+    func testDstShiftForward_isTimezoneShift() {
+        XCTAssertEqual(verdict(mtime: mtime + 3600), .timezoneShift)
     }
 
-    func testDstShiftBackward_needsVerification() {
-        XCTAssertEqual(verdict(mtime: mtime - 3600), .needsVerification)
+    func testDstShiftBackward_isTimezoneShift() {
+        XCTAssertEqual(verdict(mtime: mtime - 3600), .timezoneShift)
     }
 
-    func testHalfHourShift_needsVerification() {
-        XCTAssertEqual(verdict(mtime: mtime + 1800), .needsVerification)
+    func testHalfHourShift_isTimezoneShift() {
+        XCTAssertEqual(verdict(mtime: mtime + 1800), .timezoneShift)
     }
 
-    func testShiftWithin10msGranularityOfDst_needsVerification() {
+    func testShiftWithin10msGranularityOfDst_isTimezoneShift() {
         // ExFAT ha granularita' 10ms: uno shift DST puo' non essere esatto al microsecondo.
-        XCTAssertEqual(verdict(mtime: mtime + 3600.01), .needsVerification)
+        XCTAssertEqual(verdict(mtime: mtime + 3600.01), .timezoneShift)
     }
 
     func testNearlyButNotDstShift_isStale() {
         XCTAssertEqual(verdict(mtime: mtime + 3500), .stale)
+    }
+
+    // Il verdetto DST deve restare DISTINTO da needsVerification: se collassassero,
+    // la regola tornerebbe a non fare nulla (entrambi -> rehash) e il rihash
+    // semestrale dell'intera libreria tornerebbe.
+    func testTimezoneShiftIsNotNeedsVerification() {
+        XCTAssertNotEqual(verdict(mtime: mtime + 3600), .needsVerification)
+        XCTAssertEqual(verdict(hashedAt: mtime + 1.0), .needsVerification)
     }
 
     // La dimensione ha la precedenza: se e' cambiata, il file e' cambiato, punto.
@@ -292,6 +300,16 @@ enum IndexEntryVerdict {
     /// Non possiamo escludere un cambiamento: rihashare prima di fidarci in un
     /// percorso ad alto danno (skip in import); accettabile fidarsi in segnalazione.
     case needsVerification
+    /// L'mtime e' spostato di esattamente un'ora (o mezz'ora) e la dimensione e'
+    /// identica: quasi certamente un cambio di fuso su ExFAT, non una modifica.
+    /// Lo scanner adotta il nuovo mtime SENZA rihashare.
+    ///
+    /// Verdetto SEPARATO da `.needsVerification` di proposito. Quando i due erano
+    /// lo stesso caso, la regola DST non faceva assolutamente nulla — entrambi
+    /// portavano al rehash — e quindi non evitava affatto il "rihash dell'intera
+    /// libreria due volte l'anno" che la spec le attribuisce come unico scopo.
+    /// Trovato dal Critic il 2026-08-25.
+    case timezoneShift
 }
 
 /// Decide se l'hash memorizzato per un file e' ancora attendibile.
@@ -329,7 +347,7 @@ func indexEntryVerdict(storedSize: Int64,
         return currentMTime >= storedHashedAt - racyMarginSeconds ? .needsVerification : .fresh
     }
     if abs(delta - 3600) <= granularity || abs(delta - 1800) <= granularity {
-        return .needsVerification
+        return .timezoneShift
     }
     return .stale
 }
@@ -338,11 +356,11 @@ func indexEntryVerdict(storedSize: Int64,
 - [ ] **Step 5: Verifica che i test passino**
 
 Run: `xcodebuild -project AppBackupFoto.xcodeproj -scheme AppBackupFoto -destination 'platform=macOS' test -only-testing:AppBackupFotoTests/IndexEntryVerdictTests 2>&1 | tail -20`
-Expected: `Executed 12 tests, with 0 failures`
+Expected: `Executed 13 tests, with 0 failures`
 
 - [ ] **Step 6: Build, suite completa, commit**
 
-Expected suite: **197 test** (185 + 12).
+Expected suite: **200 test** (187 + 13).
 
 ```bash
 git add AppBackupFoto/ContentView.swift AppBackupFotoTests/IndexEntryVerdictTests.swift AppBackupFoto.xcodeproj/project.pbxproj
@@ -757,7 +775,7 @@ Expected: `Executed 13 tests, with 0 failures`
 
 - [ ] **Step 7: Build, suite completa, commit**
 
-Expected suite: **210 test** (197 + 13).
+Expected suite: **213 test** (200 + 13).
 
 ```bash
 git add AppBackupFoto/ContentView.swift AppBackupFotoTests/LibraryIndexStoreTests.swift AppBackupFoto.xcodeproj/project.pbxproj
@@ -960,6 +978,58 @@ final class LibraryIndexerTests: XCTestCase {
         XCTAssertEqual(try store.count(), 5)
     }
 
+    // La guardia non deve scattare in silenzio: il numero va riportato, altrimenti
+    // dopo una riorganizzazione legittima scatterebbe a ogni avvio senza che nessuno
+    // se ne accorga.
+    func testPlausibilityGuard_reportsWhatItKept() throws {
+        for i in 0..<10 { try makeFile("Foto/f\(i).jpg", contents: "c\(i)") }
+        _ = try indexer.scan(root: root)
+        for i in 0..<8 {
+            try FileManager.default.removeItem(at: root.appendingPathComponent("Foto/f\(i).jpg"))
+        }
+        let p = try indexer.scan(root: root)
+        XCTAssertEqual(p.vanishedKept, 8, "la guardia deve dire QUANTE entry ha tenuto")
+        XCTAssertEqual(try store.count(), 10)
+    }
+
+    func testPlausibilityGuard_reportsZeroWhenItDoesNotTrip() throws {
+        for i in 0..<10 { try makeFile("Foto/f\(i).jpg", contents: "c\(i)") }
+        _ = try indexer.scan(root: root)
+        try FileManager.default.removeItem(at: root.appendingPathComponent("Foto/f0.jpg"))
+        let p = try indexer.scan(root: root)
+        XCTAssertEqual(p.vanishedKept, 0)
+        XCTAssertEqual(try store.count(), 9)
+    }
+
+    // Cambio di fuso: l'mtime si sposta di un'ora esatta ma il contenuto no.
+    // Deve adottare il nuovo mtime SENZA rihashare — e' l'unico effetto reale
+    // della regola DST, senza il quale rihasheremmo tutto due volte l'anno.
+    func testTimezoneShift_adoptsMTimeWithoutRehashing() throws {
+        let url = try makeFile("Foto/a.jpg", contents: "contenuto")
+        _ = try indexer.scan(root: root)
+        let before = try store.entry(forKey: normalizedIndexKey("Foto/a.jpg"))!
+
+        // Sposta SOLO l'mtime di un'ora esatta, lasciando il contenuto intatto.
+        let shifted = Date(timeIntervalSince1970: before.mtime + 3600)
+        try FileManager.default.setAttributes([.modificationDate: shifted],
+                                              ofItemAtPath: url.path)
+
+        let p = try indexer.scan(root: root)
+        XCTAssertEqual(p.hashed, 0, "un cambio di fuso non deve far rihashare")
+        XCTAssertEqual(p.rebasedByTimezone, 1)
+
+        let after = try store.entry(forKey: normalizedIndexKey("Foto/a.jpg"))!
+        XCTAssertEqual(after.hash, before.hash, "l'hash resta quello gia' calcolato")
+        XCTAssertEqual(after.mtime, before.mtime + 3600, accuracy: 0.05,
+                       "il nuovo mtime va adottato, altrimenti si ricade qui a ogni scansione")
+
+        // La scansione successiva deve trovarlo .fresh: se l'mtime non fosse stato
+        // adottato, ogni scansione ripeterebbe il rebase all'infinito.
+        let third = try indexer.scan(root: root)
+        XCTAssertEqual(third.rebasedByTimezone, 0)
+        XCTAssertEqual(third.skipped, 1)
+    }
+
     // La via d'uscita: dopo una cancellazione massiccia VERA, la "Ricostruzione
     // completa" scavalca la guardia e ripulisce le entry fantasma.
     func testFullRebuild_bypassesPlausibilityGuard() throws {
@@ -1029,6 +1099,19 @@ final class LibraryIndexer {
         var skipped = 0     // file gia' indicizzati e ancora attendibili
         var errors = 0      // file non indicizzabili per errore di lettura
         var total = 0       // entry totali nell'indice a fine scansione
+
+        /// Entry che risultano sparite dal disco ma che NON sono state rimosse,
+        /// perche' la guardia di plausibilita' ha giudicato sospetta la sparizione.
+        /// 0 = guardia non scattata. **Va mostrato all'utente** (Task 6): una guardia
+        /// che scatta in silenzio e' la stessa classe di problema che questo progetto
+        /// teme di piu'. Dopo una riorganizzazione legittima della libreria scatterebbe
+        /// a ogni avvio, per sempre, senza che nessuno se ne accorga.
+        var vanishedKept = 0
+
+        /// File il cui mtime e' risultato spostato di un'ora esatta (cambio di fuso):
+        /// mtime adottato SENZA rihashare. E' il risparmio che la regola DST esiste
+        /// per ottenere.
+        var rebasedByTimezone = 0
     }
 
     private let store: LibraryIndexStore
@@ -1128,6 +1211,30 @@ final class LibraryIndexer {
                     progress.skipped += 1
                     continue
                 }
+                if verdict == .timezoneShift {
+                    // Cambio di fuso, non modifica del file: adotta il nuovo mtime e
+                    // TIENI l'hash. E' l'unico punto in cui la regola DST produce un
+                    // effetto reale — senza questo ramo rihasheremmo l'intera libreria
+                    // due volte l'anno, cioe' esattamente cio' che la spec dice di
+                    // voler evitare.
+                    //
+                    // Sicuro perche' il rischio e' confinato al percorso a BASSO danno
+                    // (ADR-0003): perche' sia un errore servirebbe un file cambiato,
+                    // di dimensione identica, con mtime spostato di 3600s +/- 50ms. E
+                    // anche in quel caso l'import rilegge e rihasha il candidato prima
+                    // di saltarlo, quindi nessuna foto verrebbe persa: al massimo una
+                    // riga sbagliata nel pannello Doppioni.
+                    batch.append(LibraryIndexEntry(path: key, displayPath: relative,
+                                                   size: size, mtime: mtime,
+                                                   hash: existing.hash,
+                                                   hashedAt: existing.hashedAt))
+                    progress.rebasedByTimezone += 1
+                    if batch.count >= batchSize {
+                        try store.upsert(batch)
+                        batch.removeAll(keepingCapacity: true)
+                    }
+                    continue
+                }
                 // .stale e .needsVerification portano entrambi al rehash: durante la
                 // scansione conviene sempre risolvere il dubbio, il costo e' lo stesso.
             }
@@ -1208,8 +1315,13 @@ final class LibraryIndexer {
             || knownKeys.isEmpty
             || vanished.count * 2 <= knownKeys.count
 
-        if scanWasComplete && !vanished.isEmpty && plausible {
-            try store.remove(keys: Array(vanished))
+        if scanWasComplete && !vanished.isEmpty {
+            if plausible {
+                try store.remove(keys: Array(vanished))
+            } else {
+                // NON in silenzio: il Task 6 mostra questo numero all'utente.
+                progress.vanishedKept = vanished.count
+            }
         }
 
         progress.total = try store.count()
@@ -1224,11 +1336,11 @@ final class LibraryIndexer {
 - [ ] **Step 5: Verifica che i test passino**
 
 Run: `xcodebuild -project AppBackupFoto.xcodeproj -scheme AppBackupFoto -destination 'platform=macOS' test -only-testing:AppBackupFotoTests/LibraryIndexerTests 2>&1 | tail -20`
-Expected: `Executed 16 tests, with 0 failures`
+Expected: `Executed 19 tests, with 0 failures`
 
 - [ ] **Step 6: Build, suite completa, commit**
 
-Expected suite: **226 test** (210 + 16).
+Expected suite: **232 test** (213 + 19).
 
 ```bash
 git add AppBackupFoto/ContentView.swift AppBackupFotoTests/LibraryIndexerTests.swift AppBackupFoto.xcodeproj/project.pbxproj
@@ -1368,7 +1480,7 @@ In `CompletionSheet`, accanto alla riga condizionale già esistente per `changed
 xcodebuild -project AppBackupFoto.xcodeproj -scheme AppBackupFoto -configuration Debug build 2>&1 | tail -10
 xcodebuild -project AppBackupFoto.xcodeproj -scheme AppBackupFoto -destination 'platform=macOS' test 2>&1 | tail -15
 ```
-Expected: `** BUILD SUCCEEDED **`, **226 test invariati** (questo task non ne aggiunge: è wiring su percorsi con I/O reale, come `runMacToSSD` e gli altri job che non hanno XCTest diretti). Il criterio è **nessuna regressione**: in particolare i test di `FileSyncerZeroOverwriteTests` e `FileSyncerChangedSkippedTests` devono restare verdi, a prova che il default no-op non ha alterato il comportamento dei flussi esistenti.
+Expected: `** BUILD SUCCEEDED **`, **232 test invariati** (questo task non ne aggiunge: è wiring su percorsi con I/O reale, come `runMacToSSD` e gli altri job che non hanno XCTest diretti). Il criterio è **nessuna regressione**: in particolare i test di `FileSyncerZeroOverwriteTests` e `FileSyncerChangedSkippedTests` devono restare verdi, a prova che il default no-op non ha alterato il comportamento dei flussi esistenti.
 
 - [ ] **Step 6: Commit**
 
@@ -1447,7 +1559,15 @@ Aggiungi anche l'osservatore di smontaggio, così una scansione in corso si ferm
 
 - [ ] **Step 2: Card "Indice libreria" in `ToolsSheet`**
 
-Nella `ScrollView` del pannello Revisione, accanto alle card esistenti, aggiungi una card con: numero di file indicizzati (`try? runner.libraryIndexStore?.count()`), bottone "Costruisci indice" / "Aggiorna indice", bottone "Interrompi" visibile solo durante la scansione, e la `Progress` corrente (file esaminati / hashati / saltati). Prima di avviare una costruzione completa, mostra un `SimpleAlert` di conferma che spieghi che l'operazione legge per intero ogni foto e video dell'SSD e può richiedere diversi minuti.
+Nella `ScrollView` del pannello Revisione, accanto alle card esistenti, aggiungi una card con: numero di file indicizzati (`try? runner.libraryIndexStore?.count()`), bottone "Costruisci indice" / "Aggiorna indice", bottone "Interrompi" visibile solo durante la scansione, e la `Progress` corrente (file esaminati / hashati / saltati).
+
+**Obbligatorio, non decorativo — se `indexProgress?.vanishedKept ?? 0 > 0`, mostra una riga di avviso** con il tono degli altri finding di Revisione:
+
+> ⚠️ N file risultano spariti in blocco e **non** sono stati rimossi dall'indice. Se hai riorganizzato la libreria, usa **Ricostruzione completa** per ripulirlo.
+
+Senza questa riga la guardia di plausibilita' scatta in silenzio, e dopo una riorganizzazione legittima della libreria continuerebbe a scattare **a ogni avvio, per sempre**, senza che l'utente abbia modo di saperlo se non notando risultati strani nel pannello Doppioni. E' la stessa classe di problema — comportamento silenzioso su dati che l'utente crede protetti — che il progetto tratta come la peggiore.
+
+Se `indexProgress?.rebasedByTimezone ?? 0 > 0`, basta invece una riga informativa neutra ("N file riallineati dopo un cambio di fuso orario"): non e' un problema, e' la regola DST che fa il suo lavoro. Prima di avviare una costruzione completa, mostra un `SimpleAlert` di conferma che spieghi che l'operazione legge per intero ogni foto e video dell'SSD e può richiedere diversi minuti.
 
 - [ ] **Step 3: Toggle in `SettingsSheet`**
 
@@ -1463,7 +1583,7 @@ In `ContentView`, accanto all'`.onChange(of: volumes.ssdMounted)` già esistente
 
 - [ ] **Step 5: Build, suite completa, verifica manuale**
 
-Expected: `** BUILD SUCCEEDED **`, 226 test invariati.
+Expected: `** BUILD SUCCEEDED **`, 232 test invariati.
 
 Verifica manuale (richiede SSD collegato, quindi **a carico di Enrico**): aprire Diagnostica, vedere la card, avviare la costruzione, verificare che il progresso avanzi, interromperla e verificare che l'indice resti utilizzabile, riavviarla e verificare che riprenda senza rihashare ciò che era già stato fatto.
 
