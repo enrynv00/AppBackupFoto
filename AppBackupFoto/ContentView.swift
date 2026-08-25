@@ -3,6 +3,7 @@ import Combine
 import AppKit
 import UserNotifications
 import UniformTypeIdentifiers
+import SQLite3
 import CryptoKit
 import Charts
 import ImageIO
@@ -1634,6 +1635,247 @@ func indexEntryVerdict(storedSize: Int64,
         return .timezoneShift
     }
     return .stale
+}
+
+// MARK: - LibraryIndexStore
+
+/// Una riga dell'indice di contenuto.
+struct LibraryIndexEntry {
+    /// Chiave normalizzata (NFC + minuscole), relativa alla root dell'SSD.
+    let path: String
+    /// Percorso come appare davvero su disco, per mostrarlo all'utente.
+    let displayPath: String
+    let size: Int64
+    /// mtime LETTO DALL'SSD, mai quello della sorgente originale: la copia
+    /// APFS -> ExFAT tronca a 10ms (misurato), quindi i due non coincidono mai.
+    let mtime: Double
+    let hash: String
+    /// Istante in cui l'hash e' stato calcolato — serve alla regola anti-racy.
+    let hashedAt: Double
+}
+
+/// Normalizza un percorso relativo per usarlo come chiave dell'indice.
+/// ExFAT e' case-insensitive/case-preserving e non normalizza l'Unicode; APFS preserva
+/// la normalizzazione originale. Senza questo passaggio lo stesso file potrebbe
+/// generare due entry distinte (NFC vs NFD, o maiuscole/minuscole diverse).
+func normalizedIndexKey(_ relativePath: String) -> String {
+    relativePath.precomposedStringWithCanonicalMapping.lowercased()
+}
+
+/// Persistenza SQLite dell'indice. Scelta su JSON monolitico perche' un aggiornamento
+/// incrementale costa O(log n) invece di riscrivere l'intero file, e perche' una
+/// corruzione degrada parzialmente invece di rendere tutto illeggibile.
+///
+/// NOTA DI DURABILITA': su macOS `fsync()` non garantisce la persistenza fisica e la
+/// SQLite di sistema puo' sostituire F_FULLFSYNC con F_BARRIERFSYNC. Conseguenza
+/// peggiore: perdere l'ultima transazione in caso di power loss. Accettato — l'indice
+/// e' una cache ricostruibile, mai una fonte di verita'.
+final class LibraryIndexStore {
+    static let schemaVersion = 1
+
+    enum StoreError: Error, LocalizedError {
+        case cannotOpen(String)
+        case sqlFailed(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .cannotOpen(let m): return "Impossibile aprire l'indice: \(m)"
+            case .sqlFailed(let m):  return "Errore nell'indice: \(m)"
+            }
+        }
+    }
+
+    private var db: OpaquePointer?
+
+    init(url: URL) throws {
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
+                                                withIntermediateDirectories: true)
+        guard sqlite3_open(url.path, &db) == SQLITE_OK, db != nil else {
+            let msg = db.map { String(cString: sqlite3_errmsg($0)) } ?? "sconosciuto"
+            sqlite3_close(db)
+            db = nil
+            throw StoreError.cannotOpen(msg)
+        }
+        try exec("PRAGMA journal_mode=WAL;")
+        try exec("PRAGMA foreign_keys=ON;")
+        try createSchemaIfNeeded()
+    }
+
+    deinit { sqlite3_close(db) }
+
+    private func exec(_ sql: String) throws {
+        var err: UnsafeMutablePointer<CChar>?
+        if sqlite3_exec(db, sql, nil, nil, &err) != SQLITE_OK {
+            let msg = err.map { String(cString: $0) } ?? "sconosciuto"
+            sqlite3_free(err)
+            throw StoreError.sqlFailed(msg)
+        }
+    }
+
+    private func createSchemaIfNeeded() throws {
+        // Un indice scritto da una versione futura/sconosciuta dello schema non va
+        // interpretato a caso: si riparte da zero. L'indice e' una cache, buttarlo
+        // non perde nulla di originale.
+        if let existing = try schemaVersionOnDisk(), existing != Self.schemaVersion {
+            try exec("DROP TABLE IF EXISTS entries; DROP TABLE IF EXISTS meta;")
+        }
+        try exec("""
+        CREATE TABLE IF NOT EXISTS entries (
+            path         TEXT PRIMARY KEY,
+            display_path TEXT NOT NULL,
+            size         INTEGER NOT NULL,
+            mtime        REAL NOT NULL,
+            hash         TEXT NOT NULL,
+            hashed_at    REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_entries_hash ON entries(hash);
+        CREATE INDEX IF NOT EXISTS idx_entries_size ON entries(size);
+        CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        """)
+        try exec("INSERT OR IGNORE INTO meta(key,value) VALUES('schema_version','\(Self.schemaVersion)');")
+    }
+
+    /// Legge la versione dello schema, o nil se il database e' nuovo/vuoto.
+    private func schemaVersionOnDisk() throws -> Int? {
+        var check: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT name FROM sqlite_master WHERE type='table' AND name='meta';", -1, &check, nil) == SQLITE_OK else { return nil }
+        let hasMeta = sqlite3_step(check) == SQLITE_ROW
+        sqlite3_finalize(check)
+        guard hasMeta else { return nil }
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT value FROM meta WHERE key='schema_version';", -1, &stmt, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_step(stmt) == SQLITE_ROW, let text = sqlite3_column_text(stmt, 0) else { return nil }
+        return Int(String(cString: text))
+    }
+
+    /// Inserisce o sostituisce entry in una sola transazione: un batch e' atomico,
+    /// quindi un'interruzione lascia l'indice parziale ma coerente, mai a meta' riga.
+    func upsert(_ entries: [LibraryIndexEntry]) throws {
+        guard !entries.isEmpty else { return }
+        try exec("BEGIN TRANSACTION;")
+        do {
+            var stmt: OpaquePointer?
+            let sql = "INSERT OR REPLACE INTO entries(path,display_path,size,mtime,hash,hashed_at) VALUES(?,?,?,?,?,?);"
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                throw StoreError.sqlFailed(String(cString: sqlite3_errmsg(db)))
+            }
+            defer { sqlite3_finalize(stmt) }
+            let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+            for e in entries {
+                sqlite3_reset(stmt)
+                sqlite3_bind_text(stmt, 1, e.path, -1, transient)
+                sqlite3_bind_text(stmt, 2, e.displayPath, -1, transient)
+                sqlite3_bind_int64(stmt, 3, e.size)
+                sqlite3_bind_double(stmt, 4, e.mtime)
+                sqlite3_bind_text(stmt, 5, e.hash, -1, transient)
+                sqlite3_bind_double(stmt, 6, e.hashedAt)
+                guard sqlite3_step(stmt) == SQLITE_DONE else {
+                    throw StoreError.sqlFailed(String(cString: sqlite3_errmsg(db)))
+                }
+            }
+            try exec("COMMIT;")
+        } catch {
+            try? exec("ROLLBACK;")
+            throw error
+        }
+    }
+
+    private func readEntry(_ stmt: OpaquePointer?) -> LibraryIndexEntry {
+        LibraryIndexEntry(path: String(cString: sqlite3_column_text(stmt, 0)),
+                          displayPath: String(cString: sqlite3_column_text(stmt, 1)),
+                          size: sqlite3_column_int64(stmt, 2),
+                          mtime: sqlite3_column_double(stmt, 3),
+                          hash: String(cString: sqlite3_column_text(stmt, 4)),
+                          hashedAt: sqlite3_column_double(stmt, 5))
+    }
+
+    func entry(forKey key: String) throws -> LibraryIndexEntry? {
+        var stmt: OpaquePointer?
+        let sql = "SELECT path,display_path,size,mtime,hash,hashed_at FROM entries WHERE path=?;"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw StoreError.sqlFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, key, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        return sqlite3_step(stmt) == SQLITE_ROW ? readEntry(stmt) : nil
+    }
+
+    func entries(withHash hash: String) throws -> [LibraryIndexEntry] {
+        var stmt: OpaquePointer?
+        let sql = "SELECT path,display_path,size,mtime,hash,hashed_at FROM entries WHERE hash=?;"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw StoreError.sqlFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, hash, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        var out: [LibraryIndexEntry] = []
+        while sqlite3_step(stmt) == SQLITE_ROW { out.append(readEntry(stmt)) }
+        return out
+    }
+
+    /// Filtro dimensione-prima: se nessun file indicizzato ha questa dimensione,
+    /// il file in arrivo non va nemmeno hashato. E' lo stadio 1 del pipeline su cui
+    /// convergono rmlint, jdupes e rdfind.
+    func hasAnyEntry(withSize size: Int64) throws -> Bool {
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT 1 FROM entries WHERE size=? LIMIT 1;", -1, &stmt, nil) == SQLITE_OK else {
+            throw StoreError.sqlFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int64(stmt, 1, size)
+        return sqlite3_step(stmt) == SQLITE_ROW
+    }
+
+    func allKeys() throws -> Set<String> {
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT path FROM entries;", -1, &stmt, nil) == SQLITE_OK else {
+            throw StoreError.sqlFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+        var out = Set<String>()
+        while sqlite3_step(stmt) == SQLITE_ROW { out.insert(String(cString: sqlite3_column_text(stmt, 0))) }
+        return out
+    }
+
+    func remove(keys: [String]) throws {
+        guard !keys.isEmpty else { return }
+        try exec("BEGIN TRANSACTION;")
+        do {
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, "DELETE FROM entries WHERE path=?;", -1, &stmt, nil) == SQLITE_OK else {
+                throw StoreError.sqlFailed(String(cString: sqlite3_errmsg(db)))
+            }
+            defer { sqlite3_finalize(stmt) }
+            let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+            for k in keys {
+                sqlite3_reset(stmt)
+                sqlite3_bind_text(stmt, 1, k, -1, transient)
+                guard sqlite3_step(stmt) == SQLITE_DONE else {
+                    throw StoreError.sqlFailed(String(cString: sqlite3_errmsg(db)))
+                }
+            }
+            try exec("COMMIT;")
+        } catch {
+            try? exec("ROLLBACK;")
+            throw error
+        }
+    }
+
+    func count() throws -> Int {
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM entries;", -1, &stmt, nil) == SQLITE_OK else {
+            throw StoreError.sqlFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+        return sqlite3_step(stmt) == SQLITE_ROW ? Int(sqlite3_column_int64(stmt, 0)) : 0
+    }
+
+    /// Solo per i test: forza la versione dello schema per verificare il reset.
+    func setSchemaVersionForTesting(_ version: Int) throws {
+        try exec("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version','\(version)');")
+    }
 }
 
 func sha256(of url: URL) -> String? {

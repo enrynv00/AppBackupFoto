@@ -383,7 +383,7 @@ git commit -m "Add indexEntryVerdict trust logic with racy and DST rules (roadma
 - Produce: `final class LibraryIndexStore` con: `init(url: URL) throws`, `func upsert(_ entries: [LibraryIndexEntry]) throws`, `func entry(forKey key: String) throws -> LibraryIndexEntry?`, `func entries(withHash hash: String) throws -> [LibraryIndexEntry]`, `func hasAnyEntry(withSize size: Int64) throws -> Bool`, `func allKeys() throws -> Set<String>`, `func remove(keys: [String]) throws`, `func count() throws -> Int`, `static let schemaVersion = 1`
 - Consumato da: Task 4 e Task 6.
 
-- [ ] **Step 1: Scrivi il file di test**
+- [x] **Step 1: Scrivi il file di test**
 
 Crea `AppBackupFotoTests/LibraryIndexStoreTests.swift`:
 
@@ -506,16 +506,16 @@ final class LibraryIndexStoreTests: XCTestCase {
 }
 ```
 
-- [ ] **Step 2: Registra il file di test in `project.pbxproj`**
+- [x] **Step 2: Registra il file di test in `project.pbxproj`**
 
 Stessa procedura, nome `LibraryIndexStoreTests.swift`, due ID nuovi.
 
-- [ ] **Step 3: Verifica il fallimento atteso**
+- [x] **Step 3: Verifica il fallimento atteso**
 
 Run: `xcodebuild -project AppBackupFoto.xcodeproj -scheme AppBackupFoto -destination 'platform=macOS' test -only-testing:AppBackupFotoTests/LibraryIndexStoreTests 2>&1 | tail -30`
 Expected: FAIL con `cannot find 'LibraryIndexStore' in scope`.
 
-- [ ] **Step 4: Aggiungi l'import**
+- [x] **Step 4: Aggiungi l'import**
 
 In cima a `ContentView.swift`, accanto agli altri import (riga ~5, dove c'è già `import UniformTypeIdentifiers`):
 
@@ -525,7 +525,7 @@ import SQLite3
 
 Verificato: SQLite3 di sistema è 3.51.0 e `import SQLite3` funziona da Swift senza dipendenze esterne.
 
-- [ ] **Step 5: Implementa**
+- [x] **Step 5: Implementa**
 
 ```swift
 /// Una riga dell'indice di contenuto.
@@ -768,12 +768,12 @@ final class LibraryIndexStore {
 }
 ```
 
-- [ ] **Step 6: Verifica che i test passino**
+- [x] **Step 6: Verifica che i test passino**
 
 Run: `xcodebuild -project AppBackupFoto.xcodeproj -scheme AppBackupFoto -destination 'platform=macOS' test -only-testing:AppBackupFotoTests/LibraryIndexStoreTests 2>&1 | tail -20`
 Expected: `Executed 13 tests, with 0 failures`
 
-- [ ] **Step 7: Build, suite completa, commit**
+- [x] **Step 7: Build, suite completa, commit**
 
 Expected suite: **216 test** (203 + 13). La baseline e' 203, non 200: il Task 2 ne ha aggiunti 3 dopo il mutation test del code reviewer.
 
