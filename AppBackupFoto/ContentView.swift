@@ -1451,10 +1451,24 @@ func importFolderSlug(_ label: String) -> String {
     // Un nome che inizia per "." è una cartella nascosta, e tutto ciò che in questa
     // app enumera il filesystem passa da `.skipsHiddenFiles`: la cartella sarebbe
     // invisibile al backup SSD→HDD, alla sua anteprima, all'elenco cartelle e
-    // all'indice di contenuto. Si tolgono i punti iniziali (il ri-trim serve per
-    // etichette tipo ". Foto", dove tolto il punto resta uno spazio in testa).
-    cleaned = String(cleaned.drop(while: { $0 == "." }))
-        .trimmingCharacters(in: .whitespacesAndNewlines)
+    // all'indice di contenuto.
+    //
+    // Il ciclo è necessario, un solo passaggio NON basta: togliendo i punti resta
+    // spesso uno spazio in testa (". Foto"), e il trim che lo rimuove può riportare
+    // in testa il punto successivo. Con ". .EOS_DIGITAL" la versione a passaggio
+    // singolo produceva ".EOS_DIGITAL" — esattamente il caso che doveva impedire.
+    // Termina sempre: a ogni giro la stringa si accorcia o resta uguale, e in quel
+    // caso il ciclo esce.
+    //
+    // Il confronto è sugli scalari Unicode e non sui `Character` perché il
+    // filesystem guarda il primo byte: il grafema "." + accento combinante ha un
+    // primo `Character` diverso da "." ma primo byte 0x2E, quindi sarebbe nascosto.
+    var previous: String
+    repeat {
+        previous = cleaned
+        while cleaned.unicodeScalars.first == "." { cleaned.unicodeScalars.removeFirst() }
+        cleaned = cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
+    } while cleaned != previous
 
     if cleaned.isEmpty || cleaned.allSatisfy({ $0 == "." }) { return "Import" }
     return cleaned

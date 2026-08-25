@@ -147,11 +147,37 @@ final class ImportSourceGuardTests: XCTestCase {
         XCTAssertEqual(importFolderSlug("."), "Import")
     }
 
+    func testSlug_alternatingDotsAndSpaces_areFullyRemoved() {
+        // Regressione trovata in review sul commit `79a4c2d`. La prima versione del
+        // fix faceva UN solo passaggio (`drop(while:)` poi trim): con punto-spazio-punto
+        // il trim riportava in testa il punto successivo e nessuno lo toglieva più.
+        // ". .EOS_DIGITAL" produceva ".EOS_DIGITAL", cioè esattamente il caso che quel
+        // commit dichiarava di aver chiuso. Serve un ciclo fino al punto fisso.
+        XCTAssertEqual(importFolderSlug(". . Foto"), "Foto")
+        XCTAssertEqual(importFolderSlug(".. .Foto"), "Foto")
+        XCTAssertEqual(importFolderSlug(". .EOS_DIGITAL"), "EOS_DIGITAL")
+        XCTAssertEqual(importFolderSlug(". ..x"), "x")
+    }
+
+    func testSlug_onlyDotsAndSpaces_fallsBackToImport() {
+        // ". . ." non veniva salvato dal guard finale: `allSatisfy({ $0 == "." })`
+        // è falso appena c'è uno spazio in mezzo.
+        XCTAssertEqual(importFolderSlug(". . ."), "Import")
+        XCTAssertEqual(importFolderSlug(" .  .  . "), "Import")
+    }
+
     func testSlug_neverProducesHiddenFolderName() {
         // Proprietà generale: nessun input può produrre un nome nascosto.
-        for label in [".x", "..x", "...", ".", "..", "  .y  ", ". ", ".\u{0}z"] {
-            XCTAssertFalse(importFolderSlug(label).hasPrefix("."),
-                           "slug nascosto prodotto da \(label.debugDescription)")
+        // Il filesystem guarda il primo BYTE, quindi il confronto qui è su UTF-8,
+        // non su `hasPrefix(".")` — un grafema come "." + accento combinante ha un
+        // primo Character diverso da "." ma primo byte 0x2E.
+        let labels = [".x", "..x", "...", ".", "..", "  .y  ", ". ", ".\u{0}z",
+                      ". . Foto", ".. .Foto", ". ..x", ". . .", " .  .  . ",
+                      ".\u{0301}Foto", ". .\u{0301}x"]
+        for label in labels {
+            let slug = importFolderSlug(label)
+            XCTAssertNotEqual(slug.utf8.first, 0x2E,
+                              "slug nascosto \(slug.debugDescription) da \(label.debugDescription)")
         }
     }
 
