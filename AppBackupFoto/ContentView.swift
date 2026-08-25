@@ -1574,7 +1574,23 @@ enum IndexEntryVerdict {
 /// La chiave (percorso, dimensione, mtime) NON e' una garanzia: `mtime` e' riscrivibile
 /// da userspace (exiftool, `rsync -t`, restore da Finder). restic e borg si irrobustiscono
 /// con inode e ctime, ma su ExFAT — il filesystem dell'SSD — l'inode non e' stabile
-/// (documentato da Apple DTS) e quel rinforzo non e' disponibile. Da qui le due difese:
+/// (documentato da Apple DTS) e quel rinforzo non e' disponibile.
+///
+/// ATTENZIONE, e' il punto che si fraintende piu' facilmente: **questa funzione non
+/// difende dai tre vettori appena elencati**. exiftool, `rsync -t` e il restore da
+/// Finder *preservano* l'mtime originale, quindi un file con contenuto diverso e
+/// dimensione identica esce di qui come `.fresh`, ed e' corretto che sia cosi'.
+/// L'unica difesa reale contro quel caso e' altrove: nel percorso di import il
+/// candidato viene **riletto e rihashato** prima di saltare un file (ADR-0003,
+/// `Docs/adr/0003-due-livelli-di-fiducia-sullo-stesso-indice.md`). Quella rilettura
+/// sembra ridondante — l'indice ha gia' la risposta — e non lo e': e' la sola cosa
+/// che impedisce a un hash stantio di far saltare in silenzio una foto diversa.
+/// **Non rimuoverla in nome di questa funzione.**
+///
+/// Le due regole qui sotto servono a un problema diverso e piu' ristretto: contenere
+/// i rihash inutili senza aprire buchi. Verificate empiricamente il 2026-08-25
+/// (12 milioni di casi simulati: zero `.fresh` con hash stantio entro la granularita'
+/// reale del filesystem; il buco si apre solo sopra i 2s di granularita').
 ///
 /// 1. **Regola anti-racy**, presa da git e borg: se il file risulta modificato entro
 ///    `racyMarginSeconds` da quando ne abbiamo calcolato l'hash, non possiamo escludere
@@ -1604,6 +1620,17 @@ func indexEntryVerdict(storedSize: Int64,
         return currentMTime >= storedHashedAt - racyMarginSeconds ? .needsVerification : .fresh
     }
     if abs(delta - 3600) <= granularity || abs(delta - 1800) <= granularity {
+        // NOTA: qui la regola anti-racy del ramo sopra e' DELIBERATAMENTE sospesa, ed
+        // e' l'unico verdetto fiducioso che ne fa a meno. Applicarla anche qui
+        // ucciderebbe i cambi di fuso legittimi dei file hashati di recente: uno shift
+        // in avanti sposta l'mtime *dopo* `hashedAt` per costruzione, quindi ogni
+        // file con hashedAt entro ~1h dal proprio mtime finirebbe a rihashare — cioe'
+        // proprio il rihash di massa che questa regola esiste per evitare.
+        // Rischio accettato in ADR-0003: perche' sia un errore serve un file cambiato,
+        // di dimensione identica AL BYTE, con mtime spostato di esattamente 1800s o
+        // 3600s (+/-50ms). Misurato il 2026-08-25: 1 caso su ~37.000 modifiche reali.
+        // E anche allora il danno resta confinato al percorso a BASSO danno, perche'
+        // l'import rilegge e rihasha comunque il candidato prima di saltarlo.
         return .timezoneShift
     }
     return .stale

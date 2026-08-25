@@ -45,7 +45,10 @@ final class IndexEntryVerdictTests: XCTestCase {
 
     // Tolleranza DST: uno shift esatto di un'ora (o mezz'ora, per i fusi a offset :30)
     // e' quasi certamente un cambio di fuso su ExFAT, non una modifica del file.
-    // Non invalidare in blocco: riverificare.
+    // NON si riverifica e NON si rihasha: si adotta il nuovo mtime tenendo l'hash
+    // gia' calcolato. "Riverificare" sarebbe il rehash, cioe' esattamente quello che
+    // succederebbe trattandolo come `stale` — la regola non farebbe nulla. Vedi
+    // ADR-0003 e testTimezoneShiftIsNotNeedsVerification qui sotto.
     func testDstShiftForward_isTimezoneShift() {
         XCTAssertEqual(verdict(mtime: mtime + 3600), .timezoneShift)
     }
@@ -65,6 +68,26 @@ final class IndexEntryVerdictTests: XCTestCase {
 
     func testNearlyButNotDstShift_isStale() {
         XCTAssertEqual(verdict(mtime: mtime + 3500), .stale)
+    }
+
+    // I tre test qui sotto ancorano le tolleranze al loro valore VERO invece che a
+    // 42s e 3500s, che erano i negativi piu' vicini. Aggiunti dopo un mutation test
+    // (2026-08-25) che ha dimostrato il buco: `granularity` allargata da 0.05 a 2.0
+    // — errore di copia-incolla plausibile, e' il valore di racyMarginSeconds due
+    // righe sopra — lasciava verdi tutti e 13 i test originali, mentre un file
+    // modificato 1,5s dopo l'mtime memorizzato sarebbe uscito `.fresh`. Idem per la
+    // finestra DST, che sopravviveva allargata fino a 99 secondi.
+    func testChangeJustAboveGranularity_isStale() {
+        XCTAssertEqual(verdict(mtime: mtime + 0.2), .stale)
+    }
+
+    func testJustOutsideDstWindow_isStale() {
+        XCTAssertEqual(verdict(mtime: mtime + 3600.2), .stale)
+    }
+
+    func testTwoHourShift_isStale() {
+        // Nessuna tolleranza per gli shift multipli: solo 1800s e 3600s sono fusi.
+        XCTAssertEqual(verdict(mtime: mtime + 7200), .stale)
     }
 
     // Il verdetto DST deve restare DISTINTO da needsVerification: se collassassero,

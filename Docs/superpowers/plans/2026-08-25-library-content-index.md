@@ -775,7 +775,7 @@ Expected: `Executed 13 tests, with 0 failures`
 
 - [ ] **Step 7: Build, suite completa, commit**
 
-Expected suite: **213 test** (200 + 13).
+Expected suite: **216 test** (203 + 13). La baseline e' 203, non 200: il Task 2 ne ha aggiunti 3 dopo il mutation test del code reviewer.
 
 ```bash
 git add AppBackupFoto/ContentView.swift AppBackupFotoTests/LibraryIndexStoreTests.swift AppBackupFoto.xcodeproj/project.pbxproj
@@ -1196,8 +1196,22 @@ final class LibraryIndexer {
             let key = normalizedIndexKey(relative)
             seenKeys.insert(key)
 
-            let size = Int64(values?.fileSize ?? 0)
-            let mtime = values?.contentModificationDate?.timeIntervalSince1970 ?? 0
+            // Un file di cui non si riesce a leggere dimensione o mtime NON si indicizza.
+            // Motivo (code reviewer, 2026-08-25, riprodotto): col fallback `?? 0` un mtime
+            // illeggibile per due scansioni di fila produce storedMTime == currentMTime == 0,
+            // e indexEntryVerdict risponde `.fresh` per sempre — quel file non verrebbe mai
+            // piu' rihashato, qualunque cosa gli succeda a parita' di dimensione. Non e' un
+            // difetto della funzione pura (0 e' un timestamp legittimo per lei), e' il `?? 0`
+            // del chiamante. Stessa logica gia' adottata per la lettura troncata: meglio non
+            // indicizzare che indicizzare male, perche' a valle questo hash decide se saltare
+            // un file in import.
+            guard let fileSize = values?.fileSize,
+                  let modified = values?.contentModificationDate else {
+                progress.errors += 1
+                continue
+            }
+            let size = Int64(fileSize)
+            let mtime = modified.timeIntervalSince1970
 
             // Riuso dell'hash memorizzato quando la entry e' ancora attendibile.
             // In modalita' "verifica completa" non ci si fida di nulla di memorizzato.
@@ -1340,7 +1354,7 @@ Expected: `Executed 19 tests, with 0 failures`
 
 - [ ] **Step 6: Build, suite completa, commit**
 
-Expected suite: **232 test** (213 + 19).
+Expected suite: **235 test** (216 + 19).
 
 ```bash
 git add AppBackupFoto/ContentView.swift AppBackupFotoTests/LibraryIndexerTests.swift AppBackupFoto.xcodeproj/project.pbxproj
@@ -1585,7 +1599,7 @@ Scrivi 4 e 5 **prima** di collegare il predicato in `runImport` e guardali falli
 xcodebuild -project AppBackupFoto.xcodeproj -scheme AppBackupFoto -configuration Debug build 2>&1 | tail -10
 xcodebuild -project AppBackupFoto.xcodeproj -scheme AppBackupFoto -destination 'platform=macOS' test 2>&1 | tail -15
 ```
-Expected: `** BUILD SUCCEEDED **`, **237 test** (232 + 5). Il resto del task è wiring su percorsi con I/O reale, come `runMacToSSD` e gli altri job che non hanno XCTest diretti; il criterio lì è **nessuna regressione**: in particolare `FileSyncerZeroOverwriteTests` e `FileSyncerChangedSkippedTests` devono restare verdi, a prova che i default no-op non hanno alterato i flussi esistenti.
+Expected: `** BUILD SUCCEEDED **`, **240 test** (235 + 5). Il resto del task è wiring su percorsi con I/O reale, come `runMacToSSD` e gli altri job che non hanno XCTest diretti; il criterio lì è **nessuna regressione**: in particolare `FileSyncerZeroOverwriteTests` e `FileSyncerChangedSkippedTests` devono restare verdi, a prova che i default no-op non hanno alterato i flussi esistenti.
 
 - [ ] **Step 8: Commit**
 
@@ -1688,7 +1702,7 @@ In `ContentView`, accanto all'`.onChange(of: volumes.ssdMounted)` già esistente
 
 - [ ] **Step 5: Build, suite completa, verifica manuale**
 
-Expected: `** BUILD SUCCEEDED **`, 237 test invariati.
+Expected: `** BUILD SUCCEEDED **`, 240 test invariati.
 
 Verifica manuale (richiede SSD collegato, quindi **a carico di Enrico**): aprire Diagnostica, vedere la card, avviare la costruzione, verificare che il progresso avanzi, interromperla e verificare che l'indice resti utilizzabile, riavviarla e verificare che riprenda senza rihashare ciò che era già stato fatto.
 
