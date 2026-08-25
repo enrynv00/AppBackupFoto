@@ -537,3 +537,11 @@ Se la sezione "Obiettivi futuri" o la tabella "Stato attuale" menziona #27 o "co
 git add Docs/ROADMAP.md Docs/CLAUDE.md
 git commit -m "docs: mark roadmap #27 sub-project A (local source import) as done"
 ```
+
+#### Nota post-grilling (2026-08-25) — chiusa la decisione sospesa sull'etichetta con punto iniziale
+
+La domanda lasciata aperta su `importFolderSlug` ("che si fa con un'etichetta che inizia con un punto?") è stata chiusa durante il grilling del piano di #31, commit `79a4c2d`. **Risposta: i punti iniziali si rimuovono**, dentro la funzione pura, dove stanno già le altre difese.
+
+Non era una questione estetica. La versione precedente ricadeva su `"Import"` solo per label vuote o di **soli** punti, quindi `.EOS_DIGITAL` passava intatta e creava `<SSD>/Import/.EOS_DIGITAL`: una cartella **nascosta**. `.skipsHiddenFiles` è usato in 8 punti di `ContentView.swift`, fra cui `FileSyncer.previewDir` e `syncDir` — cioè la copia SSD→HDD — e `listAvailableFolders`. Le foto importate lì sarebbero rimaste sull'SSD ma **non sarebbero mai state copiate sull'HDD né elencate nella UI, senza produrre un solo errore**, e sarebbero rimaste fuori dall'indice di contenuto di #31, quindi anche dal dedup. Raggiungibile scrivendo un punto in un campo di testo libero.
+
+Un punto **interno** all'etichetta (`"Canon 5D .backup"`) resta valido e viene conservato. 6 nuovi test, incluso un test di proprietà che verifica che nessun input possa produrre un nome nascosto.

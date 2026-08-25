@@ -12,6 +12,22 @@
 - Il **pannello Doppioni** avrà un piano suo. Il nucleo è software funzionante e testabile senza di esso, e tenerli separati evita un piano unico troppo lungo per essere eseguito bene.
 - Il **suffisso progressivo automatico** sull'etichetta di destinazione (`<etichetta> (2)`) appartiene a `ImportView`, cioè al Task 3 di `Docs/superpowers/plans/2026-08-25-device-source-import.md` (#27-A), che riprenderà dopo questo piano.
 
+## Nota post-grilling (2026-08-25) — quattro correzioni prima di scrivere una riga
+
+Sessione di grilling su questo piano **dopo** l'approvazione di spec e piano, prima dell'inizio del Task 1. Quattro problemi trovati leggendo il piano e il codice reale, non ipotizzati. Due erano già in codice di produzione e sono stati corretti subito; due erano nel Task 4 di questo piano e sono corretti qui sotto. **Non reintrodurli.**
+
+**Corretti in produzione (commit `79a4c2d` e `037d028`, suite 162 → 173):**
+
+1. **Etichetta di import con punto iniziale → cartella nascosta.** `importFolderSlug` ricadeva su `"Import"` solo per label vuote o di soli punti, quindi `.EOS_DIGITAL` creava `<SSD>/Import/.EOS_DIGITAL`. Poiché `.skipsHiddenFiles` è usato in 8 punti di `ContentView.swift` — fra cui `FileSyncer.syncDir` (la copia SSD→HDD), la sua anteprima e `listAvailableFolders` — quelle foto **non sarebbero mai state copiate su HDD né elencate**, senza un errore, e sarebbero rimaste fuori da questo indice. Era la decisione lasciata in sospeso su #27-A: chiusa rimuovendo i punti iniziali dentro la funzione pura.
+2. **Lista di esclusioni in copie multiple.** Esisteva già in due copie identiche (`FileSyncer.excluded` e una locale in `ReviewEngine.scanLocalCatalog`); il Task 4 stava per aggiungere la terza, con un commento che prometteva di "non divergere". Estratta in `LibraryExclusions`, fonte unica. **Il Task 4 la usa, non la ridichiara.**
+
+**Corretti in questo piano (Task 4):**
+
+3. **`cancelled` non veniva mai rimesso a `false`.** Dopo una singola cancellazione — dell'utente o automatica per volume sparito — ogni `scan` successiva sulla stessa istanza sarebbe uscita subito senza fare nulla, e la rimozione dei file spariti non sarebbe più girata. Con `LibraryIndexer` come `@StateObject` della finestra (Task 6) il sintomo è "l'indice ha smesso di aggiornarsi finché non riavvio l'app". Ora `scan` riparte pulita, e `cancelled` (utente) è separato da `volumeVanished` (disco sparito) perché hanno conseguenze diverse a valle.
+4. **Lo scollegamento a metà scansione poteva svuotare l'indice, proprio nel caso più frequente.** Il controllo di esistenza della root stava **dentro** il ramo `if batch.count >= batchSize`. In una scansione incrementale — quella automatica all'avvio — quasi tutti i file sono `.fresh` e fanno `continue` prima di `batch.append`: il batch non si riempie mai, quel controllo non gira mai, `cancelled` resta falso e `knownKeys - seenKeys` rimuove tutti i file non ancora visitati. Non si perdono foto (l'indice è una cache), ma si perde la ricostruzione da 5-15 minuti e **l'import successivo, senza dati di dedup, ricrea i doppioni che questa feature esiste per evitare.** Ora il controllo è una precondizione della rimozione, più una guardia di plausibilità (>50% sparito = sospetto) con la "Ricostruzione completa" come via d'uscita esplicita.
+
+**Lezione trasversale, la stessa dei due bug precedenti del progetto** (`sha256(of:)` e BUG-5): i test possono codificare il bug invece di trovarlo. `testCancelStopsScan` sarebbe passato con `cancelled` rotto, e `testRootDisappearingMidScan_doesNotWipeIndex` testava la root assente **all'inizio**, non a metà — cioè il caso che la guardia esistente già copriva. Entrambi riscritti.
+
 ## Global Constraints
 
 - **Zero delete, zero overwrite, read-only sulla sorgente.** Questa feature è interamente in sola lettura sul volume delle foto: non scrive, non sposta, non cancella nulla sull'SSD.
@@ -19,7 +35,10 @@
 - Build: `xcodebuild -project AppBackupFoto.xcodeproj -scheme AppBackupFoto -configuration Debug build`
 - Test: `xcodebuild -project AppBackupFoto.xcodeproj -scheme AppBackupFoto -destination 'platform=macOS' test`
 - **Il target `AppBackupFotoTests` non è file-system-synchronized**: ogni nuovo file di test va registrato a mano in `AppBackupFoto.xcodeproj/project.pbxproj` in 4 punti (`PBXBuildFile`, `PBXFileReference`, gruppo `AppBackupFotoTests`, `PBXSourcesBuildPhase`). Altrimenti compila ma non viene eseguito, e i test "passano" solo perché non girano. **Verificare sempre il conteggio totale atteso**, mai fidarsi del solo `** TEST SUCCEEDED **`.
-- **Baseline all'inizio di questo piano: 162 test verdi**, ultimo commit `c868cf4`.
+- **Baseline all'inizio di questo piano: 173 test verdi**, ultimo commit `037d028`.
+  (Era 162 su `c868cf4`. I due commit del 2026-08-25 nati dal grilling di questo piano
+  hanno aggiunto 11 test: `79a4c2d` — nessuna etichetta di import puo' produrre una
+  cartella nascosta, +6 — e `037d028` — `LibraryExclusions` come fonte unica, +5.)
 - **L'hashing usa sempre `sha256(of:)` esistente** (`ContentView.swift:1454`), che fa I/O POSIX a basso livello. **Mai `FileHandle`**: è il bug di memoria da 41GB già pagato una volta su questo progetto.
 - **L'indice è una cache, non una fonte di verità.** Nulla al suo interno è dato originale; deve essere sempre ricostruibile da zero. Nessun percorso di codice deve trattare l'assenza o la corruzione dell'indice come un errore fatale.
 - L'indice vive in `~/Library/Application Support/AppBackupFoto/`, **mai sull'SSD**.
@@ -147,7 +166,7 @@ Expected: `Executed 12 tests, with 0 failures`, `** TEST SUCCEEDED **`
 xcodebuild -project AppBackupFoto.xcodeproj -scheme AppBackupFoto -configuration Debug build 2>&1 | tail -10
 xcodebuild -project AppBackupFoto.xcodeproj -scheme AppBackupFoto -destination 'platform=macOS' test 2>&1 | tail -15
 ```
-Expected: `** BUILD SUCCEEDED **`, e **174 test** (162 + 12). Verifica il numero nel log, non solo `TEST SUCCEEDED`.
+Expected: `** BUILD SUCCEEDED **`, e **185 test** (173 + 12). Verifica il numero nel log, non solo `TEST SUCCEEDED`.
 
 ```bash
 git add AppBackupFoto/ContentView.swift AppBackupFotoTests/IndexableKindTests.swift AppBackupFoto.xcodeproj/project.pbxproj
@@ -323,7 +342,7 @@ Expected: `Executed 12 tests, with 0 failures`
 
 - [ ] **Step 6: Build, suite completa, commit**
 
-Expected suite: **186 test** (174 + 12).
+Expected suite: **197 test** (185 + 12).
 
 ```bash
 git add AppBackupFoto/ContentView.swift AppBackupFotoTests/IndexEntryVerdictTests.swift AppBackupFoto.xcodeproj/project.pbxproj
@@ -738,7 +757,7 @@ Expected: `Executed 13 tests, with 0 failures`
 
 - [ ] **Step 7: Build, suite completa, commit**
 
-Expected suite: **199 test** (186 + 13).
+Expected suite: **210 test** (197 + 13).
 
 ```bash
 git add AppBackupFoto/ContentView.swift AppBackupFotoTests/LibraryIndexStoreTests.swift AppBackupFoto.xcodeproj/project.pbxproj
@@ -874,19 +893,86 @@ final class LibraryIndexerTests: XCTestCase {
         XCTAssertEqual(reports.last?.hashed, 5)
     }
 
-    func testCancelStopsScan() throws {
+    // Cancellazione DURANTE la scansione: e' il flusso reale (l'utente preme
+    // "Interrompi" mentre il lavoro gira). Un `cancel()` PRIMA di `scan()` non e' un
+    // caso reale ed e' volutamente ignorato, perche' `scan` riparte pulita.
+    func testCancelDuringScan_stopsEarly() throws {
         for i in 0..<50 { try makeFile("Foto/f\(i).jpg", contents: "c\(i)") }
-        indexer.cancel()
-        let p = try indexer.scan(root: root)
-        XCTAssertEqual(p.hashed, 0, "una scansione gia' cancellata non deve hashare nulla")
+        let idx = indexer!
+        let p = try idx.scan(root: root, batchSize: 5) { _ in idx.cancel() }
+        XCTAssertLessThan(p.hashed, 50, "la cancellazione deve fermare la scansione")
+        XCTAssertGreaterThan(try store.count(), 0, "cio' che era gia' stato committato resta")
+    }
+
+    // Il bug che questo test blocca: `cancelled` non veniva mai rimesso a false, quindi
+    // dopo UNA cancellazione l'istanza non avrebbe indicizzato mai piu' nulla, e la
+    // rimozione dei file spariti non sarebbe piu' girata. Con `LibraryIndexer` come
+    // @StateObject della finestra (Task 6) il sintomo e' "l'indice ha smesso di
+    // aggiornarsi finche' non riavvio l'app".
+    func testScanAfterCancel_worksAgain() throws {
+        for i in 0..<20 { try makeFile("Foto/f\(i).jpg", contents: "c\(i)") }
+        let idx = indexer!
+        _ = try idx.scan(root: root, batchSize: 2) { _ in idx.cancel() }
+        XCTAssertLessThan(try store.count(), 20, "la prima scansione e' stata interrotta")
+
+        let second = try idx.scan(root: root)
+        XCTAssertEqual(try store.count(), 20, "la seconda scansione deve completare l'indice")
+        XCTAssertEqual(second.errors, 0)
     }
 
     func testPartialIndexAfterCancelIsStillUsable() throws {
         for i in 0..<10 { try makeFile("Foto/f\(i).jpg", contents: "c\(i)") }
-        _ = try indexer.scan(root: root)
-        // L'indice resta leggibile e coerente anche senza una scansione "completa".
-        XCTAssertEqual(try store.count(), 10)
+        let idx = indexer!
+        _ = try idx.scan(root: root, batchSize: 2) { _ in idx.cancel() }
+        // Un indice parziale deve essere leggibile e coerente, mai a meta' riga.
+        let count = try store.count()
+        XCTAssertGreaterThan(count, 0)
+        XCTAssertLessThan(count, 10)
         XCTAssertNoThrow(try store.allKeys())
+        XCTAssertEqual(try store.allKeys().count, count)
+    }
+
+    // Guardia di plausibilita' (Q3). Una scansione che vede sparire piu' della meta'
+    // dell'indice e' quasi sempre un'interruzione non riconosciuta: nel dubbio si
+    // tiene l'indice, perche' svuotarlo costa una ricostruzione da 5-15 minuti e
+    // lascia l'import successivo senza dedup.
+    func testMassiveDisappearance_keepsIndex() throws {
+        for i in 0..<10 { try makeFile("Foto/f\(i).jpg", contents: "c\(i)") }
+        _ = try indexer.scan(root: root)
+        XCTAssertEqual(try store.count(), 10)
+
+        for i in 0..<8 {
+            try FileManager.default.removeItem(at: root.appendingPathComponent("Foto/f\(i).jpg"))
+        }
+        _ = try indexer.scan(root: root)
+        XCTAssertEqual(try store.count(), 10, "sparizione implausibile: l'indice si tiene")
+    }
+
+    // ...ma una cancellazione normale viene applicata, altrimenti l'indice non si
+    // pulirebbe mai. (Copre anche il confine: 5 su 10 e' ancora plausibile.)
+    func testHalfDisappearance_isStillApplied() throws {
+        for i in 0..<10 { try makeFile("Foto/f\(i).jpg", contents: "c\(i)") }
+        _ = try indexer.scan(root: root)
+        for i in 0..<5 {
+            try FileManager.default.removeItem(at: root.appendingPathComponent("Foto/f\(i).jpg"))
+        }
+        _ = try indexer.scan(root: root)
+        XCTAssertEqual(try store.count(), 5)
+    }
+
+    // La via d'uscita: dopo una cancellazione massiccia VERA, la "Ricostruzione
+    // completa" scavalca la guardia e ripulisce le entry fantasma.
+    func testFullRebuild_bypassesPlausibilityGuard() throws {
+        for i in 0..<10 { try makeFile("Foto/f\(i).jpg", contents: "c\(i)") }
+        _ = try indexer.scan(root: root)
+        for i in 0..<8 {
+            try FileManager.default.removeItem(at: root.appendingPathComponent("Foto/f\(i).jpg"))
+        }
+        _ = try indexer.scan(root: root)
+        XCTAssertEqual(try store.count(), 10, "la scansione normale si tiene tutto")
+
+        _ = try indexer.scan(root: root, ignoringStoredHashes: true)
+        XCTAssertEqual(try store.count(), 2, "la ricostruzione completa ripulisce")
     }
 
     // Modalita' "verifica completa": non fidarsi di nulla di memorizzato.
@@ -901,9 +987,14 @@ final class LibraryIndexerTests: XCTestCase {
         XCTAssertEqual(full.skipped, 0)
     }
 
-    // Volume scollegato a meta' scansione: le entry gia' indicizzate NON devono
-    // essere scambiate per file cancellati e rimosse dall'indice.
-    func testRootDisappearingMidScan_doesNotWipeIndex() throws {
+    // Root assente all'INIZIO (SSD scollegato prima di partire): le entry gia'
+    // indicizzate non vanno scambiate per file cancellati.
+    // NB: questo test NON copre lo scollegamento a meta' scansione — la root sparisce
+    // prima che `scan` cominci, quindi scatta la `guard` in cima. Il caso "a meta'"
+    // e' coperto dal controllo dopo il ciclo piu' dalla guardia di plausibilita'
+    // (`testMassiveDisappearance_keepsIndex`), perche' non e' simulabile in modo
+    // deterministico da un test: dipende da quando l'enumeratore smette di produrre.
+    func testRootAbsentAtStart_doesNotWipeIndex() throws {
         for i in 0..<10 { try makeFile("Foto/f\(i).jpg", contents: "c\(i)") }
         _ = try indexer.scan(root: root)
         XCTAssertEqual(try store.count(), 10)
@@ -941,23 +1032,25 @@ final class LibraryIndexer {
     }
 
     private let store: LibraryIndexStore
-    private var cancelled = false
     private let fm = FileManager.default
 
-    /// Stesse esclusioni gia' in vigore in FileSyncer, per non divergere.
-    private let excludedNames: Set<String> = [
-        ".DS_Store", ".Spotlight-V100", ".TemporaryItems", ".Trashes",
-        ".fseventsd", ".DocumentRevisions-V100", "lost+found", "Backups.backupdb"
-    ]
+    /// L'utente ha interrotto. Azzerato all'inizio di ogni `scan`: un'istanza
+    /// cancellata una volta deve poter tornare a scansionare.
+    private var cancelled = false
+
+    /// Il volume e' sparito sotto di noi. Tenuto SEPARATO da `cancelled` perche' ha
+    /// una conseguenza diversa: dopo una cancellazione dell'utente l'indice e'
+    /// parziale ma il disco c'e'; dopo uno scollegamento non sappiamo piu' nulla di
+    /// cio' che non abbiamo visto, quindi la rimozione delle entry non deve girare.
+    private var volumeVanished = false
 
     init(store: LibraryIndexStore) { self.store = store }
 
     func cancel() { cancelled = true }
 
-    private func shouldExclude(_ url: URL) -> Bool {
-        let name = url.lastPathComponent
-        return excludedNames.contains(name) || name.hasPrefix("._")
-    }
+    // Le esclusioni NON sono ridichiarate qui: `LibraryExclusions` e' la fonte unica
+    // condivisa con FileSyncer e ReviewEngine. Una seconda copia "da tenere allineata"
+    // e' esattamente il modo in cui le due divergono.
 
     /// Scansione completa con aggiornamento incrementale.
     /// I commit avvengono a batch (non uno per file, non uno solo alla fine): cosi'
@@ -966,6 +1059,15 @@ final class LibraryIndexer {
     func scan(root: URL, batchSize: Int = 200,
               ignoringStoredHashes: Bool = false,
               onProgress: @escaping (Progress) -> Void = { _ in }) throws -> Progress {
+        // Ogni scansione riparte pulita. Senza questo reset, `cancel()` (o un
+        // singolo scollegamento) spegnerebbe l'indicizzazione per tutta la vita
+        // dell'istanza: ogni `scan` successiva uscirebbe subito senza fare nulla e
+        // la rimozione dei file spariti non girerebbe mai piu'. Se `LibraryIndexer`
+        // e' un `@StateObject` che vive quanto la finestra (Task 6), il sintomo e'
+        // "l'indice ha smesso di aggiornarsi finche' non riavvio l'app".
+        cancelled = false
+        volumeVanished = false
+
         var progress = Progress()
         var batch: [LibraryIndexEntry] = []
         var seenKeys = Set<String>()
@@ -989,7 +1091,7 @@ final class LibraryIndexer {
 
         while let url = enumerator.nextObject() as? URL {
             if cancelled { break }
-            if shouldExclude(url) { enumerator.skipDescendants(); continue }
+            if LibraryExclusions.shouldExclude(url) { enumerator.skipDescendants(); continue }
 
             let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey])
             guard values?.isRegularFile == true else { continue }
@@ -1047,12 +1149,11 @@ final class LibraryIndexer {
                 onProgress(progress)
 
                 // Volume scollegato a meta' scansione: fermarsi in modo pulito invece
-                // di produrre errori per 100.000 file. Il controllo sta qui, a ogni
-                // batch, perche' e' economico e non serve piu' spesso di cosi'.
-                // NOTA: `cancelled = true` serve a impedire che la rimozione delle
-                // entry "sparite" scambi un volume assente per file cancellati.
+                // di produrre errori per 100.000 file. Qui e' solo un'uscita ANTICIPATA
+                // opportunistica: la garanzia vera sta nel controllo dopo il ciclo,
+                // perche' questo ramo gira solo quando un batch si riempie.
                 if !fm.fileExists(atPath: root.path) {
-                    cancelled = true
+                    volumeVanished = true
                     break
                 }
             }
@@ -1060,11 +1161,45 @@ final class LibraryIndexer {
 
         if !batch.isEmpty { try store.upsert(batch) }
 
-        // Rimuove dall'indice i file spariti dal disco — ma solo se la scansione e'
-        // arrivata in fondo: dopo un'interruzione "non visto" non significa "assente".
-        if !cancelled {
-            let vanished = knownKeys.subtracting(seenKeys)
-            if !vanished.isEmpty { try store.remove(keys: Array(vanished)) }
+        // ---- Rimozione dei file spariti: tre guardie, tutte necessarie ----
+        //
+        // Il controllo di esistenza della root sta QUI e non solo dentro il ramo del
+        // batch. Nella scansione incrementale — quella automatica all'avvio, il caso
+        // piu' frequente — quasi tutti i file sono `.fresh` e fanno `continue` PRIMA
+        // di `batch.append`: il batch non si riempie mai, quel ramo non viene mai
+        // eseguito, e uno scollegamento a meta' passerebbe inosservato. L'enumeratore
+        // finirebbe, `volumeVanished` resterebbe falso, e `knownKeys - seenKeys`
+        // rimuoverebbe TUTTI i file non ancora visitati: l'indice svuotato, la
+        // ricostruzione da 5-15 minuti da rifare, e — peggio — il primo import
+        // successivo senza dati di dedup ricrea esattamente i doppioni che questa
+        // feature esiste per evitare.
+        if !fm.fileExists(atPath: root.path) { volumeVanished = true }
+
+        // In modalita' "verifica completa" ogni file viene comunque visitato, quindi
+        // `seenKeys` e' completo e il confronto resta valido.
+        let scanWasComplete = !cancelled && !volumeVanished
+        let vanished = knownKeys.subtracting(seenKeys)
+
+        // Terza guardia, di plausibilita': sparire piu' della meta' dell'indice in
+        // una sola scansione e' quasi sempre un'interruzione che non abbiamo
+        // riconosciuto, non 60.000 cancellazioni reali fatte dall'utente. Nel dubbio
+        // si tiene: una entry stantia costa una riverifica al prossimo import
+        // (percorso ad alto danno, che rilegge comunque il file candidato, quindi su
+        // un file sparito non scatta nessuno skip), mentre un indice svuotato costa
+        // una ricostruzione completa e lascia l'import successivo senza dedup.
+        //
+        // `ignoringStoredHashes` la scavalca di proposito: e' la "Ricostruzione
+        // completa", un'azione esplicita dell'utente che significa "fidati del
+        // disco". Senza questa via d'uscita, dopo una cancellazione massiccia VERA
+        // le entry fantasma resterebbero per sempre (ogni scansione successiva
+        // rivedrebbe la stessa sparizione implausibile) e il pannello Doppioni
+        // mostrerebbe gruppi che non esistono piu'.
+        let plausible = ignoringStoredHashes
+            || knownKeys.isEmpty
+            || vanished.count * 2 <= knownKeys.count
+
+        if scanWasComplete && !vanished.isEmpty && plausible {
+            try store.remove(keys: Array(vanished))
         }
 
         progress.total = try store.count()
@@ -1074,14 +1209,16 @@ final class LibraryIndexer {
 }
 ```
 
+**Perche' `volumeVanished` non e' semplicemente `cancelled`.** Sono due fatti diversi con la stessa conseguenza *immediata* (fermarsi) ma conseguenze diverse a valle: dopo una cancellazione dell'utente il disco c'e' ancora e l'indice parziale e' affidabile per cio' che ha visto; dopo uno scollegamento non sappiamo nulla di cio' che non abbiamo visitato. Riunirli e' gia' costato un bug in questo progetto — vedi `isRunning`/`vmPossiblyUp` in `ImmichManager` (`.claude/rules/architecture.md`), dove due segnali fusi in uno hanno prodotto un vicolo cieco nella UI.
+
 - [ ] **Step 5: Verifica che i test passino**
 
 Run: `xcodebuild -project AppBackupFoto.xcodeproj -scheme AppBackupFoto -destination 'platform=macOS' test -only-testing:AppBackupFotoTests/LibraryIndexerTests 2>&1 | tail -20`
-Expected: `Executed 12 tests, with 0 failures`
+Expected: `Executed 16 tests, with 0 failures`
 
 - [ ] **Step 6: Build, suite completa, commit**
 
-Expected suite: **211 test** (199 + 12).
+Expected suite: **226 test** (210 + 16).
 
 ```bash
 git add AppBackupFoto/ContentView.swift AppBackupFotoTests/LibraryIndexerTests.swift AppBackupFoto.xcodeproj/project.pbxproj
@@ -1221,7 +1358,7 @@ In `CompletionSheet`, accanto alla riga condizionale già esistente per `changed
 xcodebuild -project AppBackupFoto.xcodeproj -scheme AppBackupFoto -configuration Debug build 2>&1 | tail -10
 xcodebuild -project AppBackupFoto.xcodeproj -scheme AppBackupFoto -destination 'platform=macOS' test 2>&1 | tail -15
 ```
-Expected: `** BUILD SUCCEEDED **`, **211 test invariati** (questo task non ne aggiunge: è wiring su percorsi con I/O reale, come `runMacToSSD` e gli altri job che non hanno XCTest diretti). Il criterio è **nessuna regressione**: in particolare i test di `FileSyncerZeroOverwriteTests` e `FileSyncerChangedSkippedTests` devono restare verdi, a prova che il default no-op non ha alterato il comportamento dei flussi esistenti.
+Expected: `** BUILD SUCCEEDED **`, **226 test invariati** (questo task non ne aggiunge: è wiring su percorsi con I/O reale, come `runMacToSSD` e gli altri job che non hanno XCTest diretti). Il criterio è **nessuna regressione**: in particolare i test di `FileSyncerZeroOverwriteTests` e `FileSyncerChangedSkippedTests` devono restare verdi, a prova che il default no-op non ha alterato il comportamento dei flussi esistenti.
 
 - [ ] **Step 6: Commit**
 
@@ -1316,7 +1453,7 @@ In `ContentView`, accanto all'`.onChange(of: volumes.ssdMounted)` già esistente
 
 - [ ] **Step 5: Build, suite completa, verifica manuale**
 
-Expected: `** BUILD SUCCEEDED **`, 211 test invariati.
+Expected: `** BUILD SUCCEEDED **`, 226 test invariati.
 
 Verifica manuale (richiede SSD collegato, quindi **a carico di Enrico**): aprire Diagnostica, vedere la card, avviare la costruzione, verificare che il progresso avanzi, interromperla e verificare che l'indice resti utilizzabile, riavviarla e verificare che riprenda senza rihashare ciò che era già stato fatto.
 
