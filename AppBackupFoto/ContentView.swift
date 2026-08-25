@@ -1419,7 +1419,15 @@ let importFolderSlugMaxBytes = 200
 ///   dalla cartella dedicata (`<SSD>/Import/..` scrive nella root dell'SSD) — si
 ///   ricade su `"Import"`;
 /// - la lunghezza è ≤ `importFolderSlugMaxBytes` byte UTF-8; il troncamento avviene
-///   **per caratteri**, quindi non spezza mai una sequenza UTF-8 (né un grafema) a metà.
+///   **per caratteri**, quindi non spezza mai una sequenza UTF-8 (né un grafema) a metà;
+/// - il risultato non inizia mai con `.`, quindi non è mai una cartella **nascosta**.
+///   Non è un dettaglio estetico: `.skipsHiddenFiles` è usato in 8 punti di questo file,
+///   fra cui `FileSyncer.previewDir`/`syncDir` (la copia SSD→HDD) e
+///   `listAvailableFolders`. Un import atterrato in `<SSD>/Import/.EOS_DIGITAL` sarebbe
+///   rimasto sull'SSD ma **non sarebbe mai stato copiato su HDD né elencato nella UI**,
+///   senza produrre un solo errore — e sarebbe rimasto fuori dall'indice di contenuto
+///   (roadmap #31), quindi anche dal dedup. Un punto **interno** all'etichetta
+///   ("Canon 5D .backup") è invece innocuo e viene conservato.
 func importFolderSlug(_ label: String) -> String {
     var cleaned = String(String.UnicodeScalarView(
         label.unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) }))
@@ -1439,6 +1447,14 @@ func importFolderSlug(_ label: String) -> String {
         }
         cleaned = truncated.trimmingCharacters(in: .whitespacesAndNewlines)
     }
+
+    // Un nome che inizia per "." è una cartella nascosta, e tutto ciò che in questa
+    // app enumera il filesystem passa da `.skipsHiddenFiles`: la cartella sarebbe
+    // invisibile al backup SSD→HDD, alla sua anteprima, all'elenco cartelle e
+    // all'indice di contenuto. Si tolgono i punti iniziali (il ri-trim serve per
+    // etichette tipo ". Foto", dove tolto il punto resta uno spazio in testa).
+    cleaned = String(cleaned.drop(while: { $0 == "." }))
+        .trimmingCharacters(in: .whitespacesAndNewlines)
 
     if cleaned.isEmpty || cleaned.allSatisfy({ $0 == "." }) { return "Import" }
     return cleaned

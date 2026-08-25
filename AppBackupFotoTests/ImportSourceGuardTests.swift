@@ -113,6 +113,48 @@ final class ImportSourceGuardTests: XCTestCase {
         XCTAssertEqual(importFolderSlug("Canon 5D .backup"), "Canon 5D .backup")
     }
 
+    // MARK: - Punto iniziale: cartella nascosta, invisibile a TUTTA l'app
+
+    func testSlug_leadingDot_isRemoved() {
+        // "<SSD>/Import/.EOS_DIGITAL" è una cartella NASCOSTA. Non è un problema
+        // estetico: `.skipsHiddenFiles` compare in 8 punti di ContentView.swift,
+        // fra cui `previewDir` e `syncDir` (la copia SSD→HDD) e
+        // `listAvailableFolders`. Le foto importate lì resterebbero sull'SSD ma
+        // non verrebbero MAI copiate su HDD né elencate nella UI, senza un solo
+        // errore — e non entrerebbero nell'indice di contenuto (roadmap #31),
+        // quindi nemmeno nel dedup.
+        XCTAssertEqual(importFolderSlug(".EOS_DIGITAL"), "EOS_DIGITAL")
+    }
+
+    func testSlug_leadingDotAfterTrim_isRemoved() {
+        // Il punto può emergere solo dopo il trim degli spazi.
+        XCTAssertEqual(importFolderSlug("  .EOS_DIGITAL  "), "EOS_DIGITAL")
+    }
+
+    func testSlug_multipleLeadingDots_areRemoved() {
+        XCTAssertEqual(importFolderSlug("..Foto vacanze"), "Foto vacanze")
+    }
+
+    func testSlug_leadingDotThenSpace_isTrimmedAgain() {
+        // Tolto il punto resta uno spazio in testa: va ritrimmato, altrimenti
+        // il nome della cartella inizierebbe con uno spazio.
+        XCTAssertEqual(importFolderSlug(". Foto"), "Foto")
+    }
+
+    func testSlug_leadingDotOnly_fallsBackToImport() {
+        // Tolti i punti non resta nulla: deve valere il fallback già esistente.
+        XCTAssertEqual(importFolderSlug(".."), "Import")
+        XCTAssertEqual(importFolderSlug("."), "Import")
+    }
+
+    func testSlug_neverProducesHiddenFolderName() {
+        // Proprietà generale: nessun input può produrre un nome nascosto.
+        for label in [".x", "..x", "...", ".", "..", "  .y  ", ". ", ".\u{0}z"] {
+            XCTAssertFalse(importFolderSlug(label).hasPrefix("."),
+                           "slug nascosto prodotto da \(label.debugDescription)")
+        }
+    }
+
     func testSlug_removesControlCharactersInsideLabel() {
         // Il trim tocca solo i bordi: un \n a metà stringa resterebbe nel nome.
         XCTAssertEqual(importFolderSlug("Foto\nVacanze"), "FotoVacanze")
