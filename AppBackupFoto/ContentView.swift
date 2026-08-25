@@ -1460,6 +1460,32 @@ func importFolderSlug(_ label: String) -> String {
     return cleaned
 }
 
+/// File e cartelle di sistema che nessun percorso di questa app deve mai trattare
+/// come contenuto dell'utente: né copiare (`FileSyncer`), né elencare
+/// (`ReviewEngine.scanLocalCatalog`), né indicizzare (roadmap #31).
+///
+/// **Fonte unica, di proposito.** Questa lista è vissuta a lungo in due copie
+/// identiche, in due tipi diversi, ciascuna con il proprio `shouldExclude`. Due
+/// liste che "devono restare uguali" divergono appena qualcuno ne aggiorna una
+/// sola, e il sintomo è silenzioso: un file escluso dalla copia ma incluso
+/// nell'indice (o viceversa) non produce nessun errore, solo un conteggio che non
+/// torna. Aggiungere qui, mai nei singoli chiamanti.
+enum LibraryExclusions {
+    static let names: Set<String> = [
+        ".DS_Store", ".Spotlight-V100", ".TemporaryItems", ".Trashes",
+        ".fseventsd", ".DocumentRevisions-V100", "lost+found", "Backups.backupdb"
+    ]
+
+    /// Confronto sull'ultima componente del path, mai sul path intero: una cartella
+    /// di passaggio dal nome simile non deve escludere i file che contiene.
+    /// `._*` sono i sidecar AppleDouble che macOS crea sui filesystem non-HFS —
+    /// l'SSD è ExFAT, quindi ce ne sono ovunque.
+    static func shouldExclude(_ url: URL) -> Bool {
+        let name = url.lastPathComponent
+        return names.contains(name) || name.hasPrefix("._")
+    }
+}
+
 enum FileKind {
     static func isImage(url: URL) -> Bool {
         guard let type = UTType(filenameExtension: url.pathExtension) else { return false }
@@ -1650,11 +1676,6 @@ final class FileSyncer {
 
     private var cancelled = false
     private let fm = FileManager.default
-    private let excluded: Set<String> = [
-        ".DS_Store", ".Spotlight-V100", ".TemporaryItems", ".Trashes",
-        ".fseventsd", ".DocumentRevisions-V100", "lost+found", "Backups.backupdb"
-    ]
-
     func cancel() { cancelled = true }
 
     // MARK: - Dry-run preview (solo stat, nessuna copia)
@@ -1843,8 +1864,7 @@ final class FileSyncer {
     }
 
     private func shouldExclude(_ url: URL) -> Bool {
-        let n = url.lastPathComponent
-        return excluded.contains(n) || n.hasPrefix("._")
+        LibraryExclusions.shouldExclude(url)
     }
 
 }
@@ -4020,10 +4040,6 @@ final class ReviewEngine {
     // relativa/dimensione/data. Sola lettura — nessuna azione, nessuna modifica. Stessa
     // esclusione di file di sistema già usata da FileSyncer.
     func scanLocalCatalog(rootURL: URL) -> [CatalogEntry] {
-        let excluded: Set<String> = [
-            ".DS_Store", ".Spotlight-V100", ".TemporaryItems", ".Trashes",
-            ".fseventsd", ".DocumentRevisions-V100", "lost+found", "Backups.backupdb"
-        ]
         let resolvedRoot = URL(fileURLWithPath: realResolvedPath(rootURL), isDirectory: true)
         guard let enumerator = fm.enumerator(
             at: resolvedRoot,
@@ -4037,7 +4053,7 @@ final class ReviewEngine {
             let vals = try? f.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey])
             guard vals?.isRegularFile == true else { continue }
             let name = f.lastPathComponent
-            if excluded.contains(name) || name.hasPrefix("._") { continue }
+            if LibraryExclusions.shouldExclude(f) { continue }
             let relativePath = String(f.path.dropFirst(base.count).drop(while: { $0 == "/" }))
             entries.append(CatalogEntry(
                 name: name,
