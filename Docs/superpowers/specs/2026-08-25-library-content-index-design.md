@@ -132,6 +132,25 @@ Deliberatamente **non** si implementa l'hash parziale sui primi N byte: la ricer
 
 **1. Dedup in import (#27-A).** `runImport` consulta l'indice attraverso un'interfaccia stretta. I file già presenti con contenuto identico vengono saltati e conteggiati, e il conteggio compare nel riepilogo di fine job come riga condizionale, stesso stile della riga "file cambiati non copiati" già esistente (#13). Rientra qui anche il **suffisso progressivo automatico** sull'etichetta di destinazione, deciso in brainstorming: se `<SSD>/Import/<etichetta>` esiste già, l'app propone `<etichetta> (2)`, mostrato e modificabile nel wizard prima di avviare.
 
+#### Doppioni interni allo stesso import (deciso 2026-08-25, dopo il Critic)
+
+Il bisogno n.1 in cima a questa spec ha **due** scenari, e il primo giro di piano ne copriva uno solo:
+
+- **Fra import diversi** — reimporto una scheda o una cartella già importata in passato. Coperto: l'indice contiene già quei file, `isAlreadyInLibrary` li riconosce.
+- **Dentro lo stesso import** — la sorgente contiene già al suo interno due file byte-identici (vecchi dischi con backup parziali sovrapposti, schede SD riusate e ricopiate a mano più volte). **Non** coperto dalla prima stesura: l'indice viene aggiornato *dopo* l'import, quindi durante il job la prima copia non risulta da nessuna parte e la seconda viene scritta ugualmente.
+
+**Deciso: il secondo scenario è in scope.** Enrico ha confermato che le sorgenti reali previste da #27 sono proprio quelle in cui capita.
+
+**Perché costa quasi nulla.** `FileSyncer.syncFile` calcola **già** `sha256(of: src)` dopo ogni copia, per la verifica d'integrità post-copia — e oggi quel valore viene scartato. Il dedup intra-import non aggiunge hashing: si limita a conservare in memoria, per la durata del job, le coppie `(dimensione, hash)` dei file effettivamente copiati, e a consultarle insieme all'indice persistito. Vale la nota di aspettativa già scritta sopra: fa risparmiare **spazio**, non tempo.
+
+**Vincoli che restano invariati:**
+- Il filtro a due stadi non cambia: un file la cui dimensione non compare né nell'indice né fra le copie della sessione **non viene hashato**.
+- Si registra solo un file la cui verifica d'integrità post-copia è **riuscita** (`srcHash == dstHash`). Una copia con hash mismatch non entra nella mappa di sessione: sarebbe esattamente l'hash di cui non ci si può fidare.
+- Il percorso resta **ad alto danno** (si salta un file), quindi vale la stessa regola dell'indice persistito: prima di dichiarare il doppione il candidato già copiato viene **riletto e rihashato** dal disco. Un solo modello di fiducia, nessuna eccezione da ricordare.
+- La persistenza a batch resta post-import (ADR-0002/0003): la mappa di sessione vive in memoria e muore col job, non è una seconda scrittura sullo store.
+
+**Conseguenza visibile**: i doppioni interni finiscono nello stesso contatore `duplicatesSkipped` del riepilogo di fine job — per l'utente sono la stessa cosa ("questa foto ce l'avevi già"), e distinguere le due provenienze sarebbe gergo tecnico senza valore per lui.
+
 **2. Pannello Doppioni.** Nuova vista che elenca i gruppi di file identici già presenti: quanti gruppi, quanto spazio occupano, dove stanno i file di ciascun gruppo. **Sola lettura, nessuna azione distruttiva.** Se diventa una nuova `Window` scene di primo livello va gated con `AuthGateManager` come tutte le altre (regola stabilita in #30 e già applicata a Diagnostica/Catalogo/Foto).
 
 ## Fuori scope (deciso esplicitamente)

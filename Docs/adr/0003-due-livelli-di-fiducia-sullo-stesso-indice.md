@@ -24,3 +24,11 @@ Sono ora due verdetti distinti. `.needsVerification` (dubbio anti-racy) rihasha,
 È sicuro proprio per la distinzione che questa ADR stabilisce. Perché sia un errore servirebbe un file modificato, di dimensione identica al byte, con mtime spostato di esattamente 3600s (±50ms). E anche in quel caso il danno è confinato al percorso a **basso** danno: l'import rilegge e rihasha comunque il candidato prima di saltarlo, quindi nessuna foto viene persa — al massimo una riga sbagliata nel pannello Doppioni.
 
 **Se qualcuno in futuro pensasse di semplificare unendo i due verdetti**: leggere prima questa nota. Unirli riporta il rihash semestrale dell'intera libreria, in silenzio.
+
+## Nota (2026-08-25): la regola vale anche per la memoria del job corrente
+
+Il dedup copre anche i doppioni **interni allo stesso import** (spec #31, sezione omonima): `ImportSessionIndex` ricorda in memoria le coppie `(dimensione, hash)` dei file copiati nel job in corso, che l'indice persistito non può ancora conoscere.
+
+Quegli hash sono più affidabili di quelli dell'indice — li ha calcolati questo stesso processo pochi secondi prima, e li ha verificati contro il file di destinazione. **Non gode comunque di una fiducia diversa**: anche il candidato copiato in sessione viene riletto e rihashato prima di dichiarare il doppione. Non perché il rischio sia concreto, ma perché "quando si salta un file si rilegge, sempre" è una regola che si ricorda; "si rilegge tranne nel caso X" è una regola che qualcuno un giorno applicherà male. Costa una lettura locale, e solo quando un doppione c'è davvero.
+
+La memoria di sessione **non** è una seconda scrittura sullo store: vive in RAM, muore col job, e la persistenza resta a batch post-import come stabilito in ADR-0002.

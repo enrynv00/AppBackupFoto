@@ -1360,6 +1360,8 @@ git commit -m "Add LibraryIndexer with incremental scan and truncated-read guard
 
 **Pattern da seguire**: `isDuplicate` si aggiunge con **default no-op** alle firme pubbliche, esattamente come è stato fatto per `onCurrentFile` in #17 — così `runMacToSSD`, `runSSDToHDD`, `runSyncS3` e `RestoreEngine` non vanno toccati affatto e continuano a comportarsi identici.
 
+**Nota di revisione (2026-08-25)**: il Task 5 copre **due** scenari, non uno solo (decisione di Enrico dopo il Critic, motivata nella spec, sezione "Doppioni interni allo stesso import"). Oltre al reimport di una sorgente già importata in passato — che l'indice persistito riconosce da sé — va coperto il caso in cui la **stessa sorgente contenga già al suo interno** due file byte-identici. Costa quasi nulla perché `syncFile` calcola **già** `sha256(of: src)` per la verifica d'integrità post-copia e oggi lo butta via: basta conservarlo per la durata del job.
+
 - [ ] **Step 1: Estendi `SyncResult` e `JobStats`**
 
 In `FileSyncer.SyncResult`, accanto a `changedSkipped`:
@@ -1372,32 +1374,99 @@ In `JobStats`, accanto a `changedSkipped`:
     var duplicatesSkipped = 0
 ```
 
-- [ ] **Step 2: Aggiungi il predicato a `FileSyncer`**
+Un solo contatore per entrambi gli scenari: per l'utente sono la stessa cosa ("questa foto ce l'avevi già"), distinguerli sarebbe gergo tecnico senza valore.
 
-Aggiungi il parametro con default no-op a `sync`, `syncDir` e `syncFile` (stessa catena già percorsa da `onCurrentFile`):
+- [ ] **Step 2: `ImportSessionIndex` — memoria dei file copiati nel job corrente**
+
+Nuovo tipo in `ContentView.swift`, subito prima di `final class FileSyncer` (localizzalo con `grep -n "final class FileSyncer"`):
+
+```swift
+/// Doppioni interni allo stesso import (roadmap #31): ricorda le coppie
+/// (dimensione, hash) dei file copiati in **questo** job, che l'indice persistito
+/// non puo' ancora conoscere perche' viene aggiornato solo a import finito.
+///
+/// Vive in memoria e muore col job: non e' una seconda scrittura sullo store, che
+/// resta a batch post-import (ADR-0002 e ADR-0003).
+///
+/// Ci si registra **solo** un file la cui verifica d'integrita' post-copia e'
+/// riuscita: l'hash di una copia con mismatch e' esattamente quello di cui non ci
+/// si puo' fidare.
+///
+/// Thread-safety: `FileSyncer` gira su una coda di lavoro globale, non sul
+/// MainActor. Il lock e' economico (un solo accesso per file) e toglie di mezzo la
+/// domanda "e se un giorno la copia diventasse concorrente?".
+final class ImportSessionIndex {
+    private var bySize: [Int64: [(hash: String, url: URL)]] = [:]
+    private let lock = NSLock()
+
+    func record(hash: String, at url: URL) {
+        guard let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize else { return }
+        lock.lock(); defer { lock.unlock() }
+        bySize[Int64(size), default: []].append((hash: hash, url: url))
+    }
+
+    func candidates(withSize size: Int64) -> [(hash: String, url: URL)] {
+        lock.lock(); defer { lock.unlock() }
+        return bySize[size] ?? []
+    }
+}
+```
+
+- [ ] **Step 3: Aggiungi predicato e hook a `FileSyncer`**
+
+Due parametri con **default no-op** su `sync`, `syncDir` e `syncFile` — stessa catena già percorsa da `onCurrentFile` in #17, così `runMacToSSD`, `runSSDToHDD`, `runSyncS3` e `RestoreEngine` non si toccano affatto:
 
 ```swift
     func sync(from src: URL, to dst: URL, deep: Bool,
               onStatus: @escaping (String) -> Void,
               onProgress: @escaping (SyncResult) -> Void,
               onCurrentFile: @escaping (URL) -> Void = { _ in },
-              isDuplicate: @escaping (URL) -> Bool = { _ in false }) async throws -> SyncResult {
+              isDuplicate: @escaping (URL) -> Bool = { _ in false },
+              onCopied: @escaping (URL, String) -> Void = { _, _ in }) async throws -> SyncResult {
 ```
 
-In `syncFile`, **prima** della copia e **dopo** il controllo di esistenza a destinazione (l'ordine conta: zero-overwrite resta la prima regola), aggiungi:
+In `syncFile`, il controllo va **dopo** quello di esistenza a destinazione (zero-overwrite resta la prima regola) e come **ramo dell'`if` esistente**, non con un `return` anticipato — altrimenti si salta `result.done += 1` e la `onProgress` finale, e la barra di progresso si pianta sui doppioni:
 
 ```swift
-        // Dedup per contenuto (roadmap #31): il file esiste gia' altrove nella libreria
-        // con contenuto byte-identico. Non e' un errore e non e' un file "cambiato":
-        // ha un contatore suo, per non confondersi con changedSkipped (#13).
-        if isDuplicate(src) {
-            result.duplicatesSkipped += 1
-            result.done += 1
-            return
+        if needs {
+            if fm.fileExists(atPath: dst.path) {
+                // destination exists but differs — zero-overwrite rule: skip
+                result.skipped += 1
+                result.changedSkipped += 1
+            } else if isDuplicate(src) {
+                // Dedup per contenuto (roadmap #31): il file esiste gia' altrove nella
+                // libreria con contenuto byte-identico. Non e' un errore e non e' un
+                // file "cambiato": ha un contatore suo, per non confondersi con
+                // changedSkipped (#13). Conta come skipped come tutti gli altri salti,
+                // cosi' copied + skipped + errors + hashErrors continua a fare done.
+                result.skipped += 1
+                result.duplicatesSkipped += 1
+            } else {
+                // …ramo di copia esistente, invariato fino alla verifica hash…
+            }
         }
 ```
 
-- [ ] **Step 3: Aggiungi lo store a `BackupRunner` e il predicato a `runImport`**
+E nel ramo di copia, dove oggi la verifica d'integrità butta via l'hash, conservalo. **Ristruttura** l'`if let` esistente, perché così com'è scritto oggi il ramo `else` non ha `srcHash` legato (ci si arriva anche quando `sha256` ha restituito `nil`):
+
+```swift
+                    let srcHash = sha256(of: src)
+                    let dstHash = sha256(of: dst)
+                    if let srcHash, let dstHash, srcHash != dstHash {
+                        result.hashErrors += 1   // mismatch SHA256: conteggiato separato da errori I/O
+                        let name = src.lastPathComponent
+                        DispatchQueue.main.async { onStatus("⚠️ HASH MISMATCH: \(name) — copia non integra, controlla il log") }
+                    } else {
+                        result.copied += 1
+                        // roadmap #31: l'hash di verifica esiste gia', non buttarlo via.
+                        // Solo con verifica riuscita su entrambi i lati: se sha256 ha
+                        // fallito la lettura non registriamo nulla (verso sicuro — al
+                        // massimo un doppione interno non viene riconosciuto).
+                        if let srcHash, dstHash == srcHash { onCopied(dst, srcHash) }
+                    }
+```
+
+- [ ] **Step 4: Aggiungi lo store a `BackupRunner` e collega il predicato in `runImport`**
 
 In `BackupRunner`, accanto agli altri membri:
 
@@ -1412,18 +1481,19 @@ In `BackupRunner`, accanto agli altri membri:
     }()
 ```
 
-In `runImport`, costruisci il predicato e passalo a `sync`. Sostituisci la chiamata a `self?.syncer.sync(...)` con:
+In `runImport` (`grep -n "func runImport"`), crea la sessione **dentro** il job — una per import, mai condivisa fra job — e passala a entrambi i lati. Sostituisci la chiamata a `self?.syncer.sync(...)`:
 
 ```swift
             let store = self.libraryIndexStore
+            let session = ImportSessionIndex()
             return try await self?.syncer.sync(from: source, to: dst, deep: false,
                 onStatus: { self?.publishStatus($0) },
                 onProgress: { self?.publishProgress($0) },
                 onCurrentFile: { self?.publishCurrentFile($0) },
                 isDuplicate: { url in
-                    guard let store else { return false }
-                    return BackupRunner.isAlreadyInLibrary(url: url, store: store)
-                })
+                    BackupRunner.isAlreadyInLibrary(url: url, store: store, session: session)
+                },
+                onCopied: { dst, hash in session.record(hash: hash, at: dst) })
 ```
 
 E aggiungi il metodo, `nonisolated` perché viene invocato dal thread di lavoro di `FileSyncer`, non dal MainActor (stessa lezione di `makeThumbnail` in #17):
@@ -1432,34 +1502,57 @@ E aggiungi il metodo, `nonisolated` perché viene invocato dal thread di lavoro 
     /// Decide se un file in arrivo e' gia' presente nella libreria con contenuto identico.
     ///
     /// Due stadi, come rmlint/jdupes/rdfind: prima la dimensione (gratis), poi l'hash
-    /// (costoso). Un file la cui dimensione non compare nell'indice non viene nemmeno
-    /// hashato.
+    /// (costoso). Un file la cui dimensione non compare ne' nell'indice persistito ne'
+    /// fra le copie di questa sessione non viene nemmeno hashato.
     ///
     /// MODELLO DI FIDUCIA (vedi spec #31): questo e' il percorso AD ALTO DANNO — un hash
     /// stantio qui farebbe saltare in silenzio una foto diversa. Percio' NON ci si fida
-    /// dell'hash memorizzato: il candidato sul disco viene riletto e rihashato prima di
-    /// dichiarare il duplicato. Costa la lettura di un solo file per candidato.
-    nonisolated static func isAlreadyInLibrary(url: URL, store: LibraryIndexStore) -> Bool {
-        guard let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize,
-              let hasSameSize = try? store.hasAnyEntry(withSize: Int64(size)),
-              hasSameSize else { return false }
-        guard let sourceHash = sha256(of: url),
-              let candidates = try? store.entries(withHash: sourceHash),
-              !candidates.isEmpty else { return false }
+    /// di nessun hash memorizzato, ne' quello dell'indice ne' quello della sessione: il
+    /// candidato sul disco viene riletto e rihashato prima di dichiarare il duplicato.
+    /// Una regola sola, nessuna eccezione da ricordare. Costa la lettura di un file per
+    /// candidato, e solo quando un doppione c'e' davvero.
+    nonisolated static func isAlreadyInLibrary(url: URL,
+                                               store: LibraryIndexStore?,
+                                               session: ImportSessionIndex) -> Bool {
+        guard let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize else { return false }
+        let size64 = Int64(size)
 
-        // Riverifica: l'hash memorizzato potrebbe essere stantio (mtime riscrivibile
-        // da userspace, inode non affidabili su ExFAT). Rileggiamo davvero il candidato.
-        guard let ssdRoot = BookmarkManager.shared.urls[.ssd] else { return false }
-        for candidate in candidates {
-            let candidateURL = ssdRoot.appendingPathComponent(candidate.displayPath)
-            guard FileManager.default.fileExists(atPath: candidateURL.path) else { continue }
-            if sha256(of: candidateURL) == sourceHash { return true }
+        // Stadio 1 — dimensione, gratis. Sessione corrente e indice persistito insieme.
+        let sessionCandidates = session.candidates(withSize: size64)
+        var storeHasSize = false
+        if let store { storeHasSize = (try? store.hasAnyEntry(withSize: size64)) ?? false }
+        guard !sessionCandidates.isEmpty || storeHasSize else { return false }
+
+        // Stadio 2 — hash della sorgente, costoso.
+        guard let sourceHash = sha256(of: url) else { return false }
+
+        // Copie fatte in questo stesso job (l'indice persistito non le conosce ancora).
+        for candidate in sessionCandidates where candidate.hash == sourceHash {
+            if fileOnDisk(candidate.url, matches: sourceHash) { return true }
+        }
+
+        // Indice persistito.
+        guard let store,
+              let entries = try? store.entries(withHash: sourceHash),
+              !entries.isEmpty,
+              let ssdRoot = BookmarkManager.shared.urls[.ssd] else { return false }
+        for entry in entries {
+            if fileOnDisk(ssdRoot.appendingPathComponent(entry.displayPath), matches: sourceHash) { return true }
         }
         return false
     }
+
+    /// Riverifica di un candidato: l'hash memorizzato potrebbe essere stantio (mtime
+    /// riscrivibile da userspace, inode non affidabili su ExFAT), quindi si rilegge.
+    /// Un candidato sparito non e' un doppione: si prosegue col successivo.
+    private nonisolated static func fileOnDisk(_ url: URL, matches hash: String) -> Bool {
+        FileManager.default.fileExists(atPath: url.path) && sha256(of: url) == hash
+    }
 ```
 
-- [ ] **Step 4: Propaga il contatore e mostralo**
+**Effetto collaterale accettato**: `runImport` chiama `previewSync` per il controllo dello spazio libero, e `previewFile` non sa nulla del dedup — quindi `toAddBytes` **sovrastima** lo spazio necessario quando la sorgente contiene doppioni. Il verso è quello sicuro (al massimo l'app rifiuta un import che sarebbe entrato), e il riepilogo di fine job riporta comunque il numero vero. Non allineare `previewSync`: significherebbe hashare tutto due volte, per una stima.
+
+- [ ] **Step 5: Propaga il contatore e mostralo**
 
 In `BackupRunner.run(label:)` e in `publishProgress`, accanto a `self.stats.changedSkipped = r.changedSkipped`, aggiungi:
 ```swift
@@ -1474,19 +1567,31 @@ In `CompletionSheet`, accanto alla riga condizionale già esistente per `changed
             }
 ```
 
-- [ ] **Step 5: Build e suite completa**
+- [ ] **Step 6: Test**
+
+Nuovo file `AppBackupFotoTests/ImportDedupTests.swift`. I primi tre sono logica pura sul tipo nuovo; gli ultimi due girano su directory temporanee reali, nello stile di `FileSyncerZeroOverwriteTests` (nessun mock).
+
+1. `testSessionIndexIgnoresUnknownSize` — `candidates(withSize:)` su una dimensione mai registrata torna vuoto.
+2. `testSessionIndexRecordsAndFindsBySize` — dopo `record`, il candidato torna con hash e URL giusti.
+3. `testSessionIndexKeepsDistinctHashesOfSameSize` — due file di **pari dimensione** e hash diversi convivono nello stesso bucket, entrambi recuperabili. È il bucket che deve reggere la collisione di dimensione, non l'hash.
+4. `testIntraImportDuplicateIsCopiedOnce` — sorgente con lo stesso contenuto in due sottocartelle diverse e **nomi diversi**: a destinazione esiste solo il primo, `duplicatesSkipped == 1`, `copied == 1`, e `copied + skipped + errors + hashErrors == done`.
+5. `testSameSizeDifferentContentAreBothCopied` — **il test di sicurezza**: due file di dimensione identica ma contenuto diverso vengono copiati **entrambi**, `duplicatesSkipped == 0`. È il falso positivo che costerebbe una foto, quindi deve fallire se qualcuno un giorno degradasse il confronto alla sola dimensione.
+
+Scrivi 4 e 5 **prima** di collegare il predicato in `runImport` e guardali fallire (4) e passare (5): il test che passa già col bug è l'errore ricorrente di questo progetto, terza volta dopo il parsing YAML di Immich.
+
+- [ ] **Step 7: Build e suite completa**
 
 ```bash
 xcodebuild -project AppBackupFoto.xcodeproj -scheme AppBackupFoto -configuration Debug build 2>&1 | tail -10
 xcodebuild -project AppBackupFoto.xcodeproj -scheme AppBackupFoto -destination 'platform=macOS' test 2>&1 | tail -15
 ```
-Expected: `** BUILD SUCCEEDED **`, **232 test invariati** (questo task non ne aggiunge: è wiring su percorsi con I/O reale, come `runMacToSSD` e gli altri job che non hanno XCTest diretti). Il criterio è **nessuna regressione**: in particolare i test di `FileSyncerZeroOverwriteTests` e `FileSyncerChangedSkippedTests` devono restare verdi, a prova che il default no-op non ha alterato il comportamento dei flussi esistenti.
+Expected: `** BUILD SUCCEEDED **`, **237 test** (232 + 5). Il resto del task è wiring su percorsi con I/O reale, come `runMacToSSD` e gli altri job che non hanno XCTest diretti; il criterio lì è **nessuna regressione**: in particolare `FileSyncerZeroOverwriteTests` e `FileSyncerChangedSkippedTests` devono restare verdi, a prova che i default no-op non hanno alterato i flussi esistenti.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
-git add AppBackupFoto/ContentView.swift
-git commit -m "Wire content dedup into FileSyncer.sync and runImport (roadmap #31)"
+git add AppBackupFoto/ContentView.swift AppBackupFotoTests/ImportDedupTests.swift
+git commit -m "Wire content dedup into FileSyncer.sync and runImport, including intra-import duplicates (roadmap #31)"
 ```
 
 ---
@@ -1583,7 +1688,7 @@ In `ContentView`, accanto all'`.onChange(of: volumes.ssdMounted)` già esistente
 
 - [ ] **Step 5: Build, suite completa, verifica manuale**
 
-Expected: `** BUILD SUCCEEDED **`, 232 test invariati.
+Expected: `** BUILD SUCCEEDED **`, 237 test invariati.
 
 Verifica manuale (richiede SSD collegato, quindi **a carico di Enrico**): aprire Diagnostica, vedere la card, avviare la costruzione, verificare che il progresso avanzi, interromperla e verificare che l'indice resti utilizzabile, riavviarla e verificare che riprenda senza rihashare ciò che era già stato fatto.
 
@@ -1618,7 +1723,8 @@ Aggiungi una sezione sui quattro componenti nuovi. Documenta esplicitamente, per
 - che l'**inode non è utilizzabile** su ExFAT e perché (con la fonte);
 - che la **tolleranza DST** non ha prior art ed è una scelta di questo progetto;
 - che le chiavi dell'indice sono **normalizzate NFC + minuscole** e perché;
-- che `isDuplicate` ha un **default no-op** apposta, così i tre job esistenti e `RestoreEngine` non sono toccati.
+- che `isDuplicate` e `onCopied` hanno un **default no-op** apposta, così i tre job esistenti e `RestoreEngine` non sono toccati;
+- che `ImportSessionIndex` copre i doppioni **interni allo stesso import** riusando l'hash che la verifica d'integrità post-copia calcola già — se qualcuno rimuovesse quella verifica, il dedup intra-import morirebbe in silenzio con lei.
 
 - [ ] **Step 4: Commit**
 
