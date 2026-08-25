@@ -163,3 +163,25 @@ Deliberatamente **non** si implementa l'hash parziale sui primi N byte: la ricer
 ## Prossimo passo
 
 Spec da approvare esplicitamente da Enrico prima del piano di implementazione. Alla sua approvazione, #27-A riprende dal Task 3 (`ImportView`), che consumerà l'indice.
+
+---
+
+## Nota post-implementazione (2026-08-25, Task 1) — copertura reale di `UTType`
+
+La spec lasciava aperto: *"Da verificare al primo run reale se qualche formato presente nella libreria di Enrico non venga riconosciuto"*. Verificato subito dopo il Task 1, eseguendo la stessa logica di `IndexableKind.of` su questo Mac (macOS 26). **SSD non collegato**, quindi questa è la copertura dei formati, non un censimento di ciò che c'è davvero sull'SSD: quello resta da fare al primo run.
+
+**Riconosciuti correttamente**: tutti i formati foto comuni (jpg, jpeg, heic, heif, png, gif, tiff, tif, bmp, webp, **avif**, **jxl**) e **14 RAW su 15** (cr2, cr3, nef, nrw, arw, srf, raf, orf, rw2, dng, pef, srw, 3fr, iiq). Video: mov, mp4, m4v, avi, mts, m2ts, 3gp. I sidecar e gli archivi restano fuori come previsto (xmp, aae, json, zip, thm, srt).
+
+**Non riconosciuti** — restano fuori dall'indice, quindi fuori dal dedup:
+
+| Estensione | Cos'è | Impatto |
+| :---- | :---- | :---- |
+| `.mkv` | Matroska | **Il più rilevante**: container video diffuso, non prodotto da fotocamere ma possibile da altre sorgenti |
+| `.x3f` | RAW Sigma Foveon | Trascurabile senza una Sigma |
+| `.hevc` | stream HEVC grezzo | Raro come estensione di file |
+| `.insv` | video Insta360 | Rilevante solo con una camera 360 |
+| `.lrv` | proxy a bassa risoluzione GoPro/DJI | **Escluderli va bene**: sono file usa-e-getta |
+
+**Nessuna azione richiesta ora.** Vale il principio già stabilito: sbagliare per esclusione è il verso sicuro — un file non classificato non partecipa al dedup e **viene copiato, mai saltato**. Se al primo run reale l'SSD contiene `.mkv` in quantità, la correzione è una riga (un insieme di estensioni aggiuntive in `IndexableKind`), non un cambio di design.
+
+**Da fare al primo run con SSD collegato**: censire le estensioni realmente presenti (`find <SSD> -type f | sed 's/.*\.//' | sort | uniq -c | sort -rn`) e confrontarle con questa tabella.

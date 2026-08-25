@@ -69,7 +69,7 @@ Un solo file applicativo (`ContentView.swift`, convenzione di progetto) più qua
 - Consuma: `UTType` (da `UniformTypeIdentifiers`, già importato a riga 5).
 - Produce: `enum IndexableKind { case image, video, notIndexable }` e `static func IndexableKind.of(url: URL) -> IndexableKind` — consumato dal Task 4 (`LibraryIndexer`).
 
-- [ ] **Step 1: Scrivi il file di test**
+- [x] **Step 1: Scrivi il file di test**
 
 Crea `AppBackupFotoTests/IndexableKindTests.swift`:
 
@@ -107,7 +107,7 @@ final class IndexableKindTests: XCTestCase {
 }
 ```
 
-- [ ] **Step 2: Registra il file di test in `project.pbxproj`**
+- [x] **Step 2: Registra il file di test in `project.pbxproj`**
 
 Genera due ID:
 ```bash
@@ -123,12 +123,12 @@ Usa `grep -n "ImportSourceGuardTests" AppBackupFoto.xcodeproj/project.pbxproj` p
 3. Gruppo `AppBackupFotoTests`, dentro `children = ( ... )`: `				<FILEREF_ID> /* IndexableKindTests.swift */,`
 4. `PBXSourcesBuildPhase` `62FE197CBAC2C2E908580583 /* Sources */`, dentro `files = ( ... )`: `				<BUILDFILE_ID> /* IndexableKindTests.swift in Sources */,`
 
-- [ ] **Step 3: Verifica il fallimento atteso**
+- [x] **Step 3: Verifica il fallimento atteso**
 
 Run: `xcodebuild -project AppBackupFoto.xcodeproj -scheme AppBackupFoto -destination 'platform=macOS' test -only-testing:AppBackupFotoTests/IndexableKindTests 2>&1 | tail -30`
 Expected: FAIL con `cannot find 'IndexableKind' in scope`. **Se invece il comando non trova affatto la classe di test, la registrazione in `project.pbxproj` non ha funzionato: fermati e segnalalo.**
 
-- [ ] **Step 4: Implementa**
+- [x] **Step 4: Implementa**
 
 In `AppBackupFoto/ContentView.swift`, subito dopo la chiusura di `enum FileKind`:
 
@@ -155,12 +155,12 @@ enum IndexableKind {
 }
 ```
 
-- [ ] **Step 5: Verifica che i test passino**
+- [x] **Step 5: Verifica che i test passino**
 
 Run: `xcodebuild -project AppBackupFoto.xcodeproj -scheme AppBackupFoto -destination 'platform=macOS' test -only-testing:AppBackupFotoTests/IndexableKindTests 2>&1 | tail -20`
 Expected: `Executed 12 tests, with 0 failures`, `** TEST SUCCEEDED **`
 
-- [ ] **Step 6: Build, suite completa, commit**
+- [x] **Step 6: Build, suite completa, commit**
 
 ```bash
 xcodebuild -project AppBackupFoto.xcodeproj -scheme AppBackupFoto -configuration Debug build 2>&1 | tail -10
