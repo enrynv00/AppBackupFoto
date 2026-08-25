@@ -1366,6 +1366,33 @@ func isLikelyVolumeRoot(_ url: URL) -> Bool {
     url.pathComponents.count <= 3
 }
 
+/// True se `source` coincide con, è contenuto in, o contiene uno dei path già
+/// configurati (Libreria Foto/SSD/HDD) — usata dal wizard di import per evitare
+/// un self-import senza senso della libreria dentro se stessa.
+func isSourceInsideConfiguredLocations(_ source: URL, configuredURLs: [URL]) -> Bool {
+    let sourcePath = source.standardizedFileURL.path
+    for configured in configuredURLs {
+        let configuredPath = configured.standardizedFileURL.path
+        if sourcePath == configuredPath
+            || sourcePath.hasPrefix(configuredPath + "/")
+            || configuredPath.hasPrefix(sourcePath + "/") {
+            return true
+        }
+    }
+    return false
+}
+
+/// Converte un'etichetta libera in un nome di cartella sicuro per il filesystem
+/// (sostituisce "/" e ":" — gli unici caratteri realmente problematici in un path
+/// macOS — con "-"), con un fallback se il risultato è vuoto dopo il trim.
+func importFolderSlug(_ label: String) -> String {
+    let cleaned = label
+        .replacingOccurrences(of: "/", with: "-")
+        .replacingOccurrences(of: ":", with: "-")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    return cleaned.isEmpty ? "Import" : cleaned
+}
+
 enum FileKind {
     static func isImage(url: URL) -> Bool {
         guard let type = UTType(filenameExtension: url.pathExtension) else { return false }
