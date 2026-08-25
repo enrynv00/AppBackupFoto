@@ -1051,6 +1051,16 @@ final class LibraryIndexer {
     // Le esclusioni NON sono ridichiarate qui: `LibraryExclusions` e' la fonte unica
     // condivisa con FileSyncer e ReviewEngine. Una seconda copia "da tenere allineata"
     // e' esattamente il modo in cui le due divergono.
+    //
+    // ATTENZIONE (trovato dal Security Auditor, 2026-08-25): il filtro effettivo di
+    // questo scanner deve essere `.skipsHiddenFiles` sull'enumerator PIU'
+    // `LibraryExclusions`, mai una sola delle due. Sei degli otto nomi della lista
+    // iniziano con un punto, quindi sono gia' coperti dall'enumerator; ma se qualcuno
+    // "semplificasse" togliendo `.skipsHiddenFiles`, l'indice diventerebbe un
+    // superset di cio' che FileSyncer copia davvero. Incrociato con ADR-0003, una
+    // copia nascosta byte-identica sull'SSD farebbe saltare un import reale mentre
+    // quella copia non arriva mai ne' su HDD ne' su Cubbit: perdita silenziosa.
+    // L'opzione `.skipsHiddenFiles` piu' sotto NON e' un dettaglio di performance.
 
     /// Scansione completa con aggiornamento incrementale.
     /// I commit avvengono a batch (non uno per file, non uno solo alla fine): cosi'

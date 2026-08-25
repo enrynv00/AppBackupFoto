@@ -1474,9 +1474,25 @@ func importFolderSlug(_ label: String) -> String {
     return cleaned
 }
 
-/// File e cartelle di sistema che nessun percorso di questa app deve mai trattare
-/// come contenuto dell'utente: né copiare (`FileSyncer`), né elencare
-/// (`ReviewEngine.scanLocalCatalog`), né indicizzare (roadmap #31).
+/// File e cartelle di sistema da non trattare come contenuto dell'utente.
+///
+/// **Chi la usa davvero, oggi**: `FileSyncer` (Mac→SSD e SSD→HDD) e
+/// `ReviewEngine.scanLocalCatalog`. **Non** la usano `S3Syncer.previewUpload`,
+/// `S3Syncer.sync` e `ReviewEngine.sampleLocalPair`, che hanno una variante più
+/// debole (`hasPrefix("._") || name == ".DS_Store"`). Poiché tutti girano dentro un
+/// enumerator con `.skipsHiddenFiles`, la divergenza reale è di due soli nomi non
+/// nascosti: `lost+found` e `Backups.backupdb`. La direzione è innocua (escludono
+/// *meno*, quindi copiano di più, mai di meno) ma non è nulla: un `Backups.backupdb`
+/// sull'SSD verrebbe caricato su Cubbit e non copiato su HDD. Da decidere se
+/// allinearli — è un cambio di comportamento, non una rifattorizzazione.
+///
+/// **Il filtro effettivo è `.skipsHiddenFiles` PIÙ questa lista**, non questa lista
+/// da sola: 6 degli 8 nomi qui sotto iniziano con un punto e sarebbero già saltati
+/// dall'enumerator. Chi scrive un nuovo percorso di scansione deve usare **entrambi**.
+/// Usare solo questa lista produrrebbe un insieme più largo di quello che viene
+/// copiato — e per l'indice di contenuto (#31) sarebbe una perdita silenziosa: una
+/// copia nascosta e byte-identica farebbe saltare un import reale, mentre quella
+/// copia non arriva mai né su HDD né su Cubbit.
 ///
 /// **Fonte unica, di proposito.** Questa lista è vissuta a lungo in due copie
 /// identiche, in due tipi diversi, ciascuna con il proprio `shouldExclude`. Due
