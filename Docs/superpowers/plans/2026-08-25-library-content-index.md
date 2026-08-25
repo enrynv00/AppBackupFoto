@@ -39,7 +39,7 @@ Sessione di grilling su questo piano **dopo** l'approvazione di spec e piano, pr
   (Era 162 su `c868cf4`. I due commit del 2026-08-25 nati dal grilling di questo piano
   hanno aggiunto 11 test: `79a4c2d` — nessuna etichetta di import puo' produrre una
   cartella nascosta, +6 — e `037d028` — `LibraryExclusions` come fonte unica, +5.)
-- **L'hashing usa sempre `sha256(of:)` esistente** (`ContentView.swift:1454`), che fa I/O POSIX a basso livello. **Mai `FileHandle`**: è il bug di memoria da 41GB già pagato una volta su questo progetto.
+- **L'hashing usa sempre `sha256(of:)` esistente** (localizzala con `grep -n '^func sha256(of' AppBackupFoto/ContentView.swift` — **mai per numero di riga**: i commit di oggi l'hanno gia' spostata da 1454 a 1531, e ogni task successivo la sposta ancora), che fa I/O POSIX a basso livello. **Mai `FileHandle`**: è il bug di memoria da 41GB già pagato una volta su questo progetto.
 - **L'indice è una cache, non una fonte di verità.** Nulla al suo interno è dato originale; deve essere sempre ricostruibile da zero. Nessun percorso di codice deve trattare l'assenza o la corruzione dell'indice come un errore fatale.
 - L'indice vive in `~/Library/Application Support/AppBackupFoto/`, **mai sull'SSD**.
 - Nessun test deve toccare SSD, HDD o dati reali: solo directory temporanee, con cleanup in `tearDown`.
@@ -1230,7 +1230,7 @@ git commit -m "Add LibraryIndexer with incremental scan and truncated-read guard
 ### Task 5: Dedup in `FileSyncer.sync` e in `runImport`
 
 **Files:**
-- Modify: `AppBackupFoto/ContentView.swift` — `FileSyncer.SyncResult` (~riga 1539), `FileSyncer.sync`/`syncDir`/`syncFile`, `JobStats` (~riga 1316), `BackupRunner.runImport`, `CompletionSheet`
+- Modify: `AppBackupFoto/ContentView.swift` — `FileSyncer.SyncResult`, `FileSyncer.sync`/`syncDir`/`syncFile`, `JobStats`, `BackupRunner.runImport`, `CompletionSheet` (**localizzali con `grep -n`, non per numero di riga**: sono cambiati piu' volte oggi)
 
 **Interfaces:**
 - Consuma: `LibraryIndexStore`, `LibraryIndexer`, `indexEntryVerdict`, `sha256(of:)`.

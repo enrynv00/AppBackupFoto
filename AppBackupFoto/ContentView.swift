@@ -1501,9 +1501,13 @@ enum LibraryExclusions {
 }
 
 enum FileKind {
+    /// Usato dalle miniature (#17). Delega a `IndexableKind` invece di ripetere lo
+    /// stesso `UTType(filenameExtension:)` + `conforms(to: .image)`: le due versioni
+    /// erano gia' identiche, e tenerle separate significava che la prossima
+    /// estensione di una sola delle due le avrebbe fatte divergere in silenzio —
+    /// esattamente il problema che `LibraryExclusions` documenta.
     static func isImage(url: URL) -> Bool {
-        guard let type = UTType(filenameExtension: url.pathExtension) else { return false }
-        return type.conforms(to: .image)
+        IndexableKind.of(url: url) == .image
     }
 }
 
