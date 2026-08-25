@@ -181,6 +181,26 @@ git add AppBackupFoto/ContentView.swift AppBackupFotoTests/ImportSourceGuardTest
 git commit -m "Add isSourceInsideConfiguredLocations/importFolderSlug pure helpers (roadmap #27)"
 ```
 
+#### Nota post-review (2026-08-25) — due bloccanti corretti dopo il commit `ac7505d`
+
+Il codice mostrato negli Step qui sopra è la **prima versione**, trovata insufficiente dal Code Reviewer. Non reintrodurla: entrambi i problemi erano riproducibili empiricamente, non stilistici.
+
+**1. `importFolderSlug` non era un costruttore di path sicuro.** Sostituire solo `/` e `:` e trimmare i bordi lascia passare casi in cui `<SSD>/Import/<slug>` non è affatto la cartella dedicata:
+
+| label | dst | dove atterravano i file |
+|---|---|---|
+| `".."` | `<SSD>/Import/..` | la **root dell'SSD** |
+| `"."` | `<SSD>/Import/.` | `<SSD>/Import/`, nessun isolamento per-import |
+
+più caratteri di controllo in mezzo alla stringa (il trim tocca solo i bordi), un `\0` che fa fallire `createDirectory`, e una label oltre **255 byte UTF-8** (~200 caratteri accentati bastano: il limite del filesystem è in byte, non in caratteri) che manda il job in errore. La versione attuale, tutta dentro la funzione pura (i chiamanti non sanno nulla): rimuove `CharacterSet.controlCharacters`, ricade su `"Import"` anche per `"."`/`".."`/soli punti, e tronca a `importFolderSlugMaxBytes` (200 byte, margine sotto i 255 reali) **iterando per caratteri** e sommando le lunghezze in byte — mai un `prefix()` sui byte grezzi, che spezzerebbe una sequenza UTF-8 a metà.
+
+**2. La guardia symlink non scattava, e la conseguenza a valle è una ricorsione runaway.** Il confronto era puramente testuale, quindi un alias verso una location configurata la scavalcava. Misurato dal reviewer con la sorgente puntata (via alias) all'SSD: `FileSyncer.syncDir` crea `dst` **prima** di chiamare `contentsOfDirectory(at: src)`, quindi la cartella appena creata compare nel listing della sorgente e viene ricorsa — partendo da 3 file: **83 cartelle create, 81 file copiati, profondità 55**, fermata solo da PATH_MAX. Correzione su due livelli:
+
+- `isSourceInsideConfiguredLocations` risolve i symlink su **entrambi i lati** (`resolvingSymlinksInPath()` su `source` e su ogni elemento di `configuredURLs`, mai su uno solo). Verificato empiricamente che su path inesistenti (es. `/Volumes/SSD - Enri` a SSD scollegato) la funzione restituisce il path invariato, quindi i 9 test originali passano senza modifiche. Vale il limite già documentato in `.claude/rules/architecture.md` (ReviewEngine/`sampleLocalPair`): `resolvingSymlinksInPath()` lascia di proposito `/var` e `/tmp` non risolti — irrilevante per `/Users/...` e `/Volumes/...`, e comunque simmetrico dato che i due lati ricevono lo stesso trattamento. Non serve `realpath()` qui.
+- `runImport` (Task 2) ha una guardia **strutturale** indipendente dalla scelta dell'utente nella UI: dopo aver calcolato `dst`, `isSourceInsideConfiguredLocations(dst, configuredURLs: [source])` copre i tre casi (uguali, dst dentro source, source dentro dst) e aborta con un alert esplicito, chiamando `bm.stopAccessing(.ssd)` prima del `return` come gli altri rami del metodo. È il secondo strato: copre symlink, aliasing futuri e qualunque buco residuo dello slug.
+
+Test: `ImportSourceGuardTests` passa da 9 a **23** test (nuovi: `configuredURLs: []`, tre casi con symlink reali creati in `NSTemporaryDirectory()` con cleanup in `tearDownWithError`, `"."`/`".."`/soli punti, caratteri di controllo interni, limite in byte, troncamento che non spezza un carattere multibyte, label accentata esattamente al limite, e un `createDirectory` reale sul nome troncato). Suite completa: **162 test, 0 failure**.
+
 ---
 
 ### Task 2: `BackupRunner.runImport(source:label:)`

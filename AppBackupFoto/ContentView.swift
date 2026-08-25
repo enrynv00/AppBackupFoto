@@ -1366,13 +1366,30 @@ func isLikelyVolumeRoot(_ url: URL) -> Bool {
     url.pathComponents.count <= 3
 }
 
-/// True se `source` coincide con, è contenuto in, o contiene uno dei path già
-/// configurati (Libreria Foto/SSD/HDD) — usata dal wizard di import per evitare
-/// un self-import senza senso della libreria dentro se stessa.
+/// True se `source` coincide con, è contenuto in, o contiene uno dei path in
+/// `configuredURLs`. Usata dal wizard di import per due scopi: evitare un
+/// self-import della libreria dentro se stessa (`configuredURLs` = Libreria
+/// Foto/SSD/HDD) e, come guardia strutturale in `runImport`, escludere che
+/// destinazione e sorgente si contengano a vicenda.
+///
+/// I symlink vengono risolti **su entrambi i lati** prima del confronto, mai su uno
+/// solo: senza questo, un alias verso una location configurata passerebbe la guardia
+/// e `FileSyncer.syncDir` finirebbe per ricorrere dentro la destinazione che ha
+/// appena creato (crea `dst` prima di elencare `src`), con una ricorsione runaway
+/// fermata solo da PATH_MAX.
+///
+/// Su path inesistenti (es. `/Volumes/SSD - Enri` con SSD scollegato)
+/// `resolvingSymlinksInPath()` restituisce il path invariato — verificato
+/// empiricamente — quindi il confronto testuale resta valido anche a volume assente.
+/// Limite noto, ereditato dalla piattaforma e documentato in
+/// `.claude/rules/architecture.md` (ReviewEngine/`sampleLocalPair`): su macOS
+/// `resolvingSymlinksInPath()` lascia di proposito `/var` e `/tmp` non risolti. È
+/// irrilevante per i path di questo progetto (`/Users/...`, `/Volumes/...`) ed è
+/// comunque simmetrico, dato che il trattamento dei due lati è identico.
 func isSourceInsideConfiguredLocations(_ source: URL, configuredURLs: [URL]) -> Bool {
-    let sourcePath = source.standardizedFileURL.path
+    let sourcePath = source.resolvingSymlinksInPath().standardizedFileURL.path
     for configured in configuredURLs {
-        let configuredPath = configured.standardizedFileURL.path
+        let configuredPath = configured.resolvingSymlinksInPath().standardizedFileURL.path
         if sourcePath == configuredPath
             || sourcePath.hasPrefix(configuredPath + "/")
             || configuredPath.hasPrefix(sourcePath + "/") {
@@ -1382,15 +1399,49 @@ func isSourceInsideConfiguredLocations(_ source: URL, configuredURLs: [URL]) -> 
     return false
 }
 
-/// Converte un'etichetta libera in un nome di cartella sicuro per il filesystem
-/// (sostituisce "/" e ":" — gli unici caratteri realmente problematici in un path
-/// macOS — con "-"), con un fallback se il risultato è vuoto dopo il trim.
+/// Limite in **byte UTF-8** per il nome di cartella prodotto da `importFolderSlug`.
+/// Margine deliberato sotto i 255 byte reali di HFS+/APFS/ExFAT: il limite del
+/// filesystem è in byte, non in caratteri, e ~200 caratteri accentati bastano a
+/// superarlo facendo fallire `createDirectory`.
+let importFolderSlugMaxBytes = 200
+
+/// Converte un'etichetta libera in un nome di **singola** componente di path, sicuro
+/// da passare a `appendingPathComponent` e da creare con `createDirectory`.
+///
+/// Garanzie (tutte dentro la funzione: i chiamanti non devono sapere nulla):
+/// - `/` e `:` diventano `-`, quindi il risultato non può introdurre livelli di path
+///   né essere reinterpretato dal Finder;
+/// - i caratteri di controllo (incluso `\0`, che farebbe fallire `createDirectory`, e
+///   `\n`/`\r` in mezzo alla stringa, che il solo trim sui bordi non toccherebbe)
+///   vengono rimossi;
+/// - il risultato non è mai `""`, `"."`, `".."` né una sequenza di soli punti — casi
+///   in cui `appendingPathComponent` produrrebbe una destinazione che risolve fuori
+///   dalla cartella dedicata (`<SSD>/Import/..` scrive nella root dell'SSD) — si
+///   ricade su `"Import"`;
+/// - la lunghezza è ≤ `importFolderSlugMaxBytes` byte UTF-8; il troncamento avviene
+///   **per caratteri**, quindi non spezza mai una sequenza UTF-8 (né un grafema) a metà.
 func importFolderSlug(_ label: String) -> String {
-    let cleaned = label
+    var cleaned = String(String.UnicodeScalarView(
+        label.unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) }))
+    cleaned = cleaned
         .replacingOccurrences(of: "/", with: "-")
         .replacingOccurrences(of: ":", with: "-")
         .trimmingCharacters(in: .whitespacesAndNewlines)
-    return cleaned.isEmpty ? "Import" : cleaned
+
+    if cleaned.utf8.count > importFolderSlugMaxBytes {
+        var truncated = ""
+        var bytes = 0
+        for character in cleaned {
+            let size = String(character).utf8.count
+            if bytes + size > importFolderSlugMaxBytes { break }
+            truncated.append(character)
+            bytes += size
+        }
+        cleaned = truncated.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    if cleaned.isEmpty || cleaned.allSatisfy({ $0 == "." }) { return "Import" }
+    return cleaned
 }
 
 enum FileKind {
@@ -3527,6 +3578,18 @@ final class BackupRunner: ObservableObject {
             return
         }
         let dst = ssdURL.appendingPathComponent("Import").appendingPathComponent(importFolderSlug(label))
+        // Guardia strutturale, indipendente da quello che l'utente ha scelto nella UI:
+        // se destinazione e sorgente coincidono o si contengono a vicenda (symlink,
+        // alias, o un buco residuo dello slug), FileSyncer.syncDir creerebbe dst prima
+        // di elencare src, si ritroverebbe la propria destinazione nel listing della
+        // sorgente e ricorrerebbe fino a PATH_MAX. Secondo strato rispetto alla guardia
+        // self-import del wizard, che questa non sostituisce.
+        if isSourceInsideConfiguredLocations(dst, configuredURLs: [source]) {
+            bm.stopAccessing(.ssd)
+            alert("Import non eseguibile",
+                  "La cartella di destinazione '\(dst.path)' e la sorgente '\(source.path)' coincidono o una contiene l'altra.\n\nScegli una sorgente fuori dall'SSD (o cambia l'etichetta di destinazione).")
+            return
+        }
         Task { @MainActor [weak self] in
             guard let self else { return }
             let preview = await self.syncer.previewSync(from: source, to: dst, deep: false)
