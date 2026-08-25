@@ -771,16 +771,46 @@ final class LibraryIndexStore {
 - [x] **Step 6: Verifica che i test passino**
 
 Run: `xcodebuild -project AppBackupFoto.xcodeproj -scheme AppBackupFoto -destination 'platform=macOS' test -only-testing:AppBackupFotoTests/LibraryIndexStoreTests 2>&1 | tail -20`
-Expected: `Executed 13 tests, with 0 failures`
+Expected: `Executed 13 tests, with 0 failures` (dopo la review sono **25** — vedi nota in fondo al task)
 
 - [x] **Step 7: Build, suite completa, commit**
 
-Expected suite: **216 test** (203 + 13). La baseline e' 203, non 200: il Task 2 ne ha aggiunti 3 dopo il mutation test del code reviewer.
+Expected suite: **216 test** (203 + 13). La baseline e' 203, non 200: il Task 2 ne ha aggiunti 3 dopo il mutation test del code reviewer. **Dopo la review il totale reale e' 228** (i 12 test nuovi della nota in fondo al task): e' questa la baseline per i task successivi.
 
 ```bash
 git add AppBackupFoto/ContentView.swift AppBackupFotoTests/LibraryIndexStoreTests.swift AppBackupFoto.xcodeproj/project.pbxproj
 git commit -m "Add LibraryIndexStore SQLite persistence (roadmap #31)"
 ```
+
+#### Nota post-review (2026-08-26) — 12 rilievi chiusi dopo il commit `69981d7`
+
+Il codice mostrato nello Step 5 qui sopra è la **prima versione**. Code Reviewer e Security Auditor l'hanno bocciata con rilievi **riprodotti empiricamente** (salvo dove indicato), e il mutation test ha trovato **11 mutanti sopravvissuti su 24**. Non reintrodurre nulla di quel codice: i due bug più gravi diventano attivi appena il Task 4 crea i call site.
+
+**1. Thread safety (ALTA).** La SQLite di sistema è compilata *multi-thread*, non *serialized* (`sqlite3_threadsafe()` → 2): la connessione di `sqlite3_open` non ha mutex e 4 thread × 50 `upsert` crashano in `sqlite3_step` (SIGSEGV, 3 run su 3 — riprodotto anche qui rimettendo il bug: il test runner esce senza eseguire il test). Il solo mutex non basta: con `SQLITE_OPEN_FULLMUTEX` e coda concorrente i `BEGIN` si accavallano ("cannot start a transaction within a transaction") e il `ROLLBACK` di uno annulla la transazione dell'altro — misurato dal reviewer 1610 righe perse su 2000, e riprodotto qui 105 su 200. Ora: **coda seriale privata**, ogni metodo pubblico è un wrapper sottile che fa `queue.sync` su un'implementazione privata `...Unsynchronized` (mai `queue.sync` annidato: sarebbe deadlock), transazione inclusa, più `sqlite3_open_v2` con `SQLITE_OPEN_FULLMUTEX` come cintura. Serializza anche `sqlite3_errmsg`, che da due thread era use-after-free. Serve davvero: nel Task 6 l'aggiornamento dell'indice parte dallo stesso `.onChange(of: volumes.ssdMounted)` del backup automatico, mentre `isAlreadyInLibrary` legge dalla coda di `FileSyncer` e il pannello Revisione conta dal main thread.
+
+**2. Versione dello schema (ALTA).** La versione non sta più in una riga della tabella `meta` ma in **`PRAGMA user_version`**: intero per costruzione, presente su qualunque file SQLite, 0 sui database nuovi. `Int(String(cString:))` restituiva nil per `2.0`, `v2`, `' 2 '` o riga assente, e il chiamante lo leggeva come "database nuovo" → nessun reset, dati vecchi adottati. Il caso peggiore era **irreversibile**: una versione futura con una colonna rinominata faceva riuscire l'`init` e fallire ogni `entry()`/`upsert()` con `no such column` a ogni avvio per sempre (riprodotto: rimettendo la vecchia lettura, il test nuovo fallisce esattamente con `no such column: hash`). Ora qualunque versione diversa da quella attesa ⇒ reset, come impone ADR-0002. La tabella `meta` è stata **rimossa** (non serviva ad altro); il `DROP TABLE IF EXISTS meta` resta solo per ripulire i database scritti dalla prima versione.
+
+**3. File non-SQLite nella posizione dell'indice (MEDIA).** 8KB di byte casuali come `index.sqlite` facevano lanciare `sqlFailed("file is not a database")` a ogni avvio, per sempre: dedup spento e doppioni ricreati a ogni import, senza che l'utente potesse saperlo. Incoerente con il reset su schema sconosciuto. Ora su `SQLITE_NOTADB`/`SQLITE_CORRUPT` in `init` la connessione si chiude, si cancellano **solo** quel file e i suoi `-wal`/`-shm` (dentro una posizione già validata dal punto 8) e si riprova **una volta sola**.
+
+**4. Colonna TEXT NULL (MEDIA).** `TEXT PRIMARY KEY` in una tabella rowid non implica NOT NULL e ammette più righe NULL (riprodotto da connessione esterna): `String(cString:)` su puntatore nil terminava il processo (SIGTRAP, exit 133). Ora `NOT NULL` esplicito nello schema **e** guardia nil in `readEntry`/`allKeys` che **salta** la riga — servono entrambi, perché il vincolo non protegge le righe già scritte.
+
+**5. Errori di `sqlite3_step` scambiati per "nessun risultato" (MEDIA, rilievo dedotto).** `while sqlite3_step(...) == SQLITE_ROW` esce identico su `SQLITE_DONE` e su `SQLITE_ERROR`/`SQLITE_CORRUPT`/`SQLITE_BUSY`: `entries(withHash:)` poteva restituire un array **troncato senza errore** e il dedup concluderne "nessuna copia esiste". Ora tutti i cicli passano da `stepRow`, che lancia su qualunque codice diverso da `ROW`/`DONE`.
+
+**6. Valori di ritorno dei `bind` ignorati (MEDIA).** Un bind fallito lascia il parametro NULL e l'INSERT riesce lo stesso: l'indice si avvelenava da solo e il crash del punto 4 arrivava alla lettura successiva. Ora ogni bind passa da `bindText`/`bindInt64`/`bindDouble`, che controllano l'rc.
+
+**7. `setSchemaVersionForTesting` eliminata (BASSA/MEDIA).** Era `internal` e senza `#if DEBUG`, ed era l'unico hook test-only di tutto `ContentView.swift`. Il test ora scrive la versione da una **seconda connessione sqlite3**, che è anche una simulazione più fedele di "scritto da una versione futura".
+
+**8. L'indice non deve mai stare sull'SSD (BASSA).** `init` crea l'intera catena di directory mancanti, quindi un chiamante che passasse un percorso sul volume sorgente ci creerebbe dentro cartelle e tre file — non danneggia foto, ma viola la spec e il principio read-only. Aggiunta `validateLocation`, **allow-list** (non deny-list su `/Volumes`, così una posizione nuova è vietata per default): Application Support, più la directory temporanea di sistema che i test usano — anch'essa sul disco interno, mai un volume esterno. Deviazione consapevole dal testo del rilievo, che diceva solo "Application Support": l'alternativa era far scrivere ai test dentro la Application Support reale dell'utente.
+
+**9. `normalizedIndexKey` canonicalizza la forma del percorso (BASSA).** `Foto//a.jpg`, `/Foto/a.jpg`, `./Foto/a.jpg`, `Foto/./a.jpg` davano quattro chiavi diverse: bastava che un punto del codice costruisse il path relativo con o senza slash per spostare **tutte** le chiavi (indice apparentemente vuoto e ~120.000 file rihashati, o una seconda copia di ogni entry). Ora slash iniziali e doppi vengono eliminati e i segmenti `.` scartati; la precondizione è documentata. Gli spazi ai bordi **non** vengono toccati (sono nomi di file diversi, non varianti di scrittura). Documentato anche, senza cambiare il comportamento, che `lowercased()` collassa i singleton canonici (K U+212A, Å U+212B, Ω U+2126): su ExFAT quei file coesistono, ma la direzione dell'errore è quella sicura — una copia in più, mai uno skip sbagliato.
+
+**10. Il commento sulla durabilità diceva il falso (BASSA).** Il database gira in WAL con `synchronous=NORMAL`: la finestra di perdita non è "l'ultima transazione" ma tutto il WAL non ancora checkpointato (~1000 pagine, ~4MB). **`synchronous=FULL` resta escluso di proposito** (l'indice è una cache, un fsync per batch su 100.000 file non si ripaga): è stato corretto il commento, che ora dice anche perché va bene — il replay del WAL è atomico per transazione, quindi resta un indice *più vecchio*, mai *sbagliato*.
+
+**11. Contratto di `entries(withHash:)` (BASSA).** Scritto esplicitamente nel doc-comment: risultato **corretto ma potenzialmente parziale**, un array vuoto significa "non lo so", non "nessuna copia esiste", e chi decide di saltare un file rilegge e rihasha il candidato (ADR-0003). Senza quel contratto, un chiamante futuro trasformerebbe una transazione persa in una foto non copiata.
+
+**12. `deinit` usa `sqlite3_close_v2`** (MINORE), che smonta la connessione anche con statement vivi.
+
+**Test: da 13 a 25** in `LibraryIndexStoreTests`, suite completa **228 test, 0 failure** (era 216). Ognuno dei 12 nuovi è stato verificato **rimettendo il bug** e controllando che fallisca davvero (non solo che sia verde): round-trip esatto di `mtime`/`hashedAt` (i due soli input di `indexEntryVerdict`, che nessun test rileggeva); batch con una riga rifiutata da un trigger `RAISE(ABORT)` creato da una connessione esterna, che verifica rollback **e** assenza di transazione appesa; `remove` con 3 chiavi; `hasAnyEntry` con dimensione minore; `path` asserito uguale a `normalizedIndexKey`; accesso concorrente (8 thread × 25 scritture/letture) senza crash né righe perse; `user_version` sconosciuta scritta dall'esterno; schema di una versione futura con versione `2.0` in tabella; canonicalizzazione del percorso (isolata e attraverso lo store); file spazzatura ricostruito; posizione fuori da Application Support rifiutata senza creare nulla; riga con TEXT NULL saltata invece di far crashare il processo.
 
 ---
 
@@ -1354,7 +1384,7 @@ Expected: `Executed 19 tests, with 0 failures`
 
 - [ ] **Step 6: Build, suite completa, commit**
 
-Expected suite: **235 test** (216 + 19).
+Expected suite: **247 test** (228 + 19). La baseline e' 228, non 216: vedi la nota post-review in fondo al Task 3.
 
 ```bash
 git add AppBackupFoto/ContentView.swift AppBackupFotoTests/LibraryIndexerTests.swift AppBackupFoto.xcodeproj/project.pbxproj
@@ -1599,7 +1629,7 @@ Scrivi 4 e 5 **prima** di collegare il predicato in `runImport` e guardali falli
 xcodebuild -project AppBackupFoto.xcodeproj -scheme AppBackupFoto -configuration Debug build 2>&1 | tail -10
 xcodebuild -project AppBackupFoto.xcodeproj -scheme AppBackupFoto -destination 'platform=macOS' test 2>&1 | tail -15
 ```
-Expected: `** BUILD SUCCEEDED **`, **240 test** (235 + 5). Il resto del task è wiring su percorsi con I/O reale, come `runMacToSSD` e gli altri job che non hanno XCTest diretti; il criterio lì è **nessuna regressione**: in particolare `FileSyncerZeroOverwriteTests` e `FileSyncerChangedSkippedTests` devono restare verdi, a prova che i default no-op non hanno alterato i flussi esistenti.
+Expected: `** BUILD SUCCEEDED **`, **252 test** (247 + 5). Il resto del task è wiring su percorsi con I/O reale, come `runMacToSSD` e gli altri job che non hanno XCTest diretti; il criterio lì è **nessuna regressione**: in particolare `FileSyncerZeroOverwriteTests` e `FileSyncerChangedSkippedTests` devono restare verdi, a prova che i default no-op non hanno alterato i flussi esistenti.
 
 - [ ] **Step 8: Commit**
 
@@ -1702,7 +1732,7 @@ In `ContentView`, accanto all'`.onChange(of: volumes.ssdMounted)` già esistente
 
 - [ ] **Step 5: Build, suite completa, verifica manuale**
 
-Expected: `** BUILD SUCCEEDED **`, 240 test invariati.
+Expected: `** BUILD SUCCEEDED **`, 252 test invariati.
 
 Verifica manuale (richiede SSD collegato, quindi **a carico di Enrico**): aprire Diagnostica, vedere la card, avviare la costruzione, verificare che il progresso avanzi, interromperla e verificare che l'indice resti utilizzabile, riavviarla e verificare che riprenda senza rihashare ciò che era già stato fatto.
 

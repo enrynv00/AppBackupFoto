@@ -1658,70 +1658,254 @@ struct LibraryIndexEntry {
 /// ExFAT e' case-insensitive/case-preserving e non normalizza l'Unicode; APFS preserva
 /// la normalizzazione originale. Senza questo passaggio lo stesso file potrebbe
 /// generare due entry distinte (NFC vs NFD, o maiuscole/minuscole diverse).
+///
+/// PRECONDIZIONE: `relativePath` e' il percorso **relativo alla root della libreria**,
+/// come letto dal filesystem. La funzione canonicalizza la forma del percorso — via lo
+/// slash iniziale, via i doppi slash, via i segmenti `.` — perche' altrimenti basterebbe
+/// che un solo punto del codice costruisse la stringa in modo diverso (root con o senza
+/// slash finale) per spostare **tutte** le chiavi: l'indice sembrerebbe vuoto e l'intera
+/// libreria verrebbe rihashata, oppure si creerebbe una seconda copia di ogni entry.
+/// Non tocca invece gli spazi ai bordi dei nomi (`"a.jpg "` resta diverso da `"a.jpg"`):
+/// sono nomi di file legittimi e diversi, non varianti della stessa scrittura.
+/// I segmenti `..` non vengono risolti: qui non arrivano mai, e risolverli a stringhe
+/// significherebbe indovinare.
+///
+/// NOTA (nessun fix, e' voluto): `lowercased()` collassa i singleton canonici — K (U+212A
+/// KELVIN), Å (U+212B ANGSTROM) e Ω (U+2126 OHM) producono la stessa chiave delle lettere
+/// normali. Su ExFAT quei due file possono coesistere davvero, quindi la loro entry si
+/// sovrascriverebbe a vicenda. La direzione dell'errore e' quella sicura: l'indice dimentica
+/// un file (che verra' rihashato, o al peggio copiato una seconda volta), mai il contrario
+/// — non produce mai uno skip sbagliato, perche' lo skip in import rilegge e rihasha
+/// comunque il candidato (ADR-0003).
 func normalizedIndexKey(_ relativePath: String) -> String {
-    relativePath.precomposedStringWithCanonicalMapping.lowercased()
+    let folded = relativePath.precomposedStringWithCanonicalMapping.lowercased()
+    return folded.split(separator: "/", omittingEmptySubsequences: true)
+        .filter { $0 != "." }
+        .joined(separator: "/")
 }
 
 /// Persistenza SQLite dell'indice. Scelta su JSON monolitico perche' un aggiornamento
 /// incrementale costa O(log n) invece di riscrivere l'intero file, e perche' una
 /// corruzione degrada parzialmente invece di rendere tutto illeggibile.
 ///
-/// NOTA DI DURABILITA': su macOS `fsync()` non garantisce la persistenza fisica e la
-/// SQLite di sistema puo' sostituire F_FULLFSYNC con F_BARRIERFSYNC. Conseguenza
-/// peggiore: perdere l'ultima transazione in caso di power loss. Accettato — l'indice
-/// e' una cache ricostruibile, mai una fonte di verita'.
+/// CONCORRENZA: la SQLite di sistema di macOS e' compilata in modalita' *multi-thread*,
+/// non *serialized* (`sqlite3_threadsafe()` ritorna 2, misurato): una connessione aperta
+/// non e' condivisibile fra thread. Con i chiamanti reali — lo scanner scrive da una coda
+/// di background mentre l'import legge dalla sua e il pannello Revisione conta dal main
+/// thread — l'uso non sincronizzato **crasha** dentro `sqlite3_step` (riprodotto, SIGSEGV
+/// con 4 thread). Il solo mutex di SQLite non basta: senza serializzazione i `BEGIN` di due
+/// batch si accavallano ("cannot start a transaction within a transaction") e il `ROLLBACK`
+/// di uno annulla la transazione in volo dell'altro (misurato: 1610 righe su 2000 perse).
+/// Quindi: **una coda seriale privata**, ogni metodo pubblico esegue lì dentro, transazione
+/// inclusa. `SQLITE_OPEN_FULLMUTEX` resta come cintura aggiuntiva.
+/// I metodi privati `...Unsynchronized` presuppongono di essere gia' sulla coda e non
+/// devono mai chiamare un metodo pubblico: `queue.sync` annidato e' un deadlock.
+///
+/// NOTA DI DURABILITA': il database gira in WAL con `synchronous=NORMAL` (il default di
+/// macOS; la store imposta solo `journal_mode`). In questa modalita' i commit **non** sono
+/// fsyncati: in caso di power loss non si perde "l'ultima transazione", si perde tutto il
+/// WAL non ancora checkpointato (~1000 pagine, ~4MB). E' accettato di proposito e non va
+/// "corretto" con `synchronous=FULL`: l'indice e' una cache ricostruibile e un fsync per
+/// batch su ~100.000 file non si ripaga. Regge perche' il replay del WAL e' atomico per
+/// transazione: quello che resta e' un indice **piu' vecchio**, mai un indice sbagliato —
+/// e un indice parziale e' esattamente ciò che ADR-0002 mette in conto.
 final class LibraryIndexStore {
     static let schemaVersion = 1
 
     enum StoreError: Error, LocalizedError {
         case cannotOpen(String)
-        case sqlFailed(String)
+        case sqlFailed(String, code: Int32)
+        case invalidLocation(String)
 
         var errorDescription: String? {
             switch self {
             case .cannotOpen(let m): return "Impossibile aprire l'indice: \(m)"
-            case .sqlFailed(let m):  return "Errore nell'indice: \(m)"
+            case .sqlFailed(let m, _): return "Errore nell'indice: \(m)"
+            case .invalidLocation(let p): return "Posizione non ammessa per l'indice: \(p)"
             }
+        }
+
+        /// Il file esiste ma non e' leggibile come database: va ricostruito, non interpretato.
+        var meansFileIsNotAUsableDatabase: Bool {
+            guard case .sqlFailed(_, let code) = self else { return false }
+            // Solo il codice primario: SQLite espone anche codici estesi (SQLITE_CORRUPT_VTAB...).
+            let primary = code & 0xFF
+            return primary == SQLITE_NOTADB || primary == SQLITE_CORRUPT
         }
     }
 
     private var db: OpaquePointer?
+    private let queue = DispatchQueue(label: "AppBackupFoto.LibraryIndexStore")
 
     init(url: URL) throws {
+        try Self.validateLocation(url)
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
                                                 withIntermediateDirectories: true)
-        guard sqlite3_open(url.path, &db) == SQLITE_OK, db != nil else {
-            let msg = db.map { String(cString: sqlite3_errmsg($0)) } ?? "sconosciuto"
-            sqlite3_close(db)
-            db = nil
-            throw StoreError.cannotOpen(msg)
+        try queue.sync {
+            do {
+                try openUnsynchronized(url)
+            } catch let error as StoreError where error.meansFileIsNotAUsableDatabase {
+                // Un file che non e' un database SQLite (bytes casuali, un file troncato,
+                // una corruzione) renderebbe l'indice inutilizzabile PER SEMPRE: ogni avvio
+                // fallirebbe allo stesso modo e il dedup resterebbe spento, ricreando i
+                // doppioni a ogni import. E' incoerente con la scelta di ricostruire su
+                // schema sconosciuto (ADR-0002): un file illeggibile e' *meno* interpretabile
+                // di uno schema sconosciuto. Si cancella SOLO l'indice e i suoi sidecar
+                // -wal/-shm — mai nient'altro, e solo dentro la posizione gia' validata
+                // sopra — e si riprova UNA volta sola: se fallisce ancora, e' un problema
+                // vero (permessi, disco pieno) e deve arrivare al chiamante.
+                closeUnsynchronized()
+                try Self.deleteDatabaseFiles(at: url)
+                try openUnsynchronized(url)
+            }
         }
-        try exec("PRAGMA journal_mode=WAL;")
-        try exec("PRAGMA foreign_keys=ON;")
-        try createSchemaIfNeeded()
     }
 
-    deinit { sqlite3_close(db) }
+    deinit {
+        // close_v2 e non close: smonta la connessione anche se per qualche motivo
+        // restasse uno statement vivo, invece di lasciare il handle aperto.
+        sqlite3_close_v2(db)
+    }
+
+    // MARK: Posizione ammessa
+
+    /// L'indice e' una cache che vive sul Mac e **non deve mai finire sull'SSD** (spec #31:
+    /// "mai sull'SSD"), perche' la sorgente si tratta in sola lettura. `init` crea le
+    /// directory mancanti a catena, quindi un chiamante distratto che passasse un percorso
+    /// sul volume sorgente ci creerebbe dentro cartelle e tre file. La guardia e' una
+    /// allow-list e non una deny-list su `/Volumes`: cosi' una posizione nuova e' vietata
+    /// per default invece di esserlo solo se qualcuno si ricorda di aggiungerla.
+    private static func validateLocation(_ url: URL) throws {
+        let dir = url.deletingLastPathComponent()
+        let candidates = [dir.standardizedFileURL.path,
+                          dir.standardizedFileURL.resolvingSymlinksInPath().path]
+        let roots = allowedRoots()
+        for candidate in candidates where roots.contains(where: { isInside(candidate, root: $0) }) {
+            return
+        }
+        throw StoreError.invalidLocation(url.path)
+    }
+
+    private static func allowedRoots() -> [String] {
+        var roots = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
+        // La directory temporanea di sistema e' ammessa perche' i test aprono uno store
+        // usa-e-getta per ogni caso: e' comunque sul disco interno del Mac, per-utente,
+        // e non e' mai un volume esterno — l'invariante che conta resta intatta.
+        roots.append(URL(fileURLWithPath: NSTemporaryDirectory()))
+        return roots.flatMap {
+            [$0.standardizedFileURL.path, $0.standardizedFileURL.resolvingSymlinksInPath().path]
+        }
+    }
+
+    private static func isInside(_ path: String, root: String) -> Bool {
+        let p = path.hasSuffix("/") ? path : path + "/"
+        let r = root.hasSuffix("/") ? root : root + "/"
+        return p.hasPrefix(r)
+    }
+
+    private static func deleteDatabaseFiles(at url: URL) throws {
+        let fm = FileManager.default
+        for path in [url.path, url.path + "-wal", url.path + "-shm"] where fm.fileExists(atPath: path) {
+            try fm.removeItem(atPath: path)
+        }
+    }
+
+    // MARK: Apertura
+
+    private func openUnsynchronized(_ url: URL) throws {
+        let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX
+        guard sqlite3_open_v2(url.path, &db, flags, nil) == SQLITE_OK, db != nil else {
+            let msg = db.map { String(cString: sqlite3_errmsg($0)) } ?? "sconosciuto"
+            closeUnsynchronized()
+            throw StoreError.cannotOpen(msg)
+        }
+        do {
+            try exec("PRAGMA journal_mode=WAL;")
+            try exec("PRAGMA foreign_keys=ON;")
+            try createSchemaIfNeeded()
+        } catch {
+            closeUnsynchronized()
+            throw error
+        }
+    }
+
+    private func closeUnsynchronized() {
+        sqlite3_close_v2(db)
+        db = nil
+    }
+
+    // MARK: Helper SQLite
+
+    private func sqlError() -> StoreError {
+        StoreError.sqlFailed(String(cString: sqlite3_errmsg(db)), code: sqlite3_errcode(db))
+    }
 
     private func exec(_ sql: String) throws {
         var err: UnsafeMutablePointer<CChar>?
-        if sqlite3_exec(db, sql, nil, nil, &err) != SQLITE_OK {
+        let rc = sqlite3_exec(db, sql, nil, nil, &err)
+        if rc != SQLITE_OK {
             let msg = err.map { String(cString: $0) } ?? "sconosciuto"
             sqlite3_free(err)
-            throw StoreError.sqlFailed(msg)
+            throw StoreError.sqlFailed(msg, code: rc)
         }
     }
 
+    private func prepare(_ sql: String) throws -> OpaquePointer? {
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { throw sqlError() }
+        return stmt
+    }
+
+    /// I bind vanno controllati: un bind fallito (SQLITE_NOMEM, SQLITE_TOOBIG) lascia il
+    /// parametro **non legato**, cioe' NULL, e l'INSERT riesce lo stesso — l'indice si
+    /// avvelena da solo e il danno emerge molto dopo, in mezzo a un import.
+    private func bindText(_ stmt: OpaquePointer?, _ index: Int32, _ value: String) throws {
+        let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        guard sqlite3_bind_text(stmt, index, value, -1, transient) == SQLITE_OK else { throw sqlError() }
+    }
+
+    private func bindInt64(_ stmt: OpaquePointer?, _ index: Int32, _ value: Int64) throws {
+        guard sqlite3_bind_int64(stmt, index, value) == SQLITE_OK else { throw sqlError() }
+    }
+
+    private func bindDouble(_ stmt: OpaquePointer?, _ index: Int32, _ value: Double) throws {
+        guard sqlite3_bind_double(stmt, index, value) == SQLITE_OK else { throw sqlError() }
+    }
+
+    /// Esegue un `sqlite3_step` che deve produrre 0 o 1 righe.
+    /// `SQLITE_ERROR`/`SQLITE_CORRUPT`/`SQLITE_BUSY` **non** vanno confusi con "nessuna riga":
+    /// scambiarli per un risultato vuoto e' esattamente il modo in cui il dedup concluderebbe
+    /// "nessuna copia esiste" su un indice rotto, e ricopierebbe il file in silenzio.
+    private func stepRow(_ stmt: OpaquePointer?) throws -> Bool {
+        let rc = sqlite3_step(stmt)
+        if rc == SQLITE_ROW { return true }
+        guard rc == SQLITE_DONE else { throw sqlError() }
+        return false
+    }
+
+    // MARK: Schema
+
     private func createSchemaIfNeeded() throws {
-        // Un indice scritto da una versione futura/sconosciuta dello schema non va
-        // interpretato a caso: si riparte da zero. L'indice e' una cache, buttarlo
+        // La versione dello schema e' `PRAGMA user_version`, non una riga di tabella: e' un
+        // intero per costruzione (nessun "2.0"/"v2" da interpretare), esiste su qualunque
+        // file SQLite e vale 0 sui database nuovi. Con la versione tenuta in una tabella,
+        // un valore non numerico veniva letto come "database nuovo" e i dati vecchi
+        // venivano adottati — il caso peggiore era irreversibile (schema futuro con colonne
+        // diverse: ogni lettura falliva a ogni avvio, per sempre).
+        // Qualunque versione diversa da quella attesa — piu' vecchia, piu' nuova, o zero —
+        // significa "ricostruisci", mai "interpreta al meglio" (ADR-0002). Buttare l'indice
         // non perde nulla di originale.
-        if let existing = try schemaVersionOnDisk(), existing != Self.schemaVersion {
+        if try userVersionOnDisk() != Int32(Self.schemaVersion) {
+            // `meta` non esiste piu' in questo schema: il DROP serve solo a ripulire i
+            // database scritti dalla prima versione della store, che la creava.
             try exec("DROP TABLE IF EXISTS entries; DROP TABLE IF EXISTS meta;")
         }
+        // NOT NULL esplicito sulle colonne TEXT: in una tabella rowid `TEXT PRIMARY KEY`
+        // **non** implica NOT NULL e ammette perfino piu' righe NULL (verificato scrivendole
+        // da una connessione esterna). Una riga con path NULL faceva poi crashare la lettura.
         try exec("""
         CREATE TABLE IF NOT EXISTS entries (
-            path         TEXT PRIMARY KEY,
+            path         TEXT PRIMARY KEY NOT NULL,
             display_path TEXT NOT NULL,
             size         INTEGER NOT NULL,
             mtime        REAL NOT NULL,
@@ -1730,131 +1914,80 @@ final class LibraryIndexStore {
         );
         CREATE INDEX IF NOT EXISTS idx_entries_hash ON entries(hash);
         CREATE INDEX IF NOT EXISTS idx_entries_size ON entries(size);
-        CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         """)
-        try exec("INSERT OR IGNORE INTO meta(key,value) VALUES('schema_version','\(Self.schemaVersion)');")
+        try exec("PRAGMA user_version=\(Self.schemaVersion);")
     }
 
-    /// Legge la versione dello schema, o nil se il database e' nuovo/vuoto.
-    private func schemaVersionOnDisk() throws -> Int? {
-        var check: OpaquePointer?
-        guard sqlite3_prepare_v2(db, "SELECT name FROM sqlite_master WHERE type='table' AND name='meta';", -1, &check, nil) == SQLITE_OK else { return nil }
-        let hasMeta = sqlite3_step(check) == SQLITE_ROW
-        sqlite3_finalize(check)
-        guard hasMeta else { return nil }
-
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, "SELECT value FROM meta WHERE key='schema_version';", -1, &stmt, nil) == SQLITE_OK else { return nil }
+    private func userVersionOnDisk() throws -> Int32 {
+        let stmt = try prepare("PRAGMA user_version;")
         defer { sqlite3_finalize(stmt) }
-        guard sqlite3_step(stmt) == SQLITE_ROW, let text = sqlite3_column_text(stmt, 0) else { return nil }
-        return Int(String(cString: text))
+        guard try stepRow(stmt) else { return 0 }
+        return sqlite3_column_int(stmt, 0)
     }
+
+    // MARK: API pubblica (tutta serializzata sulla coda privata)
 
     /// Inserisce o sostituisce entry in una sola transazione: un batch e' atomico,
     /// quindi un'interruzione lascia l'indice parziale ma coerente, mai a meta' riga.
     func upsert(_ entries: [LibraryIndexEntry]) throws {
-        guard !entries.isEmpty else { return }
-        try exec("BEGIN TRANSACTION;")
-        do {
-            var stmt: OpaquePointer?
-            let sql = "INSERT OR REPLACE INTO entries(path,display_path,size,mtime,hash,hashed_at) VALUES(?,?,?,?,?,?);"
-            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-                throw StoreError.sqlFailed(String(cString: sqlite3_errmsg(db)))
-            }
-            defer { sqlite3_finalize(stmt) }
-            let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-            for e in entries {
-                sqlite3_reset(stmt)
-                sqlite3_bind_text(stmt, 1, e.path, -1, transient)
-                sqlite3_bind_text(stmt, 2, e.displayPath, -1, transient)
-                sqlite3_bind_int64(stmt, 3, e.size)
-                sqlite3_bind_double(stmt, 4, e.mtime)
-                sqlite3_bind_text(stmt, 5, e.hash, -1, transient)
-                sqlite3_bind_double(stmt, 6, e.hashedAt)
-                guard sqlite3_step(stmt) == SQLITE_DONE else {
-                    throw StoreError.sqlFailed(String(cString: sqlite3_errmsg(db)))
-                }
-            }
-            try exec("COMMIT;")
-        } catch {
-            try? exec("ROLLBACK;")
-            throw error
-        }
-    }
-
-    private func readEntry(_ stmt: OpaquePointer?) -> LibraryIndexEntry {
-        LibraryIndexEntry(path: String(cString: sqlite3_column_text(stmt, 0)),
-                          displayPath: String(cString: sqlite3_column_text(stmt, 1)),
-                          size: sqlite3_column_int64(stmt, 2),
-                          mtime: sqlite3_column_double(stmt, 3),
-                          hash: String(cString: sqlite3_column_text(stmt, 4)),
-                          hashedAt: sqlite3_column_double(stmt, 5))
+        try queue.sync { try upsertUnsynchronized(entries) }
     }
 
     func entry(forKey key: String) throws -> LibraryIndexEntry? {
-        var stmt: OpaquePointer?
-        let sql = "SELECT path,display_path,size,mtime,hash,hashed_at FROM entries WHERE path=?;"
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-            throw StoreError.sqlFailed(String(cString: sqlite3_errmsg(db)))
-        }
-        defer { sqlite3_finalize(stmt) }
-        sqlite3_bind_text(stmt, 1, key, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
-        return sqlite3_step(stmt) == SQLITE_ROW ? readEntry(stmt) : nil
+        try queue.sync { try entryUnsynchronized(forKey: key) }
     }
 
+    /// Tutte le entry con questo hash.
+    ///
+    /// CONTRATTO (ADR-0003): il risultato e' **corretto ma potenzialmente parziale**. Una
+    /// entry puo' mancare perche' il file non e' ancora stato indicizzato, perche' l'ultimo
+    /// WAL e' andato perso, o perche' l'indice e' stato ricostruito da poco. Un array vuoto
+    /// significa "non lo so", **non** "nessuna copia esiste". E l'inverso vale altrettanto:
+    /// una entry presente non prova che quel file sul disco abbia ancora quel contenuto.
+    /// Quindi chi decide di **saltare** un file rilegge e rihasha il candidato su disco
+    /// prima di dichiarare il doppione, sempre. Fidarsi di questo risultato senza
+    /// riverificare trasformerebbe una transazione persa in una foto non copiata.
     func entries(withHash hash: String) throws -> [LibraryIndexEntry] {
-        var stmt: OpaquePointer?
-        let sql = "SELECT path,display_path,size,mtime,hash,hashed_at FROM entries WHERE hash=?;"
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-            throw StoreError.sqlFailed(String(cString: sqlite3_errmsg(db)))
-        }
-        defer { sqlite3_finalize(stmt) }
-        sqlite3_bind_text(stmt, 1, hash, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
-        var out: [LibraryIndexEntry] = []
-        while sqlite3_step(stmt) == SQLITE_ROW { out.append(readEntry(stmt)) }
-        return out
+        try queue.sync { try entriesUnsynchronized(withHash: hash) }
     }
 
     /// Filtro dimensione-prima: se nessun file indicizzato ha questa dimensione,
     /// il file in arrivo non va nemmeno hashato. E' lo stadio 1 del pipeline su cui
     /// convergono rmlint, jdupes e rdfind.
     func hasAnyEntry(withSize size: Int64) throws -> Bool {
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, "SELECT 1 FROM entries WHERE size=? LIMIT 1;", -1, &stmt, nil) == SQLITE_OK else {
-            throw StoreError.sqlFailed(String(cString: sqlite3_errmsg(db)))
-        }
-        defer { sqlite3_finalize(stmt) }
-        sqlite3_bind_int64(stmt, 1, size)
-        return sqlite3_step(stmt) == SQLITE_ROW
+        try queue.sync { try hasAnyEntryUnsynchronized(withSize: size) }
     }
 
     func allKeys() throws -> Set<String> {
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, "SELECT path FROM entries;", -1, &stmt, nil) == SQLITE_OK else {
-            throw StoreError.sqlFailed(String(cString: sqlite3_errmsg(db)))
-        }
-        defer { sqlite3_finalize(stmt) }
-        var out = Set<String>()
-        while sqlite3_step(stmt) == SQLITE_ROW { out.insert(String(cString: sqlite3_column_text(stmt, 0))) }
-        return out
+        try queue.sync { try allKeysUnsynchronized() }
     }
 
     func remove(keys: [String]) throws {
-        guard !keys.isEmpty else { return }
+        try queue.sync { try removeUnsynchronized(keys: keys) }
+    }
+
+    func count() throws -> Int {
+        try queue.sync { try countUnsynchronized() }
+    }
+
+    // MARK: Implementazioni (gia' sulla coda: non chiamarle dall'esterno)
+
+    private func upsertUnsynchronized(_ entries: [LibraryIndexEntry]) throws {
+        guard !entries.isEmpty else { return }
         try exec("BEGIN TRANSACTION;")
         do {
-            var stmt: OpaquePointer?
-            guard sqlite3_prepare_v2(db, "DELETE FROM entries WHERE path=?;", -1, &stmt, nil) == SQLITE_OK else {
-                throw StoreError.sqlFailed(String(cString: sqlite3_errmsg(db)))
-            }
+            let sql = "INSERT OR REPLACE INTO entries(path,display_path,size,mtime,hash,hashed_at) VALUES(?,?,?,?,?,?);"
+            let stmt = try prepare(sql)
             defer { sqlite3_finalize(stmt) }
-            let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-            for k in keys {
+            for e in entries {
                 sqlite3_reset(stmt)
-                sqlite3_bind_text(stmt, 1, k, -1, transient)
-                guard sqlite3_step(stmt) == SQLITE_DONE else {
-                    throw StoreError.sqlFailed(String(cString: sqlite3_errmsg(db)))
-                }
+                try bindText(stmt, 1, e.path)
+                try bindText(stmt, 2, e.displayPath)
+                try bindInt64(stmt, 3, e.size)
+                try bindDouble(stmt, 4, e.mtime)
+                try bindText(stmt, 5, e.hash)
+                try bindDouble(stmt, 6, e.hashedAt)
+                guard sqlite3_step(stmt) == SQLITE_DONE else { throw sqlError() }
             }
             try exec("COMMIT;")
         } catch {
@@ -1863,18 +1996,81 @@ final class LibraryIndexStore {
         }
     }
 
-    func count() throws -> Int {
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM entries;", -1, &stmt, nil) == SQLITE_OK else {
-            throw StoreError.sqlFailed(String(cString: sqlite3_errmsg(db)))
-        }
-        defer { sqlite3_finalize(stmt) }
-        return sqlite3_step(stmt) == SQLITE_ROW ? Int(sqlite3_column_int64(stmt, 0)) : 0
+    /// Legge una riga, o nil se una colonna TEXT e' NULL.
+    /// Il NOT NULL nello schema non protegge le righe scritte prima (o da un'altra
+    /// connessione): `String(cString:)` su un puntatore nil fa crashare il processo, quindi
+    /// una riga malformata si **salta**. Meglio un'entry in meno — che porta a un rehash o
+    /// a una copia in piu' — che un import che muore a meta'.
+    private func readEntry(_ stmt: OpaquePointer?) -> LibraryIndexEntry? {
+        guard let path = sqlite3_column_text(stmt, 0),
+              let displayPath = sqlite3_column_text(stmt, 1),
+              let hash = sqlite3_column_text(stmt, 4) else { return nil }
+        return LibraryIndexEntry(path: String(cString: path),
+                                 displayPath: String(cString: displayPath),
+                                 size: sqlite3_column_int64(stmt, 2),
+                                 mtime: sqlite3_column_double(stmt, 3),
+                                 hash: String(cString: hash),
+                                 hashedAt: sqlite3_column_double(stmt, 5))
     }
 
-    /// Solo per i test: forza la versione dello schema per verificare il reset.
-    func setSchemaVersionForTesting(_ version: Int) throws {
-        try exec("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version','\(version)');")
+    private func entryUnsynchronized(forKey key: String) throws -> LibraryIndexEntry? {
+        let stmt = try prepare("SELECT path,display_path,size,mtime,hash,hashed_at FROM entries WHERE path=?;")
+        defer { sqlite3_finalize(stmt) }
+        try bindText(stmt, 1, key)
+        return try stepRow(stmt) ? readEntry(stmt) : nil
+    }
+
+    private func entriesUnsynchronized(withHash hash: String) throws -> [LibraryIndexEntry] {
+        let stmt = try prepare("SELECT path,display_path,size,mtime,hash,hashed_at FROM entries WHERE hash=?;")
+        defer { sqlite3_finalize(stmt) }
+        try bindText(stmt, 1, hash)
+        var out: [LibraryIndexEntry] = []
+        while try stepRow(stmt) {
+            if let entry = readEntry(stmt) { out.append(entry) }
+        }
+        return out
+    }
+
+    private func hasAnyEntryUnsynchronized(withSize size: Int64) throws -> Bool {
+        let stmt = try prepare("SELECT 1 FROM entries WHERE size=? LIMIT 1;")
+        defer { sqlite3_finalize(stmt) }
+        try bindInt64(stmt, 1, size)
+        return try stepRow(stmt)
+    }
+
+    private func allKeysUnsynchronized() throws -> Set<String> {
+        let stmt = try prepare("SELECT path FROM entries;")
+        defer { sqlite3_finalize(stmt) }
+        var out = Set<String>()
+        while try stepRow(stmt) {
+            if let path = sqlite3_column_text(stmt, 0) { out.insert(String(cString: path)) }
+        }
+        return out
+    }
+
+    private func removeUnsynchronized(keys: [String]) throws {
+        guard !keys.isEmpty else { return }
+        try exec("BEGIN TRANSACTION;")
+        do {
+            let stmt = try prepare("DELETE FROM entries WHERE path=?;")
+            defer { sqlite3_finalize(stmt) }
+            for k in keys {
+                sqlite3_reset(stmt)
+                try bindText(stmt, 1, k)
+                guard sqlite3_step(stmt) == SQLITE_DONE else { throw sqlError() }
+            }
+            try exec("COMMIT;")
+        } catch {
+            try? exec("ROLLBACK;")
+            throw error
+        }
+    }
+
+    private func countUnsynchronized() throws -> Int {
+        let stmt = try prepare("SELECT COUNT(*) FROM entries;")
+        defer { sqlite3_finalize(stmt) }
+        guard try stepRow(stmt) else { throw sqlError() }
+        return Int(sqlite3_column_int64(stmt, 0))
     }
 }
 
