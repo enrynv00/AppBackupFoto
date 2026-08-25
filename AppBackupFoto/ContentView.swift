@@ -3514,6 +3514,42 @@ final class BackupRunner: ObservableObject {
         }
     }
 
+    func runImport(source: URL, label: String) {
+        speedUnit = "file/s"
+        guard let ssdURL = bm.startAccessing(.ssd) else {
+            alert("Accesso all'SSD non disponibile", "Vai in Impostazioni e riseleziona l'SSD.")
+            return
+        }
+        if !isLikelyVolumeRoot(ssdURL) {
+            bm.stopAccessing(.ssd)
+            alert("Bookmark SSD non valido",
+                  "Il percorso '\(ssdURL.path)' non è la radice del volume.\n\nVai in Impostazioni (⚙) → riseleziona SSD scegliendo '/Volumes/SSD - Enri' (root del volume, non una sottocartella).")
+            return
+        }
+        let dst = ssdURL.appendingPathComponent("Import").appendingPathComponent(importFolderSlug(label))
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let preview = await self.syncer.previewSync(from: source, to: dst, deep: false)
+            let space = self.hasSufficientSpace(bytesNeeded: preview.toAddBytes, atVolumeOf: ssdURL)
+            guard space.ok else {
+                self.bm.stopAccessing(.ssd)
+                pendingAlert = SimpleAlert(
+                    title: "Spazio insufficiente sull'SSD",
+                    message: "Servono circa \(ByteCountFormatter.string(fromByteCount: preview.toAddBytes, countStyle: .file)), "
+                        + "liberi \(ByteCountFormatter.string(fromByteCount: space.availableBytes, countStyle: .file)) su \(ssdURL.path).")
+                return
+            }
+            self.run(label: "Importa: \(label)") { [weak self] in
+                self?.publishStatus("Importa: \(source.path)  →  SSD: \(dst.path)")
+                defer { self?.bm.stopAccessing(.ssd) }
+                return try await self?.syncer.sync(from: source, to: dst, deep: false,
+                    onStatus: { self?.publishStatus($0) },
+                    onProgress: { self?.publishProgress($0) },
+                    onCurrentFile: { self?.publishCurrentFile($0) })
+            }
+        }
+    }
+
     func previewMacToSSD() {
         guard let photosURL = bm.startAccessing(.photos) else {
             alert("Accesso alla Libreria Foto non disponibile",
