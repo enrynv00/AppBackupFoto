@@ -120,7 +120,32 @@ Questo progetto usa il workflow a ruoli espliciti descritto in `~/.claude/docs/s
 
 **Sostituisce la vecchia regola "Pattern Advisor"**: il costo non è più un vincolo per Enrico — non serve chiedere conferma prima di ogni dispatch. Dal 2026-08-16 Implementer, Code Reviewer e Security/Rules Auditor girano tutti su Opus 5 (non più Sonnet 5/Fable 5), solo Architect era già su Opus 5.
 
-Gate automatici attivi su questo progetto (vedi `.claude/settings.json`): un hook blocca la scrittura sotto `Log/`, un hook blocca la fine sessione se `ContentView.swift`/i test sono stati modificati senza un build/test verde successivo.
+Gate automatici attivi su questo progetto (vedi `.claude/settings.json`): un hook blocca la scrittura sotto `Log/`, un hook blocca la fine sessione se `ContentView.swift`/i test sono stati modificati senza un build/test verde successivo, e un hook blocca i comandi git distruttivi (`push`, `reset --hard`, `clean -f`, `branch -D`, `checkout .`, `restore .`) prima che vengano eseguiti — `git add` e `git commit` restano liberi.
+
+---
+
+## Agent skills
+
+Dal 2026-08-25 questo progetto ha installate le 25 skill di [mattpocock/skills](https://github.com/mattpocock/skills) v1.2.3 in `.claude/skills/`, **solo a livello di progetto**, in prova. Sono complementari ai ruoli sopra, non li sostituiscono: i ruoli dicono *chi* fa il lavoro, le skill *come* si fa.
+
+### Issue tracker
+
+Le issue vivono come markdown in `Docs/superpowers/tickets/`, non su GitHub — il repo è pubblico e questo progetto maneggia credenziali S3. Vedi `Docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Le cinque etichette canoniche (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`), usate come valori della riga `Status:` nei file di ticket. Vedi `Docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Layout single-context, tutto sotto `Docs/` (non alla root). Vedi `Docs/agents/domain.md`.
+
+### Cautele
+
+- **`/code-review`**: la skill di mattpocock ha lo stesso nome del built-in di Claude Code e lo shadowa in questo progetto. È voluto — controlla Standards + Spec invece di cacciare bug. Il ruolo Code Reviewer usa questa.
+- **`/research`**: non usarla, ha un bug di ricorsione noto (#530) che spawna run duplicate. Usa la `deep-research` globale.
+- **`/wizard`**: in fase di scoping legge i file `.env*`. Qui non ce ne sono, ma le credenziali S3 stanno in `rclone.conf` e nel Keychain: tienilo presente se un giorno ne aggiungi uno.
+- **`/diagnosing-bugs`**: fa incollare output e artefatti di debug nei ticket. Redigi tu i segreti — l'issue upstream sul redacting automatico (#674) è aperta.
 
 ---
 

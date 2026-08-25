@@ -18,3 +18,10 @@ Script/sparkle-tools/
 build/
 
 .superpowers/
+
+# Skill di terze parti (mattpocock/skills v1.2.3, MIT) installate localmente in prova
+# dal 2026-08-25 — reinstallabili da https://github.com/mattpocock/skills, non
+# ridistribuite da questo repo (che è pubblico). La configurazione che le governa
+# è invece versionata: Docs/agents/ e .claude/hooks/.
+.claude/skills/
+.claude/hooks/*.orig
