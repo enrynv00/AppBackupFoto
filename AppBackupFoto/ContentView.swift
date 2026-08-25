@@ -1493,6 +1493,27 @@ enum FileKind {
     }
 }
 
+/// Classificazione a tre vie per l'indice di contenuto (roadmap #31).
+/// Sostituisce una lista di cartelle da escludere scritta a mano: la cartella "Zip"
+/// resta fuori dall'indice perche' un archivio non e' ne' immagine ne' video, non
+/// perche' si chiama cosi' — cosi' la regola regge anche per sorgenti future.
+enum IndexableKind {
+    case image
+    case video
+    case notIndexable
+
+    /// Classifica per estensione via `UTType`. Limite noto e accettato: non ispeziona
+    /// il contenuto, quindi un file con estensione errata/assente o un RAW di un modello
+    /// non riconosciuto da macOS finisce in `.notIndexable`. Sbagliare per esclusione e'
+    /// il verso sicuro: quel file non partecipa al dedup e viene copiato, mai saltato.
+    static func of(url: URL) -> IndexableKind {
+        guard let type = UTType(filenameExtension: url.pathExtension) else { return .notIndexable }
+        if type.conforms(to: .image) { return .image }
+        if type.conforms(to: .movie) { return .video }
+        return .notIndexable
+    }
+}
+
 func sha256(of url: URL) -> String? {
     // I/O POSIX a basso livello (open/read/close) invece di FileHandle.readData(ofLength:):
     // su file molto grandi (decine di GB), FileHandle/NSData tende a mantenere le pagine
