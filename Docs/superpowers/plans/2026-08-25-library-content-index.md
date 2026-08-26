@@ -1736,7 +1736,7 @@ presa da nessuno.
 
 **Nota di revisione (2026-08-25)**: il Task 5 copre **due** scenari, non uno solo (decisione di Enrico dopo il Critic, motivata nella spec, sezione "Doppioni interni allo stesso import"). Oltre al reimport di una sorgente già importata in passato — che l'indice persistito riconosce da sé — va coperto il caso in cui la **stessa sorgente contenga già al suo interno** due file byte-identici. Costa quasi nulla perché `syncFile` calcola **già** `sha256(of: src)` per la verifica d'integrità post-copia e oggi lo butta via: basta conservarlo per la durata del job.
 
-- [ ] **Step 1: Estendi `SyncResult` e `JobStats`**
+- [x] **Step 1: Estendi `SyncResult` e `JobStats`**
 
 In `FileSyncer.SyncResult`, accanto a `changedSkipped`:
 ```swift
@@ -1750,7 +1750,7 @@ In `JobStats`, accanto a `changedSkipped`:
 
 Un solo contatore per entrambi gli scenari: per l'utente sono la stessa cosa ("questa foto ce l'avevi già"), distinguerli sarebbe gergo tecnico senza valore.
 
-- [ ] **Step 2: `ImportSessionIndex` — memoria dei file copiati nel job corrente**
+- [x] **Step 2: `ImportSessionIndex` — memoria dei file copiati nel job corrente**
 
 Nuovo tipo in `ContentView.swift`, subito prima di `final class FileSyncer` (localizzalo con `grep -n "final class FileSyncer"`):
 
@@ -1786,7 +1786,7 @@ final class ImportSessionIndex {
 }
 ```
 
-- [ ] **Step 3: Aggiungi predicato e hook a `FileSyncer`**
+- [x] **Step 3: Aggiungi predicato e hook a `FileSyncer`**
 
 Due parametri con **default no-op** su `sync`, `syncDir` e `syncFile` — stessa catena già percorsa da `onCurrentFile` in #17, così `runMacToSSD`, `runSSDToHDD`, `runSyncS3` e `RestoreEngine` non si toccano affatto:
 
@@ -1840,7 +1840,7 @@ E nel ramo di copia, dove oggi la verifica d'integrità butta via l'hash, conser
                     }
 ```
 
-- [ ] **Step 4: Aggiungi lo store a `BackupRunner` e collega il predicato in `runImport`**
+- [x] **Step 4: Aggiungi lo store a `BackupRunner` e collega il predicato in `runImport`**
 
 In `BackupRunner`, accanto agli altri membri:
 
@@ -1926,7 +1926,7 @@ E aggiungi il metodo, `nonisolated` perché viene invocato dal thread di lavoro 
 
 **Effetto collaterale accettato**: `runImport` chiama `previewSync` per il controllo dello spazio libero, e `previewFile` non sa nulla del dedup — quindi `toAddBytes` **sovrastima** lo spazio necessario quando la sorgente contiene doppioni. Il verso è quello sicuro (al massimo l'app rifiuta un import che sarebbe entrato), e il riepilogo di fine job riporta comunque il numero vero. Non allineare `previewSync`: significherebbe hashare tutto due volte, per una stima.
 
-- [ ] **Step 5: Propaga il contatore e mostralo**
+- [x] **Step 5: Propaga il contatore e mostralo**
 
 In `BackupRunner.run(label:)` e in `publishProgress`, accanto a `self.stats.changedSkipped = r.changedSkipped`, aggiungi:
 ```swift
@@ -1941,7 +1941,7 @@ In `CompletionSheet`, accanto alla riga condizionale già esistente per `changed
             }
 ```
 
-- [ ] **Step 6: Test**
+- [x] **Step 6: Test**
 
 Nuovo file `AppBackupFotoTests/ImportDedupTests.swift`. I primi tre sono logica pura sul tipo nuovo; gli ultimi due girano su directory temporanee reali, nello stile di `FileSyncerZeroOverwriteTests` (nessun mock).
 
@@ -1953,7 +1953,7 @@ Nuovo file `AppBackupFotoTests/ImportDedupTests.swift`. I primi tre sono logica 
 
 Scrivi 4 e 5 **prima** di collegare il predicato in `runImport` e guardali fallire (4) e passare (5): il test che passa già col bug è l'errore ricorrente di questo progetto, terza volta dopo il parsing YAML di Immich.
 
-- [ ] **Step 7: Build e suite completa**
+- [x] **Step 7: Build e suite completa**
 
 ```bash
 xcodebuild -project AppBackupFoto.xcodeproj -scheme AppBackupFoto -configuration Debug build 2>&1 | tail -10
@@ -1961,12 +1961,53 @@ xcodebuild -project AppBackupFoto.xcodeproj -scheme AppBackupFoto -destination '
 ```
 Expected: `** BUILD SUCCEEDED **`, **270 test** (265 + 5; la baseline non e' piu' 247 ne' 248 ne' 257 — vedi le due note post-review in fondo al Task 4). Il resto del task è wiring su percorsi con I/O reale, come `runMacToSSD` e gli altri job che non hanno XCTest diretti; il criterio lì è **nessuna regressione**: in particolare `FileSyncerZeroOverwriteTests` e `FileSyncerChangedSkippedTests` devono restare verdi, a prova che i default no-op non hanno alterato i flussi esistenti.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add AppBackupFoto/ContentView.swift AppBackupFotoTests/ImportDedupTests.swift
 git commit -m "Wire content dedup into FileSyncer.sync and runImport, including intra-import duplicates (roadmap #31)"
 ```
+
+#### Nota di implementazione (2026-08-26) — dove il codice reale ha vinto sul piano
+
+Il piano e' stato scritto prima dei due giri di hardening del Task 4: quattro punti degli
+snippet qui sopra non corrispondono piu' al codice, e in tutti e quattro ha vinto il codice.
+
+1. **`syncFile` ha tre esiti di verifica, non due.** Lo Step 3 proponeva di "ristrutturare
+   l'`if let`" perche' il ramo `else` non aveva `srcHash` legato: quella ristrutturazione
+   e' gia' stata fatta dal commit `3e8e25a` (`copied` / `hashErrors` / `copiedUnverified`).
+   `onCopied(dst, srcHash)` sta quindi **dentro** il solo ramo `srcHash == dstHash`, e non
+   servono ne' `if let srcHash` ne' il confronto `dstHash == srcHash` suggeriti dal piano.
+   Di conseguenza l'identita' dei contatori e'
+   `copied + skipped + errors + hashErrors + copiedUnverified == done` (cinque caselle, non
+   quattro) — cosi' e' asserita nei test.
+2. **`isAlreadyInLibrary` prende `libraryRoot` esplicito** invece di leggere
+   `BookmarkManager.shared.urls[.ssd]` da dentro. Due motivi: `urls` e' `@Published` e
+   quella funzione gira sulla coda di lavoro di `FileSyncer` (leggerla di la' e' una lettura
+   cross-thread di stato osservabile), e `runImport` la root ce l'ha gia' risolta
+   (`ssdURL`, gia' validata come volume-root). Effetto collaterale utile: la funzione non
+   dipende piu' da un singleton e il ramo sull'indice persistito diventa testabile.
+3. **La riga di `CompletionSheet` e' una `Label`, non una `Text`**: e' lo stile delle
+   quattro righe condizionali gia' presenti (`hashErrors`, `copiedUnverified`,
+   `changedSkipped`). Testo: "Gia' presenti in libreria, non copiati: N", colore
+   `.secondary` e non `warning` — non e' un guasto.
+4. **`SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`**: un valore di default
+   `session: ImportSessionIndex = ImportSessionIndex()` in un helper di test viene valutato
+   in contesto MainActor e produce un warning. Il parametro e' esplicito nei test.
+   `ImportSessionIndex` resta senza annotazioni, come `FileSyncer` e `LibraryIndexStore`.
+
+**Test: 12 invece dei 5 previsti; suite completa 277 (era 265).** I sette in piu' esistono
+perche' senza di loro sette mutanti sopravvivevano su codice ad alto danno: ordine
+zero-overwrite/dedup (1), rilettura del candidato di sessione e di quello dell'indice
+(2), ramo dell'indice persistito (1), registrazione di copie non verificate e con mismatch
+(2), sorgente illeggibile scambiata per doppione (1). Mutation testing: 10 mutanti su 11
+uccisi; l'undicesimo — filtro dimensione (stadio 1) rimosso — **sopravvive di proposito**:
+e' solo prestazioni, la correttezza la decide l'hash.
+
+**Non fatto, di proposito**: `duplicatesSkipped` non e' stato aggiunto a `JobSummary` ne' a
+`JobSummary.isClean`, per lo stesso motivo per cui non c'e' `copiedUnverified` (decisione di
+prodotto separata). E `previewSync` non e' allineato: sovrastima lo spazio necessario quando
+la sorgente contiene doppioni, verso sicuro, gia' accettato nello Step 4.
 
 ---
 

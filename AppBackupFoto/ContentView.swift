@@ -1328,6 +1328,7 @@ struct JobStats {
     var hashErrors: Int = 0   // file con SHA256 mismatch dopo la copia
     var copiedUnverified: Int = 0   // file copiati la cui verifica SHA256 non ha potuto concludersi (vedi FileSyncer.SyncResult)
     var changedSkipped: Int = 0   // file esistente ma diverso dalla sorgente, skippato per zero-overwrite (roadmap #13)
+    var duplicatesSkipped: Int = 0   // file gia' presenti altrove in libreria con contenuto identico (roadmap #31)
 }
 
 struct SpeedSample: Identifiable {
@@ -2809,6 +2810,44 @@ final class BookmarkManager: ObservableObject {
     }
 }
 
+// MARK: - ImportSessionIndex
+
+/// Doppioni interni allo stesso import (roadmap #31): ricorda le coppie
+/// (dimensione, hash) dei file copiati in **questo** job, che l'indice persistito
+/// non puo' ancora conoscere perche' viene aggiornato solo a import finito.
+///
+/// Vive in memoria e muore col job: non e' una seconda scrittura sullo store, che
+/// resta a batch post-import (ADR-0002 e ADR-0003).
+///
+/// Ci si registra **solo** un file la cui verifica d'integrita' post-copia e'
+/// riuscita: l'hash di una copia con mismatch e' esattamente quello di cui non ci
+/// si puo' fidare, e lo stesso vale per una copia non verificabile
+/// (`copiedUnverified`), dove la verifica non ha proprio concluso.
+///
+/// Questi hash **non godono comunque di una fiducia diversa** da quelli dell'indice:
+/// anche un candidato copiato in sessione viene riletto e rihashato prima di
+/// dichiarare il doppione (ADR-0003). "Quando si salta un file si rilegge, sempre"
+/// e' una regola che si ricorda; "si rilegge tranne nel caso X" no.
+///
+/// Thread-safety: `FileSyncer` gira su una coda di lavoro globale, non sul
+/// MainActor. Il lock e' economico (un solo accesso per file) e toglie di mezzo la
+/// domanda "e se un giorno la copia diventasse concorrente?".
+final class ImportSessionIndex {
+    private var bySize: [Int64: [(hash: String, url: URL)]] = [:]
+    private let lock = NSLock()
+
+    func record(hash: String, at url: URL) {
+        guard let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize else { return }
+        lock.lock(); defer { lock.unlock() }
+        bySize[Int64(size), default: []].append((hash: hash, url: url))
+    }
+
+    func candidates(withSize size: Int64) -> [(hash: String, url: URL)] {
+        lock.lock(); defer { lock.unlock() }
+        return bySize[size] ?? []
+    }
+}
+
 // MARK: - FileSyncer
 final class FileSyncer {
     struct SyncResult {
@@ -2823,6 +2862,12 @@ final class FileSyncer {
         /// succedere e' che finisca fra i `copied`, cioe' fra i verificati.
         var copiedUnverified = 0
         var changedSkipped = 0   // file esistente ma diverso dalla sorgente, skippato per zero-overwrite (roadmap #13)
+        /// File non copiati perche' lo stesso contenuto e' gia' presente altrove nella
+        /// libreria (roadmap #31). Un solo contatore per i due scenari — reimport di una
+        /// sorgente gia' importata e doppione interno allo stesso import — perche' per
+        /// l'utente sono la stessa cosa ("questa foto ce l'avevi gia'").
+        /// E' un sottoinsieme di `skipped`, come `changedSkipped`.
+        var duplicatesSkipped = 0
         var startDate = Date()
         var percent: Int { total > 0 ? min(100, done * 100 / total) : 0 }
         var elapsedSec: Int { Int(Date().timeIntervalSince(startDate)) }
@@ -2900,10 +2945,20 @@ final class FileSyncer {
         }
     }
 
+    /// - Parameters:
+    ///   - isDuplicate: predicato di dedup per contenuto (roadmap #31), consultato **solo**
+    ///     per i file che verrebbero copiati davvero. Default no-op: `runMacToSSD`,
+    ///     `runSSDToHDD`, `runSyncS3` e `RestoreEngine` non lo passano e si comportano
+    ///     identici a prima.
+    ///   - onCopied: notifica di copia **verificata** (dst, hash SHA256 gia' calcolato per
+    ///     la verifica d'integrita'). Serve a riconoscere i doppioni interni allo stesso
+    ///     import senza rileggere nulla in piu'. Default no-op.
     func sync(from src: URL, to dst: URL, deep: Bool,
               onStatus: @escaping (String) -> Void,
               onProgress: @escaping (SyncResult) -> Void,
-              onCurrentFile: @escaping (URL) -> Void = { _ in }) async throws -> SyncResult {
+              onCurrentFile: @escaping (URL) -> Void = { _ in },
+              isDuplicate: @escaping (URL) -> Bool = { _ in false },
+              onCopied: @escaping (URL, String) -> Void = { _, _ in }) async throws -> SyncResult {
         try await withCheckedThrowingContinuation { [self] cont in
             DispatchQueue.global(qos: .userInitiated).async {
                 self.cancelled = false
@@ -2931,7 +2986,8 @@ final class FileSyncer {
                     }
                     try self.syncDir(src: src, dst: dst, base: src, deep: deep,
                                      result: &result, onStatus: onStatus, onProgress: onProgress,
-                                     onCurrentFile: onCurrentFile)
+                                     onCurrentFile: onCurrentFile,
+                                     isDuplicate: isDuplicate, onCopied: onCopied)
                     cont.resume(returning: result)
                 } catch {
                     cont.resume(throwing: error)
@@ -2956,7 +3012,9 @@ final class FileSyncer {
                          result: inout SyncResult,
                          onStatus: @escaping (String) -> Void,
                          onProgress: @escaping (SyncResult) -> Void,
-                         onCurrentFile: @escaping (URL) -> Void) throws {
+                         onCurrentFile: @escaping (URL) -> Void,
+                         isDuplicate: @escaping (URL) -> Bool = { _ in false },
+                         onCopied: @escaping (URL, String) -> Void = { _, _ in }) throws {
         if cancelled { return }
         if !fm.fileExists(atPath: dst.path) {
             try fm.createDirectory(at: dst, withIntermediateDirectories: true)
@@ -2974,11 +3032,13 @@ final class FileSyncer {
             if vals?.isDirectory == true {
                 try syncDir(src: item, dst: destItem, base: base, deep: deep,
                             result: &result, onStatus: onStatus, onProgress: onProgress,
-                            onCurrentFile: onCurrentFile)
+                            onCurrentFile: onCurrentFile,
+                            isDuplicate: isDuplicate, onCopied: onCopied)
             } else if vals?.isRegularFile == true {
                 syncFile(src: item, dst: destItem, deep: deep,
                          result: &result, onStatus: onStatus, onProgress: onProgress,
-                         onCurrentFile: onCurrentFile)
+                         onCurrentFile: onCurrentFile,
+                         isDuplicate: isDuplicate, onCopied: onCopied)
             }
         }
     }
@@ -2987,7 +3047,9 @@ final class FileSyncer {
                           result: inout SyncResult,
                           onStatus: @escaping (String) -> Void,
                           onProgress: @escaping (SyncResult) -> Void,
-                          onCurrentFile: @escaping (URL) -> Void) {
+                          onCurrentFile: @escaping (URL) -> Void,
+                          isDuplicate: @escaping (URL) -> Bool = { _ in false },
+                          onCopied: @escaping (URL, String) -> Void = { _, _ in }) {
         let needs: Bool
         if !fm.fileExists(atPath: dst.path) {
             needs = true
@@ -3009,6 +3071,23 @@ final class FileSyncer {
                 // destination exists but differs — zero-overwrite rule: skip
                 result.skipped += 1
                 result.changedSkipped += 1
+            } else if isDuplicate(src) {
+                // Dedup per contenuto (roadmap #31): il file esiste gia' altrove nella
+                // libreria con contenuto byte-identico (verificato rileggendo e
+                // rihashando il candidato, ADR-0003). Non e' un errore e non e' un file
+                // "cambiato": ha un contatore suo, per non confondersi con
+                // `changedSkipped` (#13). Conta anche come `skipped`, cosi'
+                // copied + skipped + errors + hashErrors + copiedUnverified continua a
+                // fare `done`.
+                //
+                // L'ordine dei due rami e' load-bearing: lo zero-overwrite resta la
+                // PRIMA regola, il dedup e' un ramo dello stesso `if` e non un `return`
+                // anticipato — un `return` salterebbe `result.done += 1` e la
+                // `onProgress` finale, piantando la barra di avanzamento sui doppioni.
+                result.skipped += 1
+                result.duplicatesSkipped += 1
+                let name = src.lastPathComponent
+                DispatchQueue.main.async { onStatus("Già in libreria, non copiato: \(name)") }
             } else {
                 let snap = result
                 DispatchQueue.main.async {
@@ -3038,6 +3117,13 @@ final class FileSyncer {
                     if let srcHash, let dstHash {
                         if srcHash == dstHash {
                             result.copied += 1
+                            // roadmap #31: l'hash della verifica esiste gia', non buttarlo
+                            // via. Solo qui, cioe' solo con verifica RIUSCITA su entrambi i
+                            // lati: l'hash di una copia con mismatch e' quello di cui non ci
+                            // si puo' fidare, e in `copiedUnverified` la verifica non ha
+                            // proprio concluso. Verso sicuro: al massimo un doppione interno
+                            // non viene riconosciuto e il file viene copiato due volte.
+                            onCopied(dst, srcHash)
                         } else {
                             result.hashErrors += 1   // mismatch SHA256: conteggiato separato da errori I/O
                             DispatchQueue.main.async { onStatus("⚠️ HASH MISMATCH: \(name) — copia non integra, controlla il log") }
@@ -4630,6 +4716,15 @@ final class BackupRunner: ObservableObject {
     private let syncer = FileSyncer()
     private let s3Syncer = S3Syncer()
     private let bm = BookmarkManager.shared
+    /// Indice di contenuto della libreria (roadmap #31). Lazy: se non si riesce ad
+    /// aprirlo, il dedup semplicemente non avviene — l'indice e' una cache, mai un
+    /// prerequisito per importare (ADR-0002). Nessun percorso di codice deve fallire
+    /// per colpa sua, per questo `try?` e non `try`.
+    private(set) lazy var libraryIndexStore: LibraryIndexStore? = {
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("AppBackupFoto")
+        return try? LibraryIndexStore(url: dir.appendingPathComponent("library-index.sqlite"))
+    }()
     private var syncTask: Task<Void, Never>?
     private var wasStopped = false
     private let maxOut = 60_000
@@ -4794,6 +4889,71 @@ final class BackupRunner: ObservableObject {
         }
     }
 
+    /// Decide se un file in arrivo e' gia' presente nella libreria con contenuto identico
+    /// (roadmap #31).
+    ///
+    /// Due stadi, come rmlint/jdupes/rdfind: prima la dimensione (gratis), poi l'hash
+    /// (costoso). Un file la cui dimensione non compare ne' nell'indice persistito ne'
+    /// fra le copie di questa sessione non viene nemmeno hashato.
+    ///
+    /// MODELLO DI FIDUCIA (spec #31, ADR-0003): questo e' il percorso AD ALTO DANNO — un
+    /// hash stantio qui farebbe saltare in silenzio una foto diversa, e "saltata in
+    /// silenzio" significa che non arrivera' mai sull'SSD e nessuno se ne accorgera'.
+    /// Percio' NON ci si fida di nessun hash memorizzato, ne' quello dell'indice ne'
+    /// quello della sessione corrente: il candidato sul disco viene riletto e rihashato
+    /// prima di dichiarare il duplicato. Una regola sola, nessuna eccezione da ricordare.
+    /// Costa la lettura di un file per candidato, e solo quando un doppione c'e' davvero.
+    /// La rilettura sembra ridondante — l'indice ha gia' la risposta — e non lo e': e'
+    /// questa decisione. Non rimuoverla per ottimizzare.
+    ///
+    /// `nonisolated` perche' viene invocata dal thread di lavoro di `FileSyncer`, non dal
+    /// MainActor (stessa lezione di `makeThumbnail` in #17).
+    ///
+    /// - Parameter libraryRoot: root della libreria a cui sono relativi i `displayPath`
+    ///   dell'indice. Passata esplicitamente e non letta da `BookmarkManager.shared`
+    ///   perche' `urls` e' `@Published` e verrebbe letta da un thread di background;
+    ///   `runImport` ce l'ha gia' risolta. `nil` disattiva il solo stadio sull'indice
+    ///   persistito.
+    nonisolated static func isAlreadyInLibrary(url: URL,
+                                              store: LibraryIndexStore?,
+                                              session: ImportSessionIndex,
+                                              libraryRoot: URL?) -> Bool {
+        guard let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize else { return false }
+        let size64 = Int64(size)
+
+        // Stadio 1 — dimensione, gratis. Sessione corrente e indice persistito insieme.
+        let sessionCandidates = session.candidates(withSize: size64)
+        var storeHasSize = false
+        if let store { storeHasSize = (try? store.hasAnyEntry(withSize: size64)) ?? false }
+        guard !sessionCandidates.isEmpty || storeHasSize else { return false }
+
+        // Stadio 2 — hash della sorgente, costoso.
+        guard let sourceHash = sha256(of: url) else { return false }
+
+        // Copie fatte in questo stesso job (l'indice persistito non le conosce ancora).
+        for candidate in sessionCandidates where candidate.hash == sourceHash {
+            if fileOnDisk(candidate.url, matches: sourceHash) { return true }
+        }
+
+        // Indice persistito. Un risultato vuoto significa "non lo so", mai "nessuna copia
+        // esiste" (contratto di `entries(withHash:)`): nel dubbio si copia.
+        guard let store,
+              let libraryRoot,
+              let entries = try? store.entries(withHash: sourceHash),
+              !entries.isEmpty else { return false }
+        for entry in entries {
+            if fileOnDisk(libraryRoot.appendingPathComponent(entry.displayPath), matches: sourceHash) { return true }
+        }
+        return false
+    }
+
+    /// Riverifica di un candidato: l'hash memorizzato potrebbe essere stantio (mtime
+    /// riscrivibile da userspace, inode non affidabili su ExFAT), quindi si rilegge.
+    /// Un candidato sparito non e' un doppione: si prosegue col successivo.
+    private nonisolated static func fileOnDisk(_ url: URL, matches hash: String) -> Bool {
+        FileManager.default.fileExists(atPath: url.path) && sha256(of: url) == hash
+    }
+
     func runImport(source: URL, label: String) {
         speedUnit = "file/s"
         guard let ssdURL = bm.startAccessing(.ssd) else {
@@ -4831,13 +4991,24 @@ final class BackupRunner: ObservableObject {
                         + "liberi \(ByteCountFormatter.string(fromByteCount: space.availableBytes, countStyle: .file)) su \(ssdURL.path).")
                 return
             }
+            // Dedup per contenuto (roadmap #31). Lo store puo' essere `nil`: in quel caso
+            // il dedup semplicemente non avviene, l'import prosegue identico a prima —
+            // l'indice e' una cache, mai un prerequisito (ADR-0002).
+            let store = self.libraryIndexStore
+            // Una sessione per import, mai condivisa fra job: muore con questa chiusura.
+            let session = ImportSessionIndex()
             self.run(label: "Importa: \(label)") { [weak self] in
                 self?.publishStatus("Importa: \(source.path)  →  SSD: \(dst.path)")
                 defer { self?.bm.stopAccessing(.ssd) }
                 return try await self?.syncer.sync(from: source, to: dst, deep: false,
                     onStatus: { self?.publishStatus($0) },
                     onProgress: { self?.publishProgress($0) },
-                    onCurrentFile: { self?.publishCurrentFile($0) })
+                    onCurrentFile: { self?.publishCurrentFile($0) },
+                    isDuplicate: { url in
+                        BackupRunner.isAlreadyInLibrary(url: url, store: store,
+                                                        session: session, libraryRoot: ssdURL)
+                    },
+                    onCopied: { dst, hash in session.record(hash: hash, at: dst) })
             }
         }
     }
@@ -4995,6 +5166,7 @@ final class BackupRunner: ObservableObject {
                         self.stats.verifiedOk = r.copied              // tutti i copied sono verified ok
                         self.stats.copiedUnverified = r.copiedUnverified  // copiati ma non verificabili: fuori da copied/verifiedOk
                         self.stats.changedSkipped = r.changedSkipped  // file cambiati, non copiati (roadmap #13)
+                        self.stats.duplicatesSkipped = r.duplicatesSkipped  // gia' in libreria, non copiati (roadmap #31)
                     }
                     self.phase = .success("Completato: \(label)")
                     Notifier.send(self.phase.label,
@@ -5040,6 +5212,7 @@ final class BackupRunner: ObservableObject {
             self.stats.hashErrors = r.hashErrors          // mismatch SHA256 in tempo reale
             self.stats.copiedUnverified = r.copiedUnverified  // copiati ma non verificabili, in tempo reale
             self.stats.changedSkipped = r.changedSkipped  // file cambiati, non copiati (roadmap #13)
+            self.stats.duplicatesSkipped = r.duplicatesSkipped  // gia' in libreria, non copiati (roadmap #31)
             self.stats.verifiedOk = r.copied              // tutti i copied sono verified ok
             self.stats.eta = (r.copied > 0 && r.etaSec > 0) ? self.smoothEta(raw: r.etaSec) : "—"
             if r.elapsedSec > 0 {
@@ -6330,6 +6503,11 @@ struct CompletionSheet: View {
                 Label("\(stats.changedSkipped) file locali cambiati, non copiati (regola zero-overwrite)",
                       systemImage: "arrow.triangle.2.circlepath")
                     .font(.caption).foregroundStyle(AppColor.warning).multilineTextAlignment(.center)
+            }
+            if stats.duplicatesSkipped > 0 {
+                Label("Già presenti in libreria, non copiati: \(stats.duplicatesSkipped)",
+                      systemImage: "doc.on.doc")
+                    .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
             }
             if stats.errors > 0 {
                 Label("Controlla il log per i dettagli sugli errori.", systemImage: "exclamationmark.triangle.fill")
