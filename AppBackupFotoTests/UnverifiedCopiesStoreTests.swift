@@ -117,4 +117,106 @@ final class UnverifiedCopiesStoreTests: XCTestCase {
         XCTAssertEqual(state.totalCount, 5)
         XCTAssertTrue(state.paths.isEmpty)
     }
+
+    // MARK: Retrocompatibilita' della forma vecchia (percorsi senza data)
+
+    // Il record scritto prima che le voci avessero una data usava `paths: [String]`. Se non
+    // lo si legge piu', i debiti gia' contratti spariscono in silenzio al primo
+    // aggiornamento dell'app: e' esattamente l'errore gia' pagato con `changedSkipped`.
+    func testLegacyRecordWithoutDates_isStillRead() {
+        defaults.set(Data("{\"totalCount\":2,\"paths\":[\"/tmp/foto/A.JPG\",\"/tmp/foto/B.JPG\"]}".utf8),
+                     forKey: "unverifiedCopies")
+
+        let state = UnverifiedCopiesStore.load(defaults: defaults)
+        XCTAssertEqual(state.totalCount, 2)
+        XCTAssertEqual(state.paths, ["/tmp/foto/A.JPG", "/tmp/foto/B.JPG"])
+    }
+
+    // Una voce senza data non si puo' giudicare: non scade. Farla scadere su una data
+    // inventata farebbe sparire un debito reale, che e' il verso sbagliato dell'errore.
+    func testLegacyEntryWithoutADate_neverExpires() {
+        defaults.set(Data("{\"totalCount\":1,\"paths\":[\"/tmp/foto/A.JPG\"]}".utf8),
+                     forKey: "unverifiedCopies")
+
+        let fraDieciAnni = Date().addingTimeInterval(10 * 365 * 24 * 3600)
+        let state = UnverifiedCopiesStore.load(now: fraDieciAnni, defaults: defaults)
+        XCTAssertEqual(state.totalCount, 1)
+        XCTAssertEqual(state.paths, ["/tmp/foto/A.JPG"])
+    }
+
+    // MARK: Scadenza
+
+    // Un file importato da una scheda SD poi scollegata non ha piu' una sorgente con cui
+    // essere confrontato in nessuna coppia: senza scadenza resterebbe in lista per sempre,
+    // occupando uno dei 200 posti e falsando un conteggio che nessuno potra' mai chiudere.
+    func testEntryOlderThanTheExpiry_leavesBothTheListAndTheCount() {
+        let now = Date()
+        // Letterale e non `expiryInterval`: se qualcuno cambiasse la costante, questo test
+        // deve accorgersene invece di seguirla.
+        UnverifiedCopiesStore.record(url(1), now: now.addingTimeInterval(-31 * 24 * 3600), defaults: defaults)
+
+        let state = UnverifiedCopiesStore.load(now: now, defaults: defaults)
+        XCTAssertTrue(state.paths.isEmpty, "una voce scaduta non resta in lista")
+        XCTAssertEqual(state.totalCount, 0, "e non deve nemmeno restare nel conteggio")
+    }
+
+    func testEntryYoungerThanTheExpiry_stays() {
+        let now = Date()
+        UnverifiedCopiesStore.record(url(1), now: now.addingTimeInterval(-29 * 24 * 3600), defaults: defaults)
+
+        let state = UnverifiedCopiesStore.load(now: now, defaults: defaults)
+        XCTAssertEqual(state.paths, [url(1).path])
+        XCTAssertEqual(state.totalCount, 1)
+    }
+
+    // Il confine e' deciso una volta sola: esattamente 30 giorni NON e' scaduto, un secondo
+    // dopo si'. L'istante e' iniettato, quindi non e' una corsa.
+    func testTheExpiryBoundaryIsDeterministic() {
+        let now = Date()
+        let trentaGiorni: TimeInterval = 30 * 24 * 3600
+        let sulFilo = UnverifiedCopies.Entry(path: url(1).path,
+                                             recordedAt: now.addingTimeInterval(-trentaGiorni))
+        let unSecondoOltre = UnverifiedCopies.Entry(path: url(2).path,
+                                                    recordedAt: now.addingTimeInterval(-trentaGiorni - 1))
+
+        XCTAssertFalse(UnverifiedCopiesStore.isExpired(sulFilo, now: now))
+        XCTAssertTrue(UnverifiedCopiesStore.isExpired(unSecondoOltre, now: now))
+    }
+
+    // La scadenza non deve toccare le voci ancora buone che stanno accanto a una scaduta.
+    func testOnlyTheExpiredEntriesAreDropped() {
+        let now = Date()
+        UnverifiedCopiesStore.record(url(1), now: now.addingTimeInterval(-40 * 24 * 3600), defaults: defaults)
+        UnverifiedCopiesStore.record(url(2), now: now.addingTimeInterval(-40 * 24 * 3600), defaults: defaults)
+        UnverifiedCopiesStore.record(url(3), now: now.addingTimeInterval(-1 * 24 * 3600), defaults: defaults)
+
+        let state = UnverifiedCopiesStore.load(now: now, defaults: defaults)
+        XCTAssertEqual(state.paths, [url(3).path])
+        XCTAssertEqual(state.totalCount, 1)
+    }
+
+    // Il posto liberato da una voce scaduta torna disponibile: e' il motivo per cui la
+    // scadenza esiste.
+    func testAnExpiredEntryGivesItsSlotBack() {
+        let now = Date()
+        for i in 0..<UnverifiedCopiesStore.maxPaths {
+            UnverifiedCopiesStore.record(url(i), now: now.addingTimeInterval(-40 * 24 * 3600), defaults: defaults)
+        }
+        UnverifiedCopiesStore.record(url(9999), now: now, defaults: defaults)
+
+        let state = UnverifiedCopiesStore.load(now: now, defaults: defaults)
+        XCTAssertEqual(state.paths, [url(9999).path])
+        XCTAssertEqual(state.totalCount, 1)
+    }
+
+    // La data e' quella del momento in cui il debito e' stato contratto, non quella della
+    // lettura: se `record` non la scrivesse, nessuna voce scadrebbe mai.
+    func testRecordStampsTheEntryWithTheInstantItWasContracted() {
+        let quando = Date().addingTimeInterval(-3600)
+        UnverifiedCopiesStore.record(url(1), now: quando, defaults: defaults)
+
+        let entry = UnverifiedCopiesStore.load(now: quando, defaults: defaults).entries.first
+        XCTAssertEqual(entry?.recordedAt?.timeIntervalSince1970 ?? 0,
+                       quando.timeIntervalSince1970, accuracy: 0.001)
+    }
 }

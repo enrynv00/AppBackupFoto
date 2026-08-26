@@ -2666,6 +2666,150 @@ final class LibraryIndexer {
     }
 }
 
+// MARK: - Testi e regole della card "Foto gia' salvate" (roadmap #31, Task 6)
+
+/// I nomi dei comandi della card, in un punto solo. Non e' pignoleria: due dei messaggi
+/// dicono all'utente **quale bottone premere**, e se il nome vivesse in due posti la prima
+/// rinomina lascerebbe un messaggio che indica un bottone che non esiste piu'.
+enum LibraryIndexCommands {
+    static let build = "Crea l'elenco"
+    static let refresh = "Aggiorna l'elenco"
+    static let fullRecheck = "Controlla tutte le foto da capo"
+    static let reset = "Svuota l'elenco e ricomincia da zero"
+    static let stop = "Interrompi"
+}
+
+/// Cosa dire all'utente dopo una lettura della libreria. Logica **pura**: dipende solo dal
+/// `Progress` restituito da `LibraryIndexer.scan` e dal fatto che l'utente abbia premuto
+/// "Interrompi" — che il `Progress` non puo' sapere, perche' la cancellazione la decide la
+/// UI e arriva anche dallo smontaggio automatico di un volume.
+///
+/// Sta qui e non dentro la View perche' e' l'unica parte della card verificabile senza una
+/// corsa reale, ed e' anche quella che sbaglia piu' facilmente: la regola "traversata
+/// incompleta => non si toglie niente" ha cause diverse, e ognuna richiede una spiegazione
+/// diversa e un numero. Un colore da solo non dice a Enrico perche' il conteggio non torna.
+///
+/// Registro: nessun gergo. "Indice", "hash", "scansione incrementale" non compaiono, qui
+/// dentro come nel resto della card.
+enum LibraryIndexStatus {
+    enum Tone { case ok, info, warning }
+
+    struct Line: Identifiable {
+        /// Identita' stabile e non un UUID: le righe si ricalcolano a ogni ridisegno, e con
+        /// un UUID SwiftUI le vedrebbe tutte nuove ogni volta.
+        let id: String
+        let tone: Tone
+        let text: String
+    }
+
+    static func lines(for p: LibraryIndexer.Progress, interruptedByUser: Bool) -> [Line] {
+        var out: [Line] = []
+
+        // ---- Perche' la lettura non e' arrivata in fondo ----
+        // Righe indipendenti, non alternative: "SSD scollegato" e "3 cartelle non lette"
+        // possono essere vere insieme e sono due informazioni diverse.
+        if p.volumeVanished {
+            out.append(Line(id: "volume", tone: .warning, text:
+                "L'SSD è stato scollegato mentre l'app stava leggendo, quindi il controllo si è fermato a metà. "
+                + "Quello che aveva già letto è stato salvato: ricollega l'SSD e premi di nuovo «\(LibraryIndexCommands.refresh)»."))
+        }
+        if interruptedByUser {
+            out.append(Line(id: "interrotto", tone: .info, text:
+                "Hai fermato tu il controllo. Quello che l'app aveva già letto resta salvato e la prossima volta riprende da lì."))
+        }
+        if p.unreadableItems > 0 {
+            out.append(Line(id: "illeggibili", tone: .warning, text:
+                "\(count(p.unreadableItems, "cartella non si è lasciata aprire", "cartelle non si sono lasciate aprire")) "
+                + "(permessi o errori di lettura): quello che c'era dentro non è entrato nell'elenco."))
+        }
+        // Zero file visti con l'elenco pieno: "non ho trovato niente" non e' "non c'e'
+        // niente". E' il caso in cui l'unica via d'uscita e' svuotare l'elenco, quindi il
+        // messaggio deve nominarla: senza, l'utente resta in un vicolo cieco (ADR-0002).
+        let sawNothing = !p.volumeVanished && !interruptedByUser && p.scanned == 0 && p.total > 0
+        if sawNothing {
+            out.append(Line(id: "vuoto", tone: .warning, text:
+                "L'app non ha trovato nessuna foto sull'SSD, ma nell'elenco ce ne sono \(number(p.total)). "
+                + "Per sicurezza non ha tolto niente. Se hai davvero svuotato l'SSD, usa «\(LibraryIndexCommands.reset)»."))
+        }
+        // Residuo: la lettura risulta incompleta per un motivo che non abbiamo saputo
+        // spiegare meglio. Meglio una riga generica che il silenzio.
+        if p.traversalIncomplete && out.isEmpty {
+            out.append(Line(id: "incompleta", tone: .warning, text:
+                "Il controllo non è riuscito a leggere tutta la libreria. Per sicurezza non è stata tolta nessuna foto dall'elenco."))
+        }
+
+        // ---- Foto sparite dal disco e tenute lo stesso ----
+        // Obbligatoria: senza, la guardia scatta in silenzio e dopo una riorganizzazione
+        // legittima continuerebbe a scattare a ogni avvio, per sempre.
+        if p.vanishedKept > 0 {
+            // Il consiglio cambia col motivo, perche' i due comandi non fanno la stessa cosa:
+            // la ricontrollata completa scavalca solo la guardia di plausibilita', mai la
+            // traversata incompleta. Consigliarla dopo un'interruzione manderebbe l'utente a
+            // rifare quindici minuti di lettura per niente.
+            let advice = p.traversalIncomplete
+                ? "Finché il controllo non riesce ad arrivare in fondo, l'app non toglie niente dall'elenco: riprova con l'SSD collegato e senza interromperlo."
+                : "Se hai spostato o riorganizzato le cartelle sull'SSD, usa «\(LibraryIndexCommands.fullRecheck)» per rimettere in pari l'elenco."
+            let kept = p.vanishedKept == 1 ? "ed è stata lasciata" : "e sono state lasciate"
+            out.append(Line(id: "sparite", tone: .warning, text:
+                "\(count(p.vanishedKept, "foto risulta sparita", "foto risultano sparite")) dall'SSD \(kept) nell'elenco per sicurezza. " + advice))
+        }
+
+        // ---- Informazioni neutre: non sono problemi, ma spiegano perche' i numeri non tornano ----
+        if p.errors > 0 {
+            let entrati = p.errors == 1 ? "è entrato" : "sono entrati"
+            let copiati = p.errors == 1 ? "verrà copiato" : "verranno copiati"
+            out.append(Line(id: "errori", tone: .info, text:
+                "\(count(p.errors, "file non si è lasciato leggere", "file non si sono lasciati leggere")) e non \(entrati) nell'elenco: "
+                + "in un'importazione \(copiati) comunque."))
+        }
+        if p.outsideRoot > 0 {
+            let ignorati = p.outsideRoot == 1 ? "ed è stato ignorato" : "e sono stati ignorati"
+            out.append(Line(id: "fuori", tone: .info, text:
+                "\(count(p.outsideRoot, "file si trovava", "file si trovavano")) fuori dall'SSD \(ignorati)."))
+        }
+        if p.rebasedByTimezone > 0 {
+            out.append(Line(id: "fuso", tone: .info, text:
+                "\(count(p.rebasedByTimezone, "foto rimessa in pari", "foto rimesse in pari")) dopo un cambio dell'ora: non è un problema."))
+        }
+
+        if out.isEmpty {
+            out.append(Line(id: "ok", tone: .ok, text:
+                "Ultimo controllo completato: l'elenco è in pari con quello che c'è sull'SSD."))
+        }
+        return out
+    }
+
+    private static func number(_ n: Int) -> String { n.formatted() }
+
+    private static func count(_ n: Int, _ singular: String, _ plural: String) -> String {
+        "\(number(n)) \(n == 1 ? singular : plural)"
+    }
+}
+
+/// Quando l'elenco puo' aggiornarsi da solo. Pura e in un punto solo perche' i richiami sono
+/// due (SSD collegato, fine di un job che ha scritto sull'SSD) e devono decidere allo stesso
+/// modo.
+enum LibraryIndexAutoRefresh {
+    static let defaultsKey = "autoRefreshLibraryIndex"
+
+    /// L'interruttore vale `true` finche' l'utente non lo tocca. `UserDefaults.bool` non va
+    /// bene: risponde `false` per una chiave mai scritta, e `@AppStorage` la scrive solo al
+    /// primo cambiamento — l'aggiornamento automatico resterebbe spento per default, al
+    /// contrario di quello che dice l'interruttore in Impostazioni.
+    static func isEnabled(defaults: UserDefaults = .standard) -> Bool {
+        defaults.object(forKey: defaultsKey) as? Bool ?? true
+    }
+
+    /// - `indexedFileCount == 0`: la **prima** creazione non parte mai da sola, dura minuti e
+    ///   legge per intero ogni foto e ogni video (Task 6, Step 4).
+    /// - `isIndexing`: una lettura per volta, sempre sulla stessa istanza dello store.
+    /// - `jobIsRunning`: una lettura integrale dell'SSD in parallelo a una copia rallenta
+    ///   entrambe e conta come illeggibili i file che la copia sta scrivendo proprio ora.
+    static func shouldRun(enabled: Bool, indexedFileCount: Int, isIndexing: Bool, jobIsRunning: Bool) -> Bool {
+        enabled && indexedFileCount > 0 && !isIndexing && !jobIsRunning
+    }
+}
+
 /// Hash di un file **piu' la dimensione misurata sullo stesso descrittore**.
 struct MeasuredHash {
     let hash: String
@@ -4841,6 +4985,166 @@ final class BackupRunner: ObservableObject {
     }()
     private var syncTask: Task<Void, Never>?
     private var wasStopped = false
+
+    // MARK: Elenco delle foto gia' salvate (roadmap #31, Task 6)
+
+    /// Ultimo `Progress` pubblicato dalla lettura. `nil` = non e' mai stata fatta una
+    /// lettura da quando l'app e' aperta (o l'elenco e' appena stato svuotato).
+    @Published var indexProgress: LibraryIndexer.Progress? = nil
+    @Published private(set) var isIndexing = false
+    /// Quante foto e video ci sono nell'elenco. Tenuto qui e non letto dalla View con una
+    /// `count()` al volo: quella query passa dalla coda seriale dello store, che durante una
+    /// lettura e' occupata dalle scritture a batch, e sul main thread bloccherebbe la
+    /// finestra a ogni ridisegno.
+    @Published private(set) var indexedFileCount = 0
+    /// L'utente ha premuto "Interrompi" sull'ultima lettura. Distinto dalla cancellazione
+    /// automatica per smontaggio di un volume: `Progress` non puo' saperlo, e i due casi
+    /// vanno spiegati in modo diverso.
+    @Published private(set) var indexInterruptedByUser = false
+    private var indexer: LibraryIndexer? = nil
+    private var unmountObserver: NSObjectProtocol? = nil
+
+    init() {
+        // ATTENZIONE: le notifiche di NSWorkspace sono pubblicate sul SUO notification
+        // center, non su NotificationCenter.default. Registrarsi su quello sbagliato
+        // compila, non produce errori a runtime, e semplicemente non scatta mai.
+        unmountObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.willUnmountNotification, object: nil, queue: .main) { [weak self] _ in
+                // Non si filtra per volume: fermare una lettura in corso a ogni smontaggio e'
+                // innocuo (quello che e' stato letto resta valido e la volta dopo si riprende
+                // da li'), mentre continuare a leggere da un volume che sta sparendo produce
+                // hash calcolati su letture troncate.
+                guard let self else { return }
+                Task { @MainActor in self.stopIndexingForVolumeChange() }
+            }
+        refreshIndexedFileCount()
+    }
+
+    deinit {
+        if let unmountObserver { NSWorkspace.shared.notificationCenter.removeObserver(unmountObserver) }
+    }
+
+    func refreshIndexedFileCount() {
+        guard let store = libraryIndexStore else { indexedFileCount = 0; return }
+        // `guard let self` e non `self?.`: una `var` weak riferita da una closure
+        // concorrente e' un errore in Swift 6, e qui una referenza forte per la durata di
+        // una query non cambia niente (il runner vive quanto l'app).
+        Task.detached(priority: .utility) { [weak self] in
+            guard let self else { return }
+            let n = (try? store.count()) ?? 0
+            await MainActor.run { self.indexedFileCount = n }
+        }
+    }
+
+    /// Costruisce o aggiorna l'elenco delle foto gia' presenti sull'SSD.
+    /// `full: true` = si rilegge da capo ogni file, senza fidarsi di niente di memorizzato.
+    func rebuildLibraryIndex(full: Bool = false) {
+        guard !isIndexing else { return }
+        // L'elenco e' una cache, mai un prerequisito (ADR-0002): se non si apre, si dice e
+        // basta. Niente nell'app smette di funzionare.
+        guard let store = libraryIndexStore else {
+            alert("Elenco non disponibile",
+                  "Non è stato possibile aprire l'elenco delle foto già salvate.\n\nL'importazione funziona lo stesso: senza elenco l'app copia tutto, senza riconoscere le foto che hai già.")
+            return
+        }
+        guard let ssdURL = bm.startAccessing(.ssd) else {
+            alert("Accesso all'SSD non disponibile", "Vai in Impostazioni e riseleziona l'SSD.")
+            return
+        }
+        // La root da leggere e' ESATTAMENTE quella che `runImport` passa come `libraryRoot`:
+        // la radice del volume, non la sottocartella "Foto iPhone". I percorsi dell'elenco
+        // sono relativi a questa; se le due divergessero ogni voce punterebbe a un file
+        // inesistente e il riconoscimento dei doppioni smetterebbe di funzionare **senza
+        // dire niente** (Task 6, Step 2-ter).
+        guard isLikelyVolumeRoot(ssdURL) else {
+            bm.stopAccessing(.ssd)
+            alert("Bookmark SSD non valido",
+                  "Il percorso '\(ssdURL.path)' non è la radice del volume.\n\nVai in Impostazioni (⚙) → riseleziona SSD scegliendo '/Volumes/SSD - Enri' (root del volume, non una sottocartella).")
+            return
+        }
+        isIndexing = true
+        indexInterruptedByUser = false
+        indexProgress = LibraryIndexer.Progress()
+        // UNA SOLA istanza di store per file dell'indice: si riusa `libraryIndexStore`, mai
+        // una seconda connessione sullo stesso database. La coda seriale che protegge SQLite
+        // serializza **per istanza**: due istanze sono lo scenario SIGSEGV misurato tre run
+        // su tre (Task 6, Step 2-ter).
+        let idx = LibraryIndexer(store: store)
+        indexer = idx
+        Task.detached(priority: .utility) { [weak self] in
+            guard let self else { return }
+            do {
+                _ = try idx.scan(root: ssdURL, ignoringStoredHashes: full) { p in
+                    // `onProgress` arriva dal thread che sta leggendo, mai dal MainActor:
+                    // l'aggiornamento della finestra va pubblicato esplicitamente.
+                    Task { @MainActor in
+                        self.indexProgress = p
+                        self.indexedFileCount = p.total
+                    }
+                }
+            } catch {
+                // `scan` e' `throws`, ma un suo errore non deve poter far fallire niente
+                // altro: si mostra e si prosegue (ADR-0002).
+                await MainActor.run {
+                    self.pendingAlert = SimpleAlert(
+                        title: "Il controllo si è fermato",
+                        message: "\(error.localizedDescription)\n\nQuello che l'app aveva già letto resta salvato: puoi riprovare più tardi.")
+                }
+            }
+            // Sempre, anche dopo un errore: senza, "Interrompi" e i bottoni resterebbero
+            // disabilitati fino alla chiusura dell'app.
+            await MainActor.run {
+                self.bm.stopAccessing(.ssd)
+                self.isIndexing = false
+                self.indexer = nil
+            }
+        }
+    }
+
+    /// Interruzione richiesta dall'utente. Quello che e' stato letto resta salvato: i commit
+    /// sono a batch, un elenco parziale e' valido e utile (ADR-0002).
+    func cancelIndexing() {
+        guard isIndexing else { return }
+        indexInterruptedByUser = true
+        indexer?.cancel()
+    }
+
+    /// Un volume si sta smontando: si ferma la lettura come sopra, ma **non** la si segna
+    /// come interruzione dell'utente — il messaggio da mostrare e' un altro.
+    private func stopIndexingForVolumeChange() {
+        guard isIndexing else { return }
+        indexer?.cancel()
+    }
+
+    /// Svuota l'elenco (solo l'elenco: il file SQLite sul Mac, mai le foto) e lo riapre
+    /// vuoto. La ricostruzione **non** parte da sola: la prima creazione resta manuale.
+    func resetLibraryIndex() {
+        guard !isIndexing, let store = libraryIndexStore else { return }
+        do {
+            try store.deleteIndexAndRecreate()
+            indexProgress = nil
+            indexInterruptedByUser = false
+            indexedFileCount = 0
+        } catch {
+            // Se la cancellazione fallisce lo store resta aperto sul vecchio file ed e'
+            // ancora utilizzabile: si mostra l'errore e si prosegue, mai un errore fatale.
+            pendingAlert = SimpleAlert(
+                title: "Non è stato possibile svuotare l'elenco",
+                message: "\(error.localizedDescription)\n\nL'elenco di prima è ancora al suo posto e funziona.")
+            refreshIndexedFileCount()
+        }
+    }
+
+    /// Aggiornamento automatico: SSD collegato, oppure fine di un job che ha scritto
+    /// sull'SSD. Le condizioni stanno in `LibraryIndexAutoRefresh`, non qui.
+    func autoRefreshLibraryIndexIfEnabled() {
+        guard LibraryIndexAutoRefresh.shouldRun(enabled: LibraryIndexAutoRefresh.isEnabled(),
+                                                indexedFileCount: indexedFileCount,
+                                                isIndexing: isIndexing,
+                                                jobIsRunning: isRunning) else { return }
+        rebuildLibraryIndex()
+    }
+
     private let maxOut = 60_000
     private let maxSpeedSamples = 120
     private let lastDeepKey = "lastDeepMirrorDate"
@@ -4886,7 +5190,7 @@ final class BackupRunner: ObservableObject {
                         + "liberi \(ByteCountFormatter.string(fromByteCount: space.availableBytes, countStyle: .file)) su \(ssdURL.path).")
                 return
             }
-            self.run(label: "MAC -> SSD") { [weak self] in
+            self.run(label: "MAC -> SSD", refreshesLibraryIndex: true) { [weak self] in
                 self?.publishStatus("Foto: \(photosURL.path)  →  SSD: \(dst.path)")
                 defer { self?.bm.stopAccessing(.photos); self?.bm.stopAccessing(.ssd) }
                 return try await self?.syncer.sync(from: photosURL, to: dst, deep: false,
@@ -5152,7 +5456,7 @@ final class BackupRunner: ObservableObject {
             let store = self.libraryIndexStore
             // Una sessione per import, mai condivisa fra job: muore con questa chiusura.
             let session = ImportSessionIndex()
-            self.run(label: "Importa: \(label)") { [weak self] in
+            self.run(label: "Importa: \(label)", refreshesLibraryIndex: true) { [weak self] in
                 self?.publishStatus("Importa: \(source.path)  →  SSD: \(dst.path)")
                 defer { self?.bm.stopAccessing(.ssd) }
                 return try await self?.syncer.sync(from: source, to: dst, deep: false,
@@ -5295,7 +5599,12 @@ final class BackupRunner: ObservableObject {
             duplicatesSkipped: stats.duplicatesSkipped))
     }
 
-    private func run(label: String, work: @escaping () async throws -> FileSyncer.SyncResult?) {
+    /// - Parameter refreshesLibraryIndex: il job **scrive** sull'SSD (Mac -> SSD, Importa),
+    ///   quindi a fine corsa l'elenco delle foto gia' salvate non e' piu' in pari. Falso per
+    ///   SSD -> HDD e SSD -> Cubbit, che sull'SSD leggono soltanto: una lettura integrale
+    ///   dopo ognuno di quei job costerebbe minuti per non trovare niente di nuovo.
+    private func run(label: String, refreshesLibraryIndex: Bool = false,
+                     work: @escaping () async throws -> FileSyncer.SyncResult?) {
         guard !isRunning else { return }
         output = ""; stats = JobStats(); currentStatus = ""; currentThumbnail = nil
         wasStopped = false
@@ -5341,6 +5650,10 @@ final class BackupRunner: ObservableObject {
                         hashErrors: self.stats.hashErrors, succeeded: true,
                         changedSkipped: self.stats.changedSkipped,
                         duplicatesSkipped: self.stats.duplicatesSkipped))
+                    // Dopo un job riuscito che ha scritto sull'SSD: e' il momento in cui
+                    // l'elenco serve aggiornato, ed e' anche l'unico in cui si e' certi che
+                    // nessuno stia piu' scrivendo sul volume.
+                    if refreshesLibraryIndex { self.autoRefreshLibraryIndexIfEnabled() }
                 }
             } catch {
                 await MainActor.run {
@@ -5550,26 +5863,57 @@ enum JobHistoryStore {
 /// esattamente il problema da risolvere. Il debito e' cumulativo e si chiude un file alla
 /// volta, quindi ha una chiave sua.
 struct UnverifiedCopies: Codable, Equatable {
-    /// Quanti file risultano ancora da ricontrollare. Resta veritiero anche quando `paths`
-    /// e' troncata dal tetto: e' il numero da mostrare, `paths.count` non lo e'.
+    /// Una copia da ricontrollare: il percorso piu' l'istante in cui il debito e' stato
+    /// contratto. La data serve solo alla scadenza (`UnverifiedCopiesStore.expiryDays`).
+    struct Entry: Codable, Equatable {
+        var path: String
+        /// `nil` solo nei record scritti dalla versione che non aveva ancora questo campo.
+        /// Una voce senza data **non scade mai**: far sparire un debito reale sulla base di
+        /// una data inventata sarebbe il verso sbagliato dell'errore, e la voce resta
+        /// comunque verificabile dal campione d'integrita'.
+        var recordedAt: Date? = nil
+    }
+
+    /// Quanti file risultano ancora da ricontrollare. Resta veritiero anche quando `entries`
+    /// e' troncata dal tetto: e' il numero da mostrare, `entries.count` non lo e'.
     var totalCount: Int = 0
-    /// Percorsi assoluti conservati, al massimo `UnverifiedCopiesStore.maxPaths`. Il tetto
-    /// esiste perche' questo record sta in `UserDefaults` e senza limite crescerebbe con il
-    /// numero di file copiati, non con il numero di problemi reali.
-    var paths: [String] = []
+    /// Voci conservate, al massimo `UnverifiedCopiesStore.maxPaths`. Il tetto esiste perche'
+    /// questo record sta in `UserDefaults` e senza limite crescerebbe con il numero di file
+    /// copiati, non con il numero di problemi reali.
+    var entries: [Entry] = []
+
+    /// Percorsi conservati, nell'ordine di registrazione. Derivata da `entries`: non e' un
+    /// secondo elenco da tenere allineato.
+    var paths: [String] { entries.map(\.path) }
 }
 
 extension UnverifiedCopies {
-    private enum CodingKeys: String, CodingKey { case totalCount, paths }
+    private enum CodingKeys: String, CodingKey { case totalCount, entries }
+    /// Chiavi della forma **vecchia** del record. Enum separata perche' la sintesi di
+    /// `encode(to:)` pretende che ogni caso di `CodingKeys` corrisponda a una proprieta'
+    /// memorizzata: tenere qui `paths` (che oggi e' derivata) e' l'unico modo per leggerla
+    /// senza scrivere a mano una codifica che poi divergerebbe.
+    private enum LegacyCodingKeys: String, CodingKey { case paths }
 
     /// Stessa ragione di `JobSummary.init(from:)`: i default sulle proprieta' non li usa la
     /// decodifica sintetizzata. Qui tutti i campi sono opzionali in lettura perche' l'intero
     /// record e' una comodita': un debito che non si riesce a leggere e' un debito vuoto, mai
     /// un errore.
+    ///
+    /// `paths` e' la forma **vecchia** del record (percorsi senza data), letta solo se
+    /// `entries` non c'e'. Senza questo ramo i debiti gia' scritti sparirebbero in silenzio
+    /// al primo aggiornamento dell'app — e' lo stesso errore gia' pagato una volta con
+    /// `changedSkipped` in `JobSummary`.
     init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         totalCount = try c.decodeIfPresent(Int.self, forKey: .totalCount) ?? 0
-        paths = try c.decodeIfPresent([String].self, forKey: .paths) ?? []
+        if let decoded = try c.decodeIfPresent([Entry].self, forKey: .entries) {
+            entries = decoded
+        } else {
+            let legacy = try decoder.container(keyedBy: LegacyCodingKeys.self)
+            entries = (try legacy.decodeIfPresent([String].self, forKey: .paths) ?? [])
+                .map { Entry(path: $0, recordedAt: nil) }
+        }
     }
 }
 
@@ -5579,18 +5923,53 @@ enum UnverifiedCopiesStore {
     /// la soglia oltre la quale il record in `UserDefaults` diventa un problema di suo.
     static let maxPaths = 200
 
+    /// Scadenza di un debito. Un file importato da una scheda SD poi scollegata non ha piu'
+    /// una sorgente con cui essere confrontato in nessuna coppia campionata: senza scadenza
+    /// resterebbe in lista per sempre, occupando uno dei `maxPaths` posti e falsando il
+    /// conteggio con un debito che nessuno potra' mai chiudere.
+    ///
+    /// La regola vale per **tutte** le voci, non solo per quelle da import: una sorgente puo'
+    /// sparire in molti modi, e "scade sempre" e' una regola che si ricorda, "scade tranne
+    /// quando..." no. Il prezzo e' che una copia davvero corrotta esce dalla lista dopo 30
+    /// giorni senza essere stata verificata — ma in quei 30 giorni il campione d'integrita'
+    /// l'ha avuta in cima alla precedenza a ogni esecuzione.
+    static let expiryDays = 30
+    static var expiryInterval: TimeInterval { TimeInterval(expiryDays) * 24 * 3600 }
+
     private static let key = "unverifiedCopies"
     /// `record` e' chiamata dalla coda di lavoro di `FileSyncer`, non dal MainActor, e fa un
     /// leggi-modifica-scrivi: senza lock due file non verificati nello stesso istante ne
     /// perderebbero uno.
     private static let lock = NSLock()
 
-    static func load(defaults: UserDefaults = .standard) -> UnverifiedCopies {
+    /// Il debito, gia' ripulito dalle voci scadute: chi legge non deve ricordarsi di
+    /// filtrare. `now` e' un parametro e non `Date()` preso qui dentro perche' altrimenti
+    /// il confine della scadenza non sarebbe verificabile se non a cronometro.
+    static func load(now: Date = Date(), defaults: UserDefaults = .standard) -> UnverifiedCopies {
         guard let data = defaults.data(forKey: key),
               let decoded = try? JSONDecoder().decode(UnverifiedCopies.self, from: data) else {
             return UnverifiedCopies()
         }
-        return decoded
+        return pruningExpired(decoded, now: now)
+    }
+
+    /// Una voce e' scaduta quando ha piu' di `expiryDays` giorni. Il confine (esattamente
+    /// `expiryDays` giorni) NON e' scaduto: serve un verso deciso una volta sola, altrimenti
+    /// il test del confine sarebbe arbitrario quanto il codice.
+    static func isExpired(_ entry: UnverifiedCopies.Entry, now: Date) -> Bool {
+        guard let recordedAt = entry.recordedAt else { return false }
+        return now.timeIntervalSince(recordedAt) > expiryInterval
+    }
+
+    /// Le voci scadute escono **anche dal conteggio**: un numero che comprende debiti che
+    /// nessuno ricontrollera' piu' non e' un numero veritiero. Si scala solo di quante voci
+    /// si sono davvero tolte — dei debiti oltre il tetto non si conosce nemmeno la data,
+    /// quindi non si possono giudicare.
+    private static func pruningExpired(_ state: UnverifiedCopies, now: Date) -> UnverifiedCopies {
+        var pruned = state
+        pruned.entries = state.entries.filter { !isExpired($0, now: now) }
+        pruned.totalCount = max(0, state.totalCount - (state.entries.count - pruned.entries.count))
+        return pruned
     }
 
     /// Registra un file da ricontrollare. Idempotente sui percorsi conservati: lo stesso file
@@ -5600,23 +5979,25 @@ enum UnverifiedCopiesStore {
     /// percorso si perde. In quel regime un percorso non conservato e registrato di nuovo
     /// conterebbe due volte — caso che lo zero-overwrite rende praticamente irraggiungibile
     /// (un file gia' copiato non viene ricopiato, quindi non torna a essere non verificato).
-    static func record(_ url: URL, defaults: UserDefaults = .standard) {
+    static func record(_ url: URL, now: Date = Date(), defaults: UserDefaults = .standard) {
         lock.lock(); defer { lock.unlock() }
-        var state = load(defaults: defaults)
-        guard !state.paths.contains(url.path) else { return }
+        var state = load(now: now, defaults: defaults)
+        guard !state.entries.contains(where: { $0.path == url.path }) else { return }
         state.totalCount += 1
-        if state.paths.count < maxPaths { state.paths.append(url.path) }
+        if state.entries.count < maxPaths {
+            state.entries.append(UnverifiedCopies.Entry(path: url.path, recordedAt: now))
+        }
         save(state, defaults: defaults)
     }
 
     /// Il debito si chiude: il file e' stato ricontrollato e corrisponde alla sorgente.
     /// Il conteggio scende solo se il percorso era davvero fra quelli conservati, altrimenti
     /// si scalerebbe un debito di cui non sappiamo nulla.
-    static func clear(_ path: String, defaults: UserDefaults = .standard) {
+    static func clear(_ path: String, now: Date = Date(), defaults: UserDefaults = .standard) {
         lock.lock(); defer { lock.unlock() }
-        var state = load(defaults: defaults)
-        guard let i = state.paths.firstIndex(of: path) else { return }
-        state.paths.remove(at: i)
+        var state = load(now: now, defaults: defaults)
+        guard let i = state.entries.firstIndex(where: { $0.path == path }) else { return }
+        state.entries.remove(at: i)
         state.totalCount = max(0, state.totalCount - 1)
         save(state, defaults: defaults)
     }
@@ -6549,8 +6930,15 @@ struct ContentView: View {
             if let p, p.isTerminal { showCompletion = true }
         }
         .onChange(of: volumes.ssdMounted) { _, mounted in
-            if mounted && autoBackupEnabled && !runner.isRunning {
+            guard mounted else { return }
+            if autoBackupEnabled && !runner.isRunning {
+                // Il backup automatico scrive sull'SSD: leggerlo per intero nello stesso
+                // momento rallenta entrambi e fa risultare illeggibili i file che il backup
+                // sta scrivendo proprio ora. L'elenco si aggiorna a fine job, che e' anche
+                // il momento in cui serve davvero aggiornato.
                 runner.runMacToSSD()
+            } else {
+                runner.autoRefreshLibraryIndexIfEnabled()
             }
         }
         .sheet(isPresented: $showCompletion) {
@@ -6592,6 +6980,7 @@ struct SettingsSheet: View {
     @ObservedObject private var bm = BookmarkManager.shared
     @ObservedObject private var gate = AuthGateManager.shared
     @AppStorage("autoBackupOnSSDConnect") private var autoBackupEnabled: Bool = true
+    @AppStorage(LibraryIndexAutoRefresh.defaultsKey) private var autoRefreshLibraryIndex: Bool = true
     @State private var showDiskPrep = false
     var body: some View {
         VStack(spacing: AppSpacing.xl) {
@@ -6600,6 +6989,11 @@ struct SettingsSheet: View {
             VStack(alignment: .leading, spacing: AppSpacing.xs) {
                 Toggle("Backup automatico Mac → SSD quando colleghi l'SSD", isOn: $autoBackupEnabled)
                 Text("Appena colleghi l'SSD, se l'app è aperta, parte da sola l'aggiornamento da Foto a SSD.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }.padding(.horizontal, AppSpacing.xl)
+            VStack(alignment: .leading, spacing: AppSpacing.xs) {
+                Toggle("Tieni aggiornato da solo l'elenco delle foto già salvate", isOn: $autoRefreshLibraryIndex)
+                Text("Quando colleghi l'SSD, o appena finisce una copia, l'app dà un'occhiata veloce solo alle foto nuove. La prima creazione dell'elenco resta manuale, da Diagnostica: quella dura diversi minuti.")
                     .font(.caption).foregroundStyle(.secondary)
             }.padding(.horizontal, AppSpacing.xl)
             VStack(alignment: .leading, spacing: AppSpacing.xs) {
@@ -7650,6 +8044,8 @@ struct ToolsSheet: View {
                 }.padding(4)
             }
 
+            LibraryIndexCard(runner: runner, pendingAlert: $pendingAlert)
+
             GroupBox("Revisione") {
                 VStack(alignment: .leading, spacing: AppSpacing.sm) {
                     ForEach(runner.toolsReviewFindings) { finding in
@@ -7797,6 +8193,138 @@ struct ToolsSheet: View {
         } message: { a in
             Text(a.message)
         }
+    }
+}
+
+/// Card "Foto gia' salvate sull'SSD" del pannello Diagnostica (roadmap #31, Task 6).
+///
+/// Registro delle stringhe: si dice **a cosa serve**, mai come e' fatto. "Indice",
+/// "hash", "SHA256", "scansione incrementale" non compaiono a schermo. Il comando
+/// distruttivo dice sempre CHE COSA cancella, perche' "elimina" da solo, su un'app che
+/// gestisce foto, si legge come "elimina le foto".
+struct LibraryIndexCard: View {
+    @ObservedObject var runner: BackupRunner
+    @Binding var pendingAlert: SimpleAlert?
+
+    /// Stima dichiarata prima di partire. Non e' mai stata misurata sul volume vero: e'
+    /// scritta come un ordine di grandezza, non come una promessa.
+    private let durata = "di solito servono dai 5 ai 15 minuti"
+
+    var body: some View {
+        GroupBox("Foto già salvate sull'SSD") {
+            VStack(alignment: .leading, spacing: AppSpacing.sm) {
+                Text("L'app tiene un elenco delle foto e dei video che sono già sull'SSD. Serve quando importi da una fotocamera o dal telefono: gli scatti che hai già non vengono ricopiati una seconda volta.")
+                    .font(AppFont.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                DiagRow(label: "Elenco",
+                        value: runner.indexedFileCount > 0
+                            ? "\(runner.indexedFileCount.formatted()) foto e video"
+                            : "non ancora creato")
+
+                if runner.isIndexing {
+                    HStack(spacing: AppSpacing.sm) {
+                        ProgressView().controlSize(.small)
+                        Text(progressLine).font(AppFont.caption).foregroundStyle(.secondary)
+                        Spacer()
+                        Button(LibraryIndexCommands.stop) { runner.cancelIndexing() }
+                            .buttonStyle(.bordered).controlSize(.small)
+                    }
+                }
+
+                HStack(spacing: AppSpacing.sm) {
+                    Button(runner.indexedFileCount > 0 ? LibraryIndexCommands.refresh : LibraryIndexCommands.build) {
+                        if runner.indexedFileCount > 0 {
+                            // Aggiornamento: legge per intero solo le foto nuove o cambiate,
+                            // dura poco. Nessuna conferma da chiedere.
+                            runner.rebuildLibraryIndex()
+                        } else {
+                            confirmFirstBuild()
+                        }
+                    }
+                    .buttonStyle(.bordered).controlSize(.small).disabled(runner.isIndexing)
+
+                    Button(LibraryIndexCommands.fullRecheck) { confirmFullRecheck() }
+                        .buttonStyle(.bordered).controlSize(.small)
+                        .disabled(runner.isIndexing || runner.indexedFileCount == 0)
+
+                    Spacer()
+
+                    Button(LibraryIndexCommands.reset) { confirmReset() }
+                        .buttonStyle(.bordered).controlSize(.small)
+                        .tint(AppColor.error)
+                        .disabled(runner.isIndexing || runner.indexedFileCount == 0)
+                }
+
+                if !runner.isIndexing, let progress = runner.indexProgress {
+                    ForEach(LibraryIndexStatus.lines(for: progress,
+                                                     interruptedByUser: runner.indexInterruptedByUser)) { line in
+                        HStack(alignment: .top, spacing: AppSpacing.sm) {
+                            Image(systemName: icon(line.tone))
+                                .foregroundStyle(color(line.tone))
+                                .font(.system(size: 12))
+                            Text(line.text).font(AppFont.caption).foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Spacer()
+                        }
+                    }
+                }
+            }.padding(4)
+        }
+    }
+
+    private var progressLine: String {
+        let p = runner.indexProgress ?? LibraryIndexer.Progress()
+        return "Lettura in corso — \(p.scanned.formatted()) file guardati, \(p.hashed.formatted()) nuovi o cambiati, \(p.skipped.formatted()) già noti"
+    }
+
+    private func icon(_ tone: LibraryIndexStatus.Tone) -> String {
+        switch tone {
+        case .ok: return "checkmark.circle.fill"
+        case .info: return "info.circle.fill"
+        case .warning: return "exclamationmark.triangle.fill"
+        }
+    }
+
+    private func color(_ tone: LibraryIndexStatus.Tone) -> Color {
+        switch tone {
+        case .ok: return AppColor.success
+        case .info: return .secondary
+        case .warning: return AppColor.warning
+        }
+    }
+
+    /// La prima creazione legge per intero ogni foto e ogni video dell'SSD: si dice quanto
+    /// dura **prima** di partire, e si dice che si puo' fermare.
+    private func confirmFirstBuild() {
+        pendingAlert = SimpleAlert(
+            title: "Creare l'elenco delle foto già salvate?",
+            message: "L'app legge una volta sola tutte le foto e tutti i video che sono sull'SSD, per riconoscerli alle importazioni successive: \(durata), a seconda di quanti ne hai.\n\nPuoi fermarti quando vuoi con «\(LibraryIndexCommands.stop)»: la parte già fatta resta salvata e la volta dopo si riprende da lì.\n\nL'SSD viene solo letto: niente viene spostato, modificato o cancellato.",
+            confirmTitle: "Crea l'elenco",
+            cancelTitle: "Annulla",
+            onConfirm: { runner.rebuildLibraryIndex() })
+    }
+
+    private func confirmFullRecheck() {
+        pendingAlert = SimpleAlert(
+            title: "Controllare tutte le foto da capo?",
+            message: "L'app rilegge dall'inizio ogni foto e ogni video sull'SSD, anche quelli che ha già visto: \(durata).\n\nServe dopo che hai spostato o riorganizzato le cartelle sull'SSD, per rimettere in pari l'elenco.\n\nPuoi fermarti quando vuoi. L'SSD viene solo letto: nessuna foto viene toccata.",
+            confirmTitle: "Controlla da capo",
+            cancelTitle: "Annulla",
+            onConfirm: { runner.rebuildLibraryIndex(full: true) })
+    }
+
+    /// L'unica via d'uscita quando restano nell'elenco foto che sull'SSD non ci sono piu'
+    /// e nessun controllo riesce a toglierle (ADR-0002). Deve essere raggiungibile, e deve
+    /// essere impossibile premerlo credendo di cancellare le foto.
+    private func confirmReset() {
+        pendingAlert = SimpleAlert(
+            title: "Svuotare l'elenco delle foto già salvate?",
+            message: "Viene cancellato solo l'elenco che l'app tiene sul Mac. Le tue foto e i tuoi video sull'SSD non vengono toccati: non ne viene cancellato nemmeno uno.\n\nDopo, l'elenco va rifatto da zero (\(durata)) e finché non lo rifai un'importazione può ricopiare foto che hai già.",
+            isDestructive: true,
+            confirmTitle: "Svuota l'elenco",
+            cancelTitle: "Annulla",
+            onConfirm: { runner.resetLibraryIndex() })
     }
 }
 

@@ -199,6 +199,35 @@ final class ReviewEngineIntegritySampleTests: XCTestCase {
                        "un debito di un'altra coppia non va ne' controllato ne' chiuso qui")
     }
 
+    // Un debito scaduto non deve prendersi lo slot di precedenza. E' il caso per cui la
+    // scadenza esiste: un file importato da una scheda SD poi scollegata non e' verificabile
+    // in nessuna coppia, e senza scadenza brucerebbe uno slot a ogni esecuzione, per sempre.
+    func testExpiredDebt_doesNotConsumeThePrioritySlot() throws {
+        // "scaduto.jpg" e' un mismatch, "recente.jpg" corrisponde: l'esito dice da solo
+        // quale dei due si e' preso l'unico slot, senza dipendere dal sorteggio.
+        try writePair("scaduto.jpg", src: "originale", dst: "diverso")
+        try writePair("recente.jpg", src: "identico", dst: "identico")
+        // Il record si scrive a mano: registrando i due debiti con `record` il piu' vecchio
+        // verrebbe gia' ripulito dalla seconda chiamata, e il test non proverebbe che a
+        // filtrarlo e' la lettura.
+        let scaduto = UnverifiedCopies.Entry(path: dstDir.appendingPathComponent("scaduto.jpg").path,
+                                             recordedAt: Date().addingTimeInterval(-40 * 24 * 3600))
+        let recente = UnverifiedCopies.Entry(path: dstDir.appendingPathComponent("recente.jpg").path,
+                                             recordedAt: Date())
+        defaults.set(try JSONEncoder().encode(UnverifiedCopies(totalCount: 2, entries: [scaduto, recente])),
+                     forKey: "unverifiedCopies")
+
+        let result = ReviewEngine(defaults: defaults).sampleLocalPair(
+            srcRoot: srcDir, dstRoot: dstDir, pairName: "Test", sampleSize: 1)
+
+        XCTAssertEqual(result.checked, 1)
+        XCTAssertEqual(result.matched, 1)
+        XCTAssertTrue(result.mismatches.isEmpty,
+                      "lo slot deve andare al debito ancora valido, non a quello scaduto")
+        XCTAssertEqual(UnverifiedCopiesStore.load(defaults: defaults).totalCount, 0,
+                       "il debito scaduto esce dal conteggio, quello valido si e' chiuso")
+    }
+
     // Il resto del campione resta casuale: la precedenza non deve MAI ridurre il numero di
     // file controllati.
     func testPriorityDoesNotShrinkTheSample() throws {

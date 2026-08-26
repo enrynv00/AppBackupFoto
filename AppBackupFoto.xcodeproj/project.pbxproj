@@ -15,6 +15,7 @@
 		813AF18F77AE4206B9300F8A /* IndexableKindTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9B501C85DC6845DAB6C96E30 /* IndexableKindTests.swift */; };
 		477CA589F54A4CD5A90F44FF /* IndexEntryVerdictTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 43EF9EE168F848A19910A558 /* IndexEntryVerdictTests.swift */; };
 		AA11BB22CC33DD44EE55FF60 /* UnverifiedCopiesStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA11BB22CC33DD44EE55FF61 /* UnverifiedCopiesStoreTests.swift */; };
+		AA11BB22CC33DD44EE55FF62 /* LibraryIndexStatusTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA11BB22CC33DD44EE55FF63 /* LibraryIndexStatusTests.swift */; };
 		592D43F6584F41BB9DF7F42A /* LibraryIndexStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 348051B7D93B457CBDDC3F88 /* LibraryIndexStoreTests.swift */; };
 		16B663F58F404767A12C6849 /* LibraryIndexerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CCEF8448621C46CBB6C12F0E /* LibraryIndexerTests.swift */; };
 		D410EC994EB540A8B398CD50 /* ImportDedupTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 35EACF13F6B04D3D9D4ED269 /* ImportDedupTests.swift */; };
@@ -61,6 +62,7 @@
 		9B501C85DC6845DAB6C96E30 /* IndexableKindTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = IndexableKindTests.swift; sourceTree = "<group>"; };
 		43EF9EE168F848A19910A558 /* IndexEntryVerdictTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = IndexEntryVerdictTests.swift; sourceTree = "<group>"; };
 		AA11BB22CC33DD44EE55FF61 /* UnverifiedCopiesStoreTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = UnverifiedCopiesStoreTests.swift; sourceTree = "<group>"; };
+		AA11BB22CC33DD44EE55FF63 /* LibraryIndexStatusTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = LibraryIndexStatusTests.swift; sourceTree = "<group>"; };
 		348051B7D93B457CBDDC3F88 /* LibraryIndexStoreTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = LibraryIndexStoreTests.swift; sourceTree = "<group>"; };
 		CCEF8448621C46CBB6C12F0E /* LibraryIndexerTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = LibraryIndexerTests.swift; sourceTree = "<group>"; };
 		35EACF13F6B04D3D9D4ED269 /* ImportDedupTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ImportDedupTests.swift; sourceTree = "<group>"; };
@@ -134,6 +136,7 @@
 				9B501C85DC6845DAB6C96E30 /* IndexableKindTests.swift */,
 				43EF9EE168F848A19910A558 /* IndexEntryVerdictTests.swift */,
 				AA11BB22CC33DD44EE55FF61 /* UnverifiedCopiesStoreTests.swift */,
+				AA11BB22CC33DD44EE55FF63 /* LibraryIndexStatusTests.swift */,
 				348051B7D93B457CBDDC3F88 /* LibraryIndexStoreTests.swift */,
 				CCEF8448621C46CBB6C12F0E /* LibraryIndexerTests.swift */,
 				35EACF13F6B04D3D9D4ED269 /* ImportDedupTests.swift */,
@@ -300,6 +303,7 @@
 				813AF18F77AE4206B9300F8A /* IndexableKindTests.swift in Sources */,
 				477CA589F54A4CD5A90F44FF /* IndexEntryVerdictTests.swift in Sources */,
 				AA11BB22CC33DD44EE55FF60 /* UnverifiedCopiesStoreTests.swift in Sources */,
+				AA11BB22CC33DD44EE55FF62 /* LibraryIndexStatusTests.swift in Sources */,
 				592D43F6584F41BB9DF7F42A /* LibraryIndexStoreTests.swift in Sources */,
 				16B663F58F404767A12C6849 /* LibraryIndexerTests.swift in Sources */,
 				D410EC994EB540A8B398CD50 /* ImportDedupTests.swift in Sources */,

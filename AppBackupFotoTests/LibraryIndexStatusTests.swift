@@ -1,0 +1,305 @@
+//
+//  LibraryIndexStatusTests.swift
+//  AppBackupFotoTests
+//
+//  Le righe di stato della card "Foto gia' salvate sull'SSD" (roadmap #31, Task 6) e le
+//  regole dell'aggiornamento automatico.
+//
+//  Perche' questa logica sta fuori dalla View: e' l'unica parte della card verificabile
+//  senza una corsa reale sull'SSD, ed e' quella che sbaglia piu' facilmente. La regola
+//  "traversata incompleta => non si toglie niente" ha cause diverse (SSD scollegato,
+//  cartelle illeggibili, interruzione dell'utente, zero file visti) e ognuna richiede una
+//  spiegazione diversa: se il messaggio non distingue, Enrico vede un conteggio che non
+//  torna e nessun modo di capire perche'.
+//
+
+import XCTest
+@testable import AppBackupFoto
+
+final class LibraryIndexStatusTests: XCTestCase {
+
+    /// Lettura arrivata in fondo, senza niente da segnalare.
+    private func completa(_ mutate: (inout LibraryIndexer.Progress) -> Void = { _ in }) -> LibraryIndexer.Progress {
+        var p = LibraryIndexer.Progress()
+        p.traversalIncomplete = false
+        p.scanned = 120
+        p.total = 120
+        mutate(&p)
+        return p
+    }
+
+    private func lines(_ p: LibraryIndexer.Progress, interrupted: Bool = false) -> [LibraryIndexStatus.Line] {
+        LibraryIndexStatus.lines(for: p, interruptedByUser: interrupted)
+    }
+
+    private func text(_ p: LibraryIndexer.Progress, interrupted: Bool = false) -> String {
+        lines(p, interrupted: interrupted).map(\.text).joined(separator: " | ")
+    }
+
+    // MARK: Perche' la lettura non e' arrivata in fondo
+
+    func testCleanScan_saysEverythingIsUpToDate() {
+        let out = lines(completa())
+        XCTAssertEqual(out.count, 1)
+        XCTAssertEqual(out.first?.tone, .ok)
+    }
+
+    // "SSD scollegato a meta'" e "3 cartelle senza permessi" sono due guasti diversi e
+    // vanno detti in modo diverso: il primo si risolve ricollegando il disco, il secondo no.
+    func testVolumeVanished_isToldApartFromUnreadableFolders() {
+        var p = completa()
+        p.volumeVanished = true
+        p.traversalIncomplete = true
+
+        let out = lines(p)
+        XCTAssertEqual(out.first?.id, "volume")
+        XCTAssertEqual(out.first?.tone, .warning)
+        // Una riga sola: la spiegazione generica "non sono riuscita a leggere tutto" e' un
+        // residuo, non si aggiunge a una spiegazione precisa che c'e' gia'.
+        XCTAssertEqual(out.count, 1)
+        XCTAssertTrue(text(p).lowercased().contains("scollegato"))
+        XCTAssertFalse(out.contains { $0.id == "illeggibili" })
+    }
+
+    func testUnreadableFolders_areReportedWithTheirNumber() {
+        var p = completa()
+        p.unreadableItems = 3
+        p.traversalIncomplete = true
+
+        let out = lines(p)
+        XCTAssertTrue(out.contains { $0.id == "illeggibili" && $0.tone == .warning })
+        XCTAssertTrue(text(p).contains("3"), "il numero va detto, non basta il colore")
+        XCTAssertFalse(out.contains { $0.id == "volume" })
+    }
+
+    // Un solo elemento illeggibile: il plurale sbagliato in una riga letta da un utente non
+    // tecnico e' un difetto quanto un numero sbagliato.
+    func testASingleUnreadableFolder_usesTheSingular() {
+        var p = completa()
+        p.unreadableItems = 1
+        p.traversalIncomplete = true
+
+        XCTAssertTrue(text(p).contains("1 cartella non si è lasciata aprire"))
+    }
+
+    func testUserInterruption_isSaidAndIsNotAlarming() {
+        var p = completa()
+        p.traversalIncomplete = true
+
+        let out = lines(p, interrupted: true)
+        XCTAssertTrue(out.contains { $0.id == "interrotto" && $0.tone == .info })
+        // Il punto che Enrico ha chiesto esplicitamente: chi interrompe deve capire che
+        // l'elenco parziale e' valido e non va buttato.
+        XCTAssertTrue(text(p, interrupted: true).lowercased().contains("resta salvato"))
+    }
+
+    // Zero file visti con l'elenco pieno NON e' "libreria vuota". E' l'unico caso in cui
+    // nessun controllo, nemmeno quello completo, riesce a togliere le voci fantasma: il
+    // messaggio deve nominare la sola via d'uscita (ADR-0002).
+    func testNothingFoundButTheListIsNotEmpty_pointsAtTheResetCommand() {
+        var p = LibraryIndexer.Progress()
+        p.scanned = 0
+        p.total = 42
+
+        let out = lines(p)
+        XCTAssertTrue(out.contains { $0.id == "vuoto" && $0.tone == .warning })
+        XCTAssertTrue(text(p).contains("Svuota l'elenco e ricomincia da zero"))
+        XCTAssertTrue(text(p).contains("42"))
+    }
+
+    // Lo stesso `scanned == 0` capita anche quando l'SSD non c'era proprio: li' il consiglio
+    // "svuota l'elenco" sarebbe un pessimo consiglio.
+    func testNothingFoundBecauseTheVolumeWasGone_doesNotSuggestWipingTheList() {
+        var p = LibraryIndexer.Progress()
+        p.scanned = 0
+        p.total = 42
+        p.volumeVanished = true
+
+        XCTAssertFalse(lines(p).contains { $0.id == "vuoto" })
+        XCTAssertFalse(text(p).contains("Svuota l'elenco"))
+    }
+
+    // ...e quando e' stato l'utente a fermare la lettura al primo istante.
+    func testNothingFoundBecauseTheUserStoppedImmediately_doesNotSuggestWipingTheList() {
+        var p = LibraryIndexer.Progress()
+        p.scanned = 0
+        p.total = 42
+
+        XCTAssertFalse(lines(p, interrupted: true).contains { $0.id == "vuoto" })
+    }
+
+    // Traversata incompleta senza una causa riconoscibile: meglio una riga generica che il
+    // silenzio su una lettura che non ha coperto tutta la libreria.
+    func testIncompleteScanWithNoKnownCause_stillSaysSomething() {
+        var p = completa()
+        p.traversalIncomplete = true
+
+        let out = lines(p)
+        XCTAssertEqual(out.count, 1)
+        XCTAssertEqual(out.first?.id, "incompleta")
+        XCTAssertEqual(out.first?.tone, .warning)
+    }
+
+    func testCompleteScan_doesNotClaimItWasIncomplete() {
+        XCTAssertFalse(lines(completa()).contains { $0.id == "incompleta" })
+    }
+
+    // MARK: Foto sparite dal disco e tenute lo stesso
+
+    // Obbligatoria: senza questa riga la guardia di plausibilita' scatta in silenzio e dopo
+    // una riorganizzazione legittima continuerebbe a scattare a ogni avvio, per sempre.
+    func testKeptVanishedEntries_areAlwaysReported() {
+        var p = completa()
+        p.vanishedKept = 7
+
+        let out = lines(p)
+        XCTAssertTrue(out.contains { $0.id == "sparite" && $0.tone == .warning })
+        XCTAssertTrue(text(p).contains("7"))
+    }
+
+    // Dopo una traversata COMPLETA la ricontrollata da capo serve davvero: scavalca la
+    // guardia di plausibilita'.
+    func testVanishedAfterACompleteScan_suggestsTheFullRecheck() {
+        var p = completa()
+        p.vanishedKept = 7
+
+        XCTAssertTrue(text(p).contains("Controlla tutte le foto da capo"))
+    }
+
+    // Dopo una traversata INCOMPLETA no: `ignoringStoredHashes` scavalca solo la guardia di
+    // plausibilita', mai la traversata incompleta. Consigliarla manderebbe l'utente a
+    // rifare quindici minuti di lettura per ottenere esattamente lo stesso risultato.
+    func testVanishedAfterAnIncompleteScan_doesNotSuggestTheFullRecheck() {
+        var p = completa()
+        p.vanishedKept = 7
+        p.traversalIncomplete = true
+
+        let out = text(p)
+        XCTAssertTrue(out.contains("7"))
+        XCTAssertFalse(out.contains("Controlla tutte le foto da capo"),
+                       "la ricontrollata completa non scavalca la traversata incompleta")
+    }
+
+    func testNothingVanished_saysNothingAboutIt() {
+        XCTAssertFalse(lines(completa()).contains { $0.id == "sparite" })
+    }
+
+    // MARK: Numeri che spiegano perche' il conteggio non torna
+
+    func testUnreadableFiles_areReportedAsNeutralInformation() {
+        var p = completa()
+        p.errors = 4
+
+        let out = lines(p)
+        XCTAssertTrue(out.contains { $0.id == "errori" && $0.tone == .info })
+        XCTAssertTrue(text(p).contains("4"))
+    }
+
+    func testFilesOutsideTheLibrary_areReported() {
+        var p = completa()
+        p.outsideRoot = 2
+
+        let out = lines(p)
+        XCTAssertTrue(out.contains { $0.id == "fuori" && $0.tone == .info })
+        XCTAssertTrue(text(p).contains("2"))
+    }
+
+    // Il riallineamento dopo un cambio d'ora non e' un problema: e' la regola DST che fa il
+    // suo lavoro, e va detta con tono neutro, mai come un avviso.
+    func testTimezoneRebase_isNeutralNotAWarning() {
+        var p = completa()
+        p.rebasedByTimezone = 5
+
+        let out = lines(p)
+        XCTAssertTrue(out.contains { $0.id == "fuso" && $0.tone == .info })
+        XCTAssertFalse(out.contains { $0.tone == .warning })
+        XCTAssertTrue(text(p).contains("5"))
+    }
+
+    // MARK: Registro
+
+    // Regola di progetto: l'app deve essere comprensibile a chi non sa come e' fatta. Se una
+    // stringa richiede di conoscere il programma per essere capita, e' sbagliata.
+    func testNoTechnicalJargonReachesTheScreen() {
+        var tutto = LibraryIndexer.Progress()
+        tutto.scanned = 10; tutto.hashed = 5; tutto.skipped = 5; tutto.errors = 2
+        tutto.total = 100; tutto.vanishedKept = 3; tutto.rebasedByTimezone = 4
+        tutto.unreadableItems = 6; tutto.outsideRoot = 7; tutto.volumeVanished = true
+
+        let gergo = ["indice", "hash", "sha", "scansione", "sqlite", "mtime", "cache",
+                     "entry", "traversata", "incrementale"]
+        for p in [completa(), tutto] {
+            for interrotto in [false, true] {
+                let detto = text(p, interrupted: interrotto).lowercased()
+                for parola in gergo {
+                    XCTAssertFalse(detto.contains(parola), "gergo a schermo: '\(parola)' in «\(detto)»")
+                }
+            }
+        }
+        for comando in [LibraryIndexCommands.build, LibraryIndexCommands.refresh,
+                        LibraryIndexCommands.fullRecheck, LibraryIndexCommands.reset,
+                        LibraryIndexCommands.stop] {
+            for parola in gergo {
+                XCTAssertFalse(comando.lowercased().contains(parola), "gergo su un bottone: \(comando)")
+            }
+        }
+    }
+
+    // Il comando distruttivo non puo' chiamarsi solo "Elimina": su un'app che gestisce foto
+    // si leggerebbe come "elimina le foto".
+    func testTheDestructiveCommandSaysWhatItDeletes() {
+        XCTAssertTrue(LibraryIndexCommands.reset.lowercased().contains("elenco"))
+    }
+
+    // MARK: Aggiornamento automatico
+
+    // La prima creazione dura minuti e legge per intero ogni foto: non deve MAI partire da
+    // sola, nemmeno con l'interruttore acceso.
+    func testAutoRefresh_neverBuildsTheListForTheFirstTime() {
+        XCTAssertFalse(LibraryIndexAutoRefresh.shouldRun(enabled: true, indexedFileCount: 0,
+                                                         isIndexing: false, jobIsRunning: false))
+    }
+
+    func testAutoRefresh_runsWhenTheListExistsAndNothingElseIsGoingOn() {
+        XCTAssertTrue(LibraryIndexAutoRefresh.shouldRun(enabled: true, indexedFileCount: 1,
+                                                        isIndexing: false, jobIsRunning: false))
+    }
+
+    func testAutoRefresh_respectsTheSwitch() {
+        XCTAssertFalse(LibraryIndexAutoRefresh.shouldRun(enabled: false, indexedFileCount: 1,
+                                                         isIndexing: false, jobIsRunning: false))
+    }
+
+    // Una lettura per volta: due letture insieme sarebbero due scritture sullo stesso
+    // elenco.
+    func testAutoRefresh_doesNotStartASecondReadOverTheFirst() {
+        XCTAssertFalse(LibraryIndexAutoRefresh.shouldRun(enabled: true, indexedFileCount: 1,
+                                                         isIndexing: true, jobIsRunning: false))
+    }
+
+    // Leggere l'SSD per intero mentre una copia ci sta scrivendo rallenta entrambe e fa
+    // risultare illeggibili i file che la copia sta scrivendo proprio in quel momento.
+    func testAutoRefresh_waitsForACopyJobToFinish() {
+        XCTAssertFalse(LibraryIndexAutoRefresh.shouldRun(enabled: true, indexedFileCount: 1,
+                                                         isIndexing: false, jobIsRunning: true))
+    }
+
+    // `UserDefaults.bool` risponde `false` per una chiave mai scritta, e `@AppStorage` la
+    // scrive solo al primo cambiamento: con `bool` l'aggiornamento automatico sarebbe
+    // rimasto spento per default, al contrario di quello che dice l'interruttore.
+    func testAutoRefreshSwitch_isOnUntilTheUserTurnsItOff() throws {
+        let suite = "LibraryIndexStatusTests"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        XCTAssertTrue(LibraryIndexAutoRefresh.isEnabled(defaults: defaults),
+                      "mai toccato = acceso")
+
+        defaults.set(false, forKey: LibraryIndexAutoRefresh.defaultsKey)
+        XCTAssertFalse(LibraryIndexAutoRefresh.isEnabled(defaults: defaults))
+
+        defaults.set(true, forKey: LibraryIndexAutoRefresh.defaultsKey)
+        XCTAssertTrue(LibraryIndexAutoRefresh.isEnabled(defaults: defaults))
+    }
+}

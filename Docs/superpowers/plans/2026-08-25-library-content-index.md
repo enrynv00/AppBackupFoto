@@ -2114,7 +2114,7 @@ quando la sorgente contiene doppioni, verso sicuro, gia' accettato nello Step 4.
 - Consuma: `LibraryIndexer`, `LibraryIndexStore`, `BookmarkManager.urls[.ssd]`, `VolumeMonitor.ssdMounted`.
 - Produce: `@AppStorage("autoRefreshLibraryIndex")`, stato pubblicato per il progresso.
 
-- [ ] **Step 1: Stato pubblicato in `BackupRunner`**
+- [x] **Step 1: Stato pubblicato in `BackupRunner`**
 
 ```swift
     @Published var indexProgress: LibraryIndexer.Progress? = nil
@@ -2171,7 +2171,7 @@ Aggiungi anche l'osservatore di smontaggio, così una scansione in corso si ferm
             }
 ```
 
-- [ ] **Step 2: Card "Indice libreria" in `ToolsSheet`**
+- [x] **Step 2: Card "Indice libreria" in `ToolsSheet`**
 
 Nella `ScrollView` del pannello Revisione, accanto alle card esistenti, aggiungi una card con: numero di file indicizzati (`try? runner.libraryIndexStore?.count()`), bottone "Costruisci indice" / "Aggiorna indice", bottone "Interrompi" visibile solo durante la scansione, e la `Progress` corrente (file esaminati / hashati / saltati).
 
@@ -2183,7 +2183,7 @@ Senza questa riga la guardia di plausibilita' scatta in silenzio, e dopo una rio
 
 Se `indexProgress?.rebasedByTimezone ?? 0 > 0`, basta invece una riga informativa neutra ("N file riallineati dopo un cambio di fuso orario"): non e' un problema, e' la regola DST che fa il suo lavoro. Prima di avviare una costruzione completa, mostra un `SimpleAlert` di conferma che spieghi che l'operazione legge per intero ogni foto e video dell'SSD e può richiedere diversi minuti.
 
-- [ ] **Step 2-bis: Comando esplicito "Elimina indice e ricostruisci" (obbligatorio)**
+- [x] **Step 2-bis: Comando esplicito "Elimina indice e ricostruisci" (obbligatorio)**
 
 Nella stessa card, un terzo bottone distruttivo — **solo sull'indice, mai sulle foto** — che
 cancella il file SQLite dell'indice e riparte da zero, dietro `SimpleAlert` di conferma.
@@ -2211,7 +2211,7 @@ disabilitato mentre una scansione e' in corso; dopo la cancellazione la card dev
 stato "indice assente" (nessuna costruzione automatica: la prima costruzione resta manuale,
 Step 4).
 
-- [ ] **Step 2-ter: Due vincoli sul cablaggio dello scanner (obbligatori)**
+- [x] **Step 2-ter: Due vincoli sul cablaggio dello scanner (obbligatori)**
 
 Entrambi rompono il dedup **in silenzio**, quindi stanno scritti qui e non in un commento.
 
@@ -2228,7 +2228,7 @@ copia), ma il risultato e' una feature che non fa niente e nessuno se ne accorge
 istanza**: due istanze sullo stesso database sono esattamente lo scenario SIGSEGV documentato
 nel commento della classe e misurato 3 run su 3 durante la review del Task 3.
 
-- [ ] **Step 3: Toggle in `SettingsSheet`**
+- [x] **Step 3: Toggle in `SettingsSheet`**
 
 Accanto al toggle del backup automatico:
 ```swift
@@ -2236,17 +2236,17 @@ Accanto al toggle del backup automatico:
 ```
 con etichetta "Aggiorna automaticamente l'indice della libreria" e una didascalia che chiarisca che l'aggiornamento automatico è incrementale e leggero, mentre la prima costruzione resta sempre manuale.
 
-- [ ] **Step 4: Aggancio automatico**
+- [x] **Step 4: Aggancio automatico**
 
 In `ContentView`, accanto all'`.onChange(of: volumes.ssdMounted)` già esistente per il backup automatico, aggiungi l'aggiornamento incrementale quando `autoRefreshLibraryIndex` è attivo, **solo se l'indice esiste già** (`count() > 0`): la prima costruzione non deve mai partire da sola. Aggiungi lo stesso aggiornamento a fine di un job di import riuscito.
 
-- [ ] **Step 5: Build, suite completa, verifica manuale**
+- [ ] **Step 5: Build, suite completa, verifica manuale** — build e suite fatte (`** BUILD SUCCEEDED **`, 342 test verdi, era 308: +25 `LibraryIndexStatusTests`, +8 `UnverifiedCopiesStoreTests`, +1 `ReviewEngineIntegritySampleTests`). **La verifica manuale con l'SSD collegato resta da fare, a carico di Enrico**: per questo lo step non e' spuntato.
 
 Expected: `** BUILD SUCCEEDED **`, 308 test invariati (piu' quelli che il bottone dello Step 2-bis si porta dietro — la capacita' sottostante e' gia' testata).
 
 Verifica manuale (richiede SSD collegato, quindi **a carico di Enrico**): aprire Diagnostica, vedere la card, avviare la costruzione, verificare che il progresso avanzi, interromperla e verificare che l'indice resti utilizzabile, riavviarla e verificare che riprenda senza rihashare ciò che era già stato fatto.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add AppBackupFoto/ContentView.swift
@@ -2254,6 +2254,50 @@ git commit -m "Add library index UI: build/refresh card, toggle, auto incrementa
 ```
 
 ---
+
+**Nota di esecuzione (2026-08-26) — dove il piano e il codice reale divergevano.**
+
+1. **Le etichette scritte qui erano gergo.** "Costruisci indice", "Aggiorna indice",
+   "Ricostruzione completa", "Elimina indice e ricostruisci" violano la regola di progetto
+   "l'app deve essere comprensibile a un utente senza competenze tecniche": a schermo non
+   compaiono ne' "indice" ne' "hash" ne' "scansione". La card si chiama **"Foto gia' salvate
+   sull'SSD"** e i comandi vivono in `LibraryIndexCommands` (un punto solo, perche' due
+   messaggi nominano un bottone e una rinomina non deve lasciare un riferimento morto).
+   Il testo integrale di ogni stringa e' nel rapporto consegnato a Enrico.
+
+2. **Il conteggio non si legge con `try? store.count()` dentro il `body`.** Quella query
+   passa dalla coda seriale dello store, che durante una lettura e' occupata dalle scritture
+   a batch: sul main thread bloccherebbe la finestra a ogni ridisegno. C'e' invece
+   `BackupRunner.indexedFileCount`, aggiornato fuori dal main thread e da ogni `onProgress`.
+
+3. **Le righe di stato sono logica pura** (`LibraryIndexStatus.lines(for:interruptedByUser:)`)
+   e non codice dentro la View: e' l'unica parte della card verificabile senza una corsa
+   reale. Il piano prevedeva due righe (`vanishedKept`, `rebasedByTimezone`); ce ne sono
+   nove, perche' `Progress` distingue quattro cause diverse di traversata incompleta e ognuna
+   richiede una spiegazione — e un numero — diversa. `interruptedByUser` e' un parametro
+   perche' `Progress` non puo' saperlo: la cancellazione la decide la UI, e arriva anche
+   dallo smontaggio automatico di un volume, che non e' la stessa cosa.
+
+4. **Il consiglio dopo `vanishedKept` cambia col motivo.** Il piano faceva rimandare sempre
+   alla ricontrollata completa: sarebbe sbagliato dopo una traversata incompleta, che
+   `ignoringStoredHashes` non scavalca. In quel caso il messaggio dice di riprovare, e nel
+   caso "zero file visti su un elenco pieno" nomina l'unica via d'uscita vera, lo Step 2-bis.
+
+5. **L'aggancio automatico e' anche a fine di un job Mac -> SSD, non solo di un import**
+   (`run(label:refreshesLibraryIndex:)`). Il piano prevedeva "SSD collegato" + "fine import",
+   ma sul collegamento dell'SSD parte gia' il backup automatico: leggere l'intero volume
+   mentre una copia ci scrive rallenta entrambi e conta come illeggibili i file che la copia
+   sta scrivendo in quel momento. Quindi al collegamento l'aggiornamento parte **solo se** il
+   backup automatico non parte, e i due job che scrivono sull'SSD lo fanno partire alla fine,
+   che e' anche il momento in cui serve davvero. **Cambia un comportamento osservabile: da
+   confermare con Enrico.**
+
+6. **Non coperto da test, e perche'**: la card, i tre alert di conferma, il toggle in
+   Impostazioni, l'`.onChange` di `ContentView` e i metodi di `BackupRunner`
+   (`rebuildLibraryIndex`, `cancelIndexing`, `resetLibraryIndex`, l'osservatore di
+   smontaggio) — sono `@MainActor` su bookmark veri e SwiftUI, non raggiungibili senza una
+   corsa. Stessa dichiarazione gia' fatta per `CompletionSheet` e per i cablaggi di
+   `BackupRunner` nei Task 3-5. Testato tutto cio' che sta ai due capi del cablaggio.
 
 ### Task 7: Documentazione
 
