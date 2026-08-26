@@ -1517,6 +1517,43 @@ enum LibraryExclusions {
     }
 }
 
+/// Forma canonica di un percorso, risolta **dal filesystem** con `realpath(3)`.
+///
+/// Fonte unica, per lo stesso motivo di `LibraryExclusions`. Esistevano due
+/// canonicalizzazioni diverse per lo stesso problema, e producono forme **opposte**
+/// (misurato il 2026-08-26):
+///
+///     realpath("/var/folders/.../SSD")                       -> /private/var/folders/.../SSD
+///     URL("/private/var/.../SSD").resolvingSymlinksInPath()  -> /var/folders/.../SSD
+///
+/// `URL.resolvingSymlinksInPath` lascia `/var`, `/tmp` e `/etc` non risolti **di
+/// proposito** (sono symlink verso `/private/...` che Foundation considera parte del
+/// nome canonico); `realpath` li risolve. Un codice che usa l'una per costruire le
+/// chiavi dell'indice e l'altra per rileggerle produce due insiemi di chiavi disgiunti:
+/// l'indice sembra vuoto, l'intera libreria viene rihashata e ogni entry viene
+/// duplicata a ogni scansione — il bug corretto il 2026-08-26, che sul volume reale
+/// (`/Volumes/SSD - Enri`) sarebbe **invisibile**, perche' li' non ci sono symlink ne'
+/// la regola `/private`. Usare questa, mai `resolvingSymlinksInPath`.
+///
+/// Su un percorso inesistente `realpath` fallisce e si ripiega su `url.path`: e' il
+/// caso di un file sparito fra l'enumerazione e la lettura. Innocuo, perche'
+/// l'enumeratore restituisce gia' URL in forma `realpath` (misurato: con root
+/// `/var/folders/.../SSD` produce `/private/var/...`).
+func realResolvedPath(_ url: URL) -> String {
+    var buf = [Int8](repeating: 0, count: Int(PATH_MAX))
+    guard let r = realpath(url.path, &buf) else { return url.path }
+    return String(cString: r)
+}
+
+/// Componenti del percorso canonico di `url`, per confronti fra percorsi.
+/// Il confronto va fatto per COMPONENTI, mai per lunghezza di stringa o con
+/// `hasPrefix`: `/Volumes/SSD` non e' un prefisso di `/Volumes/SSD 2`, ma lo e'
+/// testualmente. Costo misurato: 12,6 us/file (20.000 file in 0,25s), cioe' nulla
+/// rispetto alla lettura del file che segue.
+func canonicalPathComponents(of url: URL) -> [String] {
+    realResolvedPath(url).split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+}
+
 enum FileKind {
     /// Usato dalle miniature (#17). Delega a `IndexableKind` invece di ripetere lo
     /// stesso `UTType(filenameExtension:)` + `conforms(to: .image)`: le due versioni
@@ -2107,13 +2144,39 @@ final class LibraryIndexer {
         /// mtime adottato SENZA rihashare. E' il risparmio che la regola DST esiste
         /// per ottenere.
         var rebasedByTimezone = 0
+
+        /// Cartelle (o elementi) che l'enumeratore non e' riuscito ad aprire: permessi,
+        /// I/O, volume scollegato. Contate dall'`errorHandler`, che senza di lui
+        /// **prosegue in silenzio** — il default di `FileManager.enumerator`.
+        /// **Va mostrato all'utente** (Task 6): e' il "quante cartelle non sono
+        /// riuscita a leggere" che sostituisce la rimozione quando la traversata non
+        /// e' completa.
+        var unreadableItems = 0
+
+        /// La traversata NON ha coperto tutta la libreria: cartelle illeggibili,
+        /// volume scollegato, o zero file visti su un indice non vuoto. Quando e'
+        /// `true` **nessuna entry viene rimossa**, in nessuna modalita' — nemmeno
+        /// nella "Ricostruzione completa". Vedi il commento in fondo a `scan`.
+        var traversalIncomplete = true
+
+        /// Il volume sotto la root e' sparito (o e' stato rimontato) durante la
+        /// scansione. Sottoinsieme di `traversalIncomplete`, tenuto distinto perche'
+        /// il messaggio da mostrare e' diverso: "SSD scollegato" non e' "3 cartelle
+        /// senza permessi".
+        var volumeVanished = false
+
+        /// File scartati perche' il loro percorso canonico non ricade sotto la root.
+        /// Non e' un caso raggiungibile oggi (vedi il commento sul controllo), ma se
+        /// lo diventasse il sintomo sarebbe una scansione da zero file senza
+        /// spiegazione: contarli e' l'unico modo per vederlo.
+        var outsideRoot = 0
     }
 
     private let store: LibraryIndexStore
     private let fm = FileManager.default
 
-    /// L'utente ha interrotto. Azzerato all'inizio di ogni `scan`: un'istanza
-    /// cancellata una volta deve poter tornare a scansionare.
+    /// L'utente ha interrotto. Consumato alla FINE di ogni `scan`, non all'inizio:
+    /// vedi il commento in cima a `scan`.
     ///
     /// Scritto dal main thread (`cancel()`) e letto a ogni file dal thread di
     /// scansione: l'accesso passa sempre dal lock, mai dallo storage diretto.
@@ -2124,16 +2187,39 @@ final class LibraryIndexer {
         set { cancelLock.lock(); defer { cancelLock.unlock() }; cancelledStorage = newValue }
     }
 
-    /// Il volume e' sparito sotto di noi. Toccato solo dal thread che scansiona,
-    /// quindi senza lock. Tenuto SEPARATO da `cancelled` perche' ha
-    /// una conseguenza diversa: dopo una cancellazione dell'utente l'indice e'
-    /// parziale ma il disco c'e'; dopo uno scollegamento non sappiamo piu' nulla di
-    /// cio' che non abbiamo visto, quindi la rimozione delle entry non deve girare.
-    private var volumeVanished = false
+    /// Contatore condiviso con l'`errorHandler` dell'enumeratore. Serve una scatola di
+    /// riferimento e non una variabile locale perche' quella closure e' `@escaping`
+    /// (l'enumeratore la conserva) e Swift non lascia catturare un `var` locale
+    /// mutabile. Nessun lock: `errorHandler` viene invocato in modo sincrono dal thread
+    /// che chiama `nextObject()`, cioe' lo stesso che esegue `scan`.
+    private final class TraversalFailures {
+        var count = 0
+    }
 
     init(store: LibraryIndexStore) { self.store = store }
 
     func cancel() { cancelled = true }
+
+    /// Identificativo del dispositivo (`st_dev`) su cui vive `url`, `nil` se `stat`
+    /// fallisce (percorso sparito).
+    ///
+    /// E' l'UNICO dei tre candidati provati che rileva davvero lo scollegamento di un
+    /// volume esterno (misurato il 2026-08-26 su un'immagine exFAT staccata con
+    /// `hdiutil detach -force` a meta' scansione):
+    ///
+    /// | candidato | esito |
+    /// |---|---|
+    /// | `FileManager.fileExists(atPath:)` | puo' rispondere `true` per secondi dopo lo scollegamento (smontaggio asincrono) |
+    /// | `URLResourceValues.volumeIdentifier` | invariato, Foundation lo serve dalla cache dell'URL |
+    /// | `st_dev` inizio vs fine | **cambia** (16777237 -> 16777230), oppure `stat` fallisce |
+    ///
+    /// Non e' comunque il rilevatore principale: quello e' l'`errorHandler`
+    /// dell'enumeratore, che non dipende da nessun timing.
+    private func deviceIdentifier(of url: URL) -> dev_t? {
+        var info = stat()
+        guard stat(url.path, &info) == 0 else { return nil }
+        return info.st_dev
+    }
 
     // Le esclusioni NON sono ridichiarate qui: `LibraryExclusions` e' la fonte unica
     // condivisa con FileSyncer e ReviewEngine. Una seconda copia "da tenere allineata"
@@ -2156,33 +2242,70 @@ final class LibraryIndexer {
     func scan(root: URL, batchSize: Int = 200,
               ignoringStoredHashes: Bool = false,
               onProgress: @escaping (Progress) -> Void = { _ in }) throws -> Progress {
-        // Ogni scansione riparte pulita. Senza questo reset, `cancel()` (o un
-        // singolo scollegamento) spegnerebbe l'indicizzazione per tutta la vita
-        // dell'istanza: ogni `scan` successiva uscirebbe subito senza fare nulla e
-        // la rimozione dei file spariti non girerebbe mai piu'. Se `LibraryIndexer`
-        // e' un `@StateObject` che vive quanto la finestra (Task 6), il sintomo e'
-        // "l'indice ha smesso di aggiornarsi finche' non riavvio l'app".
-        cancelled = false
-        volumeVanished = false
+        // La cancellazione si consuma alla FINE della scansione, non all'inizio.
+        //
+        // Azzerarla qui sembrava equivalente e non lo e': fra il click su "Interrompi"
+        // e l'ingresso in `scan` sul thread di lavoro c'e' una finestra in cui
+        // `cancel()` arriva ma la scansione non e' ancora partita. Azzerando in cima,
+        // quel cancel veniva inghiottito e la scansione partiva lo stesso. Consumandolo
+        // in uscita si ottengono entrambe le cose: un cancel arrivato PRIMA che `scan`
+        // parta viene rispettato, e un'istanza gia' cancellata torna comunque a
+        // scansionare alla chiamata successiva (era il bug del `cancelled` mai
+        // resettato: l'indice smetteva di aggiornarsi fino al riavvio dell'app).
+        defer { cancelled = false }
 
         var progress = Progress()
         var batch: [LibraryIndexEntry] = []
         var seenKeys = Set<String>()
+        var volumeVanished = false
+        let failures = TraversalFailures()
         let knownKeys = try store.allKeys()
 
-        // Root assente (SSD scollegato) NON significa "tutti i file cancellati".
-        // Senza questa guardia l'enumeratore restituirebbe zero elementi, `seenKeys`
-        // resterebbe vuoto e la rimozione dei file spariti cancellerebbe l'INTERO
-        // indice — che e' esattamente il contrario di quello che serve.
-        guard fm.fileExists(atPath: root.path) else {
+        // Identita' del volume all'inizio, per confrontarla alla fine.
+        let deviceAtStart = deviceIdentifier(of: root)
+
+        // Root assente (SSD scollegato prima di partire): uscita anticipata.
+        // ONESTA' SUL VALORE DI QUESTA GUARDIA: rimuoverla non cambia nulla di
+        // osservabile (misurato). `fm.enumerator(at:)` su un percorso inesistente NON
+        // restituisce `nil`, restituisce un enumeratore che non produce niente, e il
+        // caso viene poi ripreso in fondo dalla regola "zero file visti + indice non
+        // vuoto => nessuna rimozione". Resta qui perche' evita una `allKeys()` e
+        // un'enumerazione inutili, e perche' distingue nel `Progress` "volume assente"
+        // da "cartelle illeggibili". Il commento precedente diceva che senza di lei
+        // l'indice INTERO verrebbe cancellato: era falso, ed e' il tipo di commento
+        // difensivo di cui il prossimo lettore si fida a torto.
+        guard deviceAtStart != nil else {
+            progress.volumeVanished = true
             progress.total = try store.count()
             onProgress(progress)
             return progress
         }
 
+        // `errorHandler` NON e' opzionale in senso pratico: il suo default e' "continua
+        // in silenzio", ed e' il buco piu' grave trovato in review (misurato il
+        // 2026-08-26). Una sottocartella con `chmod 000` fra due scansioni faceva
+        // rimuovere le entry dei file esistenti che conteneva, con `errors=0` e nessun
+        // segnale; lo scollegamento del volume a meta' scansione lo chiamava invece 43
+        // volte con `NSPOSIXErrorDomain Code=6 "Device not configured"`. Sono lo stesso
+        // guasto visto da due lati — la traversata non e' completa — e questo e' il solo
+        // rilevatore che non dipende da nessun timing.
+        // Ritorna `true` (prosegui): l'obiettivo e' contarli tutti e indicizzare quello
+        // che si riesce a leggere, non fermarsi al primo.
         guard let enumerator = fm.enumerator(at: root,
                                              includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey],
-                                             options: [.skipsHiddenFiles]) else {
+                                             options: [.skipsHiddenFiles],
+                                             errorHandler: { _, _ in
+                                                 failures.count += 1
+                                                 return true
+                                             }) else {
+            // Irraggiungibile per quanto misurato: `enumerator(at:)` non restituisce
+            // `nil` ne' su percorso inesistente ne' su un file regolare. Tenuta perche'
+            // l'API e' opzionale, ma trattata come traversata fallita, non come
+            // "libreria vuota": senza questo ramo un `nil` inatteso porterebbe a
+            // rimuovere tutto.
+            progress.unreadableItems = 1
+            progress.total = try store.count()
+            onProgress(progress)
             return progress
         }
 
@@ -2198,9 +2321,27 @@ final class LibraryIndexer {
         // file rihashati e una seconda copia di ogni entry a ogni scansione. E'
         // esattamente il rischio documentato su `normalizedIndexKey` (rilievo 9 del
         // Task 3), qui col percorso assoluto invece che con gli slash.
-        // Canonicalizzare entrambi i lati copre anche root con slash finale, doppio
-        // slash o segmento `.` (verificato sulle quattro forme).
-        let rootComponents = root.resolvingSymlinksInPath().standardizedFileURL.pathComponents
+        // La canonicalizzazione e' `realResolvedPath`, la stessa usata da ReviewEngine:
+        // due forme canoniche diverse applicate ai due lati riprodurrebbero il bug.
+        let rootComponents = canonicalPathComponents(of: root)
+
+        // Scrittura del batch + progresso + controllo opportunistico del volume, in un
+        // punto solo. Erano due rami distinti e solo quello degli hash faceva progresso
+        // e controllo: dopo un cambio d'ora e' invece il ramo `.timezoneShift` a
+        // riempire i batch, e li' non si sarebbe visto passare niente.
+        func flushBatchIfFull() throws {
+            guard batch.count >= batchSize else { return }
+            try store.upsert(batch)
+            batch.removeAll(keepingCapacity: true)
+            progress.total = try store.count()
+            onProgress(progress)
+
+            // Volume scollegato (o rimontato) a meta' scansione: fermarsi in modo
+            // pulito invece di produrre errori per 100.000 file. Uscita ANTICIPATA
+            // opportunistica: la garanzia vera sta nell'`errorHandler` e nel controllo
+            // dopo il ciclo, perche' questo gira solo quando un batch si riempie.
+            if deviceIdentifier(of: root) != deviceAtStart { volumeVanished = true }
+        }
 
         while let url = enumerator.nextObject() as? URL {
             if cancelled { break }
@@ -2210,17 +2351,32 @@ final class LibraryIndexer {
             guard values?.isRegularFile == true else { continue }
             guard IndexableKind.of(url: url) != .notIndexable else { continue }
 
-            // Fuori dalla root una volta risolti i symlink (un link che punta altrove):
-            // non e' un file della libreria e non si indicizza. Direzione sicura —
-            // un file non indicizzato viene copiato, mai saltato per errore.
-            let fileComponents = url.resolvingSymlinksInPath().standardizedFileURL.pathComponents
+            // Fuori dalla root una volta risolti i symlink: non e' un file della
+            // libreria e non si indicizza. Direzione sicura — un file non indicizzato
+            // viene copiato, mai saltato per errore.
+            // NON e' raggiungibile oggi (misurato): un symlink ha `isRegularFile ==
+            // false` ed e' gia' scartato due righe sopra, e l'enumeratore non lo segue.
+            // Resta come invariante strutturale sul calcolo del percorso relativo, ma
+            // con un contatore: se scattasse in massa il sintomo sarebbe una scansione
+            // da zero file senza spiegazione, e senza contatore sarebbe muta.
+            let fileComponents = canonicalPathComponents(of: url)
             guard fileComponents.count > rootComponents.count,
-                  Array(fileComponents.prefix(rootComponents.count)) == rootComponents else { continue }
+                  Array(fileComponents.prefix(rootComponents.count)) == rootComponents else {
+                progress.outsideRoot += 1
+                continue
+            }
             let relative = fileComponents.dropFirst(rootComponents.count).joined(separator: "/")
 
             progress.scanned += 1
 
             let key = normalizedIndexKey(relative)
+            // La chiave entra in `seenKeys` PRIMA di qualunque possibile errore, ed e'
+            // voluto: un file che esiste ma che non riusciamo a leggere non e' un file
+            // sparito, quindi la sua entry non va rimossa. Il prezzo e' che l'indice
+            // continua a servire al dedup l'hash VECCHIO di quel file. E' coperto solo
+            // dalla rilettura di ADR-0003: prima di saltare un file in import il
+            // candidato viene riletto e rihashato, quindi un hash stantio non puo' far
+            // saltare una foto. Senza quella rilettura, questa riga sarebbe un buco.
             seenKeys.insert(key)
 
             // Un file di cui non si riesce a leggere dimensione o mtime NON si indicizza.
@@ -2238,6 +2394,17 @@ final class LibraryIndexer {
                 continue
             }
             let size = Int64(fileSize)
+            // L'mtime si legge PRIMA dell'hash, e l'ordine e' load-bearing: non
+            // spostarlo dopo per "leggere una volta sola".
+            // Misurato il 2026-08-26 su un file da 400MB modificato a parita' di
+            // dimensione durante l'hashing: l'hash risultante non corrisponde al
+            // contenuto (la difesa sulle dimensioni non puo' vederlo, la dimensione non
+            // e' cambiata). Con l'mtime letto PRIMA, quello memorizzato risulta minore
+            // dell'mtime reale, `indexEntryVerdict` risponde `.stale` alla scansione
+            // successiva e il file viene rihashato: l'errore si autocorregge.
+            // Leggendo l'mtime DOPO l'hash, la stessa entry avvelenata risulterebbe
+            // `.fresh` **per sempre**, e a valle deciderebbe di saltare un file in
+            // import. Oggi siamo salvi solo per quest'ordine.
             let mtime = modified.timeIntervalSince1970
 
             // Riuso dell'hash memorizzato quando la entry e' ancora attendibile.
@@ -2270,97 +2437,101 @@ final class LibraryIndexer {
                                                    hash: existing.hash,
                                                    hashedAt: existing.hashedAt))
                     progress.rebasedByTimezone += 1
-                    if batch.count >= batchSize {
-                        try store.upsert(batch)
-                        batch.removeAll(keepingCapacity: true)
-                    }
+                    try flushBatchIfFull()
+                    if volumeVanished { break }
                     continue
                 }
                 // .stale e .needsVerification portano entrambi al rehash: durante la
                 // scansione conviene sempre risolvere il dubbio, il costo e' lo stesso.
             }
 
-            guard let hash = sha256(of: url) else {
+            // Hash e dimensione arrivano dallo STESSO descrittore aperto. Il confronto
+            // che stava qui — rileggere `fileSizeKey` dallo stesso `url` dopo l'hash —
+            // era vero per costruzione, perche' `resourceValues` serve valori in cache
+            // sull'istanza di URL (misurato: 5000 -> 5000 su un file troncato a 6 byte).
+            // Vedi `sha256Measured`.
+            guard let measured = sha256Measured(of: url) else {
                 progress.errors += 1
                 continue
             }
 
-            // Difesa contro una lettura troncata (es. volume scollegato a meta'):
-            // se la dimensione e' cambiata sotto di noi, NON indicizzare. Un hash
-            // calcolato su una lettura parziale verrebbe poi usato per saltare un
-            // file in import — fallimento silenzioso con perdita di uno scatto.
-            let sizeAfter = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize
-            guard let sizeAfter, Int64(sizeAfter) == size else {
+            // Difesa contro una lettura troncata (volume scollegato, file riscritto da
+            // un altro processo): se la dimensione misurata sul descrittore non e'
+            // quella letta dalla directory, NON indicizzare. Un hash calcolato su una
+            // lettura parziale verrebbe poi usato per saltare un file in import —
+            // fallimento silenzioso con perdita di uno scatto.
+            guard measured.size == size else {
                 progress.errors += 1
                 continue
             }
 
             batch.append(LibraryIndexEntry(path: key, displayPath: relative, size: size,
-                                           mtime: mtime, hash: hash,
+                                           mtime: mtime, hash: measured.hash,
                                            hashedAt: Date().timeIntervalSince1970))
             progress.hashed += 1
 
-            if batch.count >= batchSize {
-                try store.upsert(batch)
-                batch.removeAll(keepingCapacity: true)
-                progress.total = try store.count()
-                onProgress(progress)
-
-                // Volume scollegato a meta' scansione: fermarsi in modo pulito invece
-                // di produrre errori per 100.000 file. Qui e' solo un'uscita ANTICIPATA
-                // opportunistica: la garanzia vera sta nel controllo dopo il ciclo,
-                // perche' questo ramo gira solo quando un batch si riempie.
-                if !fm.fileExists(atPath: root.path) {
-                    volumeVanished = true
-                    break
-                }
-            }
+            try flushBatchIfFull()
+            if volumeVanished { break }
         }
 
         if !batch.isEmpty { try store.upsert(batch) }
 
-        // ---- Rimozione dei file spariti: tre guardie, tutte necessarie ----
-        //
-        // Il controllo di esistenza della root sta QUI e non solo dentro il ramo del
-        // batch. Nella scansione incrementale — quella automatica all'avvio, il caso
-        // piu' frequente — quasi tutti i file sono `.fresh` e fanno `continue` PRIMA
-        // di `batch.append`: il batch non si riempie mai, quel ramo non viene mai
-        // eseguito, e uno scollegamento a meta' passerebbe inosservato. L'enumeratore
-        // finirebbe, `volumeVanished` resterebbe falso, e `knownKeys - seenKeys`
-        // rimuoverebbe TUTTI i file non ancora visitati: l'indice svuotato, la
-        // ricostruzione da 5-15 minuti da rifare, e — peggio — il primo import
-        // successivo senza dati di dedup ricrea esattamente i doppioni che questa
-        // feature esiste per evitare.
-        if !fm.fileExists(atPath: root.path) { volumeVanished = true }
+        if deviceIdentifier(of: root) != deviceAtStart { volumeVanished = true }
 
-        // In modalita' "verifica completa" ogni file viene comunque visitato, quindi
-        // `seenKeys` e' completo e il confronto resta valido.
-        let scanWasComplete = !cancelled && !volumeVanished
+        progress.unreadableItems = failures.count
+        progress.volumeVanished = volumeVanished
+
+        // ---- Rimozione dei file spariti: solo dopo una traversata COMPLETA ----
+        //
+        // DECISIONE DI PRODOTTO (Enrico, 2026-08-26), vale in TUTTE le modalita',
+        // "Ricostruzione completa" inclusa: se la traversata non e' stata completa, la
+        // scansione non rimuove NULLA. Mostra invece quanti elementi non e' riuscita a
+        // leggere (`unreadableItems`, `vanishedKept`).
+        //
+        // Il verso dell'errore non e' simmetrico. Una riga stantia nell'indice e'
+        // innocua, perche' prima di saltare un file in import l'app rilegge e rihasha
+        // comunque il candidato sul disco (ADR-0003). Una riga cancellata per errore
+        // costa dedup spento, doppioni ricreati al primo import e 5-15 minuti di
+        // ricostruzione. Nel dubbio si tiene di piu', mai si toglie di piu'.
+        //
+        // Tre modi in cui la traversata risulta incompleta, tutti misurati:
+        // 1. `errorHandler` chiamato almeno una volta (cartella illeggibile, EIO,
+        //    volume scollegato). Da solo copre il caso peggiore: stacco al 70% della
+        //    scansione, 17.958 entry (30%) cancellate in silenzio, `errors=0`.
+        // 2. `st_dev` della root diverso da quello iniziale (o `stat` che fallisce).
+        // 3. Zero file visti su un indice NON vuoto: "enumerazione a zero file" non e'
+        //    "libreria vuota". Misurato con una root che l'enumeratore non riesce a
+        //    percorrere: `scanned=0`, nessun errore, indice azzerato (1 -> 0).
+        //    Il prezzo: se l'utente cancella DAVVERO tutte le foto, le entry fantasma
+        //    restano finche' non si cancella il file dell'indice. E' il verso scelto.
+        let sawNothing = progress.scanned == 0 && !knownKeys.isEmpty
+        progress.traversalIncomplete = failures.count > 0 || volumeVanished || sawNothing
+
         let vanished = knownKeys.subtracting(seenKeys)
 
-        // Terza guardia, di plausibilita': sparire piu' della meta' dell'indice in
-        // una sola scansione e' quasi sempre un'interruzione che non abbiamo
-        // riconosciuto, non 60.000 cancellazioni reali fatte dall'utente. Nel dubbio
-        // si tiene: una entry stantia costa una riverifica al prossimo import
-        // (percorso ad alto danno, che rilegge comunque il file candidato, quindi su
-        // un file sparito non scatta nessuno skip), mentre un indice svuotato costa
-        // una ricostruzione completa e lascia l'import successivo senza dedup.
+        // Guardia di plausibilita', indipendente dalle tre sopra: sparire piu' della
+        // meta' dell'indice in una scansione completa e' quasi sempre un'interruzione
+        // che non abbiamo riconosciuto, non 60.000 cancellazioni reali fatte dall'utente.
         //
-        // `ignoringStoredHashes` la scavalca di proposito: e' la "Ricostruzione
-        // completa", un'azione esplicita dell'utente che significa "fidati del
-        // disco". Senza questa via d'uscita, dopo una cancellazione massiccia VERA
-        // le entry fantasma resterebbero per sempre (ogni scansione successiva
-        // rivedrebbe la stessa sparizione implausibile) e il pannello Doppioni
-        // mostrerebbe gruppi che non esistono piu'.
+        // `ignoringStoredHashes` scavalca QUESTA e solo questa: e' la "Ricostruzione
+        // completa", un'azione esplicita che significa "fidati del disco". Senza questa
+        // via d'uscita, dopo una cancellazione massiccia VERA le entry fantasma
+        // resterebbero per sempre e il pannello Doppioni mostrerebbe gruppi che non
+        // esistono piu'. NON scavalca la traversata incompleta: e' la modalita' che dura
+        // 5-15 minuti sul volume vero, cioe' quella con la probabilita' piu' alta di
+        // essere interrotta da uno scollegamento.
         let plausible = ignoringStoredHashes
             || knownKeys.isEmpty
             || vanished.count * 2 <= knownKeys.count
 
-        if scanWasComplete && !vanished.isEmpty {
-            if plausible {
+        if !vanished.isEmpty {
+            if !cancelled && !progress.traversalIncomplete && plausible {
                 try store.remove(keys: Array(vanished))
             } else {
-                // NON in silenzio: il Task 6 mostra questo numero all'utente.
+                // NON in silenzio: il Task 6 mostra questo numero all'utente. Vale per
+                // tutti i motivi per cui non si e' rimosso (traversata incompleta,
+                // cancellazione, guardia di plausibilita'), perche' il significato per
+                // chi legge e' uno solo: "entry sparite dal disco che ho tenuto".
                 progress.vanishedKept = vanished.count
             }
         }
@@ -2371,7 +2542,49 @@ final class LibraryIndexer {
     }
 }
 
-func sha256(of url: URL) -> String? {
+/// Hash di un file **piu' la dimensione misurata sullo stesso descrittore**.
+struct MeasuredHash {
+    let hash: String
+    /// Byte effettivamente letti e hashati. Coincide con la dimensione del file
+    /// misurata via `fstat` prima E dopo la lettura, altrimenti l'hash non viene
+    /// restituito affatto.
+    let size: Int64
+}
+
+/// Legge un file una volta sola e restituisce hash e dimensione **dallo stesso
+/// descrittore aperto**, oppure `nil` se il file si e' mosso sotto di noi.
+///
+/// Perche' la dimensione la misura questa funzione e non il chiamante (misurato il
+/// 2026-08-26): `URL.resourceValues(forKeys:)` restituisce valori **in cache
+/// sull'istanza di URL**, e gli URL prodotti da `FileManager.enumerator` arrivano con
+/// i valori gia' prefetchati alla lettura della directory. Rileggere la dimensione
+/// dallo stesso `url` dopo l'hash ritorna quindi il valore di prima anche se il file
+/// nel frattempo e' stato troncato:
+///
+///     stessa URL (anche dall'enumeratore): 5000 -> 5000 dopo troncamento a 6 byte
+///     URL(fileURLWithPath: url.path) nuova: 6
+///
+/// Un confronto "dimensione prima vs dimensione dopo" fatto sullo stesso URL e' quindi
+/// **vero per costruzione**: era la difesa contro le letture troncate e non poteva
+/// scattare. Il caso reale misurato: file da 5000 byte troncato a 6 durante la
+/// scansione, entry salvata con `size=5000` e l'hash dei 6 byte. Quell'hash decide poi
+/// se **saltare un file in import**: e' il percorso ad alto danno.
+///
+/// Tre condizioni, tutte sullo stesso `fd`, tutte necessarie:
+/// 1. `fstat` prima della lettura,
+/// 2. byte effettivamente letti,
+/// 3. `fstat` dopo la lettura.
+/// Se le tre non coincidono, il file e' cambiato durante la lettura e l'hash non vale
+/// niente: meglio nessun hash che un hash su una lettura parziale. Verificato: un file
+/// da 200MB troncato a meta' hashing produceva prima un hash valido a tutti gli effetti,
+/// ora `nil`; un file stabile non produce mai falsi positivi.
+///
+/// Uno scollegamento del volume e' invece intercettato PRIMA, da `read()` che fallisce
+/// con EIO — verificato su un'immagine exFAT scollegata con `hdiutil detach -force`
+/// durante la lettura: `read()` -> errno 5 dopo 31.784.960 byte su 83.886.080. Sono due
+/// guardie distinte per due guasti distinti, e nel caso dello scollegamento e' sempre
+/// stata la seconda a scattare, mai il confronto sulle dimensioni.
+func sha256Measured(of url: URL) -> MeasuredHash? {
     // I/O POSIX a basso livello (open/read/close) invece di FileHandle.readData(ofLength:):
     // su file molto grandi (decine di GB), FileHandle/NSData tende a mantenere le pagine
     // lette residenti in memoria invece di rilasciarle tra una lettura e l'altra, facendo
@@ -2383,21 +2596,46 @@ func sha256(of url: URL) -> String? {
     guard fd >= 0 else { return nil }
     defer { close(fd) }
 
+    var before = stat()
+    guard fstat(fd, &before) == 0 else { return nil }
+
     var hasher = SHA256()
     let bufSize = 65536
     var buffer = [UInt8](repeating: 0, count: bufSize)
+    var bytesRead: Int64 = 0
 
     while true {
         let n = buffer.withUnsafeMutableBytes { ptr in
             read(fd, ptr.baseAddress, bufSize)
         }
+        // n < 0: errore di lettura. E' qui che si manifesta uno scollegamento del
+        // volume a meta' file (EIO), e non indicizzare e' l'unica risposta corretta.
         if n < 0 { return nil }
         if n == 0 { break }
+        bytesRead += Int64(n)
         buffer.withUnsafeBufferPointer { ptr in
             hasher.update(bufferPointer: UnsafeRawBufferPointer(start: ptr.baseAddress, count: n))
         }
     }
-    return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+
+    var after = stat()
+    guard fstat(fd, &after) == 0 else { return nil }
+    guard before.st_size == after.st_size, bytesRead == Int64(after.st_size) else { return nil }
+
+    return MeasuredHash(hash: hasher.finalize().map { String(format: "%02x", $0) }.joined(),
+                        size: bytesRead)
+}
+
+/// Hash di un file, senza la dimensione. Delega a `sha256Measured` per non avere due
+/// cicli di lettura da tenere allineati.
+///
+/// Conseguenza voluta del passaggio: un file che **cambia dimensione mentre lo si
+/// legge** ora produce `nil` per tutti i chiamanti (verifica post-copia, campione di
+/// integrita', confronto con S3), non solo per l'indice. E' il verso sicuro — un hash
+/// calcolato su una lettura parziale non deve valere da nessuna parte — e a valle
+/// `nil` e' gia' trattato ovunque come "errore, non fidarsi".
+func sha256(of url: URL) -> String? {
+    sha256Measured(of: url)?.hash
 }
 
 // MARK: - BookmarkManager
@@ -4866,14 +5104,10 @@ final class ReviewEngine {
     private let s3Syncer = S3Syncer()
     private let fm = FileManager.default
 
-    // realpath (non URL.resolvingSymlinksInPath, che lascia /var e /tmp non risolti di proposito):
-    // l'enumeratore restituisce URL con i symlink di sistema risolti (es. /var -> /private/var),
-    // quindi per far combaciare il prefisso serve la stessa risoluzione a livello di filesystem.
-    private func realResolvedPath(_ url: URL) -> String {
-        var buf = [Int8](repeating: 0, count: Int(PATH_MAX))
-        guard let r = realpath(url.path, &buf) else { return url.path }
-        return String(cString: r)
-    }
+    // La canonicalizzazione dei percorsi (`realResolvedPath`) e' una funzione globale
+    // condivisa con `LibraryIndexer`, non piu' un metodo privato di questa classe:
+    // due canonicalizzazioni diverse per lo stesso problema producono forme opposte.
+    // Vedi il commento sulla funzione.
 
     func sampleLocalPair(srcRoot: URL, dstRoot: URL, pairName: String, sampleSize: Int) -> IntegrityCheckResult {
         var result = IntegrityCheckResult(pairName: pairName)

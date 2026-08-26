@@ -49,6 +49,9 @@ final class LibraryIndexerTests: XCTestCase {
         let p = try indexer.scan(root: root)
         XCTAssertEqual(p.hashed, 2)
         XCTAssertEqual(try store.count(), 2)
+        XCTAssertFalse(p.traversalIncomplete, "traversata regolare: nessun segnale di incompletezza")
+        XCTAssertEqual(p.unreadableItems, 0)
+        XCTAssertEqual(p.outsideRoot, 0)
     }
 
     func testIgnoresNonIndexableFiles() throws {
@@ -120,8 +123,8 @@ final class LibraryIndexerTests: XCTestCase {
     }
 
     // Cancellazione DURANTE la scansione: e' il flusso reale (l'utente preme
-    // "Interrompi" mentre il lavoro gira). Un `cancel()` PRIMA di `scan()` non e' un
-    // caso reale ed e' volutamente ignorato, perche' `scan` riparte pulita.
+    // "Interrompi" mentre il lavoro gira). Il caso "cancel PRIMA di scan" e' coperto
+    // da `testCancelBeforeScan_isHonored`: dal 2026-08-26 non viene piu' inghiottito.
     func testCancelDuringScan_stopsEarly() throws {
         for i in 0..<50 { try makeFile("Foto/f\(i).jpg", contents: "c\(i)") }
         let idx = indexer!
@@ -321,5 +324,210 @@ final class LibraryIndexerTests: XCTestCase {
             XCTAssertEqual(try store.allKeys(), [key], "root come \(variant.path): nessuna chiave nuova")
             XCTAssertEqual(try store.count(), 1)
         }
+    }
+    // MARK: - Rilievi chiusi dopo la review del Task 4 (2026-08-26)
+
+    // Le esclusioni non erano esercitate da nessun test: `shouldExclude` forzata a
+    // `false` sopravviveva al mutation test, perche' `Foto/.DS_Store` e' gia' coperto
+    // tre volte da `.skipsHiddenFiles`. Questi due nomi NON iniziano con un punto:
+    // sono l'unica parte della lista che solo `LibraryExclusions` puo' fermare.
+    func testExcludedSystemFolders_areNotIndexed() throws {
+        try makeFile("Foto/ok.jpg", contents: "buona")
+        try makeFile("lost+found/x.jpg", contents: "recuperata")
+        try makeFile("Backups.backupdb/y.jpg", contents: "time machine")
+        let p = try indexer.scan(root: root)
+        XCTAssertEqual(p.hashed, 1, "solo Foto/ok.jpg")
+        XCTAssertEqual(try store.allKeys(), [normalizedIndexKey("Foto/ok.jpg")])
+    }
+
+    // `.skipsHiddenFiles` e' meta' del filtro, non un dettaglio di performance: senza,
+    // l'indice diventa un superset di cio' che FileSyncer copia davvero e una copia
+    // nascosta byte-identica farebbe saltare un import reale (ADR-0003 + commento su
+    // `LibraryExclusions`). Toglierla sopravviveva a tutti i 20 test precedenti.
+    func testHiddenFilesAndFolders_areNotIndexed() throws {
+        try makeFile("Foto/ok.jpg", contents: "buona")
+        try makeFile("Foto/.nascosta.jpg", contents: "nascosta")
+        try makeFile(".Cartella/dentro.jpg", contents: "dentro")
+        let p = try indexer.scan(root: root)
+        XCTAssertEqual(p.hashed, 1, "ne' il file nascosto ne' la cartella nascosta entrano nell'indice")
+        XCTAssertEqual(try store.allKeys(), [normalizedIndexKey("Foto/ok.jpg")])
+    }
+
+    // La regola anti-racy di ADR-0003 non era esercitata a livello di indexer:
+    // trattare `.needsVerification` come `.fresh` sopravviveva. E' il caso che ADR-0003
+    // chiama "il file potrebbe davvero essere cambiato": contenuto diverso, dimensione
+    // identica al byte, mtime identico.
+    //
+    // L'mtime dei fixture e' volutamente nel FUTURO (+60s) e non "adesso": serve
+    // `currentMTime >= hashedAt - 2s`, e con "adesso" il test dipenderebbe dal fatto
+    // che la scansione parta entro 2 secondi dalla creazione del file — cioe' sarebbe
+    // un test a tempo. Con +60s la condizione vale su qualunque macchina.
+    func testNeedsVerification_isRehashedNotTrusted() throws {
+        let url = try makeFile("Foto/a.jpg", contents: "uno")
+        let racyMTime = Date().addingTimeInterval(60)
+        try FileManager.default.setAttributes([.modificationDate: racyMTime], ofItemAtPath: url.path)
+        _ = try indexer.scan(root: root)
+        let before = try store.entry(forKey: normalizedIndexKey("Foto/a.jpg"))!
+
+        // Contenuto diverso, STESSA dimensione (3 byte), STESSO mtime.
+        try "due".data(using: .utf8)!.write(to: url)
+        try FileManager.default.setAttributes([.modificationDate: racyMTime], ofItemAtPath: url.path)
+
+        let p = try indexer.scan(root: root)
+        XCTAssertEqual(p.hashed, 1, "nel dubbio si rihasha: e' la regola anti-racy")
+        XCTAssertEqual(p.skipped, 0)
+        let after = try store.entry(forKey: normalizedIndexKey("Foto/a.jpg"))!
+        XCTAssertEqual(after.size, before.size, "la dimensione e' identica: e' proprio il caso ambiguo")
+        XCTAssertNotEqual(after.hash, before.hash, "l'hash vecchio non doveva essere confermato")
+    }
+
+    // Un file che esiste ma non si riesce a leggere NON e' un file sparito: la sua
+    // entry resta. Mutante che sopravviveva: `seenKeys.remove(key)` nel ramo di errore
+    // dell'hash — l'entry di un file esistente spariva e nessuno se ne accorgeva.
+    func testUnreadableFile_keepsItsEntry() throws {
+        try makeFile("Foto/a.jpg", contents: "uno")
+        let url = try makeFile("Foto/b.jpg", contents: "due")
+        _ = try indexer.scan(root: root)
+        let before = try store.entry(forKey: normalizedIndexKey("Foto/b.jpg"))!
+
+        // Il file cambia (quindi andrebbe rihashato) e diventa illeggibile.
+        try "contenuto molto piu' lungo di prima".data(using: .utf8)!.write(to: url)
+        try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(300)],
+                                              ofItemAtPath: url.path)
+        try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: url.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: url.path) }
+
+        let p = try indexer.scan(root: root)
+        XCTAssertEqual(p.errors, 1)
+        XCTAssertEqual(try store.count(), 2, "un file illeggibile non e' un file sparito")
+        XCTAssertEqual(p.vanishedKept, 0, "non c'e' nulla da tenere: la chiave e' stata vista")
+        XCTAssertEqual(try store.entry(forKey: normalizedIndexKey("Foto/b.jpg"))?.hash, before.hash,
+                       "resta l'hash vecchio: e' il comportamento voluto, coperto dalla rilettura di ADR-0003")
+    }
+
+    // Lettura troncata. Deterministico, nessun timing: `batchSize: 1` fa scattare
+    // `onProgress` dopo il primo file, e da li' si troncano tutti gli altri. La
+    // dimensione che l'enumeratore ha gia' messo in cache resta 5000, quindi la vecchia
+    // difesa ("rileggi fileSizeKey dallo stesso url e confronta") era vera per
+    // costruzione e non poteva scattare: le entry finivano nell'indice con size=5000 e
+    // l'hash di 6 byte. Quell'hash decide se saltare un file in import.
+    func testTruncatedRead_isNotIndexed() throws {
+        let payload = String(repeating: "A", count: 5000)
+        for i in 0..<10 { try makeFile("Foto/f\(i).jpg", contents: payload) }
+
+        let p = try indexer.scan(root: root, batchSize: 1) { [root] _ in
+            for i in 0..<10 {
+                let u = root!.appendingPathComponent("Foto/f\(i).jpg")
+                let attrs = try? FileManager.default.attributesOfItem(atPath: u.path)
+                guard (attrs?[.size] as? Int) == 5000,
+                      let fh = try? FileHandle(forWritingTo: u) else { continue }
+                try? fh.truncate(atOffset: 6)
+                try? fh.close()
+            }
+        }
+
+        XCTAssertEqual(p.hashed, 1, "solo il primo file e' stato letto integro")
+        XCTAssertEqual(p.errors, 9, "i nove troncati non devono entrare nell'indice")
+        XCTAssertEqual(try store.count(), 1)
+
+        let fullHash = try hashOfString(payload)
+        let truncatedHash = try hashOfString("AAAAAA")
+        let key = try XCTUnwrap(store.allKeys().first)
+        let entry = try XCTUnwrap(store.entry(forKey: key))
+        XCTAssertEqual(entry.size, 5000)
+        XCTAssertEqual(entry.hash, fullHash, "l'unica entry deve avere l'hash del contenuto intero")
+        XCTAssertTrue(try store.entries(withHash: truncatedHash).isEmpty,
+                      "nessuna entry deve portare l'hash del contenuto troncato con la dimensione intera")
+    }
+
+    // Cartella illeggibile: la traversata non e' completa, quindi NON si rimuove nulla
+    // e il numero di elementi non letti va riportato. Misurato prima del fix: 3 entry
+    // di file esistenti rimosse, `errors=0`, nessun segnale — la guardia di
+    // plausibilita' non protegge, perche' 3 su 6 e' esattamente "plausibile".
+    func testUnreadableDirectory_removesNothing() throws {
+        for i in 0..<3 { try makeFile("Foto/v\(i).jpg", contents: "v\(i)") }
+        for i in 0..<3 { try makeFile("Foto/segreta/s\(i).jpg", contents: "s\(i)") }
+        _ = try indexer.scan(root: root)
+        XCTAssertEqual(try store.count(), 6)
+
+        let secret = root.appendingPathComponent("Foto/segreta")
+        try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: secret.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: secret.path) }
+
+        let p = try indexer.scan(root: root)
+        XCTAssertEqual(p.unreadableItems, 1, "l'errorHandler deve contare la cartella non aperta")
+        XCTAssertTrue(p.traversalIncomplete)
+        XCTAssertEqual(p.vanishedKept, 3, "le 3 entry non viste vanno riportate, non rimosse")
+        XCTAssertEqual(try store.count(), 6, "una cartella illeggibile non e' una cartella svuotata")
+    }
+
+    // "Enumerazione a zero file" non e' "libreria vuota". Misurato prima del fix:
+    // `scanned=0`, nessun errore, indice azzerato.
+    // `ignoringStoredHashes: true` isola il caso: scavalca la guardia di plausibilita',
+    // quindi l'unica cosa che impedisce di azzerare l'indice e' questa regola.
+    func testZeroFilesScanned_removesNothing() throws {
+        for i in 0..<3 { try makeFile("Foto/f\(i).jpg", contents: "c\(i)") }
+        _ = try indexer.scan(root: root)
+        XCTAssertEqual(try store.count(), 3)
+
+        try FileManager.default.removeItem(at: root.appendingPathComponent("Foto"))
+        try makeFile("Zip/archivio.zip", contents: "non indicizzabile")
+
+        let p = try indexer.scan(root: root, ignoringStoredHashes: true)
+        XCTAssertEqual(p.scanned, 0)
+        XCTAssertEqual(p.unreadableItems, 0, "nessun errore di traversata: e' proprio il caso ambiguo")
+        XCTAssertTrue(p.traversalIncomplete)
+        XCTAssertEqual(p.vanishedKept, 3)
+        XCTAssertEqual(try store.count(), 3, "zero file visti non autorizza nessuna rimozione")
+    }
+
+    // DECISIONE DI PRODOTTO (Enrico, 2026-08-26): se la traversata non e' completa non
+    // si rimuove nulla NEMMENO in "Ricostruzione completa". E' la modalita' che dura
+    // 5-15 minuti sul volume vero, cioe' quella con la probabilita' piu' alta di essere
+    // interrotta da uno scollegamento; prima la guardia era disattivata del tutto qui
+    // (`plausible = ignoringStoredHashes || ...`) e uno stacco a meta' cancellava
+    // 12.220 entry. Righe stantie sono innocue (l'import rilegge e rihasha comunque,
+    // ADR-0003); righe cancellate per errore costano dedup spento, doppioni ricreati e
+    // una ricostruzione da 5-15 minuti.
+    func testFullRebuildWithIncompleteTraversal_removesNothing() throws {
+        for i in 0..<5 { try makeFile("Foto/v\(i).jpg", contents: "v\(i)") }
+        for i in 0..<5 { try makeFile("Foto/segreta/s\(i).jpg", contents: "s\(i)") }
+        _ = try indexer.scan(root: root)
+        XCTAssertEqual(try store.count(), 10)
+
+        let secret = root.appendingPathComponent("Foto/segreta")
+        try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: secret.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: secret.path) }
+
+        let p = try indexer.scan(root: root, ignoringStoredHashes: true)
+        XCTAssertTrue(p.traversalIncomplete)
+        XCTAssertEqual(p.unreadableItems, 1)
+        XCTAssertEqual(p.vanishedKept, 5)
+        XCTAssertEqual(try store.count(), 10,
+                       "la ricostruzione completa scavalca la plausibilita', MAI la traversata incompleta")
+    }
+
+    // Un `cancel()` arrivato fra il click e l'ingresso in `scan` sul thread di lavoro
+    // veniva inghiottito dall'azzeramento in cima a `scan`. Ora la cancellazione si
+    // consuma in uscita: viene rispettata, e la scansione successiva riparte pulita.
+    func testCancelBeforeScan_isHonored() throws {
+        for i in 0..<5 { try makeFile("Foto/f\(i).jpg", contents: "c\(i)") }
+        indexer.cancel()
+
+        let p = try indexer.scan(root: root)
+        XCTAssertEqual(p.hashed, 0, "un cancel arrivato prima che scan parta non va inghiottito")
+        XCTAssertEqual(try store.count(), 0)
+
+        let second = try indexer.scan(root: root)
+        XCTAssertEqual(second.hashed, 5, "la scansione successiva riparte pulita")
+    }
+
+    /// Hash di riferimento calcolato su un file di appoggio: serve a distinguere
+    /// "hash del contenuto intero" da "hash del contenuto troncato".
+    private func hashOfString(_ s: String) throws -> String {
+        let tmp = tempDir.appendingPathComponent("hash-\(UUID().uuidString).bin")
+        try s.data(using: .utf8)!.write(to: tmp)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        return sha256(of: tmp)!
     }
 }

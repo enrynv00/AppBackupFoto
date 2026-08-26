@@ -1384,7 +1384,7 @@ Expected: `Executed 19 tests, with 0 failures` (reale: **20** — vedi la nota i
 
 - [x] **Step 6: Build, suite completa, commit**
 
-Expected suite: **247 test** (228 + 19). Reale: **248** (228 + 20), per il test di regressione aggiunto sul calcolo del percorso relativo — vedi la nota in fondo al task. La baseline e' 228, non 216: vedi la nota post-review in fondo al Task 3.
+Expected suite: **247 test** (228 + 19). Reale: **248** (228 + 20), per il test di regressione aggiunto sul calcolo del percorso relativo — vedi la nota in fondo al task. **Dopo la review il totale reale e' 257** (9 test nuovi, vedi la "Nota post-review (2026-08-26)" in fondo al task): e' questa la baseline per i task successivi. La baseline di partenza e' 228, non 216: vedi la nota post-review in fondo al Task 3.
 
 ```bash
 git add AppBackupFoto/ContentView.swift AppBackupFotoTests/LibraryIndexerTests.swift AppBackupFoto.xcodeproj/project.pbxproj
@@ -1452,6 +1452,150 @@ che la corsa va nell'altro verso — cioe' esattamente il tipo di test che quest
 ha gia' pagato quattro volte. Se si vuole coprire davvero questi quattro casi serve un
 punto di innesto interno (callback per file, o iniezione del `FileManager`): e' una
 scelta di design, non un dettaglio di test, e va decisa esplicitamente.
+
+
+#### Nota post-review (2026-08-26) — otto rilievi chiusi, una decisione di prodotto, e la tabella dei mutanti della nota precedente era sbagliata
+
+Code Reviewer e Security Auditor hanno bocciato la versione committata in `855684a`. Tutti i
+rilievi sono stati **riprodotti**, non dedotti: immagine sparse exFAT montata con lo stesso
+driver dell'SSD e staccata con `hdiutil detach -force` a metà scansione, `chmod 000` su una
+sottocartella, file troncato durante la lettura. Il codice dello Step 5 qui sopra è la prima
+versione: non reintrodurlo.
+
+**DECISIONE DI PRODOTTO (Enrico, 2026-08-26), è il cardine di tutto il resto.** Se la
+traversata dell'SSD non è stata completa, la scansione **non rimuove nulla** dall'indice, in
+**tutte** le modalità, "Ricostruzione completa" (`ignoringStoredHashes`) inclusa. Mostra
+invece quanti elementi non è riuscita a leggere. Motivo: una riga stantia nell'indice è
+innocua, perché prima di saltare un file in import l'app rilegge e rihasha comunque il
+candidato sul disco (ADR-0003); una riga **cancellata per errore** costa dedup spento,
+doppioni ricreati al primo import e 5-15 minuti di ricostruzione. Il verso sicuro è tenere di
+più, mai togliere di più. Prezzo accettato consapevolmente: se l'utente cancella *davvero*
+tutte le foto, le entry fantasma restano finché non si cancella il file dell'indice.
+
+**1. Lo scollegamento dell'SSD non veniva rilevato (ALTA).** `fm.fileExists(atPath: root.path)`
+— il controllo su cui poggiava tutta la difesa — risponde `true` anche dopo lo scollegamento
+(macOS smonta in modo asincrono): stacco al 70%, `before=60000 scanned=42042 errors=0
+vanishedKept=0`, **17.958 entry (30%) cancellate in silenzio**. La soglia >50% copriva solo gli
+stacchi nella prima metà. In `ignoringStoredHashes` la guardia era disattivata del tutto
+(`plausible = ignoringStoredHashes || ...`) → 12.220 entry cancellate, e quella è la modalità
+che dura 5-15 minuti, cioè la più esposta. Tre rilevatori misurati nello stesso run:
+`fileExists` inutile; `URLResourceValues.volumeIdentifier` invariato (Foundation lo serve dalla
+cache) e quindi inutile — ed è la scelta che sembra ovvia; `st_dev` della root inizio vs fine
+**cambia** (16777237 → 16777230); `enumerator(..., errorHandler:)` **chiamato 43 volte** con
+`NSPOSIXErrorDomain Code=6 "Device not configured"`, segnale diretto e indipendente dal timing.
+Ora: `errorHandler` che conta gli errori, confronto `st_dev` inizio/fine, e rimozione
+subordinata alla traversata completa in tutte le modalità. Riprodotto anche qui su un'immagine
+exFAT da 3.001 file: `scanned=1284 enumErrors=9`, primo errore `NSCocoaErrorDomain 256`.
+
+**2. Una directory illeggibile faceva rimuovere entry di file esistenti (ALTA).**
+L'enumeratore era creato **senza** `errorHandler:`, il cui default è "prosegui in silenzio".
+Con `chmod 000` su una sottocartella fra due scansioni: 3 entry di file esistenti rimosse,
+`errors=0`, nessun segnale, e sotto il 50% la plausibilità non protegge. Stesso fix del punto 1:
+cartella illeggibile e disco scollegato **sono lo stesso guasto** visto da due lati.
+
+**3. "Enumerazione a zero file" non era distinta da "libreria vuota" (ALTA).** Root che
+l'enumeratore non riesce a percorrere → `scanned=0 errors=0` e indice azzerato. Ora
+`scanned == 0` con indice **non** vuoto non autorizza nessuna rimozione.
+
+**4. La difesa sulla lettura troncata non poteva scattare (ALTA) — e i due revisori sembravano
+contraddirsi.** Non si contraddicevano, verificato empiricamente in entrambi i sensi:
+`URL.resourceValues(forKeys:)` restituisce valori **in cache sull'istanza di URL**, e gli URL
+prodotti dall'enumeratore arrivano già prefetchati alla lettura della directory — rileggere
+`fileSizeKey` dallo stesso `url` dopo l'hash dà `5000 → 5000` su un file troncato a 6 byte
+(`URL(fileURLWithPath: url.path)` nuova dà 6). Il confronto era quindi **vero per costruzione**:
+entry salvata con `size=5000` e l'hash del contenuto da 6 byte. Nel test di scollegamento
+dell'Auditor a scattare era invece **l'altra** guardia, il fallimento di `sha256`: misurato,
+`read()` → `errno 5 (Input/output error)` dopo 31.784.960 byte su 83.886.080, quindi `nil` e
+`errors=1`. Due guardie distinte per due guasti distinti; quella sulle dimensioni è sempre stata
+inerte. Ora dimensione e hash vengono dallo **stesso descrittore** (`sha256Measured`: `fstat`
+prima, byte contati, `fstat` dopo), e l'indexer confronta la dimensione misurata con quella
+letta dalla directory. `sha256(of:)` delega alla nuova funzione, quindi un file che cambia
+dimensione mentre lo si legge ora dà `nil` **per tutti** i chiamanti: verso sicuro, e `nil` era
+già trattato ovunque come errore.
+
+**5. Due canonicalizzazioni opposte per lo stesso problema (MEDIA).** `ReviewEngine` usava
+`realpath()` con sopra un commento che diceva di **non** usare `URL.resolvingSymlinksInPath`;
+il codice nuovo usava proprio quella. Producono forme opposte (misurato):
+`realpath("/var/folders/…")` → `/private/var/…`, `URL("/private/var/…").resolvingSymlinksInPath()`
+→ `/var/…`. Reggeva solo perché applicava la stessa funzione ai due lati. Ora c'è un helper
+unico globale (`realResolvedPath` + `canonicalPathComponents`), usato da entrambe le parti —
+stesso argomento già applicato a `LibraryExclusions`. Costo misurato: 12,6 µs/file, contro gli
+11,1 della versione precedente. Il `continue` sul mismatch di prefisso, prima muto, ora ha un
+contatore (`Progress.outsideRoot`).
+
+**6. Tre guardie morte con commenti che affermavano il falso (MEDIA).** Misurato:
+`fm.enumerator(at:)` **non** restituisce `nil` né su percorso inesistente né su un file
+regolare (restituisce un enumeratore che non produce niente), e un symlink ha
+`isRegularFile == false` ed è già filtrato prima. Quindi: la guardia sulla root in cima non
+impedisce niente che non venga già ripreso dopo il ciclo — il commento "senza questa guardia
+cancellerebbe l'INTERO indice" era **falso** ed è stato corretto (la guardia resta, evita una
+`allKeys()` inutile e distingue "volume assente" da "cartelle illeggibili"); il `guard let
+enumerator` è irraggiungibile ed è ora documentato come tale, ma trattato come traversata
+fallita e non come libreria vuota; la guardia "fuori dalla root" è documentata come
+irraggiungibile e conta.
+
+**7. L'ordine "mtime prima dell'hash" ora è commentato (MEDIA).** Un file da 400MB modificato a
+parità di dimensione durante l'hashing produce una entry con hash che non corrisponde al
+contenuto; poiché `storedMTime` è letto **prima** dell'hash, risulta minore dell'mtime reale →
+`.stale` alla scansione successiva → rehash: si autocorregge. Se qualcuno "ottimizzasse"
+leggendo l'mtime dopo l'hash, quella entry resterebbe `.fresh` **per sempre**. Il commento sta
+ora accanto alla riga.
+
+**8. Minori.** `volumeVanished`, `unreadableItems`, `traversalIncomplete` e `outsideRoot` sono
+ora in `Progress` (servono al Task 6: uno scollegamento a metà scansione non deve restare
+invisibile). Il flush del batch è un punto solo (`flushBatchIfFull`), quindi anche il ramo
+`.timezoneShift` fa progresso e controllo del volume — dopo un cambio d'ora è proprio quello a
+riempire i batch. `cancelled` si consuma **in uscita** da `scan` e non più in ingresso: un
+`cancel()` arrivato fra il click e l'ingresso in `scan` sul worker non viene più inghiottito, e
+un'istanza già cancellata torna comunque a scansionare. Il fatto che un file illeggibile
+mantenga la vecchia entry (chiave già in `seenKeys`) è documentato accanto alla riga: è corretto,
+ma significa "hash vecchio servito al dedup", e regge **solo** grazie alla rilettura di ADR-0003.
+
+**Test: da 20 a 29** in `LibraryIndexerTests`, suite completa **257 test, 0 failure** (era 248).
+
+**La tabella dei mutanti della nota precedente era sbagliata.** Classificava come "non
+testabili senza timing" quattro casi di cui **due erano codice morto e uno codice inerte**, cioè
+mutanti che non potevano essere uccisi perché non cambiavano niente, non perché mancasse un
+punto di innesto. Correzione:
+
+| Mutante della nota precedente | Verdetto di allora | Verdetto reale |
+| :---- | :---- | :---- |
+| controllo root **dopo** il ciclo rimosso | "sopravvissuto, non testabile" | il controllo era `fileExists`, che **non rileva** lo scollegamento: era inerte, non non-testabile. Sostituito da `errorHandler` + `st_dev` |
+| guardia root **in cima** rimossa | "sopravvissuto, non testabile" | **codice morto**: `enumerator(at:)` non torna `nil` su path inesistente, il caso è ripreso in fondo. Commento corretto |
+| `?? 0` su dimensione/mtime illeggibili | "sopravvissuto, non testabile" | corretto: resta non testabile su un file regolare |
+| difesa sulla lettura troncata rimossa | "sopravvissuto, non testabile" | **inerte**: il confronto era vero per costruzione. Ora testabile e testato senza timing |
+
+**Mutation testing di questo giro (13 mutanti, uno alla volta, `LibraryIndexerTests` completa,
+bug rimesso → eseguito → ripristinato):**
+
+| Mutante | Esito |
+| :---- | :---- |
+| `LibraryExclusions.shouldExclude` → sempre `false` | **ucciso** — `testExcludedSystemFolders_areNotIndexed` |
+| `.skipsHiddenFiles` rimossa | **ucciso** — `testHiddenFilesAndFolders_areNotIndexed` |
+| `.needsVerification` trattato come `.fresh` | **ucciso** — `testNeedsVerification_isRehashedNotTrusted` |
+| `seenKeys.remove(key)` nel ramo di errore dell'hash | **ucciso** — `testUnreadableFile_keepsItsEntry` |
+| difesa sulla lettura troncata → vecchio confronto su `fileSizeKey` | **ucciso** — `testTruncatedRead_isNotIndexed` |
+| `errorHandler` che non conta (default silenzioso) | **ucciso** — 2 test |
+| regola "zero file visti" rimossa | **ucciso** — `testZeroFilesScanned_removesNothing` |
+| `ignoringStoredHashes` scavalca anche la traversata incompleta | **ucciso** — 2 test |
+| `cancelled` azzerato a inizio `scan` | **ucciso** — `testCancelBeforeScan_isHonored` |
+| canonicalizzazione asimmetrica fra root e file | **ucciso** — 25 test |
+| guardia di plausibilità rimossa | **ucciso** — 3 test |
+| confronto `st_dev` inizio/fine rimosso | **sopravvissuto** |
+| mtime letto **dopo** l'hash | **sopravvissuto** |
+
+I due sopravvissuti, e perché non si è scritto un test:
+
+- **`st_dev`**: per distinguerlo servirebbe un volume che sparisce *durante* la scansione. È
+  stato misurato davvero (immagine exFAT + `hdiutil detach -force`), ma dentro XCTest sarebbe un
+  test che monta e smonta un'immagine disco a ogni run. Il caso reale è comunque coperto in modo
+  deterministico dall'`errorHandler` (mutante sopra, ucciso): `st_dev` è la seconda cintura per
+  l'unico scenario che l'`errorHandler` non vede, cioè lo smontaggio dopo l'ultima lettura di
+  directory.
+- **mtime dopo l'hash**: richiede un file modificato **a parità di dimensione** mentre lo si sta
+  hashando. È una corsa, e un test basato su una corsa è verde col bug ogni volta che la corsa va
+  nell'altro verso — l'errore che questo progetto ha già pagato quattro volte. Protetto da un
+  commento accanto al codice, non da un test.
 
 ### Task 5: Dedup in `FileSyncer.sync` e in `runImport`
 
@@ -1689,7 +1833,7 @@ Scrivi 4 e 5 **prima** di collegare il predicato in `runImport` e guardali falli
 xcodebuild -project AppBackupFoto.xcodeproj -scheme AppBackupFoto -configuration Debug build 2>&1 | tail -10
 xcodebuild -project AppBackupFoto.xcodeproj -scheme AppBackupFoto -destination 'platform=macOS' test 2>&1 | tail -15
 ```
-Expected: `** BUILD SUCCEEDED **`, **252 test** (247 + 5). Il resto del task è wiring su percorsi con I/O reale, come `runMacToSSD` e gli altri job che non hanno XCTest diretti; il criterio lì è **nessuna regressione**: in particolare `FileSyncerZeroOverwriteTests` e `FileSyncerChangedSkippedTests` devono restare verdi, a prova che i default no-op non hanno alterato i flussi esistenti.
+Expected: `** BUILD SUCCEEDED **`, **262 test** (257 + 5; la baseline non e' piu' 247 ne' 248 — vedi la nota post-review in fondo al Task 4). Il resto del task è wiring su percorsi con I/O reale, come `runMacToSSD` e gli altri job che non hanno XCTest diretti; il criterio lì è **nessuna regressione**: in particolare `FileSyncerZeroOverwriteTests` e `FileSyncerChangedSkippedTests` devono restare verdi, a prova che i default no-op non hanno alterato i flussi esistenti.
 
 - [ ] **Step 8: Commit**
 
@@ -1792,7 +1936,7 @@ In `ContentView`, accanto all'`.onChange(of: volumes.ssdMounted)` già esistente
 
 - [ ] **Step 5: Build, suite completa, verifica manuale**
 
-Expected: `** BUILD SUCCEEDED **`, 252 test invariati.
+Expected: `** BUILD SUCCEEDED **`, 262 test invariati.
 
 Verifica manuale (richiede SSD collegato, quindi **a carico di Enrico**): aprire Diagnostica, vedere la card, avviare la costruzione, verificare che il progresso avanzi, interromperla e verificare che l'indice resti utilizzabile, riavviarla e verificare che riprenda senza rihashare ciò che era già stato fatto.
 
