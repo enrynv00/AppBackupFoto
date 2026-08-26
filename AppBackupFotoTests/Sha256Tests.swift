@@ -46,4 +46,34 @@ final class Sha256Tests: XCTestCase {
         let file = root.appendingPathComponent("does-not-exist.txt")
         XCTAssertNil(sha256(of: file))
     }
+
+    /// `sha256(of:)` delega a `sha256Measured`, quindi eredita la sua guardia: se la
+    /// dimensione misurata sul descrittore non coincide con quella riportata da `fstat`
+    /// prima E dopo la lettura, non restituisce nessun hash.
+    ///
+    /// Perche' un descrittore di pipe e non un file troncato da un altro thread: al
+    /// livello delle syscall il sintomo e' identico (`st_size` letta prima della lettura
+    /// non coincide con quella letta dopo — qui 4 -> 0, perche' su macOS `st_size` di
+    /// una pipe e' il numero di byte ancora in coda, e leggerli la svuota), ma senza
+    /// nessuna corsa fra thread: l'esito e' lo stesso a ogni run. Un test basato su una
+    /// corsa sarebbe verde col bug ogni volta che la corsa va nell'altro verso.
+    ///
+    /// Copre l'unica parte del commit `a290d93` che esce dai confini di `LibraryIndexer`
+    /// (che usa `sha256Measured` direttamente, quindi non esercita questa delega) ed era
+    /// l'unica senza test: rimettendo in `sha256(of:)` il corpo pre-commit, senza
+    /// controllo di dimensione, la suite completa restava verde.
+    func testFileWhoseMeasuredSizeDisagreesWithFstat_returnsNil() throws {
+        var fds: [Int32] = [0, 0]
+        try XCTSkipUnless(pipe(&fds) == 0, "pipe() non disponibile")
+        defer { close(fds[0]) }
+
+        let payload = Array("ciao".utf8)
+        let written = payload.withUnsafeBufferPointer { write(fds[1], $0.baseAddress, $0.count) }
+        close(fds[1])   // nessuno scrittore: la lettura vede EOF dopo i 4 byte gia' in coda
+        XCTAssertEqual(written, payload.count)
+
+        let url = URL(fileURLWithPath: "/dev/fd/\(fds[0])")
+        XCTAssertNil(sha256(of: url),
+                     "byte letti e dimensione riportata non coincidono: nessun hash, mai un hash parziale")
+    }
 }

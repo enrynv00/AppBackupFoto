@@ -161,6 +161,82 @@ final class LibraryIndexerTests: XCTestCase {
         XCTAssertEqual(try store.allKeys().count, count)
     }
 
+    // Interruzione con l'indice GIA' POPOLATO. I tre test di cancellazione qui sopra
+    // partono tutti da indice vuoto, quindi l'insieme delle chiavi sparite e' sempre
+    // vuoto e la riga che decide la rimozione non veniva mai raggiunta: rimuovendo il
+    // guard `!cancelled &&` la suite restava verde.
+    //
+    // Effetto reale del buco, misurato il 2026-08-26: indice da 40 entry, Ricostruzione
+    // completa interrotta dopo 4 file -> `store.count()` 40 -> 4, `vanishedKept=0`,
+    // nessun segnale. Sul volume vero sono ~110.000 entry cancellate da un click su
+    // Interrompi. `ignoringStoredHashes: true` isola il caso: scavalca la guardia di
+    // plausibilita', quindi l'unica cosa che impedisce la rimozione e' il fatto che una
+    // scansione interrotta conta come traversata INCOMPLETA.
+    func testCancelDuringFullRebuild_removesNothing() throws {
+        for i in 0..<40 { try makeFile("Foto/f\(i).jpg", contents: "c\(i)") }
+        _ = try indexer.scan(root: root)
+        XCTAssertEqual(try store.count(), 40)
+
+        let idx = indexer!
+        let p = try idx.scan(root: root, batchSize: 4, ignoringStoredHashes: true) { _ in idx.cancel() }
+
+        XCTAssertTrue(p.traversalIncomplete,
+                      "una scansione interrotta dall'utente NON e' una traversata completa")
+        XCTAssertGreaterThan(p.vanishedKept, 0,
+                             "le entry non viste per via dell'interruzione vanno riportate, non rimosse")
+        XCTAssertEqual(try store.count(), 40,
+                       "Interrompi non deve svuotare l'indice: sul volume vero sarebbero ~110.000 entry")
+    }
+
+    // Root che sparisce (qui: rinominata) MENTRE la scansione gira. Deterministico:
+    // `batchSize: 1` fa scattare `onProgress` dopo il primo file, e da li' la root non
+    // esiste piu' al percorso da cui si era partiti. Non monta niente, non dipende dal
+    // timing — la nota che diceva "non simulabile in modo deterministico" era sbagliata.
+    //
+    // In questo scenario l'`errorHandler` dell'enumeratore **non viene chiamato**
+    // (misurato: `unreadableItems=0`): i fallimenti di lettura finiscono in
+    // `progress.errors`, che NON concorre a `traversalIncomplete`. Quindi qui il
+    // confronto `st_dev` inizio/fine non e' "la seconda cintura", e' l'**unica**: senza
+    // di lui la scansione dichiarerebbe una traversata completa, ed e' quella
+    // dichiarazione che autorizza la rimozione delle entry non viste e che il Task 6
+    // mostra all'utente. Verificato: togliendo entrambi i controlli `st_dev` questo test
+    // fallisce; togliendone uno solo no, perche' sono ridondanti fra loro (vedi il
+    // commento accanto al codice).
+    //
+    // E' anche l'unico test che asserisce `Progress.volumeVanished`, mai asserito prima.
+    func testRootRenamedDuringScan_isReportedAsIncompleteTraversal() throws {
+        for i in 0..<10 { try makeFile("Foto/f\(i).jpg", contents: "c\(i)") }
+        _ = try indexer.scan(root: root)
+        XCTAssertEqual(try store.count(), 10)
+
+        let moved = tempDir.appendingPathComponent("SSD-scollegato")
+        let original = root!
+        var renamed = false
+        let p = try indexer.scan(root: root, batchSize: 1, ignoringStoredHashes: true) { _ in
+            guard !renamed else { return }
+            renamed = true
+            try? FileManager.default.moveItem(at: original, to: moved)
+        }
+
+        XCTAssertTrue(renamed, "la rinomina deve essere avvenuta durante la scansione")
+        XCTAssertEqual(p.unreadableItems, 0,
+                       "qui l'errorHandler NON viene chiamato: e' il motivo per cui st_dev e' l'unica difesa")
+        XCTAssertTrue(p.volumeVanished, "la root non e' piu' quella di partenza: va rilevato")
+        XCTAssertTrue(p.traversalIncomplete)
+        XCTAssertEqual(try store.count(), 10,
+                       "traversata troncata: nessuna rimozione, nemmeno in Ricostruzione completa")
+        XCTAssertEqual(p.vanishedKept, 9, "le 9 entry non viste vanno riportate, non rimosse")
+        // Misura completa, con e senza il fix (2026-08-26). Con `st_dev`:
+        // `scanned=1 errors=0 unreadableItems=0 traversalIncomplete=true volumeVanished=true
+        //  vanishedKept=9` — la scansione si ferma al primo controllo del batch e dice la
+        // verita'. Togliendo ENTRAMBI i controlli `st_dev`:
+        // `scanned=10 errors=9 unreadableItems=0 traversalIncomplete=FALSE vanishedKept=0`,
+        // cioe' 9 file su 10 illeggibili e la scansione che dichiara comunque una
+        // traversata completa. Li' l'indice non si svuota solo perche' le chiavi entrano
+        // in `seenKeys` prima del tentativo di lettura: basterebbe che uno di quei file
+        // fosse davvero sparito per rimuoverlo sulla base di una traversata mai finita.
+    }
+
     // Guardia di plausibilita' (Q3). Una scansione che vede sparire piu' della meta'
     // dell'indice e' quasi sempre un'interruzione non riconosciuta: nel dubbio si
     // tiene l'indice, perche' svuotarlo costa una ricostruzione da 5-15 minuti e
@@ -270,11 +346,14 @@ final class LibraryIndexerTests: XCTestCase {
 
     // Root assente all'INIZIO (SSD scollegato prima di partire): le entry gia'
     // indicizzate non vanno scambiate per file cancellati.
-    // NB: questo test NON copre lo scollegamento a meta' scansione — la root sparisce
-    // prima che `scan` cominci, quindi scatta la `guard` in cima. Il caso "a meta'"
-    // e' coperto dal controllo dopo il ciclo piu' dalla guardia di plausibilita'
-    // (`testMassiveDisappearance_keepsIndex`), perche' non e' simulabile in modo
-    // deterministico da un test: dipende da quando l'enumeratore smette di produrre.
+    // NB: questo test NON copre la sparizione a meta' scansione — la root sparisce prima
+    // che `scan` cominci, quindi scatta la `guard` in cima. Il caso "a meta'" e' coperto
+    // da `testRootRenamedDuringScan_removesNothing`.
+    //
+    // CORREZIONE (2026-08-26): qui c'era scritto che quel caso "non e' simulabile in modo
+    // deterministico da un test". Era falso, e ha lasciato scoperto per un giro intero il
+    // controllo su `st_dev`: rinominare la root da dentro `onProgress` con `batchSize: 1`
+    // lo riproduce senza montare niente e senza dipendere da nessun timing.
     func testRootAbsentAtStart_doesNotWipeIndex() throws {
         for i in 0..<10 { try makeFile("Foto/f\(i).jpg", contents: "c\(i)") }
         _ = try indexer.scan(root: root)

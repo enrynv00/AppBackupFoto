@@ -1384,7 +1384,7 @@ Expected: `Executed 19 tests, with 0 failures` (reale: **20** — vedi la nota i
 
 - [x] **Step 6: Build, suite completa, commit**
 
-Expected suite: **247 test** (228 + 19). Reale: **248** (228 + 20), per il test di regressione aggiunto sul calcolo del percorso relativo — vedi la nota in fondo al task. **Dopo la review il totale reale e' 257** (9 test nuovi, vedi la "Nota post-review (2026-08-26)" in fondo al task): e' questa la baseline per i task successivi. La baseline di partenza e' 228, non 216: vedi la nota post-review in fondo al Task 3.
+Expected suite: **247 test** (228 + 19). Reale: **248** (228 + 20), per il test di regressione aggiunto sul calcolo del percorso relativo — vedi la nota in fondo al task. **Dopo la review il totale reale e' 257** (9 test nuovi, vedi la "Nota post-review (2026-08-26)" in fondo al task), e **dopo il secondo giro di review e' 265** (altri 8 test, vedi la "Seconda nota post-review (2026-08-26)"): e' **265** la baseline per i task successivi. La baseline di partenza e' 228, non 216: vedi la nota post-review in fondo al Task 3.
 
 ```bash
 git add AppBackupFoto/ContentView.swift AppBackupFotoTests/LibraryIndexerTests.swift AppBackupFoto.xcodeproj/project.pbxproj
@@ -1596,6 +1596,132 @@ I due sopravvissuti, e perché non si è scritto un test:
   hashando. È una corsa, e un test basato su una corsa è verde col bug ogni volta che la corsa va
   nell'altro verso — l'errore che questo progetto ha già pagato quattro volte. Protetto da un
   commento accanto al codice, non da un test.
+
+#### Seconda nota post-review (2026-08-26) — sei rilievi sul commit `a290d93`, e due frasi della nota precedente erano false
+
+Code Reviewer e Security Auditor hanno esaminato **il commit `a290d93`** (quello che chiude la
+nota qui sopra) e hanno trovato sei rilievi, tutti **misurati** dai due revisori in modo
+indipendente. Il Task 5 non era ancora iniziato: questi sono chiusi prima.
+
+**1. (BLOCCANTE) Una copia non verificata veniva contata fra quelle verificate.** In
+`FileSyncer.syncFile` il ramo era
+`if let srcHash = ..., let dstHash = ..., srcHash != dstHash { hashErrors } else { copied }`:
+il caso `nil` — uno dei due hash non calcolabile — cadeva nell'`else` insieme agli hash uguali.
+Il ramo era gia' cosi' prima, ma `a290d93` ha **allargato** i casi in cui `sha256` restituisce
+`nil` (file che cresce o si tronca durante la lettura), convertendo un allarme corretto in un
+silenzio. Misurato end-to-end col vero `FileSyncer`, sorgente da 200MB che cresce durante la
+verifica post-copia, 3 run su 3: con `a290d93` `copied=1 hashErrors=0` (src 259MB, dst 210MB,
+hash diversi); con la `sha256` pre-commit `copied=0 hashErrors=1` e "⚠️ HASH MISMATCH". Nessun
+falso positivo introdotto dall'allargamento: 0 `nil` su file stabili (200 letture), 0 su 210
+copie APFS→exFAT, 0 su file vuoti/sparse/symlink. Scenario reale: backup automatico Mac→SSD che
+parte al collegamento dell'SSD mentre Foto sta ancora scrivendo un original — il job si chiude
+"tutto ok" e, per la regola zero-overwrite, quel file parziale sull'SSD **non verra' mai
+ricopiato** (le sync successive lo contano `changedSkipped`). Vale anche per il ripristino,
+perche' `RestoreEngine` usa lo stesso `FileSyncer`.
+
+**DECISIONE DI PRODOTTO (Enrico, 2026-08-26): contatore separato**, non riuso di `hashErrors` —
+sovrastimare le corruzioni insegnerebbe all'utente a ignorare quell'allarme. Implementato lungo
+la catena `FileSyncer.SyncResult.copiedUnverified` → `JobStats.copiedUnverified` →
+`CompletionSheet` (riga condizionale, visibile solo se > 0, stesso stile di `changedSkipped`:
+"Copiati ma non verificati: N — il controllo di integrita' non ha potuto concludersi"). I tre
+esiti ora sono distinti e nessuno di loro finisce fra i `copied`.
+
+**Corretto anche il commento aggiunto da `a290d93` accanto a `sha256(of:)`**, che affermava che
+"a valle `nil` e' gia' trattato ovunque come 'errore, non fidarsi'": verificato call site per
+call site, era vero per 4 dei 5 chiamanti e **falso proprio per `syncFile`**, l'unico ad alto
+danno.
+
+**2+3. (MEDIA) `traversalIncomplete` mentiva dopo una cancellazione, e il guard `!cancelled`
+non era coperto.** `traversalIncomplete` non includeva `cancelled`: misurato, scan interrotta
+dopo il primo batch → `scanned=4 traversalIncomplete=false vanishedKept=36`, cioe' il Task 6
+avrebbe letto "traversata completa" dopo un Interrompi. E il guard `!cancelled &&` sulla
+rimozione non era esercitato da **nessun** test (rimuovendolo la suite restava verde), perche' i
+tre test di cancellazione partono tutti da indice **vuoto**: l'insieme delle chiavi sparite e'
+sempre vuoto e quella riga non viene mai raggiunta. Effetto reale del buco: indice da 40 entry,
+Ricostruzione completa interrotta dopo 4 file → `store.count()` 40 → **4**, `vanishedKept=0`,
+nessun segnale; sul volume vero sono ~110.000 entry cancellate da un click su Interrompi, e
+`ignoringStoredHashes` scavalca la guardia di plausibilita' quindi non c'e' rete. Fix: `||
+cancelled` dentro `traversalIncomplete` e `!cancelled &&` tolto dalla condizione di rimozione,
+dove ora sarebbe ridondante. Nuovo test `testCancelDuringFullRebuild_removesNothing`, che parte
+da un indice popolato: col `|| cancelled` rimosso riproduce esattamente la misura del reviewer
+(40 → 4).
+
+**4. (MEDIA) L'allargamento di `sha256(of:)` non aveva alcuna copertura.** Rimettendo il corpo
+pre-commit (senza controllo di dimensione) la **suite completa restava verde**: `LibraryIndexer`
+usa `sha256Measured` direttamente, quindi il test sulla lettura troncata non copre la delega.
+L'unica parte del commit che usciva dai confini del componente era anche l'unica senza test.
+Aggiunto `Sha256Tests.testFileWhoseMeasuredSizeDisagreesWithFstat_returnsNil`, deterministico e
+senza corse fra thread: legge un descrittore di pipe (`/dev/fd/N`), dove `st_size` e' il numero
+di byte ancora in coda e passa da 4 a 0 leggendoli — al livello delle syscall e' la stessa firma
+di un file troncato durante la lettura. Col corpo pre-commit rimesso, e' l'unico test della
+suite che fallisce (1 fallimento su 265).
+
+**5. (MEDIA) `st_dev` E' testabile in modo deterministico — la motivazione della nota precedente
+era troppo forte.** La nota qui sopra classificava il mutante "confronto `st_dev` rimosso" come
+sopravvissuto e non testabile ("servirebbe un test che monta e smonta un'immagine disco"). Falso:
+basta **rinominare la root da dentro `onProgress` con `batchSize: 1`**. Nessun mount, nessun
+timing. Test aggiunto
+(`testRootRenamedDuringScan_isReportedAsIncompleteTraversal`), che e' anche l'unico ad
+asserire `Progress.volumeVanished`, mai asserito prima. Corretto anche il commento nel file di
+test che dichiarava il caso "non simulabile in modo deterministico".
+
+Due precisazioni che la misura ha imposto, **entrambe correzioni di quanto scritto sopra**:
+
+- In quello scenario l'`errorHandler` **non viene chiamato** (`unreadableItems=0`). La nota
+  precedente diceva che `st_dev` e' "la seconda cintura" e che il caso e' comunque coperto in
+  modo deterministico dall'`errorHandler`: li' `st_dev` e' l'**unica** difesa. Misura completa
+  col fix: `scanned=1 errors=0 unreadableItems=0 traversalIncomplete=true volumeVanished=true
+  vanishedKept=9`. Togliendo **entrambi** i controlli `st_dev`:
+  `scanned=10 errors=9 unreadableItems=0 traversalIncomplete=FALSE vanishedKept=0` — 9 file su 10
+  illeggibili e la scansione che dichiara comunque una traversata completa (l'indice non si
+  svuota solo perche' le chiavi entrano in `seenKeys` prima del tentativo di lettura).
+- Il terzo controllo `st_dev`, quello dentro il flush del batch, e' **ridondante** con quello
+  dopo il ciclo: si coprono a vicenda, ed e' per questo che nessuno dei due muore da solo
+  (verificato: tolti uno alla volta la suite resta verde, tolti insieme il test fallisce). Non e'
+  un mutante sopravvissuto misterioso, ed e' scritto accanto al codice.
+
+**6. (BASSA) Etichetta sbagliata in `ReviewEngine`.** Nel campione d'integrita', un `sha256` che
+restituisce `nil` su un file che **esiste** veniva contato come `skippedNoSource`, cioe'
+riportato come "sorgente mancante". Preesistente al commit, ma piu' raggiungibile dopo
+l'allargamento dei casi di `nil`. Ora c'e' un contatore distinto
+(`IntegrityCheckResult.skippedUnreadable`). **Non coperto da test**: e' su `sampleS3Pair`, che
+richiede rete e credenziali reali — `sampleLocalPair`, l'unico ramo unit-testabile, usa
+`skippedNoSource` in modo corretto (file davvero assente) ed e' gia' testato.
+
+**Test: da 29 a 31** in `LibraryIndexerTests`, +1 in `Sha256Tests`, +5 nel nuovo
+`FileSyncerHashVerificationTests`; suite completa **265 test, 0 failure** (era 257).
+
+**Perche' l'hash della verifica post-copia e' iniettabile in `FileSyncer`.** I tre esiti
+(verificato / mismatch / non verificabile) non sono producibili su file veri senza una corsa fra
+la copia e la verifica, e un test basato su una corsa e' verde col bug ogni volta che la corsa va
+nell'altro verso — l'errore che questo progetto ha gia' pagato piu' volte. `FileSyncer.init`
+prende quindi un parametro `hashFunction` con **default la vera `sha256(of:)`**: in produzione
+non cambia niente (nessun call site passa il parametro), e il primo test del file nuovo usa
+proprio il default su file reali.
+
+**Mutation testing di questo giro (8 mutanti, uno alla volta, bug rimesso → eseguito →
+ripristinato):**
+
+| Mutante | Esito |
+| :---- | :---- |
+| ramo di verifica post-copia rimesso com'era (`nil` → `copied`) | **ucciso** — 3 test (`testUnverifiableSourceHash…`, `…DestinationHash…`, `testThreeOutcomesInOneJob…`) |
+| `copiedUnverified` contato dentro `hashErrors` | **ucciso** — gli stessi 3 test |
+| `\|\| cancelled` rimosso da `traversalIncomplete` | **ucciso** — `testCancelDuringFullRebuild_removesNothing` (riproduce 40 → 4) |
+| corpo pre-commit di `sha256(of:)`, senza controllo di dimensione | **ucciso** — solo `testFileWhoseMeasuredSizeDisagreesWithFstat_returnsNil`, 1 fallimento su 265 |
+| **entrambi** i controlli `st_dev` rimossi | **ucciso** — `testRootRenamedDuringScan_isReportedAsIncompleteTraversal` |
+| solo il controllo `st_dev` dopo il ciclo | **sopravvissuto, ridondante** — l'altro copre |
+| solo il controllo `st_dev` dentro il flush del batch | **sopravvissuto, ridondante** — l'altro copre; si perde l'uscita anticipata, non la correttezza |
+| `!cancelled &&` rimesso nella condizione di rimozione | **sopravvissuto, ridondante** per costruzione — e' la prova che toglierlo non cambia comportamento |
+
+Non coperti da test, dichiarati: la riga di `CompletionSheet` e le due assegnazioni di
+`JobStats.copiedUnverified` in `BackupRunner` (UI/wiring, come per `changedSkipped` e
+`hashErrors`), e il contatore `skippedUnreadable` di `sampleS3Pair` (richiede rete).
+
+**Non fatto, di proposito**: `copiedUnverified` **non** e' stato aggiunto a `JobSummary`
+(il riepilogo persistito dell'ultimo job) ne' a `JobSummary.isClean`. La richiesta era la catena
+`SyncResult → JobStats → CompletionSheet`; aggiungere un campo al modello persistito e decidere
+se una copia non verificata renda "non pulito" un job e' una decisione di prodotto separata, non
+presa da nessuno.
 
 ### Task 5: Dedup in `FileSyncer.sync` e in `runImport`
 
@@ -1833,7 +1959,7 @@ Scrivi 4 e 5 **prima** di collegare il predicato in `runImport` e guardali falli
 xcodebuild -project AppBackupFoto.xcodeproj -scheme AppBackupFoto -configuration Debug build 2>&1 | tail -10
 xcodebuild -project AppBackupFoto.xcodeproj -scheme AppBackupFoto -destination 'platform=macOS' test 2>&1 | tail -15
 ```
-Expected: `** BUILD SUCCEEDED **`, **262 test** (257 + 5; la baseline non e' piu' 247 ne' 248 — vedi la nota post-review in fondo al Task 4). Il resto del task è wiring su percorsi con I/O reale, come `runMacToSSD` e gli altri job che non hanno XCTest diretti; il criterio lì è **nessuna regressione**: in particolare `FileSyncerZeroOverwriteTests` e `FileSyncerChangedSkippedTests` devono restare verdi, a prova che i default no-op non hanno alterato i flussi esistenti.
+Expected: `** BUILD SUCCEEDED **`, **270 test** (265 + 5; la baseline non e' piu' 247 ne' 248 ne' 257 — vedi le due note post-review in fondo al Task 4). Il resto del task è wiring su percorsi con I/O reale, come `runMacToSSD` e gli altri job che non hanno XCTest diretti; il criterio lì è **nessuna regressione**: in particolare `FileSyncerZeroOverwriteTests` e `FileSyncerChangedSkippedTests` devono restare verdi, a prova che i default no-op non hanno alterato i flussi esistenti.
 
 - [ ] **Step 8: Commit**
 
@@ -1922,6 +2048,26 @@ Senza questa riga la guardia di plausibilita' scatta in silenzio, e dopo una rio
 
 Se `indexProgress?.rebasedByTimezone ?? 0 > 0`, basta invece una riga informativa neutra ("N file riallineati dopo un cambio di fuso orario"): non e' un problema, e' la regola DST che fa il suo lavoro. Prima di avviare una costruzione completa, mostra un `SimpleAlert` di conferma che spieghi che l'operazione legge per intero ogni foto e video dell'SSD e può richiedere diversi minuti.
 
+- [ ] **Step 2-bis: Comando esplicito "Elimina indice e ricostruisci" (obbligatorio)**
+
+Nella stessa card, un terzo bottone distruttivo — **solo sull'indice, mai sulle foto** — che
+cancella il file SQLite dell'indice e riparte da zero, dietro `SimpleAlert` di conferma.
+
+Non e' una comodita': e' l'unica via d'uscita dalla regola "traversata incompleta ⇒ nessuna
+rimozione". Con quella regola (piu' la regola "zero file visti non autorizza rimozioni"), se
+l'utente cancellasse **davvero** tutte le foto le entry fantasma resterebbero per sempre, e la
+Ricostruzione completa **di proposito** non le rimuove: `ignoringStoredHashes` scavalca solo la
+guardia di plausibilita', mai la traversata incompleta. Oggi l'unica uscita e' cancellare il
+file dell'indice a mano dal Finder — cioe' un escape hatch che dall'app non esiste. Il prezzo
+del verso sicuro scelto (tenere di piu', mai togliere di piu') va pagato con un comando
+esplicito, non con un vicolo cieco.
+
+Requisiti minimi: conferma esplicita che spieghi in linguaggio comune cosa viene cancellato
+(l'indice, non le foto) e che la ricostruzione richiede diversi minuti; il comando deve essere
+disabilitato mentre una scansione e' in corso; dopo la cancellazione la card deve tornare allo
+stato "indice assente" (nessuna costruzione automatica: la prima costruzione resta manuale,
+Step 4).
+
 - [ ] **Step 3: Toggle in `SettingsSheet`**
 
 Accanto al toggle del backup automatico:
@@ -1936,7 +2082,7 @@ In `ContentView`, accanto all'`.onChange(of: volumes.ssdMounted)` già esistente
 
 - [ ] **Step 5: Build, suite completa, verifica manuale**
 
-Expected: `** BUILD SUCCEEDED **`, 262 test invariati.
+Expected: `** BUILD SUCCEEDED **`, 270 test invariati (piu' quelli che il comando "elimina indice e ricostruisci" dello Step 2-bis si porta dietro).
 
 Verifica manuale (richiede SSD collegato, quindi **a carico di Enrico**): aprire Diagnostica, vedere la card, avviare la costruzione, verificare che il progresso avanzi, interromperla e verificare che l'indice resti utilizzabile, riavviarla e verificare che riprenda senza rihashare ciò che era già stato fatto.
 

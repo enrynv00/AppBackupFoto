@@ -1326,6 +1326,7 @@ struct JobStats {
     var speed: String = "—"
     var verifiedOk: Int = 0   // file copiati con SHA256 verificato con successo
     var hashErrors: Int = 0   // file con SHA256 mismatch dopo la copia
+    var copiedUnverified: Int = 0   // file copiati la cui verifica SHA256 non ha potuto concludersi (vedi FileSyncer.SyncResult)
     var changedSkipped: Int = 0   // file esistente ma diverso dalla sorgente, skippato per zero-overwrite (roadmap #13)
 }
 
@@ -2213,8 +2214,15 @@ final class LibraryIndexer {
     /// | `URLResourceValues.volumeIdentifier` | invariato, Foundation lo serve dalla cache dell'URL |
     /// | `st_dev` inizio vs fine | **cambia** (16777237 -> 16777230), oppure `stat` fallisce |
     ///
-    /// Non e' comunque il rilevatore principale: quello e' l'`errorHandler`
-    /// dell'enumeratore, che non dipende da nessun timing.
+    /// Per lo scollegamento di un volume esterno il rilevatore principale resta
+    /// l'`errorHandler` dell'enumeratore, che non dipende da nessun timing. Ma NON e'
+    /// una seconda cintura sempre e comunque: se la root sparisce o viene rinominata
+    /// mentre la scansione gira, l'`errorHandler` **non viene chiamato affatto**
+    /// (misurato il 2026-08-26 — i fallimenti finiscono in `progress.errors`, che non
+    /// concorre a `traversalIncomplete`). In quello scenario questo controllo e'
+    /// l'**unico** che impedisce di scambiare la traversata troncata per completa e di
+    /// rimuovere le entry non viste. E' il caso coperto da
+    /// `testRootRenamedDuringScan_...`.
     private func deviceIdentifier(of url: URL) -> dev_t? {
         var info = stat()
         guard stat(url.path, &info) == 0 else { return nil }
@@ -2340,6 +2348,15 @@ final class LibraryIndexer {
             // pulito invece di produrre errori per 100.000 file. Uscita ANTICIPATA
             // opportunistica: la garanzia vera sta nell'`errorHandler` e nel controllo
             // dopo il ciclo, perche' questo gira solo quando un batch si riempie.
+            //
+            // Nota sul mutation testing, per non farlo sembrare un mutante misterioso:
+            // questo controllo e quello dopo il ciclo sono **ridondanti fra loro** —
+            // tolto uno, l'altro rileva comunque il volume sparito e imposta
+            // `volumeVanished`. Per questo nessuno dei due muore da solo; muoiono
+            // insieme (verificato: togliendoli entrambi,
+            // `testRootRenamedDuringScan_...` fallisce). Quello che si perde
+            // togliendo solo questo e' l'uscita anticipata, cioe' il tempo, non la
+            // correttezza.
             if deviceIdentifier(of: root) != deviceAtStart { volumeVanished = true }
         }
 
@@ -2503,9 +2520,14 @@ final class LibraryIndexer {
         //    "libreria vuota". Misurato con una root che l'enumeratore non riesce a
         //    percorrere: `scanned=0`, nessun errore, indice azzerato (1 -> 0).
         //    Il prezzo: se l'utente cancella DAVVERO tutte le foto, le entry fantasma
-        //    restano finche' non si cancella il file dell'indice. E' il verso scelto.
+        //    restano finche' non si cancella il file dell'indice — per questo il Task 6
+        //    deve offrire un comando esplicito "elimina indice e ricostruisci".
+        // 4. L'utente ha interrotto. Una scansione fermata a meta' e' incompleta esattamente
+        //    come le altre tre, e prima non lo diceva: misurato il 2026-08-26, scan interrotta
+        //    dopo il primo batch -> `scanned=4 traversalIncomplete=false vanishedKept=36`.
+        //    Il Task 6 avrebbe letto "traversata completa" dopo un Interrompi.
         let sawNothing = progress.scanned == 0 && !knownKeys.isEmpty
-        progress.traversalIncomplete = failures.count > 0 || volumeVanished || sawNothing
+        progress.traversalIncomplete = failures.count > 0 || volumeVanished || sawNothing || cancelled
 
         let vanished = knownKeys.subtracting(seenKeys)
 
@@ -2525,7 +2547,15 @@ final class LibraryIndexer {
             || vanished.count * 2 <= knownKeys.count
 
         if !vanished.isEmpty {
-            if !cancelled && !progress.traversalIncomplete && plausible {
+            // `!cancelled` NON compare piu' qui: e' gia' dentro `traversalIncomplete`
+            // (motivo 4 sopra). Come condizione separata era anche l'unico pezzo di
+            // questa riga che nessun test esercitava — i tre test di cancellazione
+            // partono da indice vuoto, quindi `vanished` e' sempre vuoto e la guardia
+            // non veniva mai raggiunta: rimuoverla lasciava la suite verde mentre sul
+            // volume vero un click su Interrompi durante una Ricostruzione completa
+            // cancellava ~110.000 entry (`ignoringStoredHashes` scavalca la guardia di
+            // plausibilita', quindi non c'e' nessuna rete sotto).
+            if !progress.traversalIncomplete && plausible {
                 try store.remove(keys: Array(vanished))
             } else {
                 // NON in silenzio: il Task 6 mostra questo numero all'utente. Vale per
@@ -2632,8 +2662,17 @@ func sha256Measured(of url: URL) -> MeasuredHash? {
 /// Conseguenza voluta del passaggio: un file che **cambia dimensione mentre lo si
 /// legge** ora produce `nil` per tutti i chiamanti (verifica post-copia, campione di
 /// integrita', confronto con S3), non solo per l'indice. E' il verso sicuro — un hash
-/// calcolato su una lettura parziale non deve valere da nessuna parte — e a valle
-/// `nil` e' gia' trattato ovunque come "errore, non fidarsi".
+/// calcolato su una lettura parziale non deve valere da nessuna parte.
+///
+/// ATTENZIONE, e' qui che si e' sbagliato una volta: NON e' vero che a valle `nil` sia
+/// trattato ovunque come "errore, non fidarsi". Verificato call site per call site il
+/// 2026-08-26: e' vero per 4 dei 5 chiamanti di questa funzione
+/// (`ImmichManager.downloadToTemporaryFile`, i due hash di `sampleLocalPair`, i due di
+/// `sampleS3Pair`) ed era **falso proprio per `FileSyncer.syncFile`**, l'unico ad alto
+/// danno: il `nil` cadeva nel ramo `else` del confronto e la copia veniva contata fra
+/// quelle verificate. Corretto (contatore `copiedUnverified`). Prima di allargare
+/// ancora i casi di `nil`, ricontrollare i chiamanti uno per uno invece di fidarsi di
+/// questa frase.
 func sha256(of url: URL) -> String? {
     sha256Measured(of: url)?.hash
 }
@@ -2775,6 +2814,14 @@ final class FileSyncer {
     struct SyncResult {
         var total = 0; var done = 0; var copied = 0; var skipped = 0; var errors = 0
         var hashErrors = 0   // file con SHA256 mismatch dopo la copia
+        /// File copiati che NON e' stato possibile verificare: uno dei due hash e'
+        /// tornato `nil` (file cresciuto o troncato mentre lo leggevamo, errore di
+        /// lettura, volume scollegato). NON e' un mismatch — il file quasi certamente
+        /// sta bene, semplicemente non l'abbiamo potuto confermare — e per questo ha un
+        /// contatore suo: riusare `hashErrors` sovrastimerebbe le corruzioni e con il
+        /// tempo insegnerebbe all'utente a ignorare quell'allarme. Quello che NON puo'
+        /// succedere e' che finisca fra i `copied`, cioe' fra i verificati.
+        var copiedUnverified = 0
         var changedSkipped = 0   // file esistente ma diverso dalla sorgente, skippato per zero-overwrite (roadmap #13)
         var startDate = Date()
         var percent: Int { total > 0 ? min(100, done * 100 / total) : 0 }
@@ -2792,6 +2839,19 @@ final class FileSyncer {
 
     private var cancelled = false
     private let fm = FileManager.default
+
+    /// Funzione di hash usata dalla verifica post-copia. In produzione e' sempre la
+    /// vera `sha256(of:)` (parametro con default): l'iniezione esiste perche' i tre
+    /// esiti della verifica — verificato, mismatch, non verificabile — non sono
+    /// altrimenti producibili da un test senza una corsa fra thread, e un test basato
+    /// su una corsa e' verde col bug ogni volta che la corsa va nell'altro verso.
+    /// Il ramo "non verificabile" era completamente scoperto fino al 2026-08-26.
+    private let hashFunction: (URL) -> String?
+
+    init(hashFunction: @escaping (URL) -> String? = { sha256(of: $0) }) {
+        self.hashFunction = hashFunction
+    }
+
     func cancel() { cancelled = true }
 
     // MARK: - Dry-run preview (solo stat, nessuna copia)
@@ -2962,12 +3022,29 @@ final class FileSyncer {
                     }
                     try fm.copyItem(at: src, to: dst)
                     DispatchQueue.main.async { onStatus("Verifica integrità: \(src.lastPathComponent)") }
-                    if let srcHash = sha256(of: src), let dstHash = sha256(of: dst), srcHash != dstHash {
-                        result.hashErrors += 1   // mismatch SHA256: conteggiato separato da errori I/O
-                        let name = src.lastPathComponent
-                        DispatchQueue.main.async { onStatus("⚠️ HASH MISMATCH: \(name) — copia non integra, controlla il log") }
+                    // Tre esiti distinti, mai due. Il `nil` (file cresciuto o troncato
+                    // mentre lo leggevamo, errore di lettura, volume scollegato) NON e'
+                    // un mismatch e NON e' una verifica riuscita: prima finiva nel ramo
+                    // `else` insieme agli hash uguali, cioe' una copia non verificata
+                    // veniva contata fra quelle verificate. Misurato il 2026-08-26 con
+                    // una sorgente da 200MB che cresce durante la verifica post-copia:
+                    // `copied=1 hashErrors=0` con src 259MB e dst 210MB, hash diversi.
+                    // Per la regola zero-overwrite quel file parziale a destinazione non
+                    // verra' MAI ricopiato (le sync successive lo contano
+                    // `changedSkipped`), quindi il silenzio qui e' definitivo.
+                    let srcHash = hashFunction(src)
+                    let dstHash = hashFunction(dst)
+                    let name = src.lastPathComponent
+                    if let srcHash, let dstHash {
+                        if srcHash == dstHash {
+                            result.copied += 1
+                        } else {
+                            result.hashErrors += 1   // mismatch SHA256: conteggiato separato da errori I/O
+                            DispatchQueue.main.async { onStatus("⚠️ HASH MISMATCH: \(name) — copia non integra, controlla il log") }
+                        }
                     } else {
-                        result.copied += 1
+                        result.copiedUnverified += 1
+                        DispatchQueue.main.async { onStatus("⚠️ Copiato ma non verificato: \(name) — la verifica SHA256 non ha potuto concludersi") }
                     }
                 } catch { result.errors += 1 }
             }
@@ -4916,6 +4993,7 @@ final class BackupRunner: ObservableObject {
                         self.stats.elapsed = FileSyncer.SyncResult.hms(r.elapsedSec)
                         self.stats.hashErrors = r.hashErrors          // mismatch SHA256
                         self.stats.verifiedOk = r.copied              // tutti i copied sono verified ok
+                        self.stats.copiedUnverified = r.copiedUnverified  // copiati ma non verificabili: fuori da copied/verifiedOk
                         self.stats.changedSkipped = r.changedSkipped  // file cambiati, non copiati (roadmap #13)
                     }
                     self.phase = .success("Completato: \(label)")
@@ -4960,6 +5038,7 @@ final class BackupRunner: ObservableObject {
             self.stats.copied = r.copied; self.stats.skipped = r.skipped; self.stats.errors = r.errors
             self.stats.elapsed = FileSyncer.SyncResult.hms(r.elapsedSec)
             self.stats.hashErrors = r.hashErrors          // mismatch SHA256 in tempo reale
+            self.stats.copiedUnverified = r.copiedUnverified  // copiati ma non verificabili, in tempo reale
             self.stats.changedSkipped = r.changedSkipped  // file cambiati, non copiati (roadmap #13)
             self.stats.verifiedOk = r.copied              // tutti i copied sono verified ok
             self.stats.eta = (r.copied > 0 && r.etaSec > 0) ? self.smoothEta(raw: r.etaSec) : "—"
@@ -5078,6 +5157,12 @@ struct IntegrityCheckResult: Identifiable {
     var matched: Int = 0
     var mismatches: [String] = []
     var skippedNoSource: Int = 0
+    /// File che ESISTONO ma di cui non si e' riusciti a calcolare l'hash (lettura
+    /// fallita, file cambiato di dimensione durante la lettura). Contarli come
+    /// `skippedNoSource` — cioe' riportarli come "sorgente mancante" — era
+    /// semplicemente falso, e dal 2026-08-26 il caso e' piu' raggiungibile di prima
+    /// (`sha256(of:)` ora restituisce `nil` anche per un file che si muove sotto di noi).
+    var skippedUnreadable: Int = 0
     var error: String? = nil
 }
 
@@ -5188,7 +5273,9 @@ final class ReviewEngine {
         for key in sample {
             onProgress("Verifica S3: \(key)")
             let localFile = ssdRoot.appendingPathComponent(key)
-            guard let localHash = sha256(of: localFile) else { result.skippedNoSource += 1; continue }
+            // Il file esiste (`candidates` e' gia' filtrato su `fileExists`): se l'hash
+            // non si calcola e' illeggibile o si e' mosso, non "sorgente mancante".
+            guard let localHash = sha256(of: localFile) else { result.skippedUnreadable += 1; continue }
             result.checked += 1
             do {
                 let tempURL = try await s3Syncer.downloadToTemp(key: key, config: config)
@@ -6232,6 +6319,11 @@ struct CompletionSheet: View {
             if stats.hashErrors > 0 {
                 Label("\(stats.hashErrors) hash mismatch — controlla il log",
                       systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption).foregroundStyle(AppColor.warning).multilineTextAlignment(.center)
+            }
+            if stats.copiedUnverified > 0 {
+                Label("Copiati ma non verificati: \(stats.copiedUnverified) — il controllo di integrità non ha potuto concludersi (file in uso durante la copia?)",
+                      systemImage: "questionmark.circle.fill")
                     .font(.caption).foregroundStyle(AppColor.warning).multilineTextAlignment(.center)
             }
             if stats.changedSkipped > 0 {
