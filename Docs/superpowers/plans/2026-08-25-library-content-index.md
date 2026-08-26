@@ -828,7 +828,7 @@ Il codice mostrato nello Step 5 qui sopra è la **prima versione**. Code Reviewe
 `ignoringStoredHashes` è la modalità "verifica completa / ignora mtime" richiesta dalla spec: rihasha tutto senza fidarsi di nulla di memorizzato. Tutti e quattro i tool esaminati dalla ricerca (`rsync --checksum`, `restic --force`, `borg --files-cache=disabled`, `rmlint --xattr-clear`) ne offrono una — è un segnale forte che serva.
 - Consumato da: Task 5 (UI) e Task 6 (dedup).
 
-- [ ] **Step 1: Scrivi il file di test**
+- [x] **Step 1: Scrivi il file di test**
 
 Crea `AppBackupFotoTests/LibraryIndexerTests.swift`:
 
@@ -1108,16 +1108,16 @@ final class LibraryIndexerTests: XCTestCase {
 }
 ```
 
-- [ ] **Step 2: Registra il file di test in `project.pbxproj`**
+- [x] **Step 2: Registra il file di test in `project.pbxproj`**
 
 Stessa procedura, nome `LibraryIndexerTests.swift`, due ID nuovi.
 
-- [ ] **Step 3: Verifica il fallimento atteso**
+- [x] **Step 3: Verifica il fallimento atteso**
 
 Run: `xcodebuild -project AppBackupFoto.xcodeproj -scheme AppBackupFoto -destination 'platform=macOS' test -only-testing:AppBackupFotoTests/LibraryIndexerTests 2>&1 | tail -30`
 Expected: FAIL con `cannot find 'LibraryIndexer' in scope`.
 
-- [ ] **Step 4: Implementa**
+- [x] **Step 4: Implementa**
 
 ```swift
 /// Attraversa la libreria sull'SSD, classifica, hasha e aggiorna l'indice.
@@ -1377,14 +1377,14 @@ final class LibraryIndexer {
 
 **Perche' `volumeVanished` non e' semplicemente `cancelled`.** Sono due fatti diversi con la stessa conseguenza *immediata* (fermarsi) ma conseguenze diverse a valle: dopo una cancellazione dell'utente il disco c'e' ancora e l'indice parziale e' affidabile per cio' che ha visto; dopo uno scollegamento non sappiamo nulla di cio' che non abbiamo visitato. Riunirli e' gia' costato un bug in questo progetto — vedi `isRunning`/`vmPossiblyUp` in `ImmichManager` (`.claude/rules/architecture.md`), dove due segnali fusi in uno hanno prodotto un vicolo cieco nella UI.
 
-- [ ] **Step 5: Verifica che i test passino**
+- [x] **Step 5: Verifica che i test passino**
 
 Run: `xcodebuild -project AppBackupFoto.xcodeproj -scheme AppBackupFoto -destination 'platform=macOS' test -only-testing:AppBackupFotoTests/LibraryIndexerTests 2>&1 | tail -20`
-Expected: `Executed 19 tests, with 0 failures`
+Expected: `Executed 19 tests, with 0 failures` (reale: **20** — vedi la nota in fondo al task)
 
-- [ ] **Step 6: Build, suite completa, commit**
+- [x] **Step 6: Build, suite completa, commit**
 
-Expected suite: **247 test** (228 + 19). La baseline e' 228, non 216: vedi la nota post-review in fondo al Task 3.
+Expected suite: **247 test** (228 + 19). Reale: **248** (228 + 20), per il test di regressione aggiunto sul calcolo del percorso relativo — vedi la nota in fondo al task. La baseline e' 228, non 216: vedi la nota post-review in fondo al Task 3.
 
 ```bash
 git add AppBackupFoto/ContentView.swift AppBackupFotoTests/LibraryIndexerTests.swift AppBackupFoto.xcodeproj/project.pbxproj
@@ -1392,6 +1392,66 @@ git commit -m "Add LibraryIndexer with incremental scan and truncated-read guard
 ```
 
 ---
+
+
+#### Nota di esecuzione (2026-08-26) — un bug reale, due scostamenti, tre mutanti sopravvissuti
+
+**Bug reale trovato dai test, corretto nel codice di produzione (non nei test).** Il
+percorso relativo era calcolato per lunghezza di stringa
+(`url.path.dropFirst(root.path.count)`), ma l'enumeratore restituisce gli URL con i
+symlink risolti: con root `/var/folders/.../SSD` produce `/private/var/...`, otto
+caratteri in piu'. Misurato: le chiavi uscivano come `40CC/SSD/Foto/a.jpg`, coerenti
+dentro la singola scansione (per questo i test che *contano* i file passavano) ma
+irrecuperabili per chiave dalla scansione successiva. Sul volume reale
+(`/Volumes/SSD - Enri`, che non e' un symlink) non si sarebbe visto mai; l'effetto
+sarebbe stato indice apparentemente vuoto, ~120.000 file rihashati e una seconda copia
+di ogni entry a ogni scansione — la stessa classe di problema del rilievo 9 del Task 3.
+Ora il relativo si ricava per **componenti canonicalizzate** su entrambi i lati
+(verificato sulle quattro forme della root: `/var`, `/private/var`, slash finale, `/.`),
+e `testKeysAreRelativeToRootWhateverItsPathForm` lo blinda: e' il ventesimo test.
+
+**Scostamento 1 — mtime dei file di prova.** Il testo dei test creava i file e li
+scansionava nello stesso istante: la regola anti-racy di `indexEntryVerdict`
+(`currentMTime >= hashedAt - 2s`) li rendeva sempre `.needsVerification`, quindi 4 test
+(`testSecondScanReusesStoredHashes`, `testIgnoringStoredHashes_rehashesEverything`,
+`testTimezoneShift_...`, e il ramo `.fresh` in generale) misuravano il caso racy invece
+del riuso incrementale. `makeFile` ora fissa un mtime nel passato (1_700_000_000), che
+e' anche la condizione reale della libreria. Il codice di produzione non e' stato
+toccato: il comportamento anti-racy e' quello voluto dal Task 2.
+
+**Scostamento 2 — thread safety del flag di cancellazione.** `cancel()` arriva dal main
+thread mentre `scan` gira su un thread di lavoro: `cancelled` e' passato da `var` nuda a
+proprieta' protetta da `NSLock` (`volumeVanished` resta senza lock, e' solo del thread di
+scansione). Il resto della classe e' come da piano.
+
+**Mutation testing (9 mutanti, uno alla volta, suite `LibraryIndexerTests` completa):**
+
+| Mutante | Esito |
+| :---- | :---- |
+| `cancelled` non resettato a inizio `scan` | **ucciso** — `testScanAfterCancel_worksAgain`: indice fermo a 2 su 20 |
+| guardia di plausibilita' rimossa (`plausible = true`) | **ucciso** — 3 test |
+| `ignoringStoredHashes` non scavalca la guardia | **ucciso** — `testFullRebuild_bypassesPlausibilityGuard` |
+| ramo `.timezoneShift` disattivato | **ucciso** — `testTimezoneShift_...` |
+| percorso relativo per lunghezza di stringa | **ucciso** — 2 test |
+| controllo root **dopo** il ciclo rimosso | **sopravvissuto** |
+| guardia root **in cima** rimossa | **sopravvissuto** |
+| `?? 0` su dimensione/mtime illeggibili | **sopravvissuto** |
+| difesa sulla lettura troncata rimossa | **sopravvissuto** |
+
+I quattro sopravvissuti hanno tutti la stessa causa: **non esiste un punto di innesto
+durante la scansione di un singolo file**. `onProgress` viene invocato solo quando un
+batch si riempie, e il controllo opportunistico della root gira nello stesso ramo subito
+dopo — quindi un test non puo' far sparire la root *dopo* l'ultimo controllo in-loop e
+*prima* della fine del ciclo, che e' l'unico scenario che distingue i due controlli. Per
+la stessa ragione non e' simulabile un mtime illeggibile su un file regolare, ne' un
+file che cambia dimensione a meta' hashing. Le due guardie sulla root sono inoltre
+**ridondanti fra loro** sui casi testabili: rimuovendone una, l'altra copre.
+Scelta di non forzare la mano: un test basato su timing (rinominare la root da un altro
+thread durante l'hashing di un file da centinaia di MB) sarebbe verde col bug ogni volta
+che la corsa va nell'altro verso — cioe' esattamente il tipo di test che questo progetto
+ha gia' pagato quattro volte. Se si vuole coprire davvero questi quattro casi serve un
+punto di innesto interno (callback per file, o iniezione del `FileManager`): e' una
+scelta di design, non un dettaglio di test, e va decisa esplicitamente.
 
 ### Task 5: Dedup in `FileSyncer.sync` e in `runImport`
 
