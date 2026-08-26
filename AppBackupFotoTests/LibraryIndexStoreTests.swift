@@ -374,4 +374,152 @@ final class LibraryIndexStoreTests: XCTestCase {
         XCTAssertEqual(found.count, 1)
         XCTAssertEqual(found.first?.displayPath, "Foto/buona.jpg")
     }
+
+    // MARK: - Cintura sull'estensione
+
+    private func garbage(_ bytes: Int = 8192) -> Data {
+        var d = Data()
+        for i in 0..<bytes { d.append(UInt8((i * 37 + 11) % 251)) }
+        return d
+    }
+
+    private func permissions(_ path: String) throws -> Int {
+        let attrs = try FileManager.default.attributesOfItem(atPath: path)
+        return try XCTUnwrap(attrs[.posixPermissions] as? NSNumber).intValue
+    }
+
+    // La guardia di posizione da sola non basta. `deleteDatabaseFiles` scatta quando SQLite
+    // risponde `SQLITE_NOTADB` — che e' esattamente cio' che SQLite risponde per QUALUNQUE
+    // file che non sia un database. Se un domani qualcuno passasse alla store il percorso di
+    // un JPEG sotto Application Support, quel JPEG verrebbe cancellato. Qui si lancia e non
+    // si tocca niente.
+    func testFileWithANonSqliteExtension_isNeverDeleted() throws {
+        let jpeg = tempDir.appendingPathComponent("una-foto.jpg")
+        let contents = garbage()
+        try contents.write(to: jpeg)
+
+        XCTAssertThrowsError(try LibraryIndexStore(url: jpeg)) { error in
+            guard case LibraryIndexStore.StoreError.notAnIndexFile = error else {
+                return XCTFail("errore inatteso: \(error)")
+            }
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: jpeg.path),
+                      "un file che non e' un indice non si cancella, mai")
+        XCTAssertEqual(try Data(contentsOf: jpeg), contents, "e non si tocca nemmeno")
+    }
+
+    // MARK: - Permessi 0600
+
+    // Il file dell'indice contiene i percorsi delle foto — dati personali, non cifrati — e
+    // nasce `0644`: leggibile da un altro utente locale dello stesso Mac. SQLite ricrea i
+    // sidecar a ogni checkpoint, quindi i permessi vanno MISURATI dopo un ciclo completo di
+    // apertura/scrittura/chiusura, non dedotti dalla documentazione.
+    func testIndexAndSidecarsAre0600_afterAFullOpenWriteCloseCycle() throws {
+        // Controllo dell'umask: se il processo di test avesse gia' un umask restrittivo, il
+        // test sarebbe verde anche senza il `chmod` e non dimostrerebbe niente.
+        let control = tempDir.appendingPathComponent("controllo.txt")
+        try Data("x".utf8).write(to: control)
+        if try permissions(control.path) == 0o600 {
+            throw XCTSkip("umask gia' restrittiva: il test non distinguerebbe il fix dal default")
+        }
+
+        let dbURL = tempDir.appendingPathComponent("permessi.sqlite")
+        var s: LibraryIndexStore? = try LibraryIndexStore(url: dbURL)
+        try s?.upsert((0..<50).map { entry("Foto/f\($0).jpg", hash: "h\($0)") })
+
+        XCTAssertEqual(try permissions(dbURL.path), 0o600)
+        for side in ["-wal", "-shm"] {
+            let p = dbURL.path + side
+            XCTAssertTrue(FileManager.default.fileExists(atPath: p), "manca \(side): il ciclo non ha scritto")
+            XCTAssertEqual(try permissions(p), 0o600, "permessi larghi su \(side)")
+        }
+
+        // Chiusura: SQLite fa il checkpoint e rimuove i sidecar.
+        s = nil
+
+        // Secondo ciclo: i sidecar vengono RICREATI da SQLite, non da noi. Devono nascere
+        // stretti perche' il database sotto e' stretto.
+        let reopened = try LibraryIndexStore(url: dbURL)
+        try reopened.upsert([entry("Foto/dopo-riapertura.jpg")])
+        XCTAssertEqual(try reopened.count(), 51)
+        XCTAssertEqual(try permissions(dbURL.path), 0o600)
+        for side in ["-wal", "-shm"] where FileManager.default.fileExists(atPath: dbURL.path + side) {
+            XCTAssertEqual(try permissions(dbURL.path + side), 0o600,
+                           "permessi larghi su \(side) ricreato da SQLite")
+        }
+    }
+
+    // MARK: - Elimina indice e ricostruisci
+
+    // L'unica via d'uscita dalla regola "traversata incompleta ⇒ nessuna rimozione": se
+    // l'utente cancellasse davvero tutte le foto, le entry fantasma resterebbero per sempre.
+    func testDeleteIndexAndRecreate_emptiesTheIndexAndLeavesItUsable() throws {
+        try store.upsert([entry("Foto/a.jpg"), entry("Foto/b.jpg", hash: "def")])
+        XCTAssertEqual(try store.count(), 2)
+
+        try store.deleteIndexAndRecreate()
+
+        XCTAssertEqual(try store.count(), 0, "l'indice va azzerato")
+        try store.upsert([entry("Foto/c.jpg")])
+        XCTAssertEqual(try store.count(), 1, "e deve restare scrivibile subito dopo")
+    }
+
+    // Che il file sia stato cancellato davvero — e non solo svuotato con un DELETE — si
+    // misura dall'inode: un file ricreato ha un inode diverso.
+    func testDeleteIndexAndRecreate_reallyRemovesTheFileFromDisk() throws {
+        let dbURL = tempDir.appendingPathComponent("inode.sqlite")
+        let s = try LibraryIndexStore(url: dbURL)
+        try s.upsert([entry("Foto/a.jpg")])
+        let before = try XCTUnwrap(try FileManager.default
+            .attributesOfItem(atPath: dbURL.path)[.systemFileNumber] as? NSNumber).uint64Value
+
+        try s.deleteIndexAndRecreate()
+
+        let after = try XCTUnwrap(try FileManager.default
+            .attributesOfItem(atPath: dbURL.path)[.systemFileNumber] as? NSNumber).uint64Value
+        XCTAssertNotEqual(before, after, "il file dell'indice va cancellato, non svuotato")
+    }
+
+    // Percorsi espliciti, mai wildcard, mai ricorsione su directory: nella stessa cartella
+    // possono starci file di altri componenti dell'app, e questa e' l'unica cancellazione di
+    // file di tutta la classe.
+    func testDeleteIndexAndRecreate_doesNotTouchAnyOtherFileInTheDirectory() throws {
+        let dbURL = tempDir.appendingPathComponent("solo-questo.sqlite")
+        let s = try LibraryIndexStore(url: dbURL)
+        try s.upsert([entry("Foto/a.jpg")])
+
+        // Vicini scelti per essere il piu' possibile "quasi l'indice": stessa estensione,
+        // stesso nome con suffisso, stesso prefisso dei sidecar.
+        let neighbours = ["altro.sqlite", "solo-questo.sqlite.backup", "solo-questo.sqliteX",
+                          "solo-questo.jpg", "note.txt"]
+        for name in neighbours {
+            try Data(name.utf8).write(to: tempDir.appendingPathComponent(name))
+        }
+        let subdir = tempDir.appendingPathComponent("sottocartella", isDirectory: true)
+        try FileManager.default.createDirectory(at: subdir, withIntermediateDirectories: true)
+        try Data("dentro".utf8).write(to: subdir.appendingPathComponent("dentro.sqlite"))
+
+        try s.deleteIndexAndRecreate()
+
+        for name in neighbours {
+            let url = tempDir.appendingPathComponent(name)
+            XCTAssertEqual(try? Data(contentsOf: url), Data(name.utf8),
+                           "\(name) non doveva essere toccato")
+        }
+        XCTAssertEqual(try? Data(contentsOf: subdir.appendingPathComponent("dentro.sqlite")),
+                       Data("dentro".utf8), "niente ricorsione nelle sottocartelle")
+    }
+
+    // Ricostruzione da zero: dopo la cancellazione l'indice riparte vuoto anche se il file
+    // conteneva dati di una libreria che non esiste piu'.
+    func testDeleteIndexAndRecreate_thenReopeningFromScratchSeesAnEmptyIndex() throws {
+        let dbURL = tempDir.appendingPathComponent("ricostruzione.sqlite")
+        let s = try LibraryIndexStore(url: dbURL)
+        try s.upsert([entry("Foto/fantasma.jpg")])
+        try s.deleteIndexAndRecreate()
+
+        let fresh = try LibraryIndexStore(url: dbURL)
+        XCTAssertEqual(try fresh.count(), 0)
+        XCTAssertNil(try fresh.entry(forKey: normalizedIndexKey("Foto/fantasma.jpg")))
+    }
 }

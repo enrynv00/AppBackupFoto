@@ -32,3 +32,13 @@ Il dedup copre anche i doppioni **interni allo stesso import** (spec #31, sezion
 Quegli hash sono più affidabili di quelli dell'indice — li ha calcolati questo stesso processo pochi secondi prima, e li ha verificati contro il file di destinazione. **Non gode comunque di una fiducia diversa**: anche il candidato copiato in sessione viene riletto e rihashato prima di dichiarare il doppione. Non perché il rischio sia concreto, ma perché "quando si salta un file si rilegge, sempre" è una regola che si ricorda; "si rilegge tranne nel caso X" è una regola che qualcuno un giorno applicherà male. Costa una lettura locale, e solo quando un doppione c'è davvero.
 
 La memoria di sessione **non** è una seconda scrittura sullo store: vive in RAM, muore col job, e la persistenza resta a batch post-import come stabilito in ADR-0002.
+
+## Nota (2026-08-26): la fiducia riguarda i media, e il filtro serve in due punti
+
+Questa ADR parla di quanto ci si fida di un hash. C'è una domanda a monte: **di quali file esiste un hash di cui valga la pena parlare**. La risposta è in `IndexableKind`: solo immagini e video partecipano al dedup, e "sbagliare per esclusione è il verso sicuro — quel file non partecipa al dedup e viene copiato, mai saltato".
+
+Il ramo dell'indice persistito la rispettava già, perché `LibraryIndexer.scan` scarta i `.notIndexable` prima di indicizzarli. Il ramo di sessione (la memoria del job corrente, nota precedente) no, e lì la regola si rompeva in modo vistoso: due sidecar da 0 byte con nomi diversi hanno lo stesso SHA256, quindi il secondo veniva dichiarato doppione del primo — e a destinazione arrivava **un solo sidecar, col nome sbagliato** rispetto alla foto rimasta senza.
+
+Il filtro sta ora in due punti, e servono entrambi: in `isAlreadyInLibrary` (lato "salto") e nella closure `onCopied` di `runImport` (lato "ricordo"). Il secondo non è ridondanza: tiene i due rami simmetrici — l'indice persistito non contiene mai non-media, e non deve contenerli nemmeno quello di sessione — mentre il primo chiude il buco per qualunque *altra* via con cui un non-media potesse finire in un indice.
+
+Il filtro non sta in `FileSyncer`, che deve restare ignaro di `IndexableKind`: il dedup è roba dell'import, e il predicato è no-op per Mac→SSD e SSD→HDD.

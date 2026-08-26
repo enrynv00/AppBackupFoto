@@ -77,7 +77,14 @@ final class ImportDedupTests: XCTestCase {
                 BackupRunner.isAlreadyInLibrary(url: url, store: store,
                                                 session: session, libraryRoot: libraryRoot)
             },
-            onCopied: { copied, hash in session.record(hash: hash, at: copied) })
+            onCopied: { copied, hash in
+                // Il filtro `IndexableKind` sta nella closure, non in `FileSyncer`, ed e'
+                // ricopiato qui perche' questa funzione promette di collegare il dedup
+                // "esattamente come lo collega `runImport`": se le due divergono, i test
+                // proteggono un cablaggio che in app non esiste.
+                guard IndexableKind.of(url: copied) != .notIndexable else { return }
+                session.record(hash: hash, at: copied)
+            })
     }
 
     /// L'identita' dei contatori: ogni file esaminato finisce in una e una sola casella.
@@ -370,5 +377,137 @@ final class ImportDedupTests: XCTestCase {
         XCTAssertEqual(result.skipped, 0)
         XCTAssertEqual(result.errors, 1, "il guasto deve restare visibile")
         assertCountersAddUp(result)
+    }
+
+    // MARK: - Solo i media partecipano al dedup
+
+    // Il doc-comment di `IndexableKind` e la spec dicono la stessa cosa: un file non
+    // classificato viene COPIATO, mai saltato. Il ramo dell'indice persistito lo rispettava
+    // gia' (`LibraryIndexer.scan` scarta i `.notIndexable` prima di indicizzarli), il ramo di
+    // sessione no. I sidecar da 0 byte sono il caso deterministico: sono tutti byte-identici,
+    // quindi senza il filtro il secondo e il terzo diventano doppioni del primo e sull'SSD ne
+    // arriva UNO SOLO, col nome sbagliato rispetto alle foto rimaste senza.
+    func testNonMediaSidecars_areAllCopiedNeverDeduplicated() async throws {
+        for n in ["0001", "0002", "0003"] {
+            try writeFile(srcDir.appendingPathComponent("IMG_\(n).JPG"), "foto \(n)")
+            try writeFile(srcDir.appendingPathComponent("IMG_\(n).AAE"), "")   // 0 byte, tutti identici
+        }
+
+        let result = try await runSync(session: ImportSessionIndex())
+
+        XCTAssertEqual(result.duplicatesSkipped, 0, "un sidecar non-media non e' mai un doppione")
+        XCTAssertEqual(result.copied, 6)
+        XCTAssertEqual(result.done, 6)
+        assertCountersAddUp(result)
+        for n in ["0001", "0002", "0003"] {
+            XCTAssertTrue(fm.fileExists(atPath: dstDir.appendingPathComponent("IMG_\(n).AAE").path),
+                          "IMG_\(n).AAE non e' arrivato a destinazione")
+        }
+    }
+
+    // La guardia sta in DUE punti e servono entrambi. Questo prova quello sul lato "salto",
+    // isolato dal filtro su `onCopied`: se l'indice — di sessione o persistito — contenesse
+    // per qualunque ragione un non-media, non dovrebbe comunque poter far saltare un file.
+    // Senza questo test il mutante che toglie la guardia da `isAlreadyInLibrary` sopravvive,
+    // perche' il filtro su `onCopied` gli impedisce di manifestarsi (misurato).
+    func testNonMediaFile_isNeverDeclaredDuplicate_evenIfTheIndexKnowsIt() throws {
+        let alreadyThere = try writeFile(dstDir.appendingPathComponent("IMG_0001.AAE"), "")
+        let incoming = try writeFile(srcDir.appendingPathComponent("IMG_0002.AAE"), "")
+        let session = ImportSessionIndex()
+        session.record(hash: try XCTUnwrap(sha256(of: alreadyThere)), at: alreadyThere)
+
+        XCTAssertFalse(BackupRunner.isAlreadyInLibrary(url: incoming, store: nil,
+                                                       session: session, libraryRoot: nil),
+                       "un non-media non e' mai un doppione, nemmeno se l'indice lo conosce")
+    }
+
+    // L'altra meta' della simmetria: il file non-media non deve nemmeno essere RICORDATO.
+    // L'indice persistito non contiene mai non-media; nemmeno quello di sessione deve.
+    func testNonMediaFile_isNotRecordedInTheSessionIndex() async throws {
+        try writeFile(srcDir.appendingPathComponent("IMG_0001.JPG"), "una foto")
+        try writeFile(srcDir.appendingPathComponent("IMG_0001.AAE"), "")
+
+        let session = ImportSessionIndex()
+        let result = try await runSync(session: session)
+
+        XCTAssertEqual(result.copied, 2)
+        XCTAssertTrue(session.candidates(withSize: 0).isEmpty,
+                      "un sidecar da 0 byte non deve entrare nell'indice di sessione")
+        XCTAssertEqual(session.candidates(withSize: try fileSize(srcDir.appendingPathComponent("IMG_0001.JPG"))).count, 1,
+                       "la foto invece si")
+    }
+
+    // MARK: - Confinamento del candidato dell'indice
+
+    // `libraryRoot.appendingPathComponent(displayPath)` non confina niente: un `displayPath`
+    // relativo con `..` risolve FUORI dalla libreria. Oggi `LibraryIndexer` non produce
+    // percorsi simili, ma il commento di `normalizedIndexKey` si appoggia esplicitamente a
+    // quell'assunzione, e un'assunzione verificata da nulla e' gia' costata tre bug qui.
+    func testIndexCandidateOutsideTheLibraryRoot_isIgnoredAndTheFileIsCopied() async throws {
+        let library = root.appendingPathComponent("library", isDirectory: true)
+        try fm.createDirectory(at: library, withIntermediateDirectories: true)
+        // Fuori dalla libreria, ma raggiungibile da dentro risalendo con `..`.
+        let outside = try writeFile(root.appendingPathComponent("fuori/gia-vista.jpg"), "una foto vera")
+        try writeFile(srcDir.appendingPathComponent("nuova.jpg"), "una foto vera")
+
+        let store = try LibraryIndexStore(url: root.appendingPathComponent("index.sqlite"))
+        try store.upsert([LibraryIndexEntry(path: normalizedIndexKey("../fuori/gia-vista.jpg"),
+                                            displayPath: "../fuori/gia-vista.jpg",
+                                            size: try fileSize(outside),
+                                            mtime: 1_700_000_000,
+                                            hash: try XCTUnwrap(sha256(of: outside)),
+                                            hashedAt: 1_700_003_600)])
+
+        let result = try await runSync(store: store, libraryRoot: library, session: ImportSessionIndex())
+
+        XCTAssertEqual(result.duplicatesSkipped, 0,
+                       "un candidato fuori dalla root non e' un doppione: nel dubbio si copia")
+        XCTAssertEqual(result.copied, 1)
+        assertCountersAddUp(result)
+        XCTAssertTrue(fm.fileExists(atPath: dstDir.appendingPathComponent("nuova.jpg").path))
+    }
+
+    // MARK: - Lato giusto della copia, dimensione illeggibile
+
+    // `onCopied` deve registrare la DESTINAZIONE, non la sorgente. Registrando la sorgente la
+    // rilettura di ADR-0003 finirebbe sul lato sbagliato della copia: si riverificherebbe il
+    // file sulla scheda SD invece della copia in libreria. Il guasto si vede solo se la copia
+    // sparisce dopo la verifica (SSD smontato a metà import): il file identico successivo
+    // verrebbe confrontato con la sorgente, che e' ancora li' e ancora identica, e saltato —
+    // zero copie sull'SSD invece di due.
+    func testCandidateIsTheCopyNotTheSource_soALostCopyIsRecopied() async throws {
+        try writeFile(srcDir.appendingPathComponent("A/uno.jpg"), "contenuto identico")
+        try writeFile(srcDir.appendingPathComponent("B/due.jpg"), "contenuto identico")
+
+        let session = ImportSessionIndex()
+        let syncer = FileSyncer()
+        let firstCopy = dstDir.appendingPathComponent("A/uno.jpg")
+        let result = try await syncer.sync(from: srcDir, to: dstDir, deep: false,
+            onStatus: { _ in },
+            onProgress: { _ in },
+            onCurrentFile: { _ in },
+            isDuplicate: { url in
+                // La prima copia sparisce prima che il secondo file venga esaminato: il
+                // candidato registrato non esiste piu' sul disco.
+                try? self.fm.removeItem(at: firstCopy)
+                return BackupRunner.isAlreadyInLibrary(url: url, store: nil,
+                                                       session: session, libraryRoot: nil)
+            },
+            onCopied: { copied, hash in session.record(hash: hash, at: copied) })
+
+        XCTAssertEqual(result.duplicatesSkipped, 0,
+                       "il candidato e' la copia, non la sorgente: se la copia non c'e' piu' non e' un doppione")
+        XCTAssertEqual(result.copied, 2)
+        assertCountersAddUp(result)
+        XCTAssertTrue(fm.fileExists(atPath: dstDir.appendingPathComponent("B/due.jpg").path))
+    }
+
+    // Gemello di `testUnreadableSourceFile_isNeverDeclaredDuplicate`, un guard piu' su:
+    // "dimensione illeggibile" non puo' voler dire "e' un doppione". Nessun dato mancante
+    // autorizza a saltare una foto.
+    func testUnreadableSizeIsNeverDeclaredDuplicate() throws {
+        let missing = srcDir.appendingPathComponent("sparito.jpg")   // non esiste: nessuna dimensione
+        XCTAssertFalse(BackupRunner.isAlreadyInLibrary(url: missing, store: nil,
+                                                       session: ImportSessionIndex(), libraryRoot: nil))
     }
 }

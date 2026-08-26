@@ -1541,7 +1541,11 @@ enum LibraryExclusions {
 /// caso di un file sparito fra l'enumerazione e la lettura. Innocuo, perche'
 /// l'enumeratore restituisce gia' URL in forma `realpath` (misurato: con root
 /// `/var/folders/.../SSD` produce `/private/var/...`).
-func realResolvedPath(_ url: URL) -> String {
+// `nonisolated`: e' pura (una `realpath`) e viene chiamata anche dalla coda di lavoro di
+// `FileSyncer`, non solo dal MainActor. Senza, il default `SWIFT_DEFAULT_ACTOR_ISOLATION =
+// MainActor` la isola e ogni chiamata da un contesto nonisolated e' un warning (un errore in
+// Swift 6).
+nonisolated func realResolvedPath(_ url: URL) -> String {
     var buf = [Int8](repeating: 0, count: Int(PATH_MAX))
     guard let r = realpath(url.path, &buf) else { return url.path }
     return String(cString: r)
@@ -1554,6 +1558,21 @@ func realResolvedPath(_ url: URL) -> String {
 /// rispetto alla lettura del file che segue.
 func canonicalPathComponents(of url: URL) -> [String] {
     realResolvedPath(url).split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+}
+
+/// Percorso di `path` relativo a `rootComponents`, o `nil` se non ci sta sotto.
+///
+/// Il confronto e' **per componenti**, mai con `hasPrefix` su stringhe: `/Volumes/SSD` non e'
+/// un prefisso di `/Volumes/SSD 2`, ma lo e' testualmente — stessa regola documentata su
+/// `canonicalPathComponents`. Non usa `realpath`, cosi' funziona anche su un percorso di un
+/// file che nel frattempo e' sparito; e' compito del chiamante passare le radici gia'
+/// canonicalizzate se gli servono.
+nonisolated func relativePath(of path: String, under rootComponents: [String]) -> String? {
+    let comps = URL(fileURLWithPath: path).standardizedFileURL.path
+        .split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+    guard comps.count > rootComponents.count,
+          Array(comps.prefix(rootComponents.count)) == rootComponents else { return nil }
+    return comps.dropFirst(rootComponents.count).joined(separator: "/")
 }
 
 enum FileKind {
@@ -1571,7 +1590,11 @@ enum FileKind {
 /// Sostituisce una lista di cartelle da escludere scritta a mano: la cartella "Zip"
 /// resta fuori dall'indice perche' un archivio non e' ne' immagine ne' video, non
 /// perche' si chiama cosi' — cosi' la regola regge anche per sorgenti future.
-enum IndexableKind {
+// `nonisolated` sul tipo: e' una classificazione pura per estensione, senza stato e senza
+// UI, e serve sia al MainActor sia alla coda di lavoro di `FileSyncer` (la guardia in
+// `isAlreadyInLibrary`). Isolarla al MainActor renderebbe un warning — un errore in Swift 6 —
+// anche il solo confronto `!=`, che passa dalla conformance a `Equatable`.
+nonisolated enum IndexableKind {
     case image
     case video
     case notIndexable
@@ -1755,12 +1778,14 @@ final class LibraryIndexStore {
         case cannotOpen(String)
         case sqlFailed(String, code: Int32)
         case invalidLocation(String)
+        case notAnIndexFile(String)
 
         var errorDescription: String? {
             switch self {
             case .cannotOpen(let m): return "Impossibile aprire l'indice: \(m)"
             case .sqlFailed(let m, _): return "Errore nell'indice: \(m)"
             case .invalidLocation(let p): return "Posizione non ammessa per l'indice: \(p)"
+            case .notAnIndexFile(let p): return "Non e' un file di indice: \(p)"
             }
         }
 
@@ -1775,8 +1800,13 @@ final class LibraryIndexStore {
 
     private var db: OpaquePointer?
     private let queue = DispatchQueue(label: "AppBackupFoto.LibraryIndexStore")
+    /// Il file su cui questa connessione e' aperta. Serve a `deleteIndexAndRecreate()`:
+    /// senza, il chiamante dovrebbe ripassare un percorso, e un percorso che arriva da
+    /// fuori e' esattamente quello che non vogliamo davanti a una `removeItem`.
+    private let url: URL
 
     init(url: URL) throws {
+        self.url = url
         try Self.validateLocation(url)
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
                                                 withIntermediateDirectories: true)
@@ -1842,10 +1872,72 @@ final class LibraryIndexStore {
         return p.hasPrefix(r)
     }
 
+    /// L'unica cancellazione di file di tutta la classe. Tre cinture, tutte necessarie:
+    ///
+    /// 1. **Posizione**: si riusa la stessa allow-list di `init` (`validateLocation`), non se
+    ///    ne scrive una seconda — due guardie diverse per lo stesso problema divergono alla
+    ///    prima modifica di una sola delle due.
+    /// 2. **Estensione**: solo `.sqlite`. La guardia di posizione da sola non basta. Chi
+    ///    chiama questa funzione lo fa perche' SQLite ha risposto `SQLITE_NOTADB`, e
+    ///    `SQLITE_NOTADB` e' esattamente cio' che SQLite risponde per **qualunque** file che
+    ///    non sia un database: un JPEG sotto Application Support verrebbe cancellato. Qui non
+    ///    si cancella, si lancia.
+    /// 3. **Percorsi espliciti**: tre path costruiti a mano, mai un wildcard, mai una
+    ///    ricorsione su directory. Se un giorno servisse cancellare altro, va scritto a mano
+    ///    anche quello.
     private static func deleteDatabaseFiles(at url: URL) throws {
+        try validateLocation(url)
+        guard url.pathExtension.lowercased() == "sqlite" else {
+            throw StoreError.notAnIndexFile(url.path)
+        }
         let fm = FileManager.default
         for path in [url.path, url.path + "-wal", url.path + "-shm"] where fm.fileExists(atPath: path) {
             try fm.removeItem(atPath: path)
+        }
+    }
+
+    /// Permessi `0600` su indice e sidecar. Il file contiene i **percorsi delle foto**
+    /// dell'utente — non credenziali, ma dati personali — e non e' cifrato. Application
+    /// Support e' gia' protetta dai permessi della home, ma il file nasce `0644`: un altro
+    /// utente locale dello stesso Mac potrebbe leggerlo. SQLite crea i sidecar copiando i
+    /// permessi del database, quindi stringere il database stringe anche `-wal`/`-shm` che
+    /// verranno ricreati dopo un checkpoint — verificato con un ciclo apertura/scrittura/
+    /// chiusura in `LibraryIndexStoreTests`, non dedotto dalla documentazione.
+    ///
+    /// Best-effort di proposito: se `chmod` fallisce l'indice resta perfettamente usabile, e
+    /// far fallire l'apertura dell'indice per un problema di permessi contraddirebbe ADR-0002
+    /// (l'indice e' una cache, la sua assenza non e' mai un errore fatale).
+    private static func restrictPermissions(at url: URL) {
+        let fm = FileManager.default
+        for path in [url.path, url.path + "-wal", url.path + "-shm"] where fm.fileExists(atPath: path) {
+            try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
+        }
+    }
+
+    /// Cancella l'indice dal disco e lo riapre vuoto, pronto per essere ricostruito da zero.
+    ///
+    /// E' l'unica via d'uscita dalla regola "traversata incompleta ⇒ nessuna rimozione": se
+    /// l'utente cancellasse davvero tutte le foto, `sawNothing` renderebbe la traversata
+    /// incompleta e le entry fantasma resterebbero per sempre — la ricostruzione completa
+    /// (`ignoringStoredHashes`) di proposito non le tocca. Senza questo metodo l'unica uscita
+    /// sarebbe cancellare il file a mano dal Finder.
+    ///
+    /// Non ricostruisce l'indice: lo azzera. Il ripopolamento e' una `LibraryIndexer.scan`
+    /// come tutte le altre.
+    ///
+    /// Se la cancellazione fallisce (permessi, file in uso) lo store viene comunque riaperto
+    /// sul vecchio file e resta utilizzabile: l'errore arriva al chiamante, che secondo
+    /// ADR-0002 deve mostrarlo e proseguire, mai trattarlo come fatale.
+    func deleteIndexAndRecreate() throws {
+        try queue.sync {
+            closeUnsynchronized()
+            do {
+                try Self.deleteDatabaseFiles(at: url)
+            } catch {
+                try? openUnsynchronized(url)
+                throw error
+            }
+            try openUnsynchronized(url)
         }
     }
 
@@ -1862,6 +1954,7 @@ final class LibraryIndexStore {
             try exec("PRAGMA journal_mode=WAL;")
             try exec("PRAGMA foreign_keys=ON;")
             try createSchemaIfNeeded()
+            Self.restrictPermissions(at: url)
         } catch {
             closeUnsynchronized()
             throw error
@@ -2953,12 +3046,18 @@ final class FileSyncer {
     ///   - onCopied: notifica di copia **verificata** (dst, hash SHA256 gia' calcolato per
     ///     la verifica d'integrita'). Serve a riconoscere i doppioni interni allo stesso
     ///     import senza rileggere nulla in piu'. Default no-op.
+    ///   - onUnverified: notifica di copia **non verificata** (dst): la verifica SHA256 non ha
+    ///     potuto concludersi. E' un callback e non un campo di `SyncResult` di proposito: il
+    ///     debito va scritto nell'istante in cui viene contratto, cosi' sopravvive anche a un
+    ///     job interrotto dall'utente o a un errore, dove `SyncResult` non arriva mai al
+    ///     chiamante. Default no-op.
     func sync(from src: URL, to dst: URL, deep: Bool,
               onStatus: @escaping (String) -> Void,
               onProgress: @escaping (SyncResult) -> Void,
               onCurrentFile: @escaping (URL) -> Void = { _ in },
               isDuplicate: @escaping (URL) -> Bool = { _ in false },
-              onCopied: @escaping (URL, String) -> Void = { _, _ in }) async throws -> SyncResult {
+              onCopied: @escaping (URL, String) -> Void = { _, _ in },
+              onUnverified: @escaping (URL) -> Void = { _ in }) async throws -> SyncResult {
         try await withCheckedThrowingContinuation { [self] cont in
             DispatchQueue.global(qos: .userInitiated).async {
                 self.cancelled = false
@@ -2987,7 +3086,8 @@ final class FileSyncer {
                     try self.syncDir(src: src, dst: dst, base: src, deep: deep,
                                      result: &result, onStatus: onStatus, onProgress: onProgress,
                                      onCurrentFile: onCurrentFile,
-                                     isDuplicate: isDuplicate, onCopied: onCopied)
+                                     isDuplicate: isDuplicate, onCopied: onCopied,
+                                     onUnverified: onUnverified)
                     cont.resume(returning: result)
                 } catch {
                     cont.resume(throwing: error)
@@ -3013,8 +3113,13 @@ final class FileSyncer {
                          onStatus: @escaping (String) -> Void,
                          onProgress: @escaping (SyncResult) -> Void,
                          onCurrentFile: @escaping (URL) -> Void,
-                         isDuplicate: @escaping (URL) -> Bool = { _ in false },
-                         onCopied: @escaping (URL, String) -> Void = { _, _ in }) throws {
+                         // Niente valori di default su `syncDir`/`syncFile`, che sono privati:
+                         // un default trasformerebbe una propagazione dimenticata in un cambio
+                         // di comportamento silenzioso invece che in un errore di compilazione.
+                         // Su `sync`, che e' pubblico, il default e' il punto del pattern.
+                         isDuplicate: @escaping (URL) -> Bool,
+                         onCopied: @escaping (URL, String) -> Void,
+                         onUnverified: @escaping (URL) -> Void) throws {
         if cancelled { return }
         if !fm.fileExists(atPath: dst.path) {
             try fm.createDirectory(at: dst, withIntermediateDirectories: true)
@@ -3033,12 +3138,14 @@ final class FileSyncer {
                 try syncDir(src: item, dst: destItem, base: base, deep: deep,
                             result: &result, onStatus: onStatus, onProgress: onProgress,
                             onCurrentFile: onCurrentFile,
-                            isDuplicate: isDuplicate, onCopied: onCopied)
+                            isDuplicate: isDuplicate, onCopied: onCopied,
+                            onUnverified: onUnverified)
             } else if vals?.isRegularFile == true {
                 syncFile(src: item, dst: destItem, deep: deep,
                          result: &result, onStatus: onStatus, onProgress: onProgress,
                          onCurrentFile: onCurrentFile,
-                         isDuplicate: isDuplicate, onCopied: onCopied)
+                         isDuplicate: isDuplicate, onCopied: onCopied,
+                         onUnverified: onUnverified)
             }
         }
     }
@@ -3048,8 +3155,9 @@ final class FileSyncer {
                           onStatus: @escaping (String) -> Void,
                           onProgress: @escaping (SyncResult) -> Void,
                           onCurrentFile: @escaping (URL) -> Void,
-                          isDuplicate: @escaping (URL) -> Bool = { _ in false },
-                          onCopied: @escaping (URL, String) -> Void = { _, _ in }) {
+                          isDuplicate: @escaping (URL) -> Bool,
+                          onCopied: @escaping (URL, String) -> Void,
+                          onUnverified: @escaping (URL) -> Void) {
         let needs: Bool
         if !fm.fileExists(atPath: dst.path) {
             needs = true
@@ -3130,6 +3238,12 @@ final class FileSyncer {
                         }
                     } else {
                         result.copiedUnverified += 1
+                        // Il debito di verifica si annota qui, non a fine job: per la regola
+                        // zero-overwrite questo file non verra' MAI ricopiato, quindi se il
+                        // percorso si perde nessuno lo ricontrollera' piu'. Lo raccoglie il
+                        // campione d'integrita' del pannello Revisione, che gira a distanza
+                        // di tempo quando la sorgente non e' piu' in uso.
+                        onUnverified(dst)
                         DispatchQueue.main.async { onStatus("⚠️ Copiato ma non verificato: \(name) — la verifica SHA256 non ha potuto concludersi") }
                     }
                 } catch { result.errors += 1 }
@@ -4778,7 +4892,8 @@ final class BackupRunner: ObservableObject {
                 return try await self?.syncer.sync(from: photosURL, to: dst, deep: false,
                     onStatus: { self?.publishStatus($0) },
                     onProgress: { self?.publishProgress($0) },
-                    onCurrentFile: { self?.publishCurrentFile($0) })
+                    onCurrentFile: { self?.publishCurrentFile($0) },
+                    onUnverified: { UnverifiedCopiesStore.record($0) })
             }
         }
     }
@@ -4828,7 +4943,8 @@ final class BackupRunner: ObservableObject {
                 let r = try await self?.syncer.sync(from: ssdURL, to: hddURL, deep: deep,
                     onStatus: { self?.publishStatus($0) },
                     onProgress: { self?.publishProgress($0) },
-                    onCurrentFile: { self?.publishCurrentFile($0) })
+                    onCurrentFile: { self?.publishCurrentFile($0) },
+                    onUnverified: { UnverifiedCopiesStore.record($0) })
                 if deep, (r?.errors ?? 1) == 0 {
                     UserDefaults.standard.set(Date(), forKey: self?.lastDeepKey ?? "")
                 }
@@ -4918,6 +5034,25 @@ final class BackupRunner: ObservableObject {
                                               store: LibraryIndexStore?,
                                               session: ImportSessionIndex,
                                               libraryRoot: URL?) -> Bool {
+        // Solo i media partecipano al dedup. `LibraryIndexer.scan` gia' scarta i
+        // `.notIndexable` prima di indicizzarli, quindi il ramo dell'indice persistito era
+        // gia' coperto; il ramo di sessione no, ed e' li' che il buco si vedeva. Senza questa
+        // riga due sidecar byte-identici con nomi diversi (`IMG_0001.AAE` e `IMG_0002.AAE`,
+        // entrambi da 0 byte, stesso SHA256) diventano l'uno il doppione dell'altro: sull'SSD
+        // ne arriva UNO SOLO, col nome sbagliato rispetto alla foto rimasta senza, e la
+        // CompletionSheet dichiara un doppione che non esiste. Il verso sicuro e' quello
+        // scritto sul doc-comment di `IndexableKind`: un file non classificato viene copiato,
+        // mai saltato.
+        guard IndexableKind.of(url: url) != .notIndexable else { return false }
+        // Attenzione a questa dimensione: `syncDir` prefetcha `.fileSizeKey` in
+        // `contentsOfDirectory`, quindi su questa URL `resourceValues` restituisce il valore
+        // MEMORIZZATO al momento in cui la directory e' stata letta, non quello attuale
+        // (misurato: dopo un troncamento, stessa URL = 5000, URL nuova = 6). E' lo stesso
+        // pattern che in questo piano e' gia' costato due bug — ma qui e' innocuo, e va detto
+        // perche' nessuno lo "corregga" credendolo il terzo: la dimensione fa SOLO da filtro
+        // a monte, a decidere e' `sha256` sul file riletto. Una dimensione stantia produce al
+        // massimo un doppione non riconosciuto, cioe' una copia in piu' — il verso sicuro.
+        // Non costruirci sopra nulla che si fidi di questo numero.
         guard let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize else { return false }
         let size64 = Int64(size)
 
@@ -4941,8 +5076,22 @@ final class BackupRunner: ObservableObject {
               let libraryRoot,
               let entries = try? store.entries(withHash: sourceHash),
               !entries.isEmpty else { return false }
+        // `displayPath` viene dall'indice, cioe' da un file su disco che potrebbe essere
+        // stato scritto da chiunque. `appendingPathComponent` non confina niente: un
+        // `displayPath` relativo con `..` risolve FUORI dalla libreria (misurato; i path
+        // assoluti invece vengono appesi e restano dentro). Oggi non e' raggiungibile perche'
+        // `LibraryIndexer` costruisce i `displayPath` solo dopo la guardia "dentro la root",
+        // ma il commento di `normalizedIndexKey` si appoggia esplicitamente all'assunzione
+        // "qui i `..` non arrivano mai": un'assunzione documentata e verificata da nulla e'
+        // gia' costata tre bug in questo piano. Un candidato fuori root non e' un doppione:
+        // si prosegue, e nel dubbio si copia.
+        let rootForms = [libraryRoot.standardizedFileURL.path, realResolvedPath(libraryRoot)].map {
+            $0.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+        }
         for entry in entries {
-            if fileOnDisk(libraryRoot.appendingPathComponent(entry.displayPath), matches: sourceHash) { return true }
+            let candidate = libraryRoot.appendingPathComponent(entry.displayPath).standardizedFileURL
+            guard rootForms.contains(where: { relativePath(of: candidate.path, under: $0) != nil }) else { continue }
+            if fileOnDisk(candidate, matches: sourceHash) { return true }
         }
         return false
     }
@@ -4950,6 +5099,12 @@ final class BackupRunner: ObservableObject {
     /// Riverifica di un candidato: l'hash memorizzato potrebbe essere stantio (mtime
     /// riscrivibile da userspace, inode non affidabili su ExFAT), quindi si rilegge.
     /// Un candidato sparito non e' un doppione: si prosegue col successivo.
+    ///
+    /// A reggere il caso del candidato sparito e' `sha256`, non `fileExists`: su un file che
+    /// non c'e' piu' la `open()` fallisce e `sha256` torna `nil`, che non e' mai uguale a un
+    /// hash. Togliendo `fileExists` la suite resta verde (misurato). Resta come precondizione
+    /// esplicita ed economica — dice a chi legge che l'assenza e' un caso previsto, non un
+    /// incidente — ma NON e' lei la difesa: chi un giorno cambiasse `sha256` deve saperlo.
     private nonisolated static func fileOnDisk(_ url: URL, matches hash: String) -> Bool {
         FileManager.default.fileExists(atPath: url.path) && sha256(of: url) == hash
     }
@@ -5008,7 +5163,15 @@ final class BackupRunner: ObservableObject {
                         BackupRunner.isAlreadyInLibrary(url: url, store: store,
                                                         session: session, libraryRoot: ssdURL)
                     },
-                    onCopied: { dst, hash in session.record(hash: hash, at: dst) })
+                    // Simmetrico alla guardia in `isAlreadyInLibrary`: l'indice persistito non
+                    // contiene mai file non-media, e non deve contenerli nemmeno quello di
+                    // sessione. Il filtro sta qui e non in `syncFile` di proposito — `FileSyncer`
+                    // deve restare ignaro di `IndexableKind`, il dedup e' roba dell'import.
+                    onCopied: { dst, hash in
+                        guard IndexableKind.of(url: dst) != .notIndexable else { return }
+                        session.record(hash: hash, at: dst)
+                    },
+                    onUnverified: { UnverifiedCopiesStore.record($0) })
             }
         }
     }
@@ -5128,7 +5291,8 @@ final class BackupRunner: ObservableObject {
         completionSnapshot = (phase, stats)
         JobHistoryStore.save(JobSummary(date: Date(), label: jobLabel, copied: stats.copied,
             skipped: stats.skipped, errors: stats.errors, hashErrors: stats.hashErrors,
-            succeeded: false, changedSkipped: stats.changedSkipped))
+            succeeded: false, changedSkipped: stats.changedSkipped,
+            duplicatesSkipped: stats.duplicatesSkipped))
     }
 
     private func run(label: String, work: @escaping () async throws -> FileSyncer.SyncResult?) {
@@ -5175,7 +5339,8 @@ final class BackupRunner: ObservableObject {
                     JobHistoryStore.save(JobSummary(date: Date(), label: label, copied: self.stats.copied,
                         skipped: self.stats.skipped, errors: self.stats.errors,
                         hashErrors: self.stats.hashErrors, succeeded: true,
-                        changedSkipped: self.stats.changedSkipped))
+                        changedSkipped: self.stats.changedSkipped,
+                        duplicatesSkipped: self.stats.duplicatesSkipped))
                 }
             } catch {
                 await MainActor.run {
@@ -5190,7 +5355,8 @@ final class BackupRunner: ObservableObject {
                     JobHistoryStore.save(JobSummary(date: Date(), label: label, copied: self.stats.copied,
                         skipped: self.stats.skipped, errors: self.stats.errors,
                         hashErrors: self.stats.hashErrors, succeeded: false,
-                        changedSkipped: self.stats.changedSkipped))
+                        changedSkipped: self.stats.changedSkipped,
+                        duplicatesSkipped: self.stats.duplicatesSkipped))
                 }
             }
         }
@@ -5298,8 +5464,57 @@ struct JobSummary: Codable {
     let hashErrors: Int
     let succeeded: Bool
     var changedSkipped: Int = 0   // default: i JobSummary persistiti prima di questo campo restano decodificabili nei test che li costruiscono senza specificarlo
+    /// Foto non copiate perche' lo stesso contenuto risultava gia' altrove in libreria
+    /// (roadmap #31). Persistito perche' l'asimmetria era al contrario: lo skip *meno*
+    /// pericoloso (`changedSkipped`, "il file c'era gia' con quel nome") era persistito da
+    /// sempre, mentre il primo percorso del progetto che decide di **non copiare una foto
+    /// perche' crede che il contenuto esista altrove** viveva solo nella CompletionSheet e
+    /// nel log, che e' troncato a `maxOut`. Come `changedSkipped` ha un default, cosi' i
+    /// record scritti da una versione precedente restano decodificabili.
+    var duplicatesSkipped: Int = 0
 
+    /// I valori di default sulle proprieta' **non** bastano per la decodifica: la
+    /// `init(from:)` sintetizzata da Swift chiama `decode(_:forKey:)` e lancia
+    /// `keyNotFound` su una chiave assente, ignorando il default (verificato: il record
+    /// scritto prima di `changedSkipped` NON si decodificava, e `JobHistoryStore.load` usa
+    /// `try?`, quindi l'ultimo job spariva dal pannello Revisione in silenzio dopo un
+    /// aggiornamento dell'app). Il vecchio commento su `changedSkipped` diceva il vero solo
+    /// per l'init membro a membro usata dai test, non per i record gia' sul disco.
+    ///
+    /// Sta in una `extension` e non nel corpo dello struct perche' una init dichiarata nel
+    /// corpo sopprimerebbe l'init membro a membro, usata da tutti i chiamanti.
+    ///
+    /// Regola per chi aggiunge un campo: default sulla proprieta' **e** `decodeIfPresent`
+    /// qui. Solo la prima meta' e' una retrocompatibilita' finta.
+    /// Invariante: ne' i file copiati-ma-non-verificati ne' i doppioni saltati rendono
+    /// "non pulito" un job. Sarebbero allarmi quasi sempre infondati, e un allarme che si
+    /// impara a ignorare non serve a niente. I non verificati hanno il loro rimedio in
+    /// `UnverifiedCopiesStore` (precedenza nel campione d'integrita'), i doppioni sono il
+    /// comportamento voluto.
     var isClean: Bool { succeeded && errors == 0 && hashErrors == 0 }
+}
+
+extension JobSummary {
+    private enum CodingKeys: String, CodingKey {
+        case date, label, copied, skipped, errors, hashErrors, succeeded
+        case changedSkipped, duplicatesSkipped
+    }
+
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        // Campi presenti fin dalla prima versione: la loro assenza e' un record rotto, non un
+        // record vecchio, e va trattata come tale (decodifica fallita ⇒ nessun ultimo job).
+        date = try c.decode(Date.self, forKey: .date)
+        label = try c.decode(String.self, forKey: .label)
+        copied = try c.decode(Int.self, forKey: .copied)
+        skipped = try c.decode(Int.self, forKey: .skipped)
+        errors = try c.decode(Int.self, forKey: .errors)
+        hashErrors = try c.decode(Int.self, forKey: .hashErrors)
+        succeeded = try c.decode(Bool.self, forKey: .succeeded)
+        // Campi aggiunti dopo: assenti nei record gia' sul disco di Enrico.
+        changedSkipped = try c.decodeIfPresent(Int.self, forKey: .changedSkipped) ?? 0
+        duplicatesSkipped = try c.decodeIfPresent(Int.self, forKey: .duplicatesSkipped) ?? 0
+    }
 }
 
 enum JobHistoryStore {
@@ -5313,6 +5528,102 @@ enum JobHistoryStore {
     static func load(defaults: UserDefaults = .standard) -> JobSummary? {
         guard let data = defaults.data(forKey: key) else { return nil }
         return try? JSONDecoder().decode(JobSummary.self, from: data)
+    }
+}
+
+/// Debito di verifica: i file **copiati ma non verificati** (`SyncResult.copiedUnverified`),
+/// cioe' quelli per cui la verifica SHA256 post-copia non ha potuto concludersi perche' uno
+/// dei due hash e' tornato `nil` — tipicamente la sorgente stava cambiando mentre la
+/// leggevamo (Foto che riscrive un original durante il backup automatico).
+///
+/// Perche' esiste. Per la regola zero-overwrite quel file **non verra' mai ricopiato**: se
+/// fosse davvero corrotto resterebbe corrotto per sempre. Finora il numero viveva solo nel
+/// riepilogo di fine job, che sparisce chiudendo la finestra. Il rimedio scelto **non** e'
+/// marcare il job come non pulito (`JobSummary.isClean` resta identico): sarebbe un allarme
+/// quasi sempre infondato, e un allarme che si impara a ignorare non serve a niente — lo
+/// stesso criterio con cui `copiedUnverified` non riusa `hashErrors`. Il rimedio e' dare a
+/// quei file la **precedenza nel campione d'integrita'** del pannello Revisione, che gira a
+/// distanza di tempo, quando la sorgente non e' piu' in uso e la verifica riesce davvero.
+///
+/// Perche' non dentro `JobSummary`. `JobHistoryStore` conserva **solo l'ultimo job**: un job
+/// successivo pulito sovrascriverebbe il record e il debito sparirebbe in silenzio, che e'
+/// esattamente il problema da risolvere. Il debito e' cumulativo e si chiude un file alla
+/// volta, quindi ha una chiave sua.
+struct UnverifiedCopies: Codable, Equatable {
+    /// Quanti file risultano ancora da ricontrollare. Resta veritiero anche quando `paths`
+    /// e' troncata dal tetto: e' il numero da mostrare, `paths.count` non lo e'.
+    var totalCount: Int = 0
+    /// Percorsi assoluti conservati, al massimo `UnverifiedCopiesStore.maxPaths`. Il tetto
+    /// esiste perche' questo record sta in `UserDefaults` e senza limite crescerebbe con il
+    /// numero di file copiati, non con il numero di problemi reali.
+    var paths: [String] = []
+}
+
+extension UnverifiedCopies {
+    private enum CodingKeys: String, CodingKey { case totalCount, paths }
+
+    /// Stessa ragione di `JobSummary.init(from:)`: i default sulle proprieta' non li usa la
+    /// decodifica sintetizzata. Qui tutti i campi sono opzionali in lettura perche' l'intero
+    /// record e' una comodita': un debito che non si riesce a leggere e' un debito vuoto, mai
+    /// un errore.
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        totalCount = try c.decodeIfPresent(Int.self, forKey: .totalCount) ?? 0
+        paths = try c.decodeIfPresent([String].self, forKey: .paths) ?? []
+    }
+}
+
+enum UnverifiedCopiesStore {
+    /// Tetto ai percorsi conservati. 200 e' ampiamente sopra il numero di file che una
+    /// sorgente in uso puo' rendere non verificabili in un job (misurato: unita'), e sotto
+    /// la soglia oltre la quale il record in `UserDefaults` diventa un problema di suo.
+    static let maxPaths = 200
+
+    private static let key = "unverifiedCopies"
+    /// `record` e' chiamata dalla coda di lavoro di `FileSyncer`, non dal MainActor, e fa un
+    /// leggi-modifica-scrivi: senza lock due file non verificati nello stesso istante ne
+    /// perderebbero uno.
+    private static let lock = NSLock()
+
+    static func load(defaults: UserDefaults = .standard) -> UnverifiedCopies {
+        guard let data = defaults.data(forKey: key),
+              let decoded = try? JSONDecoder().decode(UnverifiedCopies.self, from: data) else {
+            return UnverifiedCopies()
+        }
+        return decoded
+    }
+
+    /// Registra un file da ricontrollare. Idempotente sui percorsi conservati: lo stesso file
+    /// registrato due volte conta una volta sola.
+    ///
+    /// Oltre il tetto si incrementa **solo** il conteggio: il numero resta veritiero, il
+    /// percorso si perde. In quel regime un percorso non conservato e registrato di nuovo
+    /// conterebbe due volte — caso che lo zero-overwrite rende praticamente irraggiungibile
+    /// (un file gia' copiato non viene ricopiato, quindi non torna a essere non verificato).
+    static func record(_ url: URL, defaults: UserDefaults = .standard) {
+        lock.lock(); defer { lock.unlock() }
+        var state = load(defaults: defaults)
+        guard !state.paths.contains(url.path) else { return }
+        state.totalCount += 1
+        if state.paths.count < maxPaths { state.paths.append(url.path) }
+        save(state, defaults: defaults)
+    }
+
+    /// Il debito si chiude: il file e' stato ricontrollato e corrisponde alla sorgente.
+    /// Il conteggio scende solo se il percorso era davvero fra quelli conservati, altrimenti
+    /// si scalerebbe un debito di cui non sappiamo nulla.
+    static func clear(_ path: String, defaults: UserDefaults = .standard) {
+        lock.lock(); defer { lock.unlock() }
+        var state = load(defaults: defaults)
+        guard let i = state.paths.firstIndex(of: path) else { return }
+        state.paths.remove(at: i)
+        state.totalCount = max(0, state.totalCount - 1)
+        save(state, defaults: defaults)
+    }
+
+    private static func save(_ state: UnverifiedCopies, defaults: UserDefaults) {
+        guard let data = try? JSONEncoder().encode(state) else { return }
+        defaults.set(data, forKey: key)
     }
 }
 
@@ -5361,6 +5672,13 @@ final class ReviewEngine {
     private let bm = BookmarkManager.shared
     private let s3Syncer = S3Syncer()
     private let fm = FileManager.default
+    /// Dove vive il debito di verifica (`UnverifiedCopiesStore`). Iniettabile solo perche' i
+    /// test non devono scrivere in `UserDefaults.standard`; in app e' sempre `.standard`.
+    private let defaults: UserDefaults
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+    }
 
     // La canonicalizzazione dei percorsi (`realResolvedPath`) e' una funzione globale
     // condivisa con `LibraryIndexer`, non piu' un metodo privato di questa classe:
@@ -5388,7 +5706,37 @@ final class ReviewEngine {
         }
         guard !relPaths.isEmpty else { return result }
 
-        let sample = relPaths.shuffled().prefix(sampleSize)
+        // Precedenza ai file copiati ma non verificati. Sono gli unici che nessun altro
+        // meccanismo ricontrollera' mai: per la regola zero-overwrite non verranno ricopiati,
+        // e il conteggio di fine job sparisce con la finestra. Qui la verifica ha buone
+        // probabilita' di riuscire, perche' gira a distanza di tempo e la sorgente non e'
+        // piu' in uso. Il resto del campione resta casuale come prima.
+        let roots = [dstRoot.standardizedFileURL.path, resolvedDstRoot.path].map {
+            $0.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+        }
+        let known = Set(relPaths)
+        var debtByRel: [String: String] = [:]   // percorso relativo -> percorso assoluto registrato
+        var prioritized: [String] = []
+        for stored in UnverifiedCopiesStore.load(defaults: defaults).paths {
+            guard let rel = roots.lazy.compactMap({ relativePath(of: stored, under: $0) }).first,
+                  known.contains(rel), debtByRel[rel] == nil else { continue }
+            // Se la sorgente non c'e' piu' il file non e' verificabile in questa coppia (un
+            // import da dispositivo: la sorgente era il telefono, ora scollegato). Non gli si
+            // da' la precedenza, altrimenti brucerebbe uno slot del campione a ogni
+            // esecuzione, per sempre, senza mai potersi chiudere.
+            guard fm.fileExists(atPath: srcRoot.appendingPathComponent(rel).path) else { continue }
+            debtByRel[rel] = stored
+            prioritized.append(rel)
+        }
+
+        var sample = Array(prioritized.prefix(sampleSize))
+        if sample.count < sampleSize {
+            let alreadyChosen = Set(sample)
+            sample += relPaths.shuffled()
+                .filter { !alreadyChosen.contains($0) }
+                .prefix(sampleSize - sample.count)
+        }
+
         for rel in sample {
             let dstFile = dstRoot.appendingPathComponent(rel)
             let srcFile = srcRoot.appendingPathComponent(rel)
@@ -5399,6 +5747,12 @@ final class ReviewEngine {
             result.checked += 1
             if let srcHash = sha256(of: srcFile), let dstHash = sha256(of: dstFile), srcHash == dstHash {
                 result.matched += 1
+                // Il debito si chiude: questo file e' stato ricontrollato e corrisponde alla
+                // sorgente. Su mismatch invece resta in lista — e' appena diventato un
+                // problema vero, gia' riportato in `mismatches`.
+                if let stored = debtByRel[rel] {
+                    UnverifiedCopiesStore.clear(stored, defaults: defaults)
+                }
             } else {
                 result.mismatches.append(rel)
             }

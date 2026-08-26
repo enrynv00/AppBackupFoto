@@ -28,6 +28,74 @@ Sessione di grilling su questo piano **dopo** l'approvazione di spec e piano, pr
 
 **Lezione trasversale, la stessa dei due bug precedenti del progetto** (`sha256(of:)` e BUG-5): i test possono codificare il bug invece di trovarlo. `testCancelStopsScan` sarebbe passato con `cancelled` rotto, e `testRootDisappearingMidScan_doesNotWipeIndex` testava la root assente **all'inizio**, non a metà — cioè il caso che la guardia esistente già copriva. Entrambi riscritti.
 
+## Nota (2026-08-26) — interventi post-review, fuori dai sette task
+
+Cinque interventi decisi da Enrico dopo le review dei Task 3 e 5. Non aggiungono task: modificano
+codice gia' scritto e aggiungono requisiti al Task 6.
+
+**1. I file copiati ma non verificati vengono ricontrollati, non segnalati.** `copiedUnverified`
+(introdotto in `3e8e25a`) viveva solo nel riepilogo di fine job, che sparisce chiudendo la
+finestra — mentre per la regola zero-overwrite quel file non verra' **mai** ricopiato: se fosse
+davvero corrotto, resterebbe corrotto per sempre e nessuno se ne accorgerebbe.
+
+Decisione di Enrico: **non** rendere "non pulito" il job. Sarebbe un allarme quasi sempre
+infondato, e un allarme che si impara a ignorare non serve a niente — lo stesso criterio con cui
+`copiedUnverified` non riusa `hashErrors`. `JobSummary.isClean` non cambia. Al suo posto, quei
+file hanno la **precedenza nel campione d'integrita'** del pannello Revisione, che gira a
+distanza di tempo, quando la sorgente non e' piu' in uso e la verifica riesce davvero.
+
+Per dare la precedenza servono i **percorsi**, non il conteggio: da qui `UnverifiedCopiesStore`,
+con un tetto ai percorsi conservati (`maxPaths = 200`) e il conteggio totale a parte, cosi' il
+numero resta veritiero anche quando la lista e' troncata. Quando un file viene verificato e
+corrisponde, esce dalla lista: il debito si chiude. Su mismatch invece **resta** — e' appena
+diventato un problema vero.
+
+Tre decisioni di progetto che val la pena non riscoprire:
+
+- **Non sta in `JobSummary`.** `JobHistoryStore` conserva solo l'**ultimo** job: un job
+  successivo pulito sovrascriverebbe il record e il debito sparirebbe in silenzio, che e'
+  esattamente il problema da risolvere. Il debito e' cumulativo e si chiude un file alla volta.
+- **E' un callback (`onUnverified`), non un campo di `SyncResult`.** Il debito va scritto
+  nell'istante in cui viene contratto: cosi' sopravvive a un job interrotto dall'utente o
+  fallito, dove `SyncResult` non arriva mai al chiamante.
+- **Un debito la cui sorgente non esiste piu' non prende la precedenza.** Un file importato da
+  un dispositivo poi scollegato non e' verificabile in quella coppia: prioritizzarlo brucerebbe
+  uno slot del campione a ogni esecuzione, per sempre, senza mai potersi chiudere.
+
+**2. `LibraryIndexStore.deleteIndexAndRecreate()`** — la capacita', non il bottone (il bottone e'
+lo Step 2-bis del Task 6). Vedi ADR-0002, nota del 2026-08-26.
+
+**3. Due cinture sul file dell'indice**: cancellazione solo se l'estensione e' `.sqlite`, e
+permessi `0600` su indice e sidecar. Entrambe in ADR-0002, nota del 2026-08-26.
+
+**4. Le due stringhe della UI del Task 5**: verificate coerenti con le righe gia' presenti in
+`CompletionSheet`, lasciate come Enrico le ha approvate.
+
+**5. `IndexableKind` nel dedup intra-import**: vedi la nota nel Task 5 e ADR-0003.
+
+**Retrocompatibilita' — un bug latente trovato scrivendone il test.** I valori di default sulle
+proprieta' **non** rendono un `Codable` retrocompatibile: la `init(from:)` sintetizzata da Swift
+chiama `decode(_:forKey:)` e lancia `keyNotFound` su una chiave assente, ignorando il default.
+Il record `JobSummary` scritto prima di `changedSkipped` **non si decodificava gia' da prima di
+questo intervento**, e siccome `JobHistoryStore.load` usa `try?`, l'ultimo job spariva dal
+pannello Revisione in silenzio dopo un aggiornamento dell'app. Il vecchio commento su
+`changedSkipped` diceva il vero solo per l'init membro a membro usata dai test. Ora `JobSummary`
+e `UnverifiedCopies` hanno una `init(from:)` esplicita con `decodeIfPresent` sui campi aggiunti
+dopo. **Regola per chi aggiunge un campo: default sulla proprieta' *e* `decodeIfPresent`.** Solo
+la prima meta' e' una retrocompatibilita' finta.
+
+**Mutation testing: 22 mutanti, 22 uccisi.** Due sono sopravvissuti alla prima corsa e hanno
+richiesto di riscrivere il test, non il codice: (a) un debito fuori dalla root di destinazione
+va provato con un file dallo **stesso nome** di uno dentro la root, altrimenti la guardia
+"la sorgente esiste" maschera quella sul confinamento; (b) la guardia `IndexableKind` in
+`isAlreadyInLibrary` e' mascherata dal filtro su `onCopied`, e va provata costruendo a mano un
+`ImportSessionIndex` che contenga un non-media.
+
+**Non testato, e perche'**: che `BackupRunner` passi davvero `UnverifiedCopiesStore.record` come
+`onUnverified` ai tre job, e che i tre `JobHistoryStore.save` passino `duplicatesSkipped`. Sono
+cablaggi dentro metodi `@MainActor` di `BackupRunner` che avviano un job reale su bookmark veri:
+non sono raggiungibili senza una corsa. Testato tutto cio' che sta ai due capi del cablaggio.
+
 ## Global Constraints
 
 - **Zero delete, zero overwrite, read-only sulla sorgente.** Questa feature è interamente in sola lettura sul volume delle foto: non scrive, non sposta, non cancella nulla sull'SSD.
@@ -2000,14 +2068,40 @@ snippet qui sopra non corrispondono piu' al codice, e in tutti e quattro ha vint
 perche' senza di loro sette mutanti sopravvivevano su codice ad alto danno: ordine
 zero-overwrite/dedup (1), rilettura del candidato di sessione e di quello dell'indice
 (2), ramo dell'indice persistito (1), registrazione di copie non verificate e con mismatch
-(2), sorgente illeggibile scambiata per doppione (1). Mutation testing: 10 mutanti su 11
-uccisi; l'undicesimo — filtro dimensione (stadio 1) rimosso — **sopravvive di proposito**:
-e' solo prestazioni, la correttezza la decide l'hash.
+(2), sorgente illeggibile scambiata per doppione (1).
 
-**Non fatto, di proposito**: `duplicatesSkipped` non e' stato aggiunto a `JobSummary` ne' a
-`JobSummary.isClean`, per lo stesso motivo per cui non c'e' `copiedUnverified` (decisione di
-prodotto separata). E `previewSync` non e' allineato: sovrastima lo spazio necessario quando
-la sorgente contiene doppioni, verso sicuro, gia' accettato nello Step 4.
+**Mutanti sopravvissuti: sono almeno quattro, e non sono buchi.** La prima stesura di questa
+nota diceva "il sopravvissuto e' il filtro dimensione", al singolare. E' impreciso: nella
+stessa classe ci sono anche `where candidate.hash == sourceHash`, `!entries.isEmpty` e il
+`fileExists` dentro `fileOnDisk`. Tutti e quattro stanno **a monte** della rilettura, e una
+volta che ADR-0003 fa della rilettura l'unica autorita', tutto cio' che sta a monte e' solo
+velocita': toglierlo rende il codice piu' lento, mai piu' permissivo. Va letto cosi', non come
+copertura mancante — altrimenti il prossimo giro di review li ricaccia credendoli buchi.
+
+**Nota del 2026-08-26 — la guardia `IndexableKind` serve in DUE punti, non in uno.** Il dedup
+intra-import saltava anche i file non-media: due sidecar byte-identici con nomi diversi
+(`IMG_0001.AAE` e `IMG_0002.AAE`, entrambi 0 byte) diventavano l'uno il doppione dell'altro, e
+sull'SSD ne arrivava uno solo, col nome sbagliato rispetto alla foto rimasta senza. Il ramo
+dell'indice persistito era gia' coperto (`LibraryIndexer.scan` scarta i `.notIndexable` prima
+di indicizzarli); a scoprirlo era solo il ramo di sessione. Il filtro va messo **sia** in
+`isAlreadyInLibrary` (lato "salto") **sia** nella closure `onCopied` di `runImport` (lato
+"ricordo"), e servono entrambi per due ragioni distinte: senza il secondo la mappa di sessione
+si riempie di roba che non partecipera' mai al dedup e i due rami restano asimmetrici; senza
+il primo il buco resta aperto per qualunque altro modo in cui un non-media possa finire in un
+indice. Il filtro sta nella closure e **non** in `FileSyncer`, che deve restare ignaro di
+`IndexableKind`. Verificato che i due punti vanno testati separatamente: con entrambi in
+piedi, il mutante che toglie la guardia da `isAlreadyInLibrary` **sopravvive**, perche' il
+filtro su `onCopied` gli impedisce di manifestarsi — serve un test che costruisca a mano un
+`ImportSessionIndex` contenente un non-media.
+
+**Fatto il 2026-08-26, dopo l'audit**: `duplicatesSkipped` **e'** ora in `JobSummary` (non in
+`isClean`, che non cambia). L'asimmetria era al contrario: lo skip meno pericoloso
+(`changedSkipped`) era persistito da sempre, mentre il primo percorso del progetto che decide
+di non copiare una foto perche' crede che il contenuto esista altrove viveva solo nella
+CompletionSheet e in un log troncato.
+
+**Non fatto, di proposito**: `previewSync` non e' allineato: sovrastima lo spazio necessario
+quando la sorgente contiene doppioni, verso sicuro, gia' accettato nello Step 4.
 
 ---
 
@@ -2103,11 +2197,36 @@ file dell'indice a mano dal Finder — cioe' un escape hatch che dall'app non es
 del verso sicuro scelto (tenere di piu', mai togliere di piu') va pagato con un comando
 esplicito, non con un vicolo cieco.
 
+La **capacita'** e' gia' implementata (2026-08-26): `LibraryIndexStore.deleteIndexAndRecreate()`
+chiude la connessione, cancella il file dell'indice piu' i suoi `-wal`/`-shm` — percorsi
+espliciti, mai wildcard ne' ricorsione, e solo dentro la allow-list di posizione gia' usata da
+`init` — e riapre lo store vuoto. Se la cancellazione fallisce, lo store viene riaperto sul
+vecchio file e l'errore arriva al chiamante: la UI deve mostrarlo e proseguire, mai trattarlo
+come fatale (ADR-0002). Il metodo **non** ricostruisce l'indice: azzera e basta, il
+ripopolamento e' una `scan` come le altre. Al Task 6 resta solo il bottone.
+
 Requisiti minimi: conferma esplicita che spieghi in linguaggio comune cosa viene cancellato
 (l'indice, non le foto) e che la ricostruzione richiede diversi minuti; il comando deve essere
 disabilitato mentre una scansione e' in corso; dopo la cancellazione la card deve tornare allo
 stato "indice assente" (nessuna costruzione automatica: la prima costruzione resta manuale,
 Step 4).
+
+- [ ] **Step 2-ter: Due vincoli sul cablaggio dello scanner (obbligatori)**
+
+Entrambi rompono il dedup **in silenzio**, quindi stanno scritti qui e non in un commento.
+
+1. **`LibraryIndexer.scan(root:)` deve ricevere esattamente la stessa root** che `runImport`
+passa come `libraryRoot` — oggi `ssdURL`, la root del volume, non la sottocartella
+`Foto iPhone`. I `displayPath` dell'indice sono relativi alla root di scansione, e
+`isAlreadyInLibrary` li risolve rispetto a `libraryRoot`: se le due divergono, ogni candidato
+dell'indice punta a un percorso inesistente, `fileOnDisk` torna `false` e il dedup
+sull'indice persistito **smette di funzionare senza dire niente**. La direzione e' sicura (si
+copia), ma il risultato e' una feature che non fa niente e nessuno se ne accorge.
+
+2. **Lo scanner deve riusare `BackupRunner.libraryIndexStore`**, mai aprire una seconda
+`LibraryIndexStore` sullo stesso file. La coda seriale che protegge SQLite serializza **per
+istanza**: due istanze sullo stesso database sono esattamente lo scenario SIGSEGV documentato
+nel commento della classe e misurato 3 run su 3 durante la review del Task 3.
 
 - [ ] **Step 3: Toggle in `SettingsSheet`**
 
@@ -2123,7 +2242,7 @@ In `ContentView`, accanto all'`.onChange(of: volumes.ssdMounted)` già esistente
 
 - [ ] **Step 5: Build, suite completa, verifica manuale**
 
-Expected: `** BUILD SUCCEEDED **`, 270 test invariati (piu' quelli che il comando "elimina indice e ricostruisci" dello Step 2-bis si porta dietro).
+Expected: `** BUILD SUCCEEDED **`, 308 test invariati (piu' quelli che il bottone dello Step 2-bis si porta dietro — la capacita' sottostante e' gia' testata).
 
 Verifica manuale (richiede SSD collegato, quindi **a carico di Enrico**): aprire Diagnostica, vedere la card, avviare la costruzione, verificare che il progresso avanzi, interromperla e verificare che l'indice resti utilizzabile, riavviarla e verificare che riprenda senza rihashare ciò che era già stato fatto.
 

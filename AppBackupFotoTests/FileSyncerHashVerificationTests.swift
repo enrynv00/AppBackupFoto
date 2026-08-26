@@ -138,4 +138,43 @@ final class FileSyncerHashVerificationTests: XCTestCase {
         XCTAssertEqual(result.copiedUnverified, 1)
         XCTAssertEqual(result.done, 3)
     }
+
+    // MARK: - Il debito di verifica viene notificato
+
+    // Il conteggio da solo non basta: per ricontrollare quei file a distanza di tempo servono
+    // i PERCORSI, ed e' `onUnverified` a consegnarli. Deve arrivare la destinazione (il file
+    // da ricontrollare sta in libreria, non sulla sorgente) e deve arrivare SOLO per le copie
+    // non verificate.
+    func testUnverifiableCopy_notifiesTheDestinationPath() async throws {
+        try writeFile("a.jpg", "contenuto")
+        try writeFile("b.jpg", "altro contenuto")
+
+        var notified: [URL] = []
+        let syncer = FileSyncer(hashFunction: { url in
+            // Solo `a.jpg` risulta non verificabile; `b.jpg` si verifica normalmente.
+            url.lastPathComponent == "a.jpg" && url.path.contains("/dst/") ? nil : sha256(of: url)
+        })
+        let result = try await syncer.sync(from: srcDir, to: dstDir, deep: false,
+                                           onStatus: { _ in }, onProgress: { _ in },
+                                           onUnverified: { notified.append($0) })
+
+        XCTAssertEqual(result.copiedUnverified, 1)
+        XCTAssertEqual(result.copied, 1)
+        XCTAssertEqual(notified, [dstDir.appendingPathComponent("a.jpg")],
+                       "va notificata la copia in libreria, e solo quella non verificata")
+    }
+
+    // Una copia verificata non contrae nessun debito: notificarla riempirebbe la lista di
+    // file che non hanno bisogno di niente, e con il tetto in mezzo scaccerebbe quelli veri.
+    func testVerifiedCopy_notifiesNothing() async throws {
+        try writeFile("a.jpg", "contenuto")
+
+        var notified: [URL] = []
+        let result = try await FileSyncer().sync(from: srcDir, to: dstDir, deep: false,
+                                                 onStatus: { _ in }, onProgress: { _ in },
+                                                 onUnverified: { notified.append($0) })
+
+        XCTAssertEqual(result.copied, 1)
+        XCTAssertTrue(notified.isEmpty)
+    }
 }
