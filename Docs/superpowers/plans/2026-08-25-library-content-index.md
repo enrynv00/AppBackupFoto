@@ -2240,7 +2240,7 @@ con etichetta "Aggiorna automaticamente l'indice della libreria" e una didascali
 
 In `ContentView`, accanto all'`.onChange(of: volumes.ssdMounted)` già esistente per il backup automatico, aggiungi l'aggiornamento incrementale quando `autoRefreshLibraryIndex` è attivo, **solo se l'indice esiste già** (`count() > 0`): la prima costruzione non deve mai partire da sola. Aggiungi lo stesso aggiornamento a fine di un job di import riuscito.
 
-- [ ] **Step 5: Build, suite completa, verifica manuale** — build e suite fatte (`** BUILD SUCCEEDED **`, 342 test verdi, era 308: +25 `LibraryIndexStatusTests`, +8 `UnverifiedCopiesStoreTests`, +1 `ReviewEngineIntegritySampleTests`). **La verifica manuale con l'SSD collegato resta da fare, a carico di Enrico**: per questo lo step non e' spuntato.
+- [ ] **Step 5: Build, suite completa, verifica manuale** — build e suite fatte (`** BUILD SUCCEEDED **`, 342 test verdi, era 308: +25 `LibraryIndexStatusTests`, +8 `UnverifiedCopiesStoreTests`, +1 `ReviewEngineIntegritySampleTests`). **La verifica manuale con l'SSD collegato resta da fare, a carico di Enrico**: per questo lo step non e' spuntato. *Aggiornato dal Task 7 (2026-08-27)*: la suite e' poi salita a **346** con la nota del 2026-08-27 (i 342 qui sopra sono il numero di quel momento), e l'elenco completo delle verifiche manuali di #31 vive ora in `Docs/CLAUDE.md` sezione "Verifiche manuali e obiettivi aperti", non solo in questo piano.
 
 Expected: `** BUILD SUCCEEDED **`, 308 test invariati (piu' quelli che il bottone dello Step 2-bis si porta dietro — la capacita' sottostante e' gia' testata).
 
@@ -2367,17 +2367,17 @@ blocco su un salto in avanti dell'orologio; l'incoerenza fra lettura manuale e j
 **Files:**
 - Modify: `Docs/ROADMAP.md`, `Docs/CLAUDE.md`, `.claude/rules/architecture.md`
 
-- [ ] **Step 1: `Docs/ROADMAP.md`**
+- [x] **Step 1: `Docs/ROADMAP.md`**
 
 Aggiungi il punto **31** al capitolo aperto: indice di contenuto della libreria, nucleo implementato (data odierna), con riferimento a spec e piano. Segnala che il **pannello Doppioni** resta da fare come incremento successivo e che #27-A riprende dal Task 3.
 
 **Controllo incrociato esplicito**: dopo la modifica, rileggi l'**intero** `Docs/ROADMAP.md` cercando altre righe riassuntive che parlano dello stato del capitolo (le sezioni di riepilogo a fine capitolo si sono disallineate su #14, #15 e #16) e correggile. Non fermarti alla prima occorrenza trovata con un grep.
 
-- [ ] **Step 2: `Docs/CLAUDE.md`**
+- [x] **Step 2: `Docs/CLAUDE.md`**
 
 Aggiorna la tabella "Stato attuale" con la riga dell'indice, e la sezione "Verifiche manuali pendenti" con la verifica della prima costruzione reale su SSD.
 
-- [ ] **Step 3: `.claude/rules/architecture.md`**
+- [x] **Step 3: `.claude/rules/architecture.md`**
 
 Aggiungi una sezione sui quattro componenti nuovi. Documenta esplicitamente, perché sono le cose che un futuro intervento rischia di rompere senza accorgersene:
 - il **modello di fiducia a due livelli** e perché lo skip in import rileva sempre l'hash invece di fidarsi della cache;
@@ -2387,9 +2387,56 @@ Aggiungi una sezione sui quattro componenti nuovi. Documenta esplicitamente, per
 - che `isDuplicate` e `onCopied` hanno un **default no-op** apposta, così i tre job esistenti e `RestoreEngine` non sono toccati;
 - che `ImportSessionIndex` copre i doppioni **interni allo stesso import** riusando l'hash che la verifica d'integrità post-copia calcola già — se qualcuno rimuovesse quella verifica, il dedup intra-import morirebbe in silenzio con lei.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add Docs/ROADMAP.md Docs/CLAUDE.md .claude/rules/architecture.md
 git commit -m "docs: document library content index core (roadmap #31)"
 ```
+
+#### Nota di esecuzione (2026-08-27) — due file in piu' del previsto, e quattro righe stantie trovate nel controllo incrociato
+
+Il commit include **cinque** file, non i tre elencati qui sopra. I due in piu' sono `Docs/CONTEXT.md`
+e questo piano:
+
+- **`Docs/CONTEXT.md` contraddiceva il codice**, non era solo incompleto. La voce "Tolleranza DST"
+  diceva "si riverifica invece di invalidare in blocco": riverificare significa rihashare, cioe'
+  esattamente cio' che quella regola esiste per evitare — era la semantica della **prima** stesura,
+  quella che il Critic ha bocciato il 2026-08-25 perche' rendeva la regola inerte. La voce "Verdetto"
+  elencava tre esiti su quattro (mancava `timezoneShift`). Corrette entrambe, piu' una precisazione
+  sulla "Guardia di plausibilita'" (la Ricostruzione completa scavalca lei, **non** la regola sulla
+  traversata incompleta).
+- **Questo piano**: spuntati i quattro step del Task 7 e aggiornato lo Step 5 del Task 6, il cui
+  numero di test (342) era superato dalla nota del 2026-08-27 (346).
+
+**Controllo incrociato su `Docs/ROADMAP.md`** (lo step chiedeva esplicitamente di non fermarsi al
+primo grep). Quattro righe riassuntive disallineate, tutte corrette:
+
+1. Il riepilogo in coda al capitolo diceva **"#27 non ha ancora una spec"** — falso dal 2026-08-25:
+   `2026-08-25-device-source-import-design.md` esiste, ha un piano, e i Task 1-2 sono in `main`.
+2. L'intestazione dello stesso capitolo diceva **"Quattro punti"** e "gli altri tre restano aperti":
+   con #31 sono cinque.
+3. Nello "Stato aggiornato (2026-08-02)": **"Ancora aperto: #7 scheduling"**, mentre il punto 7 e' ✅
+   dallo stesso giorno.
+4. Nello "Stato aggiornato (2026-08-09)": **"Roadmap completa: nessun punto resta aperto"**, vero solo
+   per i punti 1-20 ma scritto in forma assoluta, con tre capitoli aperti sotto.
+
+**Anche `Docs/CLAUDE.md` aveva piu' di una riga stantia oltre a quella nota** ("139 test XCTest",
+ferma da luglio, contro 346): `ContentView.swift` descritto come "~2000 righe" quando ne ha ~8.400;
+il target di test descritto come **un solo file** quando ne contiene 31; l'elenco delle voci del menu
+hamburger fermo a 6 su 9 (mancavano Catalogo, Foto, Controlla aggiornamenti); la tabella datata
+2026-07-29 pur contenendo righe riscritte al 2026-08-18; e nessun riferimento a `Docs/adr/`, dove
+vivono le decisioni di #31. La sezione "Obiettivi futuri (non ancora iniziati)" elencava verifiche
+gia' fatte: rinominata.
+
+**In `.claude/rules/architecture.md`**, oltre alla sezione nuova, corretti tre punti che #31 aveva
+reso obsoleti: l'elenco delle esclusioni di `FileSyncer` (ora `LibraryExclusions`, fonte unica), il
+bullet su `sampleLocalPair` che descriveva una `realpath()` chiamata a mano (ora l'helper globale
+`realResolvedPath`), e `JobSummary`, a cui mancavano `duplicatesSkipped` e la regola sulla
+`init(from:)` con `decodeIfPresent`. I sei fatti misurati durante il piano — cache di
+`resourceValues`, `fileExists` cieco allo scollegamento, `sqlite3_threadsafe() == 2`, le due
+canonicalizzazioni opposte, i default `Codable` che non retrocompatibilizzano, la granularita' mtime
+a 10 ms — sono ora scritti li' **con la misura**, non solo con la conclusione.
+
+**Nessun file di codice o di test e' stato toccato.** Build e suite rilanciate a fine task proprio
+per certificarlo: `** BUILD SUCCEEDED **`, **346 test, 0 failure**.

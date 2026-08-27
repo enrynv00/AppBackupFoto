@@ -2,6 +2,8 @@
 
 Questo file definisce regole, architettura e obiettivi del progetto. Leggilo integralmente prima di toccare qualsiasi file. Il dettaglio dell'architettura Swift (componente per componente) e lo storico bug sono in `.claude/rules/architecture.md` e `.claude/rules/bug-history.md` — si caricano automaticamente quando lavori su `ContentView.swift` o `AppBackupFotoTests/`.
 
+Altre due letture brevi che questo file **non** sostituisce: le **decisioni architetturali** stanno in `Docs/adr/` (una pagina per decisione, con il perché e le conseguenze — oggi 4, tutte sull'indice di contenuto e sul concetto di doppione), e il **vocabolario del progetto** in `Docs/CONTEXT.md`. Se stai per riproporre una scelta che un ADR ha già chiuso, l'ADR dice anche quale argomento nuovo servirebbe per riaprirla.
+
 ---
 
 ## Identità del progetto
@@ -12,9 +14,9 @@ App macOS nativa (SwiftUI, Swift 5.x, target macOS 26+) per il backup automatico
 - **SSD → HDD** — mirror locale (deep checksum automatico ogni 30 giorni)
 - **SSD → Cubbit S3** — cloud backup sul bucket `backupfoto`
 
-File principale e unico: `/Users/enriconannivicenzi/Desktop/AppBackupFoto/AppBackupFoto/ContentView.swift` (~2000 righe). Non esistono altri file Swift nel target app oltre agli Assets — l'entry point `@main` (`BackupFotoEnricoApp`) vive anch'esso in questo file (`AppBackupFotoApp.swift` è stato rimosso perché ridondante).
+File principale e unico: `/Users/enriconannivicenzi/Desktop/AppBackupFoto/AppBackupFoto/ContentView.swift` (**~8.400 righe** al 2026-08-27 — il "~2000" scritto qui fino a oggi era fermo a luglio; non fidarti dei numeri di riga per localizzare una funzione, usa `grep -n`). Non esistono altri file Swift nel target app oltre agli Assets — l'entry point `@main` (`BackupFotoEnricoApp`) vive anch'esso in questo file (`AppBackupFotoApp.swift` è stato rimosso perché ridondante).
 
-Target di test separato: `AppBackupFotoTests/FileSyncerZeroOverwriteTests.swift` — XCTest che blinda l'invariante zero-overwrite su directory temporanee reali (nessun mock).
+Target di test separato `AppBackupFotoTests/`: **31 file XCTest** su directory temporanee reali (nessun mock), capostipite `FileSyncerZeroOverwriteTests.swift`, che blinda l'invariante zero-overwrite. **Il target non è file-system-synchronized**: ogni nuovo file di test va registrato a mano in `AppBackupFoto.xcodeproj/project.pbxproj` in 4 punti (`PBXBuildFile`, `PBXFileReference`, gruppo `AppBackupFotoTests`, `PBXSourcesBuildPhase`), altrimenti compila ma non viene mai eseguito e i test "passano" solo perché non girano — verificare sempre il **conteggio totale atteso**, mai il solo `** TEST SUCCEEDED **`.
 
 ---
 
@@ -75,7 +77,9 @@ Qualsiasi subprocess (rsync, bash, rclone, Process()) lanciato da un'app GUI **n
 
 ---
 
-## Stato attuale (aggiornato 2026-07-29)
+## Stato attuale (aggiornato 2026-08-27)
+
+La data sopra vale per l'intera tabella. Se ci lavori, aggiornala: fino a oggi diceva 2026-07-29 mentre alcune righe erano già state riscritte al 2026-08-18, e il conteggio dei test era fermo a 139 su 346 reali.
 
 | Funzione | Stato |
 | :---- | :---- |
@@ -87,22 +91,40 @@ Qualsiasi subprocess (rsync, bash, rclone, Process()) lanciato da un'app GUI **n
 | Notifiche sistema | ✅ Funzionano |
 | SetupView | ✅ Funziona; basta la Libreria Foto per entrare nell'app (`canEnterApp`) |
 | SettingsSheet / ToolsSheet / AppearanceSheet | ✅ Funzionano |
-| Sidebar hamburger (Report Log, Ripristina, Configurazione, Tools, Aspetto, Lingua) | ✅ Implementata |
+| Sidebar hamburger (Report Log, Ripristina, Configurazione, Tools, Catalogo, Foto, Controlla aggiornamenti, Aspetto, Lingua) | ✅ Implementata — l'elenco scritto qui fino al 2026-08-27 era fermo a 6 voci e ne ometteva 3 già in produzione |
 | Grafico velocità real-time | ✅ Implementato (Charts, MB/s per S3, file/s locale) |
-| Pannello Revisione (ToolsSheet) | ✅ Implementato — config checks, ultimo job persistito, campione integrità SHA256, pulizia upload multipart orfani |
+| Pannello Revisione (ToolsSheet) | ✅ Implementato — config checks, ultimo job persistito, campione integrità SHA256 (con **precedenza ai file copiati e mai verificati**, 2026-08-26), pulizia upload multipart orfani |
 | Backup automatico Mac→SSD | ✅ Implementato — trigger su collegamento SSD, toggle on/off in Impostazioni, solo ad app aperta |
-| Test automatici | ✅ 139 test XCTest passano (`AppBackupFotoTests`: zero-overwrite, volume-root, persistenza job, campionamento locale, parsing cartelle S3 per il restore, correttezza sha256, classificazione retry S3, lettura file a blocchi, logica AIMD del gate adattivo, ordinamento parti multipart, validazione endpoint S3, generazione docker-compose Immich verificata con parser YAML reale, esclusione dischi formattabili `DiskFormatter`) |
-| Build | ✅ `xcodebuild ... build` e `... test` verdi su questo stato |
+| Gate Touch ID all'avvio (#30) | ✅ Implementato — `AuthGateManager` + `LockScreenView`, copre anche le finestre di primo livello Diagnostica/Catalogo/Foto. Verifica con Touch ID reale ancora da fare |
+| Catalogo backup (#12) e auto-update Sparkle (#18) | ✅ Implementati — il secondo verificato end-to-end con due release reali |
+| Indice di contenuto della libreria + dedup in import (#31) | ✅ **Nucleo implementato (2026-08-25/27)** — indice SHA256 SQLite delle foto/video dell'SSD in `~/Library/Application Support/AppBackupFoto/`, mai sull'SSD; card «Foto già salvate sull'SSD» in Diagnostica; durante un import non si ricopia un file il cui contenuto è già in libreria, né un doppione interno allo stesso import. **Il pannello Doppioni non è mai stato iniziato**; alcune verifiche manuali con l'SSD collegato sono pendenti (vedi sotto). Dettagli in `.claude/rules/architecture.md`, decisioni in `Docs/adr/` |
+| Formattazione disco guidata (#28) e Immich (#29) | ⏳ Codice completo e buildabile, **mai eseguiti davvero** — nessun `diskutil eraseDisk`, nessun container avviato. Non marcarli "fatti" |
+| Test automatici | ✅ **346 test XCTest passano** (era 139 fino al 2026-07-29, numero rimasto fermo qui per un mese). 31 file in `AppBackupFotoTests`: zero-overwrite, volume-root, persistenza job, campionamento locale, parsing cartelle S3 per il restore, correttezza sha256 (incluso il file che cambia dimensione mentre lo si legge), classificazione retry S3, lettura file a blocchi, logica AIMD del gate adattivo, ordinamento parti multipart, validazione endpoint S3, generazione docker-compose Immich verificata con parser YAML reale, esclusione dischi formattabili `DiskFormatter`, guardia self-import e slug etichetta, e gli otto file nati da #31 (`IndexableKindTests`, `IndexEntryVerdictTests`, `LibraryIndexStoreTests`, `LibraryIndexerTests`, `LibraryIndexStatusTests`, `ImportDedupTests`, `UnverifiedCopiesStoreTests`, `FileSyncerHashVerificationTests`) |
+| Build | ✅ `xcodebuild ... build` e `... test` verdi su questo stato (commit `23be5d0`) |
 
 Storico bug (risolti e aperti): vedi `.claude/rules/bug-history.md`.
 
 ---
 
-## Obiettivi futuri (non ancora iniziati)
+## Verifiche manuali e obiettivi aperti
+
+(Il titolo diceva "Obiettivi futuri (non ancora iniziati)" mentre la sezione elencava anche verifiche già fatte.)
+
+**Prossimo incremento naturale**: il **pannello Doppioni** di #31, previsto dalla spec e **mai iniziato** — nessuna riga di codice, nessun piano. È il secondo consumatore dell'indice, quello a **basso danno**, dove ci si fida della cache invece di rileggere. Subito dopo, o prima, #27-A riprende dal Task 3 (il wizard di import), fermato a suo tempo proprio in attesa di #31.
 
 **Verifica manuale — campione di integrità: fatta (2026-08-23)**. Eseguita da Enrico con SSD e HDD collegati: zero problemi su tutte e 3 le coppie (Mac↔SSD, SSD↔HDD, SSD↔S3). Confermato anche che `sampleS3Pair` cancella davvero i file temporanei scaricati da S3 per il confronto (`defer { try? fm.removeItem(at: tempURL) }`, nessun residuo trovato in `$TMPDIR` dopo il check). Badge di Revisione (#20) già confermato in una sessione precedente (2026-08-16).
 
 **Verifiche manuali ancora pendenti**, in stand-by su richiesta esplicita di Enrico (2026-08-23) — vedi memoria di progetto: test TCC/formattazione reale per #28 (`Docs/superpowers/plans/2026-08-17-setup-guide-formatting.md`, Task 4 Step 5) e per #29/Immich (`Docs/superpowers/plans/2026-08-17-immich-integration.md`, Task 5 Step 4), verifica upload S3 reale con Monitor Attività, conferma Touch ID reale.
+
+**Verifiche manuali pendenti per #31 (indice di contenuto), tutte con l'SSD collegato** — Enrico non ha l'SSD a disposizione per qualche giorno (2026-08-27). Sono l'unico step non spuntato del piano `Docs/superpowers/plans/2026-08-25-library-content-index.md` (Task 6, Step 5) più quanto emerso dalle review:
+
+1. **Prima costruzione reale dell'elenco dall'app**: aprire Diagnostica → «Foto già salvate sull'SSD» → «Crea l'elenco», guardare progresso e «Interrompi». È l'unico percorso della card mai eseguito davvero.
+2. **Misurare la durata.** La card dichiara «di solito servono dai 5 ai 15 minuti» (`LibraryIndexCard.durata`) e **quel numero non è mai stato misurato**: è un ordine di grandezza scritto a tavolino. Va sostituito con la misura vera sul volume reale.
+3. **Censire le estensioni realmente presenti sull'SSD.** `IndexableKind` classifica per `UTType`, e `.mkv`, `.x3f`, `.hevc`, `.insv`, `.lrv` **non** risultano media: quei file non entrano nell'indice e non partecipano al dedup. È il verso sicuro (vengono copiati, mai saltati), ma se sull'SSD ce ne sono molti il dedup li ignora in silenzio.
+4. **`ls -a "/Volumes/SSD - Enri"`** — chiude la questione lasciata aperta su `lost+found` e `Backups.backupdb`: sono nella lista `LibraryExclusions`, ma nessuno ha mai verificato se esistano davvero su quel volume.
+5. **Un avviso della card deve comparire nella finestra Diagnostica.** Aprire Diagnostica **senza SSD collegato** e premere «Crea l'elenco»: il messaggio deve apparire *in quella finestra*. È il rilievo chiuso il 2026-08-27 con `AlertSink`, e per costruzione non è verificabile da un test (due scene SwiftUI).
+
+**Rilievi minori di #31 lasciati aperti** (non richiedono l'SSD, nessuno è bloccante): il registro anti-gergo delle righe di stato è coperto su 6 diramazioni su 9; plurali e `id` delle righe di `LibraryIndexStatus` non sono testati; i debiti di verifica delle copie non confermate **scadono in blocco se l'orologio di sistema salta in avanti** (verso non sicuro, ma il danno è una lista di priorità svuotata, non un file perso); la lettura manuale dell'elenco e i job di copia non si guardano a vicenda (i bottoni della card non sanno di un job in corso, mentre l'aggiornamento automatico sì); `NSTemporaryDirectory()` resta nell'allow-list delle posizioni valide per il file dell'indice anche in produzione, non solo nei test; e non è escluso che SwiftUI inghiotta una seconda presentazione quando l'avviso nasce dentro l'`onConfirm` di un altro alert.
 
 ---
 

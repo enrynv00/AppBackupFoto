@@ -42,15 +42,15 @@ Le decisioni architetturali stanno in `Docs/adr/`. Lo stato e l'architettura in 
 
 **Chiave normalizzata** — il percorso relativo alla root SSD, in NFC e minuscolo. Serve perché ExFAT è case-insensitive e non normalizza l'Unicode mentre APFS preserva la normalizzazione originale: senza, lo stesso file produrrebbe due entry.
 
-**Verdetto** — l'esito della domanda "l'hash memorizzato per questo file vale ancora?": `fresh` (sì), `stale` (no, il file è cambiato), `needsVerification` (non possiamo escluderlo). È logica pura, senza filesystem né database.
+**Verdetto** — l'esito della domanda "l'hash memorizzato per questo file vale ancora?". Sono **quattro**, non tre: `fresh` (sì), `stale` (no, il file è cambiato), `needsVerification` (non possiamo escluderlo, si rihasha), `timezoneShift` (cambio di ora legale, si adotta il nuovo mtime **senza** rihashare). È logica pura, senza filesystem né database.
 
 **Percorso a basso danno / percorso ad alto danno** — la distinzione che regge tutto il modello di fiducia. Segnalare un doppione nel pannello è a basso danno (una riga sbagliata in un elenco). Saltare un file durante un import è ad **alto danno** (una foto non importata, in silenzio). Sullo stesso indice si applicano due livelli di fiducia diversi: nel primo caso ci si fida della cache, nel secondo **si rilegge e si rihasha il file candidato prima di decidere lo skip**.
 
 **Regola anti-racy** — presa da git e borg: se un file risulta modificato entro un margine da quando ne abbiamo calcolato l'hash, non possiamo escludere che sia cambiato subito dopo la lettura mantenendo lo stesso mtime. Margine 2 secondi.
 
-**Tolleranza DST** — uno shift di mtime di esattamente 3600s o 1800s è quasi certamente un cambio di fuso su ExFAT, non una modifica: si riverifica invece di invalidare in blocco. **Senza prior art**: è una scelta di questo progetto, marcata come tale nel codice.
+**Tolleranza DST** — uno shift di mtime di esattamente 3600s o 1800s a dimensione identica è quasi certamente un cambio di fuso su ExFAT, non una modifica: si **adotta il nuovo mtime tenendo l'hash già calcolato** (verdetto `timezoneShift`), invece di invalidare in blocco. Questa pagina diceva "si riverifica": era la prima stesura, e con quella semantica la regola non faceva assolutamente nulla — riverificare significa rihashare, cioè esattamente ciò che la regola esiste per evitare. Corretto nel codice il 2026-08-25 e qui il 2026-08-27. **Senza prior art**: è una scelta di questo progetto, marcata come tale nel codice.
 
-**Guardia di plausibilità** — se una scansione vede sparire più della metà dell'indice, è quasi sempre un'interruzione non riconosciuta, non una cancellazione reale: nel dubbio l'indice si tiene. La **Ricostruzione completa** è la via d'uscita esplicita.
+**Guardia di plausibilità** — se una scansione vede sparire più della metà dell'indice, è quasi sempre un'interruzione non riconosciuta, non una cancellazione reale: nel dubbio l'indice si tiene. La **Ricostruzione completa** è la via d'uscita, ma solo da questa guardia: **non** scavalca la regola più forte "traversata incompleta ⇒ non si toglie niente". Se l'utente ha davvero svuotato l'SSD l'unica uscita è **svuotare l'elenco** (`deleteIndexAndRecreate`), che è il solo comando distruttivo della card.
 
 **Ricostruzione completa** (`ignoringStoredHashes`) — rihasha tutto senza fidarsi di nulla di memorizzato. Azione esplicita dell'utente, che significa "fidati del disco". Tutti i tool esaminati (rsync, restic, borg, rmlint) ne offrono una.
 
