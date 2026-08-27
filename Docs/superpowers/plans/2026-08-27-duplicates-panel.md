@@ -1,0 +1,361 @@
+# Pannello Doppioni con cancellazione (roadmap #31, seconda parte) Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Stato: da approvare.** Spec di riferimento: `Docs/superpowers/specs/2026-08-27-duplicates-panel-design.md`. Nessun task va iniziato prima di un'approvazione esplicita di Enrico, e prima che siano chiuse le sei domande aperte in coda alla spec — tre di esse (tetto per blocco, forma della seconda conferma, testo della regola assoluta) cambiano il contenuto dei task.
+
+**Goal:** Un pannello che elenca i gruppi di file byte-identici già presenti sull'SSD, propone e **spiega** quale copia tenere, e — dopo che l'utente ha spuntato i gruppi, letto un riepilogo dettagliato e confermato — sposta le copie in eccesso nel **Cestino del volume**, in modo annullabile.
+
+**Architecture:** Sei componenti separati per responsabilità, cinque dei quali testabili senza UI. `LibraryIndexStore.duplicateGroups()` è una query nuova sullo store esistente (l'indice `idx_entries_hash` c'è già). `duplicateKeepChoice` e `duplicateKeepExplanation` sono logica **pura**: dato un gruppo, quale copia si tiene e **perché**, con il motivo come parte del risultato e non ricostruito dalla UI. `DuplicateBatch` è logica **pura** di aggregazione: conteggi, byte, cartelle, tetto. `DuplicateTrasher` è il motore di cancellazione, l'unico componente che tocca file foto; ha `trashFunction` e `hashFunction` iniettabili con default reali, stesso pattern di `FileSyncer.hashFunction`. `TrashManifestStore` è il registro di ripristino, sul disco interno. `DuplicatesView` è la `Window` di primo livello, gated con `AuthGateManager`.
+
+**Tech Stack:** Swift 5.x, SwiftUI, `SQLite3` di sistema, `UniformTypeIdentifiers`, ImageIO (già in uso per `makeThumbnail`), XCTest. Nessuna dipendenza nuova.
+
+**Baseline: 346 test verdi** al commit `310efa5`. Ogni task dichiara il proprio incremento e il **cumulativo atteso**; la regola del progetto vale integralmente — il target di test **non è file-system-synchronized**, ogni file nuovo va registrato a mano in `AppBackupFoto.xcodeproj/project.pbxproj` in 4 punti, e si verifica sempre il **conteggio totale nel log**, mai il solo `** TEST SUCCEEDED **`.
+
+| Componente | Responsabilità | Test |
+| :---- | :---- | :---- |
+| `LibraryIndexStore.duplicateGroups()` | leggere i gruppi dall'indice | `DuplicateGroupsStoreTests.swift` |
+| `duplicateKeepChoice` / `duplicateKeepExplanation` | quale copia tenere, e perché, a parole | `DuplicateKeepChoiceTests.swift` |
+| `DuplicateBatch` | aggregazione del blocco: file, byte, cartelle, tetto | `DuplicateBatchTests.swift` |
+| `DuplicateTrasher` | verifica, cestinamento, aggiornamento dell'indice | `DuplicateTrasherTests.swift` |
+| `TrashManifest` / `TrashManifestStore` | registro di ripristino e annullamento | `TrashManifestTests.swift` |
+| `DuplicatesView` + `DuplicatesStatus` | la finestra; le righe di stato sono pure | `DuplicatesStatusTests.swift` |
+
+## Comandi di build e test
+
+```bash
+# build
+xcodebuild -project AppBackupFoto.xcodeproj -scheme AppBackupFoto -configuration Debug build 2>&1 | tail -10
+# suite completa
+xcodebuild -project AppBackupFoto.xcodeproj -scheme AppBackupFoto -destination 'platform=macOS' test 2>&1 | tail -15
+# singola classe
+xcodebuild -project AppBackupFoto.xcodeproj -scheme AppBackupFoto -destination 'platform=macOS' test -only-testing:AppBackupFotoTests/<Classe> 2>&1 | tail -30
+```
+
+## Regola di sicurezza valida per tutti i task
+
+Ogni task che tocca la cancellazione dichiara sotto **«Il mutante che deve morire»**: la modifica plausibile che un ottimizzatore futuro farebbe, e il test che deve diventare rosso se qualcuno la fa. Un test che passa sia col codice giusto sia con quello sbagliato non è una rete di protezione — su questo progetto è già successo tre volte (il parsing YAML di Immich con `contains`, `testCancelStopsScan`, il test sulla root sparita). **Al termine del Task 4 e del Task 5 va eseguita una corsa di mutation testing** sui mutanti elencati, con lo stesso metodo usato per il nucleo di #31 (22 mutanti, 22 uccisi).
+
+Vincolo trasversale, da non violare in nessun task: **nessun percorso di codice di questo piano può chiamare `removeItem` su un file dentro la root della libreria**, e nessuno può scrivere dentro `.Trashes`.
+
+---
+
+### Task 1: `duplicateGroups()` — leggere i gruppi dall'indice
+
+Primo perché tutto il resto lo consuma, e perché è la sola parte che tocca SQLite.
+
+**Files:**
+- Modify: `AppBackupFoto/ContentView.swift` (dentro `LibraryIndexStore`, accanto a `entries(withHash:)` — **localizza con `grep -n "func entries(withHash"`, mai per numero di riga**)
+- Create: `AppBackupFotoTests/DuplicateGroupsStoreTests.swift`
+- Modify: `AppBackupFoto.xcodeproj/project.pbxproj`
+
+**Interfaces:**
+- Consuma: `LibraryIndexEntry`, la coda seriale privata e gli helper `prepare`/`stepRow`/`bind*` già esistenti nello store.
+- Produce: `struct DuplicateGroup { let hash: String; let size: Int64; let members: [LibraryIndexEntry] }` e `func duplicateGroups() throws -> [DuplicateGroup]`. Consumato dai Task 2, 3, 4, 6.
+
+- [ ] **Step 1: Scrivi il file di test** (~14 test) su un database temporaneo reale, come già fa `LibraryIndexStoreTests`. Copertura minima:
+  - due entry stesso hash ⇒ un gruppo con due membri; tre entry ⇒ un gruppo con tre membri
+  - entry con hash unico ⇒ nessun gruppo
+  - due gruppi distinti ⇒ due gruppi, membri non mescolati
+  - **entry con `size = 0` ⇒ nessun gruppo, anche se sono tre e hanno lo stesso hash** (tutti i file vuoti condividono lo SHA256; raggrupparli significherebbe proporre di cestinare file *diversi*)
+  - un membro con `size = 0` e uno no, stesso hash: caso impossibile in pratica, ma il gruppo va escluso lo stesso — non si cestina su dati incoerenti
+  - `displayPath`, `mtime`, `hashedAt` di ogni membro sono quelli scritti, non ricostruiti
+  - indice vuoto ⇒ array vuoto, nessun errore
+  - risultato **stabile fra due chiamate** sugli stessi dati (ordinamento deterministico)
+  - un database corrotto ⇒ **lancia**, non restituisce un array vuoto
+
+- [ ] **Step 2: Registra il file in `project.pbxproj`** (4 punti; usa `grep -n "LibraryIndexStoreTests" AppBackupFoto.xcodeproj/project.pbxproj` per copiare il formato esatto).
+
+- [ ] **Step 3: Verifica il fallimento atteso** — `cannot find 'DuplicateGroup' in scope`. Se il comando non trova affatto la classe di test, la registrazione non ha funzionato: **fermati e segnalalo**.
+
+- [ ] **Step 4: Implementa.** Una sola query, dentro la coda seriale, con i vincoli già stabiliti per lo store:
+  - `SELECT ... FROM entries WHERE size > 0 AND hash IN (SELECT hash FROM entries WHERE size > 0 GROUP BY hash HAVING COUNT(*) > 1) ORDER BY hash, path`
+  - **nessun ciclo `while sqlite3_step(...) == SQLITE_ROW` nudo**: esce identico su `SQLITE_DONE` e su `SQLITE_ERROR`/`CORRUPT`/`BUSY`, cioè può restituire un elenco **troncato senza errore** — e qui un elenco troncato è un gruppo che non compare, non un dato sbagliato, ma la regola dello store è unica e non si deroga. Usa `stepRow`, che lancia.
+  - guardia nil su ogni colonna `TEXT` letta con `String(cString:)`: un puntatore nil termina il processo (SIGTRAP).
+  - doc-comment che scrive il **contratto**: risultato corretto ma **potenzialmente stantio**, esattamente come `entries(withHash:)`. Serve a mostrare una lista, **mai** a decidere una cancellazione senza rilettura (ADR-0003 + ADR-0005).
+
+- [ ] **Step 5: Test verdi** — `Executed 14 tests, with 0 failures`.
+- [ ] **Step 6: Build, suite completa, commit** — attesi **360 test** (346 + 14).
+
+**Il mutante che deve morire:**
+| Mutante | Test che deve diventare rosso |
+| :---- | :---- |
+| `size > 0` rimosso | `testZeroByteFiles_areNotAGroup` |
+| `HAVING COUNT(*) > 1` → `>= 1` | `testUniqueHash_isNotAGroup` |
+| `stepRow` sostituito da un `while sqlite3_step == SQLITE_ROW` | `testCorruptDatabase_throws` |
+
+---
+
+### Task 2: `duplicateKeepChoice` — quale copia si tiene, e perché
+
+Logica **pura**: nessun filesystem, nessun database. È la decisione 3 di Enrico, e il motivo fa parte del risultato.
+
+**Files:**
+- Modify: `AppBackupFoto/ContentView.swift` (accanto a `indexEntryVerdict`, l'altra funzione pura di #31)
+- Create: `AppBackupFotoTests/DuplicateKeepChoiceTests.swift`
+- Modify: `AppBackupFoto.xcodeproj/project.pbxproj`
+
+**Interfaces:**
+- Consuma: `DuplicateGroup` (Task 1).
+- Produce: `enum DuplicateKeepReason { case mainLibrary, notAnImport, oldest, deterministicTieBreak }`, `struct DuplicateKeepChoice { let keeper: LibraryIndexEntry; let reason: DuplicateKeepReason }`, `func duplicateKeepChoice(_ group: DuplicateGroup) -> DuplicateKeepChoice`, e `func duplicateKeepExplanation(_ choice:, in group:) -> String`. Consumati dai Task 3, 4, 6.
+
+- [ ] **Step 1: Scrivi il file di test** (~18 test):
+  - un membro sotto `Foto iPhone/` e uno sotto `Import/Scheda/` ⇒ vince il primo, `reason == .mainLibrary`
+  - due membri sotto `Foto iPhone/` ⇒ si scende alla regola successiva
+  - un membro sotto `Import/` e uno sotto `2019 Vacanze/` ⇒ vince il secondo, `.notAnImport`
+  - due membri entrambi sotto `Import/` ⇒ `.oldest`
+  - a parità di cartella, mtime diversi ⇒ vince il **più vecchio** (`.oldest`)
+  - a parità piena ⇒ `.deterministicTieBreak`, e il risultato **non cambia permutando l'ordine dei membri in input** (test che prova almeno 6 permutazioni)
+  - gruppo con tre membri e regole miste, per verificare la precedenza fra le tre regole
+  - la spiegazione **nomina la cartella vera** del file tenuto e **il numero** delle altre copie
+  - la spiegazione è diversa per ciascuno dei quattro motivi (nessun testo condiviso che renderebbe il test cieco)
+  - la spiegazione non contiene le parole «hash», «indice», «SHA256», «scansione» — registro anti-gergo, come già per `LibraryIndexStatus`
+  - `Foto iPhone` con maiuscole diverse / in NFD: riconosciuta comunque (le chiavi dell'indice sono già NFC + minuscole, ma il confronto va fatto sulla **chiave normalizzata**, non su `displayPath`)
+  - `Fotografie iPhone/` **non** è `Foto iPhone/`: confronto per **componente di percorso**, mai `hasPrefix` sulla stringa
+
+- [ ] **Step 2–3: registra il file, verifica il fallimento atteso.**
+
+- [ ] **Step 4: Implementa.** Precedenza: `mainLibrary` → `notAnImport` → `oldest` → tie-break deterministico (percorso più corto, poi ordine della chiave normalizzata). Il confronto delle cartelle passa dalla **prima componente della chiave normalizzata**, non da `hasPrefix`.
+  Commento accanto al codice, obbligatorio: **questa regola è un'ipotesi costruita su ciò che il progetto sa delle proprie cartelle, non su un censimento dell'SSD reale** (mai fatto). Se il layout vero la smentisce, cambiano questa funzione e i suoi test, non il design.
+
+- [ ] **Step 5–6: test verdi, build, suite, commit** — attesi **378 test** (360 + 18).
+
+**Il mutante che deve morire:**
+| Mutante | Test rosso |
+| :---- | :---- |
+| Precedenza `mainLibrary`/`notAnImport` invertita | `testMainLibraryBeatsOrganizedFolder` |
+| «più vecchia» → «più recente» | `testSameFolder_keepsOldest` |
+| Tie-break rimosso (ordine di input) | `testTieBreak_isStableAcrossPermutations` |
+| `hasPrefix` al posto del confronto per componenti | `testFotografieIPhone_isNotTheMainLibrary` |
+| La spiegazione non nomina il numero delle altre copie | `testExplanation_namesTheNumberOfOtherCopies` |
+
+---
+
+### Task 3: `DuplicateBatch` — il riepilogo del blocco
+
+Logica **pura**. È la prima delle due conferme richieste dalla decisione 4 di Enrico: il riepilogo dettagliato *prima* della conferma vera.
+
+**Files:** Modify `ContentView.swift`; Create `AppBackupFotoTests/DuplicateBatchTests.swift`; Modify `project.pbxproj`.
+
+**Interfaces:**
+- Consuma: `DuplicateGroup`, `DuplicateKeepChoice`.
+- Produce: `struct DuplicateBatch { let groups: [...]; let fileCount: Int; let reclaimableBytes: Int64; let folderBreakdown: [(folder: String, count: Int)]; let exceedsCap: Bool }` e `DuplicateBatch.summaryLines(...) -> [String]` (testo puro del riepilogo). Consumati dai Task 4 e 6.
+
+- [ ] **Step 1: Scrivi il file di test** (~14 test):
+  - **spazio recuperabile = `size × (numero di copie − 1)`**, non `size × numero di copie`: la copia che resta occupa comunque il suo spazio. È l'errore aritmetico più facile della feature.
+  - somma su più gruppi di dimensioni diverse
+  - conteggio file da cestinare = somma di `(membri − 1)`
+  - ripartizione per cartella: due gruppi che pescano dalla stessa cartella producono **una** riga con conteggio 2
+  - ordinamento di default: **spazio recuperabile decrescente**; a parità, numero di copie decrescente
+  - tetto: sopra la soglia `exceedsCap == true`; esattamente alla soglia `false` (off-by-one)
+  - blocco vuoto ⇒ zero, nessun crash, e il riepilogo lo dice invece di mostrare «0 file»
+  - il riepilogo dice **i file**, non i gruppi (il numero che conta è quello dei file che si spostano)
+  - il riepilogo contiene la riga **«lo spazio si libera quando svuoti il Cestino»** — misurato: cestinare non libera spazio
+  - il riepilogo contiene la riga **«le copie su HDD e su Cubbit restano dove sono»** — i mirror non cancellano mai
+  - registro anti-gergo: nessun «hash», «indice», «SHA256»
+
+- [ ] **Step 2–3: registra, verifica il fallimento atteso.**
+- [ ] **Step 4: Implementa.** Il tetto è una costante nominata con un commento che dice **perché** quel numero (ritmo misurato ~56 file/s, e un guasto a metà blocco è uno stato reale — misura 3 della spec), non un valore scelto a tavolino. **Il valore va confermato da Enrico prima di scrivere il codice** (domanda aperta 2).
+- [ ] **Step 5–6:** attesi **392 test** (378 + 14).
+
+**Il mutante che deve morire:**
+| Mutante | Test rosso |
+| :---- | :---- |
+| `size × count` invece di `size × (count − 1)` | `testReclaimableSpace_excludesTheKeptCopy` |
+| Tetto non applicato / `>` invece di `>=` | `testCap_boundary` |
+| Il riepilogo conta i gruppi invece dei file | `testSummary_countsFilesNotGroups` |
+| Le due righe di avvertimento rimosse | `testSummary_saysSpaceIsFreedOnlyWhenTrashIsEmptied`, `testSummary_saysMirrorsKeepTheirCopies` |
+
+---
+
+### Task 4: `DuplicateTrasher` — il motore di cancellazione
+
+**È il task pericoloso.** L'unico componente del progetto che sposta un file foto. Va scritto per ultimo fra quelli logici e revisionato con la massima severità.
+
+**Files:**
+- Modify: `AppBackupFoto/ContentView.swift`
+- Modify: `AppBackupFoto/ContentView.swift` — estrazione di `deviceIdentifier(of:)` da `LibraryIndexer` (oggi `private`) a **funzione libera `nonisolated`**, accanto a `realResolvedPath`. Fonte unica: il progetto ha già pagato due volte la duplicazione della stessa logica (`LibraryExclusions`, `realResolvedPath`). `LibraryIndexer` la consuma da lì, senza cambiare comportamento.
+- Create: `AppBackupFotoTests/DuplicateTrasherTests.swift`
+- Modify: `AppBackupFoto.xcodeproj/project.pbxproj`
+
+**Interfaces:**
+- Consuma: `DuplicateGroup`, `DuplicateKeepChoice`, `IndexableKind`, `sha256Measured`, `realResolvedPath`/`canonicalPathComponents`, `deviceIdentifier`, `LibraryIndexStore.remove(keys:)`, `TrashManifestStore.record(...)` (Task 5 — **il Task 5 va fatto prima di questo Step 4**, oppure l'interfaccia va stubbata e cablata in coda al Task 5; scegliere l'ordine e dichiararlo, non lasciarlo implicito).
+- Produce: `final class DuplicateTrasher` con `init(libraryRoot:store:manifest:trashFunction:hashFunction:)` — **`trashFunction` e `hashFunction` hanno per default le funzioni reali** (`FileManager.default.trashItem`, `sha256Measured`) e sono iniettate **solo dai test**: gli esiti da coprire (hash che cambia fra visualizzazione e cancellazione, scollegamento a metà blocco) non sono producibili su file veri senza una corsa fra thread, e un test basato su una corsa è verde col bug ogni volta che la corsa va nell'altro verso. Stesso pattern già in `FileSyncer.init(hashFunction:)`.
+- Produce: `struct DuplicateTrashOutcome { trashedFiles, skippedGroups: [(group, reason)], stoppedBecauseVolumeVanished: Bool, interrupted: Bool }`.
+
+- [ ] **Step 1: Scrivi il file di test** (~30 test), su directory temporanee reali (nessun mock del filesystem — convenzione del progetto).
+
+  **Verifica prima della cancellazione:**
+  - gruppo sano di 3 file identici ⇒ 2 cestinati, il tenuto resta, indice aggiornato
+  - **un membro da cestinare ha contenuto diverso** ⇒ **l'intero gruppo saltato**, zero file cestinati, motivo riportato
+  - **il file TENUTO ha contenuto diverso** ⇒ **l'intero gruppo saltato**. È il test che distingue il livello 3 di fiducia dal livello 2: rileggere solo i file da cestinare direbbe che sono uguali *fra loro*, non che sono uguali a quello che resta
+  - un membro illeggibile (`hashFunction` restituisce `nil`) ⇒ gruppo saltato. Mai «cestino quelli che ho potuto verificare»
+  - un membro con dimensione diversa da quella indicizzata ⇒ gruppo saltato
+  - un membro non esiste più ⇒ gruppo saltato
+  - hash unanimi fra loro ma **diversi dall'hash del gruppo** ⇒ gruppo saltato (l'indice era stantio su tutti i membri)
+
+  **Guardie:**
+  - una entry il cui percorso è **fuori** dalla root della libreria ⇒ mai cestinata, gruppo saltato, e il test usa un percorso che è **prefisso testuale ma non componente** della root (es. root `/tmp/x/SSD`, file in `/tmp/x/SSD 2/`) — altrimenti il test passa anche con `hasPrefix`
+  - una entry che non è `.image`/`.video` (`.txt`, `.aae`) ⇒ mai cestinata
+  - il file **tenuto non viene mai passato a `trashFunction`**: il test registra ogni chiamata e verifica che il percorso del tenuto non compaia
+  - un gruppo con un solo membro ⇒ nessuna cancellazione
+
+  **Scollegamento (la misura più importante della spec):**
+  - `trashFunction` che lancia `NSError(NSCocoaErrorDomain, 4)` **e** `st_dev` della root cambiato ⇒ **l'intero blocco si ferma**, `stoppedBecauseVolumeVanished == true`, e il numero di file già cestinati è riportato onestamente
+  - `trashFunction` che lancia `NSCocoaErrorDomain/4` **senza** cambio di `st_dev` ⇒ **solo quel gruppo** viene chiuso, il blocco prosegue, il fallimento è contato. È l'altra metà: i due casi hanno lo stesso errore e vanno distinti dal `st_dev`, non dall'errore
+  - `NSCocoaErrorDomain/4` **non** viene mai trattato come «era già sparito, tutto a posto»
+
+  **Post-condizione e indice:**
+  - il file tenuto sparisce a metà gruppo ⇒ i file appena cestinati di quel gruppo vengono **rimessi a posto**
+  - dall'indice si rimuovono **solo** le chiavi dei file effettivamente cestinati, mai quella del tenuto, mai quelle dei gruppi saltati
+  - `trashFunction` che fallisce ⇒ **la entry resta nell'indice** (ordine: prima si cestina, poi si rimuove)
+  - interruzione a metà blocco ⇒ i gruppi già chiusi restano chiusi, l'indice è coerente, `interrupted == true`
+
+  **Invariante strutturale:**
+  - con una `trashFunction` iniettata **che non fa nulla**, tutti i file del gruppo **esistono ancora** a fine corsa. Se il codice chiamasse anche `removeItem` da qualche parte, questo test diventerebbe rosso — è il modo di provare che `trashItem` è l'unica porta senza affidarsi a una lettura del codice
+
+- [ ] **Step 2–3: registra il file, verifica il fallimento atteso.**
+
+- [ ] **Step 4: Implementa** seguendo alla lettera la sequenza della sezione «La cancellazione — il percorso ad alto danno» della spec (8 punti). Ogni guardia ha accanto un commento di **una riga** che dice cosa succederebbe senza — la convenzione già usata in tutto `ContentView.swift` per le guardie non ovvie.
+
+- [ ] **Step 5: Test verdi** — `Executed 30 tests, with 0 failures`.
+
+- [ ] **Step 6: Mutation testing sui mutanti elencati sotto.** Un mutante sopravvissuto significa **riscrivere il test**, non il codice. Riporta il conteggio (`N mutanti, N uccisi`) nel commit.
+
+- [ ] **Step 7: Build, suite completa, commit** — attesi **422 test** (392 + 30).
+
+**Il mutante che deve morire:**
+| Mutante | Test rosso |
+| :---- | :---- |
+| Si rileggono solo i file da cestinare, non il tenuto | `testKeeperContentChanged_skipsWholeGroup` |
+| Un membro con hash diverso viene solo escluso, gli altri si cestinano | `testOneMemberDiffers_skipsWholeGroup` |
+| `nil` da `hashFunction` trattato come «coincide» | `testUnreadableMember_skipsWholeGroup` |
+| Il controllo di `st_dev` dopo un fallimento viene rimosso | `testUnmountMidBatch_stopsEverything` |
+| `NSCocoaErrorDomain/4` trattato come successo o come «già fatto» | `testFileNotFoundError_isNeverTreatedAsDone` |
+| Confinamento con `hasPrefix` invece che per componenti | `testSiblingRootWithCommonPrefix_isRefused` |
+| Guardia `IndexableKind` rimossa | `testNonMediaEntry_isNeverTrashed` |
+| Off-by-one che include il tenuto nel ciclo | `testKeeperIsNeverPassedToTrash` |
+| Rimozione dall'indice **prima** del cestinamento | `testTrashFailure_leavesIndexEntry` |
+| Rimozione dall'indice anche per i gruppi saltati | `testSkippedGroup_leavesIndexUntouched` |
+| Un `removeItem` aggiunto «per pulizia» | `testNoOpTrashFunction_leavesEveryFileOnDisk` |
+| Il tenuto sparito non fa scattare il ripristino | `testKeeperVanished_restoresWhatWasJustTrashed` |
+
+---
+
+### Task 5: `TrashManifest` — il registro di ripristino e l'annullamento
+
+La rete di sicurezza della decisione 2 di Enrico non può poggiare sul Finder: **misurato che il record «Rimetti a posto» è scritto in modo asincrono e va perso** se il processo muore subito dopo (226/300 e 85/100 in due misure indipendenti; 100/100 solo con il processo vivo).
+
+**Files:** Modify `ContentView.swift`; Create `AppBackupFotoTests/TrashManifestTests.swift`; Modify `project.pbxproj`.
+
+**Interfaces:**
+- Consuma: `sha256Measured`, `FileManager.moveItem`, la stessa directory di Application Support già usata da `LibraryIndexStore`.
+- Produce: `struct TrashManifest: Codable`, `struct TrashedItem: Codable { originalDisplayPath, originalKey, trashedPath, size, hash, trashedAt }`, `final class TrashManifestStore { func record(_:); func lastBatch() -> [TrashedItem]; func restore(_:) -> RestoreOutcome }`. Consumato dai Task 4 e 6.
+
+- [ ] **Step 1: Scrivi il file di test** (~18 test), su directory temporanee reali:
+  - una voce registrata è rileggibile dopo un ciclo apri/scrivi/chiudi/riapri
+  - **la voce è su disco subito dopo `record`, non a fine blocco**: il test registra una voce, riapre lo store da zero e la trova. È la lezione diretta della misura: un registro differito ha lo stesso difetto di quello del Finder
+  - ripristino di un file: torna al percorso originale, dimensione e contenuto intatti
+  - ripristino con le **cartelle intermedie cancellate** nel frattempo: vengono ricreate
+  - **il file nel Cestino è stato alterato** (hash diverso) ⇒ **non si ripristina**, e lo si dice
+  - **il percorso originale è di nuovo occupato** ⇒ **non si sovrascrive**, e lo si dice. Non basta affidarsi al rifiuto di `moveItem` (misurato `NSCocoaErrorDomain/516`): la guardia è nostra e va provata
+  - il file nel Cestino **non esiste più** (Cestino svuotato) ⇒ voce non ripristinabile, messaggio, nessun errore fatale
+  - un blocco con 3 voci di cui una non ripristinabile ⇒ le altre 2 vengono ripristinate
+  - retrocompatibilità: un record scritto **senza** un campo aggiunto dopo si decodifica lo stesso (`init(from:)` esplicita + `decodeIfPresent`; il default sulla proprietà da solo è una retrocompatibilità **finta** — fatto misurato n. 5 di #31, che aveva fatto sparire in silenzio l'ultimo job dal pannello Revisione)
+  - un file di registro spazzatura ⇒ si riparte da vuoto, mai un crash e mai un blocco dell'app
+  - permessi `0600` sul file del registro, verificati **dopo** un ciclo completo di scrittura/riapertura, con auto-skip se l'umask del processo di test è già restrittiva (altrimenti il test è verde senza dimostrare niente) — stesso schema del test sui permessi dell'indice
+  - il registro è dentro `~/Library/Application Support/AppBackupFoto/`, **mai sull'SSD**: allow-list riusata, non riscritta
+  - tetto alle voci conservate, con il conteggio totale a parte, così il numero mostrato resta veritiero a lista troncata (stessa forma di `UnverifiedCopies.maxPaths`)
+
+- [ ] **Step 2–3: registra, verifica il fallimento atteso.**
+- [ ] **Step 4: Implementa.**
+- [ ] **Step 5: Test verdi.**
+- [ ] **Step 6: Mutation testing** sui mutanti sotto.
+- [ ] **Step 7: Build, suite, commit** — attesi **440 test** (422 + 18).
+
+**Il mutante che deve morire:**
+| Mutante | Test rosso |
+| :---- | :---- |
+| `record` bufferizzato e scritto a fine blocco | `testRecordIsOnDiskImmediately` |
+| Ripristino senza verifica dell'hash | `testAlteredTrashedFile_isNotRestored` |
+| Ripristino che sovrascrive il percorso originale | `testOccupiedOriginalPath_isNotOverwritten` |
+| Una voce non ripristinabile interrompe le altre | `testOneBadEntry_doesNotBlockTheOthers` |
+| `init(from:)` sintetizzata al posto di quella esplicita | `testOldRecordWithoutNewField_stillDecodes` |
+| Registro scritto sotto la root della libreria | `testManifestLocation_isRefusedOutsideAppSupport` |
+
+---
+
+### Task 6: `DuplicatesView` — la finestra, le due conferme, le miniature
+
+La parte SwiftUI non è testabile senza una corsa reale; **è testato tutto ciò che sta ai due capi del cablaggio**, come già dichiarato per la card di #31.
+
+**Files:** Modify `ContentView.swift` (nuova scena `Window`, la view, l'aggancio nella `LibraryIndexCard`); Create `AppBackupFotoTests/DuplicatesStatusTests.swift`; Modify `project.pbxproj`.
+
+**Interfaces:** consuma tutti i componenti dei Task 1–5, `AuthGateManager`, `makeThumbnail`, `BackupRunner.isRunning`, `VolumeMonitor`. Produce `Window("Doppioni", id: "duplicates")`, `DuplicatesView`, `DuplicatesStatus.lines(...)` (pura), `DuplicateThumbnailCache`.
+
+- [ ] **Step 1: Scrivi il file di test** (~12 test) sulle sole parti pure:
+  - indice mai costruito ⇒ riga che **rimanda alla card**, mai una lista vuota che si legge come «non hai doppioni» (stessa classe di errore già corretta con `sawNothing`)
+  - indice costruito, zero gruppi ⇒ riga diversa dalla precedente
+  - N gruppi ⇒ riga con il numero di gruppi **e** i byte recuperabili
+  - job in corso ⇒ riga che spiega perché la cancellazione è disattivata
+  - SSD scollegato ⇒ riga propria, diversa da «nessun doppione»
+  - blocco sopra il tetto ⇒ riga che dice «fallo in più volte», non un rifiuto muto
+  - esito con gruppi saltati ⇒ riga con **il numero** e il motivo, mai un silenzio
+  - esito interrotto dallo scollegamento ⇒ riga propria con quanti file erano stati spostati
+  - registro anti-gergo su tutte le diramazioni: nessun «hash», «indice», «SHA256», «entry», «scansione»
+  - cache miniature: oltre il tetto la più vecchia viene sfrattata; la dimensione non supera mai il tetto
+
+- [ ] **Step 2–3: registra, verifica il fallimento atteso.**
+
+- [ ] **Step 4: Implementa la view.** Requisiti non negoziabili:
+  - **Gate `AuthGateManager`** all'inizio del `body` (`LockScreenView()` al posto del contenuto reale) e `.restorationBehavior(.disabled)`. Regola #30: una scena di primo livello nasce fuori dal gate, e questa elenca percorsi, nomi e miniature di tutte le foto.
+  - Gli avvisi sono `@State` **locali della view**, mai `runner.pendingAlert` — che ha un solo presentatore, il `.alert` di `ContentView` nella scena `main` (sezione `AlertSink` in `.claude/rules/architecture.md`). Nessun secondo presentatore di `pendingAlert`.
+  - **Due conferme distinte**: riepilogo dettagliato (`DuplicateBatch.summaryLines`) in uno sheet, **poi** la conferma vera. La forma della seconda — alert distruttivo o stringa da ridigitare come in `DiskPrepView` — **va decisa da Enrico** (domanda aperta 3) prima di scrivere questo step.
+  - Il conteggio dei gruppi **non** si legge nel `body` con una query sincrona allo store: quella query passa dalla coda seriale, occupata dalle scritture a batch, e sul main thread bloccherebbe la finestra a ogni ridisegno. Si carica fuori dal main thread e si pubblica, come già fa `BackupRunner.indexedFileCount`.
+  - **Una miniatura per gruppo**, dal file tenuto, pigra (`LazyVStack` + `.task`), con token di richiesta e cache limitata. `makeThumbnail` esistente, **mai** una seconda implementazione, **mai** l'immagine intera. Video: icona di sistema (domanda aperta 4).
+  - Cancellazione disattivata se un job è in corso, se una scansione dell'indice è in corso, o se l'SSD non è montato — con il **motivo scritto**, non un bottone grigio e basta (stessa disciplina di `RestoreView`, dove le fonti non disponibili sono disattivate *e* motivate).
+  - Progresso e interruzione durante il blocco.
+  - Bottone **«Annulla l'ultimo spostamento»**, attivo solo se il registro ha un blocco ripristinabile.
+  - Ingresso: bottone dentro `LibraryIndexCard` in Diagnostica (`openWindow(id: "duplicates")`). Voce nell'hamburger solo se Enrico la chiede (domanda aperta 1).
+
+- [ ] **Step 5–6: test verdi, build, suite, commit** — attesi **452 test** (440 + 12).
+
+- [ ] **Step 7: Dichiara esplicitamente cosa NON è coperto da test** nel commento in testa alla view e in `.claude/rules/architecture.md`: la view, i due sheet di conferma, il gate, l'apertura della finestra, le miniature. Sono SwiftUI e bookmark veri, non raggiungibili senza una corsa.
+
+---
+
+### Task 7: Documentazione — la regola assoluta, gli ADR, il vocabolario
+
+Nessun test. Va fatto **prima** di considerare la feature chiusa, non dopo: una regola assoluta cambiata e non scritta è un'eccezione silenziosa che qualcuno estenderà.
+
+**Files:** `Docs/CLAUDE.md`, `Docs/adr/0005-il-pannello-doppioni-puo-cestinare.md` (nuovo), `Docs/adr/0002-indice-cache-non-fonte-di-verita.md`, `Docs/adr/0003-due-livelli-di-fiducia-sullo-stesso-indice.md`, `Docs/CONTEXT.md`, `.claude/rules/architecture.md`.
+
+- [ ] **Step 1: `Docs/CLAUDE.md` — la regola assoluta.** Riscrivi i punti 1 e 3 col testo approvato da Enrico (domanda aperta 5; proposta nella spec, sezione «La regola assoluta cambia»). Aggiungi il ramo `trashItem` alla checklist di revisione AI, che oggi conosce `removeItem`/`moveItem`/`copyItem` ma non `trashItem`. Aggiorna la tabella di stato (pannello Doppioni non più «mai iniziato»), il conteggio dei test e la riga «Prossimo incremento naturale», che oggi descrive il pannello come «quello a basso danno, dove ci si fida della cache invece di rileggere» — **frase ora falsa**.
+- [ ] **Step 2: ADR-0005 nuovo.** Contenuto in «Cosa cambia negli ADR esistenti» nella spec. Deve contenere le tre misure del 2026-08-27 e la contro-domanda per chi un giorno proporrà di togliere la rilettura del file tenuto «perché tanto l'indice ce l'ha già».
+- [ ] **Step 3: nota datata in ADR-0003** — «pannello Doppioni = basso danno» vale ora solo per la **visualizzazione**; i livelli sono tre; rimando ad ADR-0005. Nota, non riscrittura: il ragionamento dell'ADR è ancora valido.
+- [ ] **Step 4: nota datata in ADR-0002** — la cache non può mai essere la sola base di un atto distruttivo; e la rimozione mirata delle chiavi dopo il cestinamento è **conoscenza, non inferenza**, quindi non ricade sotto «traversata incompleta ⇒ nessuna rimozione».
+- [ ] **Step 5: `Docs/CONTEXT.md`** — voci nuove (**Gruppo di doppioni**, **Copia tenuta**, **Blocco**, **Registro di ripristino**) e correzione della voce «Percorso a basso danno / percorso ad alto danno».
+- [ ] **Step 6: `.claude/rules/architecture.md`** — sezione nuova sotto quella di #31, con i componenti, le guardie, i mutanti uccisi e i fatti misurati del 2026-08-27 (che vanno nella lista «Fatti misurati — da non riscoprire pagandoli una seconda volta», in coda ai sei esistenti).
+- [ ] **Step 7: verifiche manuali pendenti.** Aggiungi a `Docs/CLAUDE.md`, accanto a quelle già in attesa dell'SSD: `trashItem` sull'SSD vero dall'app firmata; esistenza e contenuto di `.Trashes` su quel volume; `ls -1 "/Volumes/SSD - Enri"` per validare la regola di proposta del Task 2; «Rimetti a posto» premuto davvero nel Finder.
+- [ ] **Step 8: commit.**
+
+---
+
+## Riepilogo dei conteggi
+
+| Task | Test nuovi | Cumulativo atteso |
+| :---- | ----: | ----: |
+| baseline (`310efa5`) | — | **346** |
+| 1 — `duplicateGroups()` | 14 | 360 |
+| 2 — `duplicateKeepChoice` | 18 | 378 |
+| 3 — `DuplicateBatch` | 14 | 392 |
+| 4 — `DuplicateTrasher` | 30 | 422 |
+| 5 — `TrashManifest` | 18 | 440 |
+| 6 — `DuplicatesView` / `DuplicatesStatus` | 12 | 452 |
+| 7 — documentazione | 0 | 452 |
+
+I numeri per task sono **target**, non profezie: se la copertura reale ne richiede di più, si aggiornano qui. Quello che non si aggiusta è il metodo — **si verifica il conteggio totale nel log a ogni task**, mai il solo `** TEST SUCCEEDED **`.
+
+## Nota sull'ordine dei task
+
+Il Task 4 consuma `TrashManifestStore`, prodotto dal Task 5. Due ordini possibili: **5 prima di 4** (nessuno stub, ma si scrive il registro prima di sapere esattamente cosa registrare), oppure **4 con un'interfaccia stubbata** e cablaggio in coda al Task 5. Raccomandazione: **5 prima di 4**, rinumerando. Il registro è autonomo e la sua forma è già determinata dalla misura sul record del Finder; scriverlo prima evita l'unico stub del piano. **Da confermare** insieme all'approvazione.
