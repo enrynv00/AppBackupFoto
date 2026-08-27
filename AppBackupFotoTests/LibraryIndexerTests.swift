@@ -133,6 +133,25 @@ final class LibraryIndexerTests: XCTestCase {
         XCTAssertGreaterThan(try store.count(), 0, "cio' che era gia' stato committato resta")
     }
 
+    // La cancellazione deve arrivare fino al `Progress`, non restare dentro l'indexer: la
+    // UI sa solo se e' stato l'utente a premere "Interrompi" (`indexInterruptedByUser`), non
+    // se la lettura e' stata fermata dallo smontaggio di un volume qualsiasi. Ricostruire il
+    // fatto dalla UI significa scambiare quella fermata per "l'SSD e' vuoto" e consigliare
+    // l'unico comando distruttivo della card.
+    func testCancelDuringScan_isRecordedInTheProgress() throws {
+        for i in 0..<50 { try makeFile("Foto/f\(i).jpg", contents: "c\(i)") }
+        let idx = indexer!
+        let p = try idx.scan(root: root, batchSize: 5) { _ in idx.cancel() }
+        XCTAssertTrue(p.cancelled, "una lettura fermata deve dirlo nel Progress")
+        XCTAssertTrue(p.traversalIncomplete)
+    }
+
+    func testCompletedScan_isNotReportedAsStopped() throws {
+        try makeFile("Foto/a.jpg", contents: "uno")
+        let p = try indexer.scan(root: root)
+        XCTAssertFalse(p.cancelled)
+    }
+
     // Il bug che questo test blocca: `cancelled` non veniva mai rimesso a false, quindi
     // dopo UNA cancellazione l'istanza non avrebbe indicizzato mai piu' nulla, e la
     // rimozione dei file spariti non sarebbe piu' girata. Con `LibraryIndexer` come

@@ -74,6 +74,21 @@ struct SimpleAlert: Identifiable {
     var onConfirm: (() -> Void)? = nil
 }
 
+/// Dove far comparire un avviso prodotto dal `BackupRunner`.
+///
+/// Serve perche' un `SimpleAlert` non e' presentabile da chiunque: `runner.pendingAlert` ha
+/// UN SOLO presentatore, il `.alert` di `ContentView`, che vive nella scena
+/// `WindowGroup(id: "main")`. Un avviso prodotto da una funzione chiamata dalla finestra
+/// "Diagnostica" (scena `Window(id: "tools")`, un'altra scena) finirebbe su un canale che
+/// quella finestra non presenta: nessun messaggio a schermo, e se la finestra principale e'
+/// chiusa l'avviso salta fuori fuori contesto alla sua riapertura.
+///
+/// Chi chiama da un'altra finestra passa quindi il proprio canale; chi chiama dalla finestra
+/// principale (o da un percorso automatico) non passa niente e resta su `pendingAlert`.
+/// L'alternativa — un secondo `.alert(runner.pendingAlert)` dentro `ToolsSheet` — con
+/// entrambe le finestre aperte presenterebbe lo stesso avviso due volte.
+typealias AlertSink = @MainActor (SimpleAlert) -> Void
+
 /// Sfondo "card" riusato in tutta l'app: stesso corner radius/opacità ovunque.
 struct CardBackground: ViewModifier {
     func body(content: Content) -> some View {
@@ -2260,6 +2275,15 @@ final class LibraryIndexer {
         /// senza permessi".
         var volumeVanished = false
 
+        /// La lettura e' stata fermata prima della fine: "Interrompi" dell'utente oppure
+        /// smontaggio di un volume qualsiasi, che passa dallo stesso `cancel()`.
+        /// Sottoinsieme di `traversalIncomplete`, tenuto qui e non ricostruito dalla UI:
+        /// la UI conosce solo il primo dei due casi (`indexInterruptedByUser`), e per il
+        /// secondo leggerebbe `scanned == 0` senza sapere perche'. E' la differenza fra
+        /// dire "non sono riuscita a leggere tutto" ed **eleggere l'unico comando
+        /// distruttivo della card** dopo che e' stata espulsa una chiavetta.
+        var cancelled = false
+
         /// File scartati perche' il loro percorso canonico non ricade sotto la root.
         /// Non e' un caso raggiungibile oggi (vedi il commento sul controllo), ma se
         /// lo diventasse il sintomo sarebbe una scansione da zero file senza
@@ -2591,6 +2615,7 @@ final class LibraryIndexer {
 
         progress.unreadableItems = failures.count
         progress.volumeVanished = volumeVanished
+        progress.cancelled = cancelled
 
         // ---- Rimozione dei file spariti: solo dopo una traversata COMPLETA ----
         //
@@ -2725,7 +2750,16 @@ enum LibraryIndexStatus {
         // Zero file visti con l'elenco pieno: "non ho trovato niente" non e' "non c'e'
         // niente". E' il caso in cui l'unica via d'uscita e' svuotare l'elenco, quindi il
         // messaggio deve nominarla: senza, l'utente resta in un vicolo cieco (ADR-0002).
-        let sawNothing = !p.volumeVanished && !interruptedByUser && p.scanned == 0 && p.total > 0
+        // Le esclusioni sono tutte lo stesso principio: "non ho trovato niente" vale solo se
+        // la lettura ha davvero guardato. Con una cartella illeggibile (root senza permessi,
+        // TCC perso, EIO) si ottiene lo stesso `scanned == 0` — e la card finirebbe per dire
+        // insieme "non ho letto quella cartella" e "svuota l'elenco": due istruzioni opposte
+        // nella stessa schermata, di cui quella sbagliata e' l'unica distruttiva.
+        // `p.cancelled` copre lo smontaggio di un ALTRO volume (un DMG, una chiavetta)
+        // durante i primi secondi di lettura: ferma la lettura senza essere ne'
+        // `volumeVanished` ne' `interruptedByUser`.
+        let sawNothing = !p.volumeVanished && !interruptedByUser && !p.cancelled
+            && p.unreadableItems == 0 && p.scanned == 0 && p.total > 0
         if sawNothing {
             out.append(Line(id: "vuoto", tone: .warning, text:
                 "L'app non ha trovato nessuna foto sull'SSD, ma nell'elenco ce ne sono \(number(p.total)). "
@@ -5038,17 +5072,22 @@ final class BackupRunner: ObservableObject {
 
     /// Costruisce o aggiorna l'elenco delle foto gia' presenti sull'SSD.
     /// `full: true` = si rilegge da capo ogni file, senza fidarsi di niente di memorizzato.
-    func rebuildLibraryIndex(full: Bool = false) {
+    /// `onAlert` = dove mostrare gli avvisi (vedi `AlertSink`): la card della finestra
+    /// Diagnostica passa il proprio canale, l'aggiornamento automatico non passa niente.
+    func rebuildLibraryIndex(full: Bool = false, onAlert: AlertSink? = nil) {
         guard !isIndexing else { return }
         // L'elenco e' una cache, mai un prerequisito (ADR-0002): se non si apre, si dice e
         // basta. Niente nell'app smette di funzionare.
         guard let store = libraryIndexStore else {
-            alert("Elenco non disponibile",
-                  "Non è stato possibile aprire l'elenco delle foto già salvate.\n\nL'importazione funziona lo stesso: senza elenco l'app copia tutto, senza riconoscere le foto che hai già.")
+            showIndexAlert(SimpleAlert(
+                title: "Elenco non disponibile",
+                message: "Non è stato possibile aprire l'elenco delle foto già salvate.\n\nL'importazione funziona lo stesso: senza elenco l'app copia tutto, senza riconoscere le foto che hai già."), via: onAlert)
             return
         }
         guard let ssdURL = bm.startAccessing(.ssd) else {
-            alert("Accesso all'SSD non disponibile", "Vai in Impostazioni e riseleziona l'SSD.")
+            showIndexAlert(SimpleAlert(
+                title: "Accesso all'SSD non disponibile",
+                message: "Vai in Impostazioni e riseleziona l'SSD."), via: onAlert)
             return
         }
         // La root da leggere e' ESATTAMENTE quella che `runImport` passa come `libraryRoot`:
@@ -5058,8 +5097,9 @@ final class BackupRunner: ObservableObject {
         // dire niente** (Task 6, Step 2-ter).
         guard isLikelyVolumeRoot(ssdURL) else {
             bm.stopAccessing(.ssd)
-            alert("Bookmark SSD non valido",
-                  "Il percorso '\(ssdURL.path)' non è la radice del volume.\n\nVai in Impostazioni (⚙) → riseleziona SSD scegliendo '/Volumes/SSD - Enri' (root del volume, non una sottocartella).")
+            showIndexAlert(SimpleAlert(
+                title: "Bookmark SSD non valido",
+                message: "Il percorso '\(ssdURL.path)' non è la radice del volume.\n\nVai in Impostazioni (⚙) → riseleziona SSD scegliendo '/Volumes/SSD - Enri' (root del volume, non una sottocartella)."), via: onAlert)
             return
         }
         isIndexing = true
@@ -5086,9 +5126,9 @@ final class BackupRunner: ObservableObject {
                 // `scan` e' `throws`, ma un suo errore non deve poter far fallire niente
                 // altro: si mostra e si prosegue (ADR-0002).
                 await MainActor.run {
-                    self.pendingAlert = SimpleAlert(
+                    self.showIndexAlert(SimpleAlert(
                         title: "Il controllo si è fermato",
-                        message: "\(error.localizedDescription)\n\nQuello che l'app aveva già letto resta salvato: puoi riprovare più tardi.")
+                        message: "\(error.localizedDescription)\n\nQuello che l'app aveva già letto resta salvato: puoi riprovare più tardi."), via: onAlert)
                 }
             }
             // Sempre, anche dopo un errore: senza, "Interrompi" e i bottoni resterebbero
@@ -5118,7 +5158,7 @@ final class BackupRunner: ObservableObject {
 
     /// Svuota l'elenco (solo l'elenco: il file SQLite sul Mac, mai le foto) e lo riapre
     /// vuoto. La ricostruzione **non** parte da sola: la prima creazione resta manuale.
-    func resetLibraryIndex() {
+    func resetLibraryIndex(onAlert: AlertSink? = nil) {
         guard !isIndexing, let store = libraryIndexStore else { return }
         do {
             try store.deleteIndexAndRecreate()
@@ -5128,11 +5168,18 @@ final class BackupRunner: ObservableObject {
         } catch {
             // Se la cancellazione fallisce lo store resta aperto sul vecchio file ed e'
             // ancora utilizzabile: si mostra l'errore e si prosegue, mai un errore fatale.
-            pendingAlert = SimpleAlert(
+            showIndexAlert(SimpleAlert(
                 title: "Non è stato possibile svuotare l'elenco",
-                message: "\(error.localizedDescription)\n\nL'elenco di prima è ancora al suo posto e funziona.")
+                message: "\(error.localizedDescription)\n\nL'elenco di prima è ancora al suo posto e funziona."), via: onAlert)
             refreshIndexedFileCount()
         }
+    }
+
+    /// Instradamento degli avvisi dell'elenco, in un punto solo: al canale di chi ha
+    /// chiamato se ce n'e' uno, altrimenti a `pendingAlert`. Vedi `AlertSink` per il
+    /// motivo (le due finestre sono due scene e presentano canali diversi).
+    private func showIndexAlert(_ alert: SimpleAlert, via sink: AlertSink?) {
+        if let sink { sink(alert) } else { pendingAlert = alert }
     }
 
     /// Aggiornamento automatico: SSD collegato, oppure fine di un job che ha scritto
@@ -8206,6 +8253,13 @@ struct LibraryIndexCard: View {
     @ObservedObject var runner: BackupRunner
     @Binding var pendingAlert: SimpleAlert?
 
+    /// Il canale d'avviso di QUESTA finestra. Ogni comando della card lo passa a `runner`:
+    /// `runner.pendingAlert` e' presentato solo da `ContentView`, che sta in un'altra scena
+    /// (vedi `AlertSink`), quindi un errore lasciato li' non comparirebbe mai qui — e la card
+    /// resterebbe muta proprio nei casi in cui non e' successo niente (SSD non accessibile,
+    /// elenco non apribile, svuotamento fallito).
+    private var alertSink: AlertSink { { pendingAlert = $0 } }
+
     /// Stima dichiarata prima di partire. Non e' mai stata misurata sul volume vero: e'
     /// scritta come un ordine di grandezza, non come una promessa.
     private let durata = "di solito servono dai 5 ai 15 minuti"
@@ -8237,7 +8291,7 @@ struct LibraryIndexCard: View {
                         if runner.indexedFileCount > 0 {
                             // Aggiornamento: legge per intero solo le foto nuove o cambiate,
                             // dura poco. Nessuna conferma da chiedere.
-                            runner.rebuildLibraryIndex()
+                            runner.rebuildLibraryIndex(onAlert: alertSink)
                         } else {
                             confirmFirstBuild()
                         }
@@ -8302,7 +8356,7 @@ struct LibraryIndexCard: View {
             message: "L'app legge una volta sola tutte le foto e tutti i video che sono sull'SSD, per riconoscerli alle importazioni successive: \(durata), a seconda di quanti ne hai.\n\nPuoi fermarti quando vuoi con «\(LibraryIndexCommands.stop)»: la parte già fatta resta salvata e la volta dopo si riprende da lì.\n\nL'SSD viene solo letto: niente viene spostato, modificato o cancellato.",
             confirmTitle: "Crea l'elenco",
             cancelTitle: "Annulla",
-            onConfirm: { runner.rebuildLibraryIndex() })
+            onConfirm: { runner.rebuildLibraryIndex(onAlert: alertSink) })
     }
 
     private func confirmFullRecheck() {
@@ -8311,7 +8365,7 @@ struct LibraryIndexCard: View {
             message: "L'app rilegge dall'inizio ogni foto e ogni video sull'SSD, anche quelli che ha già visto: \(durata).\n\nServe dopo che hai spostato o riorganizzato le cartelle sull'SSD, per rimettere in pari l'elenco.\n\nPuoi fermarti quando vuoi. L'SSD viene solo letto: nessuna foto viene toccata.",
             confirmTitle: "Controlla da capo",
             cancelTitle: "Annulla",
-            onConfirm: { runner.rebuildLibraryIndex(full: true) })
+            onConfirm: { runner.rebuildLibraryIndex(full: true, onAlert: alertSink) })
     }
 
     /// L'unica via d'uscita quando restano nell'elenco foto che sull'SSD non ci sono piu'
@@ -8324,7 +8378,7 @@ struct LibraryIndexCard: View {
             isDestructive: true,
             confirmTitle: "Svuota l'elenco",
             cancelTitle: "Annulla",
-            onConfirm: { runner.resetLibraryIndex() })
+            onConfirm: { runner.resetLibraryIndex(onAlert: alertSink) })
     }
 }
 

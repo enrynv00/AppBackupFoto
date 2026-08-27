@@ -128,6 +128,43 @@ final class LibraryIndexStatusTests: XCTestCase {
         XCTAssertFalse(lines(p, interrupted: true).contains { $0.id == "vuoto" })
     }
 
+    // ...e quando la root non si e' lasciata aprire (permessi, TCC perso, EIO): anche li'
+    // `scanned == 0`, ma il volume c'e' e nessuno ha interrotto niente. Senza questa
+    // esclusione la card diceva insieme "1 cartella non si e' lasciata aprire" e "se hai
+    // davvero svuotato l'SSD, svuota l'elenco": due istruzioni opposte nella stessa
+    // schermata, e quella sbagliata e' l'unica distruttiva (5-15 minuti di ricostruzione e
+    // doppioni ricreati al primo import).
+    func testNothingFoundBecauseNothingCouldBeRead_doesNotSuggestWipingTheList() {
+        var p = LibraryIndexer.Progress()
+        p.scanned = 0
+        p.total = 118_432
+        p.unreadableItems = 1
+
+        let out = lines(p)
+        XCTAssertFalse(out.contains { $0.id == "vuoto" })
+        XCTAssertFalse(text(p).contains(LibraryIndexCommands.reset),
+                       "non si consiglia il comando distruttivo quando la lettura e' fallita")
+        XCTAssertTrue(out.contains { $0.id == "illeggibili" },
+                      "il motivo vero va detto lo stesso")
+    }
+
+    // ...e quando la lettura e' stata fermata da uno smontaggio che non riguarda l'SSD (un
+    // DMG, una chiavetta espulsa nei primi secondi): la cancellazione automatica passa dallo
+    // stesso `cancel()` ma NON e' un'interruzione dell'utente, e il volume non e' sparito.
+    // Senza `Progress.cancelled` la card leggeva solo `scanned == 0` e finiva a consigliare
+    // lo svuotamento dopo un evento che non c'entra niente.
+    func testNothingFoundBecauseTheReadWasStopped_doesNotSuggestWipingTheList() {
+        var p = LibraryIndexer.Progress()
+        p.scanned = 0
+        p.total = 42
+        p.cancelled = true
+
+        XCTAssertFalse(lines(p, interrupted: false).contains { $0.id == "vuoto" },
+                       "fermata non e' vuota, nemmeno quando a fermarla non e' stato l'utente")
+        // Silenzio no: la lettura non e' arrivata in fondo e va detto.
+        XCTAssertTrue(lines(p, interrupted: false).contains { $0.id == "incompleta" })
+    }
+
     // Traversata incompleta senza una causa riconoscibile: meglio una riga generica che il
     // silenzio su una lettura che non ha coperto tutta la libreria.
     func testIncompleteScanWithNoKnownCause_stillSaysSomething() {

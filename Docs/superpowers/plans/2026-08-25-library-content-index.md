@@ -2299,6 +2299,69 @@ git commit -m "Add library index UI: build/refresh card, toggle, auto incrementa
    corsa. Stessa dichiarazione gia' fatta per `CompletionSheet` e per i cablaggi di
    `BackupRunner` nei Task 3-5. Testato tutto cio' che sta ai due capi del cablaggio.
 
+#### Nota (2026-08-27) — due rilievi della review del Task 6, chiusi
+
+Enrico ha approvato **solo questi due** prima di una pausa; il resto resta aperto e va
+affrontato al ritorno, insieme al Task 7.
+
+1. **Gli errori della card non potevano comparire (ALTA, regressione del Task 6).** I cinque
+   avvisi nuovi finivano su `runner.pendingAlert`, che ha **un solo presentatore**: il
+   `.alert` di `ContentView`, dentro `WindowGroup(id: "main")`. La card sta in `ToolsSheet`,
+   che nonostante il nome non e' uno sheet ma la scena `Window("Diagnostica", id: "tools")`.
+   Catena verificata nel codice, non dedotta: `ToolsSheet` compare una volta sola (dentro
+   quella `Window`), `LibraryIndexCard` una volta sola (dentro `ToolsSheet`), e il solo
+   `.alert(runner.pendingAlert...)` del file sta in `ContentView`, che a sua volta esiste solo
+   dentro `RootView` della scena principale (e solo se `bm.canEnterApp`). Che l'asimmetria non
+   fosse voluta lo dice `ToolsSheet` stesso, che **ridichiara** un `.alert` per
+   `bm.pendingAlert` proprio per questo motivo.
+   Fix: `AlertSink` (`@MainActor (SimpleAlert) -> Void`), parametro `onAlert` opzionale su
+   `rebuildLibraryIndex`/`resetLibraryIndex`, instradato in un punto solo da
+   `showIndexAlert(_:via:)`. La card passa il proprio canale — il `@Binding pendingAlert` che
+   `ToolsSheet` **gia'** presenta — e l'aggiornamento automatico non passa niente e resta su
+   `pendingAlert`, cioe' sulla finestra principale da cui parte. **Nessun secondo
+   presentatore**: un `.alert(runner.pendingAlert)` dentro `ToolsSheet` avrebbe mostrato lo
+   stesso avviso due volte con entrambe le finestre aperte.
+
+2. **La card consigliava il comando distruttivo quando la lettura era fallita (MEDIA).**
+   `sawNothing` escludeva il volume sparito e l'interruzione dell'utente, ma non
+   `unreadableItems > 0`: con la root non percorribile (permessi, TCC perso, EIO) si ottiene
+   `scanned == 0` con `volumeVanished == false`, e la card diceva insieme "1 cartella non si
+   e' lasciata aprire" e "se hai davvero svuotato l'SSD, usa «Svuota l'elenco e ricomincia da
+   zero»" — due istruzioni opposte nella stessa schermata, di cui quella sbagliata e' l'unica
+   distruttiva (5-15 minuti di ricostruzione e doppioni ricreati al primo import).
+   Chiuso **insieme** al rilievo del Security Auditor, che ha la stessa radice:
+   `stopIndexingForVolumeChange` di proposito non imposta `interruptedByUser`, quindi
+   espellere un DMG o una chiavetta nei primi secondi produceva lo stesso stato e lo stesso
+   consiglio. Il fatto "la lettura e' stata fermata" ora sta in `Progress.cancelled`, scritto
+   da `scan` accanto a `unreadableItems`/`volumeVanished` invece di essere ricostruito dalla
+   UI, che quel caso non puo' conoscere. `sawNothing` diventa
+   `!p.volumeVanished && !interruptedByUser && !p.cancelled && p.unreadableItems == 0 &&
+   p.scanned == 0 && p.total > 0`. Una modifica sola perche' e' una sola regola — "non ho
+   trovato niente" vale solo se la lettura ha davvero guardato — e perche' due condizioni
+   separate sullo stesso `if` sarebbero divergute alla prima modifica. Il silenzio non
+   subentra: in entrambi i casi restano la riga sulle cartelle illeggibili e, dove non c'e'
+   altra causa nota, la riga generica "non e' riuscita a leggere tutta la libreria".
+
+**Test.** Suite da 342 a **346**. Nuovi: `testNothingFoundBecauseNothingCouldBeRead_...` e
+`testNothingFoundBecauseTheReadWasStopped_...` (`LibraryIndexStatusTests`),
+`testCancelDuringScan_isRecordedInTheProgress` e `testCompletedScan_isNotReportedAsStopped`
+(`LibraryIndexerTests`). Mutation testing: i mutanti 28-31 del driver (bug rimesso, suite
+rossa, ripristino) sono tutti uccisi, e i mutanti 11-12 sono stati riscritti sulla forma nuova
+di `sawNothing` e restano uccisi.
+
+**Non coperto da test, e perche'**: il rilievo 1 e' tutto UI (due `Scene` SwiftUI, un
+`@Binding` e un presentatore per finestra) e non e' verificabile senza una corsa reale;
+l'unica alternativa sarebbe un test sul timing della presentazione, che non dimostrerebbe
+niente. Vale la stessa dichiarazione del punto 6 qui sopra, gia' fatta per `LibraryIndexCard`
+e per i cablaggi dentro `BackupRunner`. Da guardare alla prima apertura della finestra
+Diagnostica senza SSD collegato: premere «Crea l'elenco» deve produrre un messaggio **in
+quella finestra**.
+
+**Restano aperti** (annotati dalla review, non toccati qui): il registro anti-gergo copre 6
+diramazioni su 9; plurali e `id` delle righe non testati; i debiti di verifica scadono in
+blocco su un salto in avanti dell'orologio; l'incoerenza fra lettura manuale e job di copia
+(il punto 5 qui sopra, da confermare con Enrico); due stringhe minori.
+
 ### Task 7: Documentazione
 
 **Files:**
