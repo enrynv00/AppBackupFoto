@@ -76,19 +76,30 @@ Primo perché tutto il resto lo consuma, e perché è la sola parte che tocca SQ
   - guardia nil su ogni colonna `TEXT` letta con `String(cString:)`: un puntatore nil termina il processo (SIGTRAP).
   - doc-comment che scrive il **contratto**: risultato corretto ma **potenzialmente stantio**, esattamente come `entries(withHash:)`. Serve a mostrare una lista, **mai** a decidere una cancellazione senza rilettura (ADR-0003 + ADR-0005).
 
-- [x] **Step 5: Test verdi** — `Executed 16 tests, with 0 failures` (16 e non 14: vedi la nota sui mutanti qui sotto).
-- [x] **Step 6: Build, suite completa, commit** — **362 test** (346 + 16), `** BUILD SUCCEEDED **` + `** TEST SUCCEEDED **`.
+- [x] **Step 5: Test verdi** — `Executed 18 tests, with 0 failures` (18 e non 14: vedi la nota sui mutanti qui sotto).
+- [x] **Step 6: Build, suite completa, commit** — **364 test** (346 + 18), `** BUILD SUCCEEDED **` + `** TEST SUCCEEDED **`.
+
+**Deciso il 2026-08-28 (coordinatore, dopo la review): `DuplicateGroup.size` è il MINIMO fra le dimensioni dei membri**, non la prima incontrata. Con un indice coerente coincidono, ma l'indice è una cache e può essere incoerente (ADR-0002) — e da quel numero esce lo spazio recuperabile mostrato nel riepilogo che precede il bottone distruttivo. Sovrastimarlo significa raccogliere un consenso su GB che non si libereranno; sottostimarlo è innocuo. Il gruppo **resta visibile** (scartarlo farebbe sparire in silenzio due doppioni veri per colpa di una terza riga avvelenata) e l'incoerenza vera la intercetta il Task 4, che rilegge, rihasha e pretende unanimità. I file da 0 byte restano esclusi come prima: non sono entry stantie, sono file **provabilmente diversi** che condividono lo SHA256 del vuoto.
 
 **Il mutante che deve morire:**
 | Mutante | Test che deve diventare rosso | Esito misurato (2026-08-28) |
 | :---- | :---- | :---- |
-| `size > 0` rimosso (entrambe le occorrenze) | `testZeroByteFiles_areNotAGroup` | **ucciso** (3 test rossi) |
-| `HAVING COUNT(*) > 1` → `>= 1`, **da solo** | `testUniqueHash_isNotAGroup` | **sopravvissuto — mutante equivalente**, vedi sotto |
+| `size > 0` rimosso (entrambe le occorrenze) | `testZeroByteFiles_areNotAGroup` | **ucciso** (4 test rossi) |
+| `size > 0` rimosso **solo dal filtro esterno** | `testZeroByteMemberInsideARealGroup_isNotAMember` | **ucciso** |
+| `size > 0` rimosso **solo dalla sottoquery** | — | **sopravvissuto — equivalente**, vedi sotto |
+| `HAVING COUNT(*) > 1` → `>= 1`, **da solo** | — | **sopravvissuto — equivalente**, vedi sotto |
 | Regola «almeno due copie» rimossa da **entrambi** i punti (SQL + Swift) | `testUniqueHash_isNotAGroup` | **ucciso** (5 test rossi) |
 | Guardia Swift `members.count > 1` rimossa, da sola | `testGroupReducedToASingleReadableMember_isNotAGroup` | **ucciso** |
+| `min` delle dimensioni → `members[0].size` | `testIncoherentSizesForTheSameHash_exposeTheSmallestSize` | **ucciso** |
 | `stepRow` sostituito da un `while sqlite3_step == SQLITE_ROW` | `testCorruptDatabase_throws` | **ucciso** |
 
-**Nota (2026-08-28) — perché il secondo mutante è equivalente e cosa si è fatto al suo posto.** La regola «almeno due copie» finisce scritta in **due** punti, esattamente come il `size > 0`: l'`HAVING COUNT(*) > 1` della query e il conteggio dei membri **leggibili** in Swift. Il secondo non è ridondanza: la query conta le *righe*, ma una riga malformata (colonna TEXT a NULL) viene saltata in lettura, quindi un gruppo di due righe può arrivare all'utente con un solo membro leggibile — e un gruppo da un membro solo mostrerebbe come doppione un file che copie non ne ha. Con quella guardia presente, mutare da solo l'`HAVING` in `>= 1` **non cambia il risultato** (cambia solo quante righe si leggono: tutto l'indice invece dei soli doppioni), quindi nessun test può ucciderlo — è un mutante equivalente, non un buco nella rete. Lo stesso vale, in modo simmetrico, per la rimozione di **una sola** delle due occorrenze di `size > 0`. Al posto suo sono stati verificati i due mutanti che *sono* osservabili: la rimozione della regola da entrambi i punti e la rimozione della sola guardia Swift, coperta da un test nuovo (da cui 16 test invece di 14). Nessun test è stato indebolito per far quadrare il conteggio.
+**Nota (2026-08-28) — quali mutanti sono equivalenti, e soprattutto quali NO.** Due regole finiscono scritte in due punti ciascuna, ed è deliberato; ma **le due occorrenze non hanno lo stesso peso, e confonderle è pericoloso**:
+
+- **`size > 0` del filtro esterno: PORTANTE, non ridondante.** Con un hash che ha già due copie vere, la sottoquery lo mette comunque nell'elenco degli hash duplicati: a tenere il file da 0 byte fuori dai *membri* resta solo il filtro esterno. Senza, un file troncato diventa il terzo membro di un gruppo sano — candidato al cestinamento, o peggio la copia che la regola di proposta sceglie di **tenere**. Misurato, e ora coperto da `testZeroByteMemberInsideARealGroup_isNotAMember`. **Non toglierla.**
+- **`size > 0` della sottoquery: ridondante** rispetto al filtro esterno più la guardia Swift, quindi mutarla da sola è equivalente. Resta perché documenta l'intento e perché regge se un domani cambia il filtro esterno.
+- **`HAVING COUNT(*) > 1` da solo: equivalente**, perché il conteggio dei membri **leggibili** in Swift lo replica. Quella guardia Swift non è ridondanza: la query conta le *righe*, ma una riga malformata (colonna TEXT a NULL) viene saltata in lettura, quindi un gruppo di due righe può arrivare con un solo membro leggibile — e un gruppo da un membro solo mostrerebbe come doppione un file che copie non ne ha. Mutare l'`HAVING` cambia solo quante righe si leggono (tutto l'indice invece dei soli doppioni), non il risultato.
+
+Al posto dei due equivalenti sono stati verificati i mutanti **osservabili**: rimozione della regola da entrambi i punti, rimozione della sola guardia Swift, e rimozione del solo filtro esterno. Da qui 18 test invece di 14. Nessun test è stato indebolito per far quadrare un conteggio.
 
 ---
 
@@ -352,15 +363,15 @@ Nessun test. Va fatto **prima** di considerare la feature chiusa, non dopo: una 
 | Task | Test nuovi | Cumulativo atteso |
 | :---- | ----: | ----: |
 | baseline (`310efa5`) | — | **346** |
-| 1 — `duplicateGroups()` | ~~14~~ **16 (reale)** | ~~360~~ **362 (reale)** |
-| 2 — `duplicateKeepChoice` | 18 | 378 → **380** |
-| 3 — `DuplicateBatch` | 14 | 392 → **394** |
-| 4 — `DuplicateTrasher` | 30 | 422 → **424** |
-| 5 — `TrashManifest` | 18 | 440 → **442** |
-| 6 — `DuplicatesView` / `DuplicatesStatus` | 12 | 452 → **454** |
-| 7 — documentazione | 0 | 452 → **454** |
+| 1 — `duplicateGroups()` | ~~14~~ **18 (reale)** | ~~360~~ **364 (reale)** |
+| 2 — `duplicateKeepChoice` | 18 | 378 → **382** |
+| 3 — `DuplicateBatch` | 14 | 392 → **396** |
+| 4 — `DuplicateTrasher` | 30 | 422 → **426** |
+| 5 — `TrashManifest` | 18 | 440 → **444** |
+| 6 — `DuplicatesView` / `DuplicatesStatus` | 12 | 452 → **456** |
+| 7 — documentazione | 0 | 452 → **456** |
 
-I cumulativi dei Task 2-7 sono scalati di **+2** dopo il Task 1 (16 test invece dei 14 previsti: due test in più per coprire la guardia Swift sui gruppi ridotti a un membro leggibile e i file da 0 byte che non devono nascondere i gruppi veri — vedi la nota sui mutanti del Task 1). Restano target, non profezie.
+I cumulativi dei Task 2-7 sono scalati di **+4** dopo il Task 1: 18 test invece dei 14 previsti, tutti nati dalla corsa sui mutanti (guardia Swift sui gruppi ridotti a un membro leggibile, file da 0 byte che non devono nascondere i gruppi veri, file da 0 byte dentro un gruppo sano, dimensione minima su indice incoerente). Restano target, non profezie.
 
 I numeri per task sono **target**, non profezie: se la copertura reale ne richiede di più, si aggiornano qui. Quello che non si aggiusta è il metodo — **si verifica il conteggio totale nel log a ogni task**, mai il solo `** TEST SUCCEEDED **`.
 

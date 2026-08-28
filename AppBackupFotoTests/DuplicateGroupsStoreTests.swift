@@ -149,6 +149,26 @@ final class DuplicateGroupsStoreTests: XCTestCase {
                       "dati incoerenti (stesso hash, dimensioni diverse di cui una nulla): niente gruppo")
     }
 
+    // Le due occorrenze di `size > 0` NON sono simmetriche, e questo e' il caso che lo
+    // dimostra: qui l'hash ha gia' due copie vere, quindi la sottoquery lo mette comunque
+    // nell'elenco degli hash duplicati — a escludere il file vuoto dai MEMBRI resta solo
+    // il filtro esterno. Senza quello, il file da 0 byte (troncato o corrotto, non una
+    // copia) diventerebbe il terzo membro del gruppo: un candidato al cestinamento, o
+    // peggio la copia che la regola di proposta sceglie di TENERE al posto di una buona.
+    // Gli altri test sui file vuoti non lo vedono: la' l'hash e' escluso dalla sottoquery.
+    func testZeroByteMemberInsideARealGroup_isNotAMember() throws {
+        try store.upsert([entry("Foto iPhone/a.jpg", size: 100, hash: "H"),
+                          entry("Takeout/a.jpg", size: 100, hash: "H"),
+                          entry("Other/troncato.jpg", size: 0, hash: "H")])
+
+        let groups = try store.duplicateGroups()
+        XCTAssertEqual(groups.count, 1)
+        XCTAssertEqual(groups.first?.members.count, 2,
+                       "il file da 0 byte non e' una copia: non e' un membro")
+        XCTAssertFalse(groups.first?.members.contains { $0.displayPath == "Other/troncato.jpg" } ?? true,
+                       "il file troncato non deve finire fra le copie da cestinare")
+    }
+
     func testZeroByteFiles_doNotHideTheRealGroups() throws {
         try store.upsert([entry("Foto iPhone/vuoto1.jpg", size: 0, hash: "SHA256-DEL-VUOTO"),
                           entry("Takeout/vuoto2.jpg", size: 0, hash: "SHA256-DEL-VUOTO"),
@@ -170,6 +190,25 @@ final class DuplicateGroupsStoreTests: XCTestCase {
         XCTAssertEqual(group.hash, "HASH-CONDIVISO")
         XCTAssertEqual(group.size, 4242)
         XCTAssertTrue(group.members.allSatisfy { $0.size == 4242 })
+    }
+
+    // Hash uguale dovrebbe significare dimensione uguale, ma l'indice e' una cache e puo'
+    // essere incoerente (ADR-0002): il codice non lo impone e non puo' imporlo. In quel
+    // caso si espone la dimensione MINIMA, mai la prima incontrata. Il numero finisce nel
+    // riepilogo che l'utente legge prima del bottone distruttivo, e lo spazio recuperabile
+    // dichiarato non deve mai essere sovrastimato: sottostimare e' innocuo, promettere GB
+    // che non si liberano e' consenso raccolto su un numero falso.
+    // Il gruppo resta comunque visibile — nasconderlo farebbe sparire due doppioni veri
+    // per colpa di una terza riga avvelenata — e l'incoerenza vera la intercetta il
+    // percorso di cancellazione, che rilegge, rihasha e pretende unanimita'.
+    func testIncoherentSizesForTheSameHash_exposeTheSmallestSize() throws {
+        try store.upsert([entry("Foto iPhone/a.jpg", size: 900, hash: "H"),
+                          entry("Takeout/a.jpg", size: 100, hash: "H"),
+                          entry("Other/a.jpg", size: 500, hash: "H")])
+
+        let group = try XCTUnwrap(try store.duplicateGroups().first)
+        XCTAssertEqual(group.members.count, 3)
+        XCTAssertEqual(group.size, 100, "mai sovrastimare lo spazio recuperabile")
     }
 
     // I membri arrivano dalle colonne dell'indice, non ricostruiti: `displayPath` e' il
@@ -200,10 +239,14 @@ final class DuplicateGroupsStoreTests: XCTestCase {
     // poggiano su questo elenco: se cambiasse ordine fra due letture, l'utente vedrebbe
     // una proposta diversa senza che sia cambiato niente.
     func testResultIsStableAcrossTwoCalls() throws {
+        // Dimensione legata all'hash, non all'indice del ciclo: contenuto uguale significa
+        // dimensione uguale, e una fixture in cui lo stesso hash ha dimensioni diverse
+        // sarebbe un indice che non puo' esistere — il test piu' "realistico" del file
+        // girerebbe su dati impossibili.
         var entries: [LibraryIndexEntry] = []
         for i in 0..<20 {
-            entries.append(entry("Foto iPhone/f\(i).jpg", size: Int64(100 + i), hash: "H\(i % 5)"))
-            entries.append(entry("Takeout/f\(i).jpg", size: Int64(100 + i), hash: "H\(i % 5)"))
+            entries.append(entry("Foto iPhone/f\(i).jpg", size: Int64(100 + i % 5), hash: "H\(i % 5)"))
+            entries.append(entry("Takeout/f\(i).jpg", size: Int64(100 + i % 5), hash: "H\(i % 5)"))
         }
         try store.upsert(entries)
 

@@ -1739,9 +1739,20 @@ struct LibraryIndexEntry {
 /// dei file da 0 byte).
 struct DuplicateGroup {
     let hash: String
-    /// La dimensione condivisa dai membri: hash uguale significa contenuto uguale, quindi
-    /// dimensione uguale. Chi cancella non si fida comunque di questo numero e rilegge la
-    /// dimensione dal disco insieme all'hash, dallo stesso descrittore (ADR-0005).
+    /// La dimensione **minima** fra quelle dei membri, non la prima incontrata.
+    ///
+    /// Con un indice coerente le dimensioni dei membri coincidono — hash uguale significa
+    /// contenuto uguale — ma l'indice e' una cache e un indice incoerente e' possibile
+    /// (ADR-0002): questa invariante **non e' imposta da nessuna parte** e non va data per
+    /// vera leggendo il tipo. In quel caso si espone deliberatamente la minima, perche' da
+    /// qui esce lo spazio recuperabile scritto nel riepilogo che l'utente legge **prima**
+    /// del bottone distruttivo: sottostimarlo e' innocuo, sovrastimarlo significa
+    /// raccogliere un consenso su GB che non si libereranno.
+    ///
+    /// Il gruppo resta comunque visibile: scartarlo farebbe sparire in silenzio una coppia
+    /// di doppioni veri per colpa di una terza riga avvelenata. L'incoerenza vera la
+    /// intercetta chi cancella, che rilegge e rihasha ogni membro — la copia tenuta
+    /// compresa — dallo stesso descrittore aperto e pretende unanimita' (ADR-0005).
     let size: Int64
     let members: [LibraryIndexEntry]
 }
@@ -2240,8 +2251,13 @@ final class LibraryIndexStore {
         // saltata da `readEntry` puo' ridurre a uno i membri leggibili, e un gruppo da un
         // membro solo non e' un gruppo — mostrarlo proporrebbe di cestinare l'unica copia.
         func flush() {
-            if let hash = currentHash, members.count > 1 {
-                groups.append(DuplicateGroup(hash: hash, size: members[0].size, members: members))
+            // `min` e non `members[0].size`: se l'indice fosse incoerente (stesso hash,
+            // dimensioni diverse) la prima riga incontrata potrebbe far promettere
+            // all'utente piu' spazio di quanto se ne libererebbe davvero. Vedi il
+            // doc-comment di `DuplicateGroup.size`.
+            if let hash = currentHash, members.count > 1,
+               let size = members.map(\.size).min() {
+                groups.append(DuplicateGroup(hash: hash, size: size, members: members))
             }
             members = []
         }
