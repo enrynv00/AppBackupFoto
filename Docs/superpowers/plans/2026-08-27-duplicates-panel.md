@@ -114,7 +114,9 @@ Logica **pura**: nessun filesystem, nessun database. È la decisione 3 di Enrico
 
 **Interfaces:**
 - Consuma: `DuplicateGroup` (Task 1).
-- Produce: `enum DuplicateKeepReason { case mainLibrary, notAnImport, oldest, deterministicTieBreak }`, `struct DuplicateKeepChoice { let keeper: LibraryIndexEntry; let reason: DuplicateKeepReason }`, `func duplicateKeepChoice(_ group: DuplicateGroup) -> DuplicateKeepChoice`, e `func duplicateKeepExplanation(_ choice:, in group:) -> String`. Consumati dai Task 3, 4, 6.
+- Produce: `enum DuplicateKeepReason { case mainLibrary, notAnImport, oldest, deterministicTieBreak }`, `struct DuplicateKeepChoice { let keeper: LibraryIndexEntry; let reason: DuplicateKeepReason; let tiedCandidates: Int }`, `func duplicateKeepChoice(_ group: DuplicateGroup) -> DuplicateKeepChoice`, e `func duplicateKeepExplanation(_ choice:, in group:) -> String`. Consumati dai Task 3, 4, 6.
+
+> **Deviazione dall'interfaccia originale, consapevole e approvata (2026-08-28).** `tiedCandidates` **non era in questo piano**: è comparso durante l'audit del Task 2. Senza di esso la frase `.mainLibrary` presenta come motivata una scelta fatta **a pari merito** fra due copie in libreria principale, di cui una finisce nel Cestino — l'utente legge una ragione che non c'è. Era il rilievo 4 del Security/Rules Auditor e non si chiudeva in nessun altro modo. Verificato per ricerca esaustiva (11.100 gruppi): il campo conta esattamente i membri indistinguibili dalla copia tenuta — stesso rango di cartella **e** stessa data — e non può contare membri che non erano in pareggio, perché `narrow` non restringe mai quando la regola non discrimina. `keeper` e `reason` restano quelli previsti dal piano e nessun consumatore cambia (i Task 3, 4 e 6 non erano ancora scritti quando è comparso).
 
 - [x] **Step 1: Scrivi il file di test** (~18 test):
   - un membro sotto `Foto iPhone/` e uno sotto `Import/Scheda/` ⇒ vince il primo, `reason == .mainLibrary`
@@ -135,7 +137,7 @@ Logica **pura**: nessun filesystem, nessun database. È la decisione 3 di Enrico
 - [x] **Step 4: Implementa.** Precedenza: `mainLibrary` → `notAnImport` → `oldest` → tie-break deterministico (percorso più corto, poi ordine della chiave normalizzata). Il confronto delle cartelle passa dalla **prima componente della chiave normalizzata**, non da `hasPrefix`.
   Commento accanto al codice, obbligatorio: **questa regola è provvisoria e dichiarata tale.** Il layout di primo livello dell'SSD risulta rilevato il 2026-07-29/30 (`Foto iPhone`, `Foto Google Drive`, `Other`, `Takeout`, `Takeout 2`, `Zip`) ma non riconfermato da allora. In particolare **la posizione di `Takeout/` e `Takeout 2/` nella gerarchia è una decisione che Enrico ha esplicitamente rimandato al momento in cui avrà il layout reale davanti** (risposta 6 del 2026-08-28): sono estrazioni automatiche, quindi l'argomento per declassarle accanto a `Import/` è forte, ma finché non è deciso restano alla pari delle altre cartelle e disambigua la data più vecchia. Se il layout vero smentisce la regola, cambiano questa funzione e i suoi test, non il design.
 
-- [x] **Step 5–6: test verdi, build, suite, commit** — `Executed 31 tests, with 0 failures` sulla sola classe, **395 test** in suite completa (23 test e 387 al primo commit `8462f9c`, 31 e 395 dopo i rilievi dell'audit).
+- [x] **Step 5–6: test verdi, build, suite, commit** — `Executed 32 tests, with 0 failures` sulla sola classe, **396 test** in suite completa. Tre commit, non uno: 23 test e 387 al primo (`8462f9c`), 31 e 395 dopo i sette rilievi dell'audit (`4734342`), 32 e 396 dopo i tre buchi di test del code-reviewer. **Il Task 2 è costato il triplo dei giri previsti, e tutti e tre sono serviti** — vedi le tre note sui test ciechi qui sotto.
 
 **Correzione del conteggio (2026-08-28).** Questo step diceva «attesi 378 test (360 + 18)» ed era stantio: la baseline reale al commit `2c87976` e' **364** (il Task 1 ha prodotto 18 test invece di 14). Il Task 2 ne ha scritti **23** invece di 18 — i cinque in piu' nascono tutti dalla corsa sui mutanti, nessuno e' stato aggiunto per far quadrare un numero: `testMainLibraryBeatsImportFolder`, `testFotoIPhone2_isNotTheMainLibrary`, `testImportante_isNotAnImportFolder`, `testFileAtTheRootIsNotAFolder`, `testComparisonUsesTheNormalizedKeyNotTheDisplayPath`. Cumulativo dopo il primo commit: **387**.
 
@@ -170,6 +172,19 @@ Corretti nello stesso giro anche: la `precondition` di `duplicateKeepChoice` ora
 | La frase torna a promettere il percorso più corto | `testExplanation_tieBreak_doesNotClaimTheShortestPath` | **ucciso** |
 | Le altre copie prese con `dropFirst()` invece che per differenza dalla tenuta | `testExplanation_notAnImport_claimsAllOthersOnlyWhenTheyReallyAreImports` | **ucciso al secondo tentativo** — vedi sotto |
 | Il conteggio presentato come fatto verificato | `testExplanation_doesNotPresentTheCountAsAVerifiedFact` | **ucciso** |
+| Clausola «percorso più corto» del tie-break cancellata | `testTieBreak_prefersTheShortestPath` (riscritto) | **ucciso** (1 test rosso) |
+| Il ramo singolare cade nel `default` ⇒ «Ci sono 1 altre copie» | `testExplanation_namesTheNumberOfOtherCopies` (riscritto) | **ucciso** (2 test rossi) |
+| `>=` → `>` in `nothingIsOlder` (parità di data) | `testExplanation_oldest_keepsTheStrongClaimWhenTheOldestDateIsATie` | **ucciso** (2 test rossi) |
+
+**Quarta, quinta e sesta riga cieca, trovate dal code-reviewer (2026-08-28).** Non erano mutanti nuovi: erano **regole vive che nessun test guardava**. Il reviewer le ha misurate cancellandole con i 31 test allora esistenti tutti verdi.
+
+- **La clausola «percorso più corto» si poteva cancellare senza far diventare rosso niente**, pur cambiando quale foto sopravvive: in ogni fixture lunghezza e ordine alfabetico **concordavano**, quindi non si contraddicevano mai. Test riscritto su `Other/zz.jpg` contro `Other/aaa/bbb/IMG_0001.JPG`, dove il più corto e il primo in alfabeto sono file diversi.
+- **`contains("1")`** era vero anche per la frase sgrammaticata «Ci sono 1 altre copie», cioè proprio l'esito del bug che doveva escludere. Ora si pretende la frase intera, più un `XCTAssertFalse` sulla forma sbagliata.
+- **Il confine `>=`/`>` di `nothingIsOlder` non era provato**: altrove le date sono sempre distinte, mentre la **parità di data fra doppioni è la norma** (`cp -p`, `rsync -t` e il restore da Finder preservano l'mtime).
+
+**Nota metodologica, dall'audit del proprio audit.** La ricerca esaustiva su 11.100 gruppi del Security/Rules Auditor **non** avrebbe trovato il primo di questi tre: cancellata la clausola sulla lunghezza, l'ordine resta totale e deterministico, quindi la proposta resta *stabile* e ogni frase resta *vera* — cambia solo **quale** foto sopravvive. Sono due reti ortogonali: le invarianti dell'auditor misurano la verità del testo e la stabilità della proposta, i mutanti del reviewer misurano che la regola di prodotto sia proprio quella e non un'altra ugualmente stabile. **Nessuna delle due copre l'altra, e sul Task 4 servono entrambe.**
+
+**Corsa finale sui tre mutanti (2026-08-28, verificata a mano dopo l'interruzione del team): baseline 32 verdi, mutante 1 ⇒ 1 rosso, mutante 2 ⇒ 2 rossi, mutante 3 ⇒ 2 rossi. 3 su 3 uccisi.** Eseguita su copia nello scratchpad con `derivedDataPath` separato, repo reale mai toccato (verificato per hash prima e dopo).
 
 **Nota (2026-08-28) — due righe di questa tabella erano cieche, e la corsa sui mutanti lo ha confermato.** Il Task 2 non prevedeva mutation testing (il piano lo chiede solo ai Task 4 e 5); e' stato fatto lo stesso, su una copia nello scratchpad, perche' due accoppiamenti mutante/test non reggevano alla lettura:
 
@@ -207,7 +222,7 @@ Logica **pura**. È la prima delle due conferme richieste dalla decisione 4 di E
 
 - [ ] **Step 2–3: registra, verifica il fallimento atteso.**
 - [ ] **Step 4: Implementa.** Tetto **500 file / 50 GB**, il primo che scatta — confermato da Enrico il 2026-08-28. È una costante nominata, con un commento che dice **perché** quel numero: non la durata (il cestinamento misura ~56 file/s, quindi 500 file ≈ 9 secondi; il tempo vero se lo prende la rilettura che lo precede) ma il **raggio di un guasto a metà blocco**, che la misura 3 della spec mostra essere uno stato reale. Il commento deve dire anche che il numero è prudente e ritarabile alla prima passata reale con l'SSD.
-- [ ] **Step 5–6:** attesi **392 test** (378 + 14).
+- [ ] **Step 5–6:** attesi **410 test** (396 + 14).
 
 **Il mutante che deve morire:**
 | Mutante | Test rosso |
@@ -233,6 +248,11 @@ Logica **pura**. È la prima delle due conferme richieste dalla decisione 4 di E
 - Consuma: `DuplicateGroup`, `DuplicateKeepChoice`, `IndexableKind`, `sha256Measured`, `realResolvedPath`/`canonicalPathComponents`, `deviceIdentifier`, `LibraryIndexStore.remove(keys:)`, `TrashManifestStore.record(...)` (Task 5 — **il Task 5 va fatto prima di questo Step 4**, oppure l'interfaccia va stubbata e cablata in coda al Task 5; scegliere l'ordine e dichiararlo, non lasciarlo implicito).
 - Produce: `final class DuplicateTrasher` con `init(libraryRoot:store:manifest:trashFunction:hashFunction:)` — **`trashFunction` e `hashFunction` hanno per default le funzioni reali** (`FileManager.default.trashItem`, `sha256Measured`) e sono iniettate **solo dai test**: gli esiti da coprire (hash che cambia fra visualizzazione e cancellazione, scollegamento a metà blocco) non sono producibili su file veri senza una corsa fra thread, e un test basato su una corsa è verde col bug ogni volta che la corsa va nell'altro verso. Stesso pattern già in `FileSyncer.init(hashFunction:)`.
 - Produce: `struct DuplicateTrashOutcome { trashedFiles, skippedGroups: [(group, reason)], stoppedBecauseVolumeVanished: Bool, interrupted: Bool }`.
+
+> **Due vincoli nati nell'audit del Task 2 (2026-08-28), da rispettare qui.** Non sono suggerimenti: chiudono due buchi misurati, e nessuno dei due è coperto dalle guardie già scritte nel Task 2.
+>
+> 1. **La coppia (gruppo, copia tenuta) va congelata al momento della conferma dell'utente** e passata così al `DuplicateTrasher`, **mai ricalcolata all'esecuzione**. Fra il riepilogo che l'utente legge e il cestinamento l'indice può essere cambiato (mtime diversi, membri diversi), e una `duplicateKeepChoice` ricalcolata su dati nuovi può nominare **un'altra copia**: l'utente acconsente a cestinare A e viene cestinato B. Attenzione: la `precondition` di appartenenza dentro `duplicateKeepExplanation` **non intercetta questo caso**, perché confronta solo il `path` — una `choice` stantia su un gruppo ricaricato la passa indenne, prendendo il conteggio dai membri nuovi e la cartella dalla copia tenuta vecchia.
+> 2. **`duplicateKeepChoice` non va chiamata dentro il ciclo di cestinamento.** Ha due `precondition`, e un crash fra `trashItem` e la scrittura del registro di ripristino lascia un file nel Cestino **non registrato** — la spec ha misurato che il record «Rimetti a posto» del Finder è asincrono e si perde proprio quando il processo muore (74/300 persi in un caso). Tutte le scelte vanno risolte **prima** di aprire il ciclo. Il filtro difensivo sui gruppi ridotti a un solo membro (`groups.filter { $0.members.count > 1 }`) va messo al confine del Task 3/6, non ammorbidendo le guardie del Task 2.
 
 - [ ] **Step 1: Scrivi il file di test** (~30 test), su directory temporanee reali (nessun mock del filesystem — convenzione del progetto).
 
@@ -273,7 +293,7 @@ Logica **pura**. È la prima delle due conferme richieste dalla decisione 4 di E
 
 - [ ] **Step 6: Mutation testing sui mutanti elencati sotto.** Un mutante sopravvissuto significa **riscrivere il test**, non il codice. Riporta il conteggio (`N mutanti, N uccisi`) nel commit.
 
-- [ ] **Step 7: Build, suite completa, commit** — attesi **422 test** (392 + 30).
+- [ ] **Step 7: Build, suite completa, commit** — attesi **440 test** (410 + 30).
 
 **Il mutante che deve morire:**
 | Mutante | Test rosso |
@@ -322,7 +342,7 @@ La rete di sicurezza della decisione 2 di Enrico non può poggiare sul Finder: *
 - [ ] **Step 4: Implementa.**
 - [ ] **Step 5: Test verdi.**
 - [ ] **Step 6: Mutation testing** sui mutanti sotto.
-- [ ] **Step 7: Build, suite, commit** — attesi **440 test** (422 + 18).
+- [ ] **Step 7: Build, suite, commit** — attesi **458 test** (440 + 18).
 
 **Il mutante che deve morire:**
 | Mutante | Test rosso |
@@ -368,8 +388,9 @@ La parte SwiftUI non è testabile senza una corsa reale; **è testato tutto ciò
   - Progresso e interruzione durante il blocco.
   - Bottone **«Annulla l'ultimo spostamento»**, attivo solo se il registro ha un blocco ripristinabile.
   - Ingresso: bottone dentro `LibraryIndexCard` in Diagnostica (`openWindow(id: "duplicates")`), **unico** — nessuna voce nell'hamburger, nemmeno disattivata (deciso il 2026-08-28).
+  - **I membri a pari merito vanno marcati visivamente nella lista** (requisito nato dall'audit del Task 2, 2026-08-28). `DuplicateKeepChoice.tiedCandidates` dice **che** un'altra copia vale quanto quella tenuta, ma non **quale**: in un gruppo da tre membri l'utente legge «Un'altra copia va bene quanto questa» davanti a **due** righe, e sta per cestinarle entrambe senza sapere a quale si riferisce. L'informazione è vera ma non azionabile finché la riga corrispondente non è riconoscibile. Se la view non può marcarle, allora è la frase a dover nominare il percorso invece del numero.
 
-- [ ] **Step 5–6: test verdi, build, suite, commit** — attesi **452 test** (440 + 12).
+- [ ] **Step 5–6: test verdi, build, suite, commit** — attesi **470 test** (458 + 12).
 
 - [ ] **Step 7: Dichiara esplicitamente cosa NON è coperto da test** nel commento in testa alla view e in `.claude/rules/architecture.md`: la view, i due sheet di conferma, il gate, l'apertura della finestra, le miniature. Sono SwiftUI e bookmark veri, non raggiungibili senza una corsa.
 

@@ -107,9 +107,14 @@ final class DuplicateKeepChoiceTests: XCTestCase {
         }
     }
 
+    // I due percorsi sono scelti perche' lunghezza e ordine alfabetico si **contraddicono**:
+    // "other/zz.jpg" e' il piu' corto ma viene DOPO "other/aaa/bbb/img_0001.jpg" in ordine
+    // alfabetico. Con una coppia in cui i due criteri concordano il test sarebbe cieco —
+    // misurato il 2026-08-28: cancellando il confronto sulla lunghezza restavano 31 test
+    // verdi, e a cambiare era quale foto sopravvive.
     func testTieBreak_prefersTheShortestPath() {
-        let short = entry("Other/IMG_0001.JPG")
-        let c = choice([entry("Other/sottocartella/lunga/IMG_0001.JPG"), short])
+        let short = entry("Other/zz.jpg")
+        let c = choice([entry("Other/aaa/bbb/IMG_0001.JPG"), short])
         XCTAssertEqual(c.keeper.path, short.path)
         XCTAssertEqual(c.reason, .deterministicTieBreak)
     }
@@ -245,11 +250,15 @@ final class DuplicateKeepChoiceTests: XCTestCase {
         let three = explanation([entry("Foto iPhone/IMG_0001.JPG"),
                                  entry("Import/Scheda/IMG_0001.JPG"),
                                  entry("Import/Reflex/IMG_0001.JPG")])
-        XCTAssertTrue(three.contains("2"), "due altre copie non sono nominate: \(three)")
+        XCTAssertTrue(three.contains("Ci sono 2 altre copie"), "due altre copie non sono nominate: \(three)")
 
+        // Il ramo singolare va preteso per intero: un `contains("1")` sarebbe vero anche in
+        // «Ci sono 1 altre copie», cioe' nella frase sgrammaticata che l'utente leggerebbe
+        // se il ramo cadesse nel `default`. Ed e' il caso piu' frequente del pannello.
         let two = explanation([entry("Foto iPhone/IMG_0001.JPG"),
                                entry("Import/Scheda/IMG_0001.JPG")])
-        XCTAssertTrue(two.contains("1"), "l'altra copia non e' nominata: \(two)")
+        XCTAssertTrue(two.contains("C'è 1 altra copia"), "l'altra copia non e' nominata: \(two)")
+        XCTAssertFalse(two.contains("Ci sono 1"), two)
     }
 
     /// Una spiegazione per ciascuno dei quattro motivi, costruita dal caso che lo produce.
@@ -333,6 +342,23 @@ final class DuplicateKeepChoiceTests: XCTestCase {
     func testExplanation_oldest_claimsTheWholeGroupOnlyWhenNothingIsOlder() {
         let text = explanation([entry("2019 Vacanze/IMG_0001.JPG", mtime: 1_500_000_000),
                                 entry("2019 Vacanze/copia/IMG_0001.JPG", mtime: 1_700_000_000)])
+        XCTAssertTrue(text.contains("nessun'altra copia è più vecchia"), text)
+        XCTAssertFalse(text.contains("Una copia più vecchia c'è"), text)
+    }
+
+    // Il confine di `nothingIsOlder`: due copie con la **stessa** data minima. "Nessun'altra
+    // copia e' piu' vecchia di questa" resta vero, e la variante debole direbbe che una copia
+    // piu' vecchia esiste — falso. Con `>` al posto di `>=` questo test diventa rosso, ed e'
+    // il solo che lo guarda: altrove le date sono sempre distinte, mentre la parita' fra
+    // doppioni e' la norma (`cp -p`, `rsync -t` e il restore da Finder preservano l'mtime).
+    func testExplanation_oldest_keepsTheStrongClaimWhenTheOldestDateIsATie() {
+        let members = [entry("Foto iPhone/a/IMG_0001.JPG", mtime: 1_700_000_100),
+                       entry("Foto iPhone/b/IMG_0001.JPG", mtime: 1_700_000_100),
+                       entry("Foto iPhone/c/IMG_0001.JPG", mtime: 1_700_000_200)]
+        let c = duplicateKeepChoice(group(members))
+        XCTAssertEqual(c.reason, .oldest)
+        XCTAssertEqual(c.tiedCandidates, 2)
+        let text = duplicateKeepExplanation(c, in: group(members))
         XCTAssertTrue(text.contains("nessun'altra copia è più vecchia"), text)
         XCTAssertFalse(text.contains("Una copia più vecchia c'è"), text)
     }

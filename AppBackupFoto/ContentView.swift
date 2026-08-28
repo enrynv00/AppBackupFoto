@@ -1994,6 +1994,10 @@ func duplicateKeepExplanation(_ choice: DuplicateKeepChoice, in group: Duplicate
     // Fatti ricalcolati sul gruppo intero, non dedotti dal motivo: sono loro a decidere se
     // la frase puo' essere forte ("tutte le altre", "nessun'altra") o deve restare debole.
     let allOthersAreImports = !others.isEmpty && others.allSatisfy(isInImportFolder)
+    // `>=` e non `>`: se un'altra copia ha la **stessa** data, "nessun'altra e' piu' vecchia
+    // di questa" resta vero, e la variante debole direbbe che esiste una copia piu' vecchia
+    // che non esiste. La parita' di data fra doppioni non e' un caso di scuola: `cp -p`,
+    // `rsync -t` e il restore da Finder preservano l'mtime.
     let nothingIsOlder = others.allSatisfy { $0.mtime >= choice.keeper.mtime }
 
     let lead: String
@@ -2011,12 +2015,21 @@ func duplicateKeepExplanation(_ choice: DuplicateKeepChoice, in group: Duplicate
         lead = nothingIsOlder
             ? "Tengo la copia che si trova \(place): ha la data più vecchia, nessun'altra copia è "
                 + "più vecchia di questa."
+            // "che questa app mette dopo" e non "che questa app considera meno affidabile":
+            // l'ordine fra le cartelle e' una regola di questa app, dichiarata provvisoria in
+            // attesa dell'`ls -1` dell'SSD, non un giudizio sulla cartella. Con la vecchia
+            // formulazione a un utente che ha ordinato "Other/" a mano l'app diceva che la sua
+            // cartella e' inaffidabile, sulla base di una regola che potrebbe cambiare.
             : "Tengo la copia che si trova \(place): ha la data più vecchia fra le copie che stanno "
                 + "in cartelle altrettanto valide. Una copia più vecchia c'è, ma si trova in una "
-                + "cartella che questa app considera meno affidabile."
+                + "cartella che questa app mette dopo."
     case .deterministicTieBreak:
+        // Qui la clausola del pari merito qui sotto non si aggiunge: il pari merito e' gia'
+        // tutto il motivo, e ripeterlo due volte nella stessa frase la fa leggere peggio
+        // proprio dove deve essere letta bene.
         lead = "Le copie si equivalgono: stanno in cartelle dello stesso tipo e hanno la stessa data. "
-            + "Tengo quella che si trova \(place)."
+            + "Tengo quella che si trova \(place): a parità scelgo sempre la stessa, così la "
+            + "proposta non cambia da un'apertura all'altra."
     }
 
     // A pari merito la scelta finale non ha nessun contenuto per l'utente, e va detto: e'
@@ -2025,7 +2038,7 @@ func duplicateKeepExplanation(_ choice: DuplicateKeepChoice, in group: Duplicate
     // Nessuna promessa sul percorso piu' corto: a lunghezze pari decide l'ordine
     // alfabetico, e il caso e' tutt'altro che raro (due scatti nella stessa cartella hanno
     // sempre nomi lunghi uguali).
-    let equallyGood = max(0, choice.tiedCandidates - 1)
+    let equallyGood = choice.reason == .deterministicTieBreak ? 0 : max(0, choice.tiedCandidates - 1)
     let tie: String
     switch equallyGood {
     case 0: tie = ""
