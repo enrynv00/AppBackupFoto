@@ -2,7 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Stato: da approvare.** Spec di riferimento: `Docs/superpowers/specs/2026-08-27-duplicates-panel-design.md`. Nessun task va iniziato prima di un'approvazione esplicita di Enrico, e prima che siano chiuse le sei domande aperte in coda alla spec — tre di esse (tetto per blocco, forma della seconda conferma, testo della regola assoluta) cambiano il contenuto dei task.
+**Stato: approvato da Enrico il 2026-08-28, esecuzione in corso.** Spec di riferimento: `Docs/superpowers/specs/2026-08-27-duplicates-panel-design.md`. Le sei domande aperte sono chiuse (commit `6fffeb2`, sezione «Risposte alle domande aperte» in coda alla spec) e le tre che cambiavano il contenuto dei task — tetto per blocco, forma della seconda conferma, testo della regola assoluta — sono già riportate nei task che le usano.
+
+**Ordine di esecuzione: il Task 5 si esegue prima del Task 4** (vedi «Nota sull'ordine dei task» in coda). La numerazione resta invariata.
 
 **Goal:** Un pannello che elenca i gruppi di file byte-identici già presenti sull'SSD, propone e **spiega** quale copia tenere, e — dopo che l'utente ha spuntato i gruppi, letto un riepilogo dettagliato e confermato — sposta le copie in eccesso nel **Cestino del volume**, in modo annullabile.
 
