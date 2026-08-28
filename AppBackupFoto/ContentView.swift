@@ -1822,6 +1822,17 @@ enum DuplicateKeepReason {
 struct DuplicateKeepChoice {
     let keeper: LibraryIndexEntry
     let reason: DuplicateKeepReason
+    /// Quante copie restavano **indistinguibili** dopo tutte le regole di prodotto, la
+    /// tenuta compresa. `1` significa che una regola ha deciso da sola; `> 1` che a
+    /// scegliere e' stato il tie-break, cioe' un criterio che per l'utente non ha nessun
+    /// contenuto.
+    ///
+    /// Serve alla spiegazione, e non e' un dettaglio interno: senza, la frase presenterebbe
+    /// come motivata una scelta fatta a pari merito. Il caso concreto: due copie in
+    /// `Foto iPhone/` e una fuori. Il motivo e' `.mainLibrary` ed e' vero, ma fra le due
+    /// copie in libreria principale — di cui una finisce nel Cestino — ha deciso il
+    /// tie-break, e la frase deve dirlo.
+    let tiedCandidates: Int
 }
 
 /// La cartella di primo livello di una chiave, oppure `nil` per un file che sta nella
@@ -1876,12 +1887,23 @@ private func isInImportFolder(_ entry: LibraryIndexEntry) -> Bool {
 /// design: la proposta resta comunque solo una proposta, che l'utente puo' cambiare gruppo
 /// per gruppo prima di confermare.
 ///
-/// - Precondition: `group.members` non e' vuoto. E' l'invariante di `DuplicateGroup`
-///   (almeno due membri), garantita dall'unico costruttore reale,
-///   `LibraryIndexStore.duplicateGroups()`. Un gruppo svuotato dai filtri di un chiamante
-///   futuro va **saltato** prima di arrivare qui, non passato in cerca di una risposta.
+/// **Questa funzione non verifica niente.** Percorsi, dimensioni e date vengono dall'indice,
+/// che e' una cache e puo' essere stantia (ADR-0002): qui si sceglie *quale* copia proporre,
+/// non si accerta che le copie siano davvero identiche. Nessun file puo' essere spostato nel
+/// Cestino sulla sola base di questa scelta — a valle resta obbligatoria la rilettura e il
+/// rihash di **ogni** membro del gruppo, la copia tenuta compresa, con esito unanime
+/// (ADR-0005 e la sezione «La cancellazione — il percorso ad alto danno» della spec). E' la
+/// funzione che nomina il sopravvissuto, quindi e' anche quella che un lettore frettoloso
+/// scambierebbe per la validazione: non lo e'.
+///
+/// - Precondition: `group.members` ha **almeno due membri**. E' l'invariante di
+///   `DuplicateGroup`, garantita dall'unico costruttore reale,
+///   `LibraryIndexStore.duplicateGroups()`. Un gruppo ridotto a un membro solo dai filtri di
+///   un chiamante futuro va **saltato**, non passato qui in cerca di una risposta: proporre
+///   di "tenere" l'unica copia esistente e' una riga che nel pannello Doppioni dichiara
+///   doppione un file che copie non ne ha.
 func duplicateKeepChoice(_ group: DuplicateGroup) -> DuplicateKeepChoice {
-    precondition(!group.members.isEmpty, "un gruppo di doppioni senza membri non ha una copia da tenere")
+    precondition(group.members.count > 1, "un gruppo di doppioni ha sempre almeno due membri")
 
     var candidates = group.members
     var reason = DuplicateKeepReason.deterministicTieBreak
@@ -1890,6 +1912,12 @@ func duplicateKeepChoice(_ group: DuplicateGroup) -> DuplicateKeepChoice {
     // Senza la seconda condizione ogni regola sembrerebbe aver deciso — tutte le copie
     // nella libreria principale direbbero "la tengo perche' e' in libreria principale",
     // che non spiega perche' proprio quella.
+    //
+    // ATTENZIONE a cosa questo NON garantisce: che ne resti una sola. Una regola puo'
+    // scartare qualcuno e lasciarne in gara due, e da li' in poi tutte le affermazioni
+    // valgono sui **sopravvissuti**, non sul gruppo intero. La spiegazione deve tenerne
+    // conto (vedi `tiedCandidates` e `duplicateKeepExplanation`): l'utente legge la frase
+    // davanti al gruppo intero, righe delle altre copie comprese.
     func narrow(_ survivors: [LibraryIndexEntry], _ because: DuplicateKeepReason) {
         guard !survivors.isEmpty, survivors.count < candidates.count else { return }
         candidates = survivors
@@ -1911,13 +1939,18 @@ func duplicateKeepChoice(_ group: DuplicateGroup) -> DuplicateKeepChoice {
     //    cambiare fra due aperture del pannello a parita' di dati. Senza, l'ordine di
     //    arrivo dei membri deciderebbe quale foto finisce nel Cestino, e una proposta
     //    instabile e' una proposta di cui l'utente non puo' fidarsi.
+    //    Lunghezza in **byte UTF-8** e non in grafemi: `String.count` dipende dalle regole
+    //    di segmentazione della versione Unicode del runtime, `utf8.count` no. La proposta
+    //    deve restare la stessa anche dopo un aggiornamento di macOS.
     let keeper = candidates.min { a, b in
-        if a.path.count != b.path.count { return a.path.count < b.path.count }
+        if a.path.utf8.count != b.path.utf8.count { return a.path.utf8.count < b.path.utf8.count }
         return a.path < b.path
     }
     // `min` restituisce nil solo su array vuoto, escluso dalla precondition; il fallback
     // esiste per non far dipendere da un `!` la funzione che decide cosa NON cestinare.
-    return DuplicateKeepChoice(keeper: keeper ?? candidates[0], reason: reason)
+    return DuplicateKeepChoice(keeper: keeper ?? candidates[0],
+                               reason: reason,
+                               tiedCandidates: candidates.count)
 }
 
 /// Come si dice all'utente la scelta di `duplicateKeepChoice`.
@@ -1925,16 +1958,31 @@ func duplicateKeepChoice(_ group: DuplicateGroup) -> DuplicateKeepChoice {
 /// Registro anti-gergo, come per `LibraryIndexStatus`: niente "hash", "indice", "SHA256",
 /// "scansione". Chi legge questa frase sta per confermare uno spostamento nel Cestino, e
 /// deve capire **quale** copia resta, **dove** sta e **quante** altre ce ne sono.
-/// Una frase diversa per ciascuno dei quattro motivi: se due motivi condividessero il
-/// testo, l'utente vedrebbe la stessa spiegazione per due decisioni diverse.
+///
+/// **Ogni affermazione qui dentro deve essere vera del gruppo che l'utente ha davanti**, non
+/// della sola parte di gruppo su cui ha lavorato l'ultima regola. E' la trappola di questa
+/// funzione, e ci e' gia' cascata una volta: `duplicateKeepChoice` restringe i candidati a
+/// ogni regola, quindi "e' la piu' vecchia" poteva comparire accanto a un gruppo in cui la
+/// copia piu' vecchia era una di quelle destinate al Cestino. Le frasi forti sono percio'
+/// ricavate da **fatti ricalcolati sul gruppo intero** (`allOthersAreImports`,
+/// `nothingIsOlder`), non dal solo `reason`, e a parita' si usa la variante debole.
+///
+/// Nemmeno il conteggio e' una certezza: viene dall'elenco delle foto, che e' l'ultima
+/// fotografia presa del disco e non il disco (ADR-0002). Per questo la frase dice "risulta"
+/// e nomina l'ultimo controllo, invece di affermare che le copie *sono* identiche: la verita'
+/// la stabilisce la rilettura al momento della cancellazione, non questa riga.
+///
+/// - Precondition: `choice` e' la scelta **di questo** gruppo. I due argomenti sono
+///   indipendenti e nessuno li lega: passare la scelta di un gruppo e i membri di un altro
+///   produrrebbe un numero di copie plausibile accanto al file sbagliato, proprio nella
+///   schermata che precede il bottone distruttivo.
 func duplicateKeepExplanation(_ choice: DuplicateKeepChoice, in group: DuplicateGroup) -> String {
-    let others = group.members.count - 1
-    let copies: String
-    switch others {
-    case ..<1: copies = "Non risultano altre copie di questo file."
-    case 1: copies = "C'è 1 altra copia identica di questo file."
-    default: copies = "Ci sono \(others) altre copie identiche di questo file."
-    }
+    precondition(group.members.contains { $0.path == choice.keeper.path },
+                 "la copia tenuta non appartiene a questo gruppo")
+
+    // Le altre copie si ricavano dal gruppo per differenza dalla tenuta: cosi' il numero
+    // detto all'utente e il file nominato vengono per forza dalla stessa fonte.
+    let others = group.members.filter { $0.path != choice.keeper.path }
 
     // La cartella si dice come e' scritta su disco (`displayPath`), non nella forma
     // minuscola della chiave: l'utente la deve poter ritrovare nel Finder.
@@ -1943,20 +1991,62 @@ func duplicateKeepExplanation(_ choice: DuplicateKeepChoice, in group: Duplicate
         ? "direttamente sull'SSD, fuori da ogni cartella"
         : "in «\(folders.joined(separator: "/"))»"
 
+    // Fatti ricalcolati sul gruppo intero, non dedotti dal motivo: sono loro a decidere se
+    // la frase puo' essere forte ("tutte le altre", "nessun'altra") o deve restare debole.
+    let allOthersAreImports = !others.isEmpty && others.allSatisfy(isInImportFolder)
+    let nothingIsOlder = others.allSatisfy { $0.mtime >= choice.keeper.mtime }
+
+    let lead: String
     switch choice.reason {
     case .mainLibrary:
-        return "Tengo la copia che si trova \(place): è la tua libreria principale, "
-            + "quella che l'app riempie a ogni backup delle foto del Mac. \(copies)"
+        lead = "Tengo la copia che si trova \(place): è nella tua libreria principale, "
+            + "quella che l'app riempie a ogni backup delle foto del Mac."
     case .notAnImport:
-        return "Tengo la copia che si trova \(place): le altre stanno in una cartella di scarico, "
-            + "dove i file arrivano alla rinfusa da schede e dischi. \(copies)"
+        lead = allOthersAreImports
+            ? "Tengo la copia che si trova \(place): tutte le altre copie stanno in una cartella di scarico, "
+                + "dove i file arrivano alla rinfusa da schede e dischi."
+            : "Tengo la copia che si trova \(place): almeno un'altra copia sta in una cartella di scarico, "
+                + "dove i file arrivano alla rinfusa da schede e dischi, e questa no."
     case .oldest:
-        return "Tengo la copia che si trova \(place): è la più vecchia, quindi è quella che hai "
-            + "da più tempo. \(copies)"
+        lead = nothingIsOlder
+            ? "Tengo la copia che si trova \(place): ha la data più vecchia, nessun'altra copia è "
+                + "più vecchia di questa."
+            : "Tengo la copia che si trova \(place): ha la data più vecchia fra le copie che stanno "
+                + "in cartelle altrettanto valide. Una copia più vecchia c'è, ma si trova in una "
+                + "cartella che questa app considera meno affidabile."
     case .deterministicTieBreak:
-        return "Le copie si equivalgono: stanno in cartelle dello stesso tipo e hanno la stessa data. "
-            + "Tengo quella \(place), che ha il percorso più corto, così la proposta resta sempre la stessa. \(copies)"
+        lead = "Le copie si equivalgono: stanno in cartelle dello stesso tipo e hanno la stessa data. "
+            + "Tengo quella che si trova \(place)."
     }
+
+    // A pari merito la scelta finale non ha nessun contenuto per l'utente, e va detto: e'
+    // l'unico modo perche' "tengo questa perche' sta nella libreria principale" non suoni
+    // come una ragione per cestinare l'altra copia che sta nella libreria principale.
+    // Nessuna promessa sul percorso piu' corto: a lunghezze pari decide l'ordine
+    // alfabetico, e il caso e' tutt'altro che raro (due scatti nella stessa cartella hanno
+    // sempre nomi lunghi uguali).
+    let equallyGood = max(0, choice.tiedCandidates - 1)
+    let tie: String
+    switch equallyGood {
+    case 0: tie = ""
+    case 1: tie = " Un'altra copia va bene quanto questa: a parità scelgo sempre la stessa, "
+        + "così la proposta non cambia da un'apertura all'altra."
+    default: tie = " Altre \(equallyGood) copie vanno bene quanto questa: a parità scelgo sempre la stessa, "
+        + "così la proposta non cambia da un'apertura all'altra."
+    }
+
+    let copies: String
+    switch others.count {
+    // Irraggiungibile con le due precondition sopra (gruppo di almeno due membri, copia
+    // tenuta che appartiene al gruppo). Resta perche' un ramo in piu' costa meno di una
+    // frase falsa: `default` direbbe "Ci sono 0 altre copie".
+    case ..<1: copies = " Non risultano altre copie di questo file."
+    case 1: copies = " C'è 1 altra copia che risulta identica a questa, in base all'ultimo controllo delle foto sull'SSD."
+    default: copies = " Ci sono \(others.count) altre copie che risultano identiche a questa, "
+        + "in base all'ultimo controllo delle foto sull'SSD."
+    }
+
+    return lead + tie + copies
 }
 
 /// Persistenza SQLite dell'indice. Scelta su JSON monolitico perche' un aggiornamento

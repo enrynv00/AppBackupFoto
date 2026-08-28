@@ -202,13 +202,26 @@ final class DuplicateKeepChoiceTests: XCTestCase {
         XCTAssertEqual(c.reason, .mainLibrary)
     }
 
-    // MARK: Casi limite
+    // MARK: Quante copie restano equivalenti alla fine
 
-    func testSingleMemberGroup_keepsThatMember() {
-        let only = entry("Other/IMG_0001.JPG")
-        let c = choice([only])
-        XCTAssertEqual(c.keeper.path, only.path)
-        XCTAssertEqual(c.reason, .deterministicTieBreak)
+    // `tiedCandidates` e' cio' che permette alla frase di non presentare come motivata una
+    // scelta fatta a pari merito. Un gruppo a un solo membro non si prova qui: viola la
+    // precondition di `duplicateKeepChoice` (`DuplicateGroup` ha sempre almeno due membri)
+    // e una precondition non e' verificabile da XCTest senza far morire il processo.
+    func testTiedCandidates_isOneWhenARuleDecidedAlone() {
+        let c = choice([entry("Foto iPhone/IMG_0001.JPG"), entry("Import/Scheda/IMG_0001.JPG")])
+        XCTAssertEqual(c.reason, .mainLibrary)
+        XCTAssertEqual(c.tiedCandidates, 1)
+    }
+
+    func testTiedCandidates_countsTheCopiesLeftAtParity() {
+        // Due copie in libreria principale piu' una fuori, tutte con la stessa data: la
+        // prima regola scarta la terza ma ne lascia due, e fra quelle decide il tie-break.
+        let c = choice([entry("Foto iPhone/a/IMG_0001.JPG"),
+                        entry("Foto iPhone/b/IMG_0001.JPG"),
+                        entry("Other/IMG_0001.JPG")])
+        XCTAssertEqual(c.reason, .mainLibrary)
+        XCTAssertEqual(c.tiedCandidates, 2)
     }
 
     // MARK: La spiegazione
@@ -273,7 +286,7 @@ final class DuplicateKeepChoiceTests: XCTestCase {
         let marker: [DuplicateKeepReason: String] = [
             .mainLibrary: "libreria principale",
             .notAnImport: "cartella di scarico",
-            .oldest: "la più vecchia",
+            .oldest: "data più vecchia",
             .deterministicTieBreak: "si equivalgono"
         ]
         for (reason, text) in texts {
@@ -301,12 +314,91 @@ final class DuplicateKeepChoiceTests: XCTestCase {
         }
     }
 
+    // MARK: Le affermazioni della frase devono essere vere del gruppo INTERO
+
+    // Trovato dall'audit del 2026-08-28. La regola 3 confronta le date fra i **candidati
+    // rimasti**, non fra tutti i membri: qui la copia piu' vecchia del gruppo sta in
+    // `Import/` ed e' una di quelle che finirebbero nel Cestino. Dire "è la più vecchia"
+    // sarebbe una frase contraddetta dalla riga sotto, nella schermata che precede la
+    // cancellazione.
+    func testExplanation_oldest_doesNotClaimToBeTheOldestOfTheWholeGroup() {
+        let text = explanation([entry("Foto iPhone/2023/IMG_0001.JPG", mtime: 1_700_000_500),
+                                entry("Foto iPhone/vecchie/IMG_0001.JPG", mtime: 1_700_000_900),
+                                entry("Import/Scheda SD/IMG_0001.JPG", mtime: 1_700_000_000)])
+        XCTAssertTrue(text.contains("Foto iPhone/2023"), text)
+        XCTAssertFalse(text.contains("nessun'altra copia è più vecchia"), text)
+        XCTAssertTrue(text.contains("Una copia più vecchia c'è"), text)
+    }
+
+    func testExplanation_oldest_claimsTheWholeGroupOnlyWhenNothingIsOlder() {
+        let text = explanation([entry("2019 Vacanze/IMG_0001.JPG", mtime: 1_500_000_000),
+                                entry("2019 Vacanze/copia/IMG_0001.JPG", mtime: 1_700_000_000)])
+        XCTAssertTrue(text.contains("nessun'altra copia è più vecchia"), text)
+        XCTAssertFalse(text.contains("Una copia più vecchia c'è"), text)
+    }
+
+    // Stessa classe di errore sulla regola 2: mtime identici sono la norma fra doppioni
+    // (`cp -p`, `rsync -t` e il restore da Finder preservano l'mtime, misurato nella spec),
+    // quindi la regola 3 spesso non discrimina e restano in gara copie che import non sono.
+    func testExplanation_notAnImport_doesNotClaimAllOtherCopiesAreImports() {
+        let text = explanation([entry("Other/IMG_0001.JPG"),
+                                entry("Takeout 2/Google Foto/IMG_0001.JPG"),
+                                entry("Import/Scheda SD/IMG_0001.JPG")])
+        XCTAssertTrue(text.contains("almeno un'altra copia sta in una cartella di scarico"), text)
+        XCTAssertFalse(text.contains("tutte le altre copie stanno in una cartella di scarico"), text)
+    }
+
+    // La copia tenuta e' messa **per ultima** apposta: le "altre copie" vanno ricavate dal
+    // gruppo per differenza dalla tenuta, non prendendo i membri dal secondo in poi. Con la
+    // tenuta in prima posizione le due formule coincidono e il test sarebbe cieco — misurato
+    // il 2026-08-28: un mutante che scriveva `dropFirst()` sopravviveva a tutti gli altri 30
+    // test. E' anche il solo legame fra i due argomenti di `duplicateKeepExplanation`.
+    func testExplanation_notAnImport_claimsAllOthersOnlyWhenTheyReallyAreImports() {
+        let text = explanation([entry("Import/Scheda/IMG_0001.JPG"),
+                                entry("Import/Reflex/IMG_0001.JPG"),
+                                entry("2019 Vacanze/IMG_0001.JPG")])
+        XCTAssertTrue(text.contains("«2019 Vacanze»"), text)
+        XCTAssertTrue(text.contains("tutte le altre copie stanno in una cartella di scarico"), text)
+    }
+
+    // A lunghezze pari decide l'ordine alfabetico, non la lunghezza — ed e' il caso piu'
+    // comune di tutti, perche' due scatti consecutivi nella stessa cartella hanno sempre
+    // nomi della stessa lunghezza. La frase non deve attribuire la scelta a una proprieta'
+    // che quel gruppo non ha.
+    func testExplanation_tieBreak_doesNotClaimTheShortestPath() {
+        let text = explanation([entry("Takeout/IMG_0001.JPG"), entry("Takeout/IMG_0002.JPG")])
+        XCTAssertFalse(text.contains("percorso più corto"), text)
+        XCTAssertTrue(text.contains("a parità scelgo sempre la stessa"), text)
+    }
+
+    // Motivo vero ma insufficiente: fra le due copie in libreria principale — di cui una va
+    // nel Cestino — ha deciso il tie-break, e la frase deve dirlo invece di far credere che
+    // ci sia una ragione sostanziale.
+    func testExplanation_saysWhenTheFinalPickWasArbitrary() {
+        let text = explanation([entry("Foto iPhone/a/IMG_0001.JPG"),
+                                entry("Foto iPhone/b/IMG_0001.JPG"),
+                                entry("Other/IMG_0001.JPG")])
+        XCTAssertTrue(text.contains("libreria principale"), text)
+        XCTAssertTrue(text.contains("va bene quanto questa"), text)
+    }
+
+    // Livello 1 di fiducia (ADR-0002/0003): i numeri vengono dall'elenco, non dal disco.
+    // La frase lo deve dire — la verita' la stabilisce la rilettura al momento della
+    // cancellazione, non questa riga.
+    func testExplanation_doesNotPresentTheCountAsAVerifiedFact() {
+        let text = explanation([entry("Foto iPhone/IMG_0001.JPG"),
+                                entry("Import/Scheda/IMG_0001.JPG"),
+                                entry("Import/Reflex/IMG_0001.JPG")])
+        XCTAssertTrue(text.contains("risultano identiche"), text)
+        XCTAssertTrue(text.contains("in base all'ultimo controllo"), text)
+    }
+
     // Un file nella root non ha una cartella da nominare: la spiegazione deve dirlo
     // comunque, senza produrre virgolette vuote.
     func testExplanation_handlesAFileAtTheRoot() {
         let text = explanation([entry("IMG_0001.JPG", mtime: 1_500_000_000),
                                 entry("Other/IMG_0001.JPG", mtime: 1_700_000_000)])
         XCTAssertFalse(text.contains("«»"), text)
-        XCTAssertTrue(text.contains("SSD"), text)
+        XCTAssertTrue(text.contains("direttamente sull'SSD, fuori da ogni cartella"), text)
     }
 }
