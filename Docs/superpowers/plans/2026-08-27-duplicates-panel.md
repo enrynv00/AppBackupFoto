@@ -116,7 +116,7 @@ Logica **pura**: nessun filesystem, nessun database. È la decisione 3 di Enrico
 - [ ] **Step 2–3: registra il file, verifica il fallimento atteso.**
 
 - [ ] **Step 4: Implementa.** Precedenza: `mainLibrary` → `notAnImport` → `oldest` → tie-break deterministico (percorso più corto, poi ordine della chiave normalizzata). Il confronto delle cartelle passa dalla **prima componente della chiave normalizzata**, non da `hasPrefix`.
-  Commento accanto al codice, obbligatorio: **questa regola è un'ipotesi costruita su ciò che il progetto sa delle proprie cartelle, non su un censimento dell'SSD reale** (mai fatto). Se il layout vero la smentisce, cambiano questa funzione e i suoi test, non il design.
+  Commento accanto al codice, obbligatorio: **questa regola è provvisoria e dichiarata tale.** Il layout di primo livello dell'SSD risulta rilevato il 2026-07-29/30 (`Foto iPhone`, `Foto Google Drive`, `Other`, `Takeout`, `Takeout 2`, `Zip`) ma non riconfermato da allora. In particolare **la posizione di `Takeout/` e `Takeout 2/` nella gerarchia è una decisione che Enrico ha esplicitamente rimandato al momento in cui avrà il layout reale davanti** (risposta 6 del 2026-08-28): sono estrazioni automatiche, quindi l'argomento per declassarle accanto a `Import/` è forte, ma finché non è deciso restano alla pari delle altre cartelle e disambigua la data più vecchia. Se il layout vero smentisce la regola, cambiano questa funzione e i suoi test, non il design.
 
 - [ ] **Step 5–6: test verdi, build, suite, commit** — attesi **378 test** (360 + 18).
 
@@ -155,7 +155,7 @@ Logica **pura**. È la prima delle due conferme richieste dalla decisione 4 di E
   - registro anti-gergo: nessun «hash», «indice», «SHA256»
 
 - [ ] **Step 2–3: registra, verifica il fallimento atteso.**
-- [ ] **Step 4: Implementa.** Il tetto è una costante nominata con un commento che dice **perché** quel numero (ritmo misurato ~56 file/s, e un guasto a metà blocco è uno stato reale — misura 3 della spec), non un valore scelto a tavolino. **Il valore va confermato da Enrico prima di scrivere il codice** (domanda aperta 2).
+- [ ] **Step 4: Implementa.** Tetto **500 file / 50 GB**, il primo che scatta — confermato da Enrico il 2026-08-28. È una costante nominata, con un commento che dice **perché** quel numero: non la durata (il cestinamento misura ~56 file/s, quindi 500 file ≈ 9 secondi; il tempo vero se lo prende la rilettura che lo precede) ma il **raggio di un guasto a metà blocco**, che la misura 3 della spec mostra essere uno stato reale. Il commento deve dire anche che il numero è prudente e ritarabile alla prima passata reale con l'SSD.
 - [ ] **Step 5–6:** attesi **392 test** (378 + 14).
 
 **Il mutante che deve morire:**
@@ -310,13 +310,13 @@ La parte SwiftUI non è testabile senza una corsa reale; **è testato tutto ciò
 - [ ] **Step 4: Implementa la view.** Requisiti non negoziabili:
   - **Gate `AuthGateManager`** all'inizio del `body` (`LockScreenView()` al posto del contenuto reale) e `.restorationBehavior(.disabled)`. Regola #30: una scena di primo livello nasce fuori dal gate, e questa elenca percorsi, nomi e miniature di tutte le foto.
   - Gli avvisi sono `@State` **locali della view**, mai `runner.pendingAlert` — che ha un solo presentatore, il `.alert` di `ContentView` nella scena `main` (sezione `AlertSink` in `.claude/rules/architecture.md`). Nessun secondo presentatore di `pendingAlert`.
-  - **Due conferme distinte**: riepilogo dettagliato (`DuplicateBatch.summaryLines`) in uno sheet, **poi** la conferma vera. La forma della seconda — alert distruttivo o stringa da ridigitare come in `DiskPrepView` — **va decisa da Enrico** (domanda aperta 3) prima di scrivere questo step.
+  - **Due conferme distinte**: riepilogo dettagliato (`DuplicateBatch.summaryLines`) in uno sheet, **poi** la conferma vera, che è un **`.alert` con bottone distruttivo** (deciso il 2026-08-28). **Non** una stringa da ridigitare: quella resta il segnale esclusivo della formattazione, l'unica operazione irreversibile del progetto, e usarla anche qui — dove il cestinamento è annullabile due volte — la svaluterebbe proprio dove serve. Di conseguenza il peso della conferma sta tutto nel riepilogo: se quello è vago, non c'è alert che tenga.
   - Il conteggio dei gruppi **non** si legge nel `body` con una query sincrona allo store: quella query passa dalla coda seriale, occupata dalle scritture a batch, e sul main thread bloccherebbe la finestra a ogni ridisegno. Si carica fuori dal main thread e si pubblica, come già fa `BackupRunner.indexedFileCount`.
-  - **Una miniatura per gruppo**, dal file tenuto, pigra (`LazyVStack` + `.task`), con token di richiesta e cache limitata. `makeThumbnail` esistente, **mai** una seconda implementazione, **mai** l'immagine intera. Video: icona di sistema (domanda aperta 4).
+  - **Una miniatura per gruppo**, dal file tenuto, pigra (`LazyVStack` + `.task`), con token di richiesta e cache limitata. `makeThumbnail` esistente, **mai** una seconda implementazione, **mai** l'immagine intera. Video: icona di sistema, nessun fotogramma e nessun `AVAssetImageGenerator` in questa versione (deciso il 2026-08-28).
   - Cancellazione disattivata se un job è in corso, se una scansione dell'indice è in corso, o se l'SSD non è montato — con il **motivo scritto**, non un bottone grigio e basta (stessa disciplina di `RestoreView`, dove le fonti non disponibili sono disattivate *e* motivate).
   - Progresso e interruzione durante il blocco.
   - Bottone **«Annulla l'ultimo spostamento»**, attivo solo se il registro ha un blocco ripristinabile.
-  - Ingresso: bottone dentro `LibraryIndexCard` in Diagnostica (`openWindow(id: "duplicates")`). Voce nell'hamburger solo se Enrico la chiede (domanda aperta 1).
+  - Ingresso: bottone dentro `LibraryIndexCard` in Diagnostica (`openWindow(id: "duplicates")`), **unico** — nessuna voce nell'hamburger, nemmeno disattivata (deciso il 2026-08-28).
 
 - [ ] **Step 5–6: test verdi, build, suite, commit** — attesi **452 test** (440 + 12).
 
@@ -330,13 +330,13 @@ Nessun test. Va fatto **prima** di considerare la feature chiusa, non dopo: una 
 
 **Files:** `Docs/CLAUDE.md`, `Docs/adr/0005-il-pannello-doppioni-puo-cestinare.md` (nuovo), `Docs/adr/0002-indice-cache-non-fonte-di-verita.md`, `Docs/adr/0003-due-livelli-di-fiducia-sullo-stesso-indice.md`, `Docs/CONTEXT.md`, `.claude/rules/architecture.md`.
 
-- [ ] **Step 1: `Docs/CLAUDE.md` — la regola assoluta.** Riscrivi i punti 1 e 3 col testo approvato da Enrico (domanda aperta 5; proposta nella spec, sezione «La regola assoluta cambia»). Aggiungi il ramo `trashItem` alla checklist di revisione AI, che oggi conosce `removeItem`/`moveItem`/`copyItem` ma non `trashItem`. Aggiorna la tabella di stato (pannello Doppioni non più «mai iniziato»), il conteggio dei test e la riga «Prossimo incremento naturale», che oggi descrive il pannello come «quello a basso danno, dove ci si fida della cache invece di rileggere» — **frase ora falsa**.
+- [ ] **Step 1: `Docs/CLAUDE.md` — la regola assoluta.** Riscrivi i punti 1 e 3 col testo approvato da Enrico il 2026-08-28, riportato **parola per parola** nella spec, sezione «La regola assoluta cambia» — copiarlo, non riscriverlo a memoria: la clausola sulla rilettura unanime («ogni membro del gruppo, la copia tenuta compresa») è stata aggiunta apposta e non va persa. Aggiungi il ramo `trashItem` alla checklist di revisione AI, che oggi conosce `removeItem`/`moveItem`/`copyItem` ma non `trashItem`. Aggiorna la tabella di stato (pannello Doppioni non più «mai iniziato»), il conteggio dei test e la riga «Prossimo incremento naturale», che oggi descrive il pannello come «quello a basso danno, dove ci si fida della cache invece di rileggere» — **frase ora falsa**.
 - [ ] **Step 2: ADR-0005 nuovo.** Contenuto in «Cosa cambia negli ADR esistenti» nella spec. Deve contenere le tre misure del 2026-08-27 e la contro-domanda per chi un giorno proporrà di togliere la rilettura del file tenuto «perché tanto l'indice ce l'ha già».
 - [ ] **Step 3: nota datata in ADR-0003** — «pannello Doppioni = basso danno» vale ora solo per la **visualizzazione**; i livelli sono tre; rimando ad ADR-0005. Nota, non riscrittura: il ragionamento dell'ADR è ancora valido.
 - [ ] **Step 4: nota datata in ADR-0002** — la cache non può mai essere la sola base di un atto distruttivo; e la rimozione mirata delle chiavi dopo il cestinamento è **conoscenza, non inferenza**, quindi non ricade sotto «traversata incompleta ⇒ nessuna rimozione».
 - [ ] **Step 5: `Docs/CONTEXT.md`** — voci nuove (**Gruppo di doppioni**, **Copia tenuta**, **Blocco**, **Registro di ripristino**) e correzione della voce «Percorso a basso danno / percorso ad alto danno».
 - [ ] **Step 6: `.claude/rules/architecture.md`** — sezione nuova sotto quella di #31, con i componenti, le guardie, i mutanti uccisi e i fatti misurati del 2026-08-27 (che vanno nella lista «Fatti misurati — da non riscoprire pagandoli una seconda volta», in coda ai sei esistenti).
-- [ ] **Step 7: verifiche manuali pendenti.** Aggiungi a `Docs/CLAUDE.md`, accanto a quelle già in attesa dell'SSD: `trashItem` sull'SSD vero dall'app firmata; esistenza e contenuto di `.Trashes` su quel volume; `ls -1 "/Volumes/SSD - Enri"` per validare la regola di proposta del Task 2; «Rimetti a posto» premuto davvero nel Finder.
+- [ ] **Step 7: verifiche manuali pendenti.** Aggiungi a `Docs/CLAUDE.md`, accanto a quelle già in attesa dell'SSD: `trashItem` sull'SSD vero dall'app firmata; esistenza e contenuto di `.Trashes` su quel volume; `ls -1 "/Volumes/SSD - Enri"` per validare la regola di proposta del Task 2 — e con quel layout davanti, **chiudere la decisione rimandata da Enrico il 2026-08-28 su dove collocare `Takeout/` e `Takeout 2/` nella gerarchia** (alla pari delle cartelle organizzate, com'è ora in via provvisoria, oppure declassate accanto a `Import/` perché sono estrazioni automatiche); «Rimetti a posto» premuto davvero nel Finder.
 - [ ] **Step 8: commit.**
 
 ---
@@ -358,4 +358,6 @@ I numeri per task sono **target**, non profezie: se la copertura reale ne richie
 
 ## Nota sull'ordine dei task
 
-Il Task 4 consuma `TrashManifestStore`, prodotto dal Task 5. Due ordini possibili: **5 prima di 4** (nessuno stub, ma si scrive il registro prima di sapere esattamente cosa registrare), oppure **4 con un'interfaccia stubbata** e cablaggio in coda al Task 5. Raccomandazione: **5 prima di 4**, rinumerando. Il registro è autonomo e la sua forma è già determinata dalla misura sul record del Finder; scriverlo prima evita l'unico stub del piano. **Da confermare** insieme all'approvazione.
+Il Task 4 consuma `TrashManifestStore`, prodotto dal Task 5. Due ordini possibili: **5 prima di 4** (nessuno stub, ma si scrive il registro prima di sapere esattamente cosa registrare), oppure **4 con un'interfaccia stubbata** e cablaggio in coda al Task 5. Raccomandazione: **5 prima di 4**, rinumerando. Il registro è autonomo e la sua forma è già determinata dalla misura sul record del Finder; scriverlo prima evita l'unico stub del piano.
+
+**Deciso il 2026-08-28: si esegue 5 prima di 4.** È una scelta di implementazione, non di prodotto, quindi presa senza girarla a Enrico (stesso criterio già usato nel progetto). I numeri dei task restano quelli scritti sopra per non invalidare i riferimenti incrociati: cambia l'ordine di esecuzione, non la numerazione.

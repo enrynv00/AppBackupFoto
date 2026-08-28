@@ -1,6 +1,6 @@
 # Spec — Pannello Doppioni con cancellazione (roadmap #31, seconda parte)
 
-**Stato: da approvare.** Nessuna riga di codice va scritta prima di un'approvazione esplicita di Enrico. Questo documento è il risultato della fase Architect, non una decisione presa.
+**Stato: domande aperte chiuse il 2026-08-28** (sezione «Risposte alle domande aperte» in coda). Resta da dare l'approvazione finale all'esecuzione del piano: nessuna riga di codice va scritta prima di quella.
 
 ## Problema
 
@@ -122,7 +122,7 @@ Tutte e quattro vanno nella lista delle verifiche manuali pendenti di `Docs/CLAU
 
 Perché una finestra e non una scheda dentro Diagnostica: il contenuto è una lista lunga, navigabile, con miniature e selezioni, e Diagnostica ha già quattro `GroupBox`; e il pannello ha un lavoro lungo suo (verifica, cestinamento con progresso) che non deve contendersi lo spazio con la diagnostica.
 
-Perché l'ingresso è nella card e non nell'hamburger: il pannello **non ha senso senza l'indice**, e la card è il posto dove l'indice si crea e si racconta. Mettere «Doppioni» nell'hamburger significherebbe offrire una funzione distruttiva a un utente che non ha ancora costruito l'elenco. *(Domanda aperta per Enrico: vuole anche la voce nell'hamburger?)*
+Perché l'ingresso è nella card e non nell'hamburger: il pannello **non ha senso senza l'indice**, e la card è il posto dove l'indice si crea e si racconta. Mettere «Doppioni» nell'hamburger significherebbe offrire una funzione distruttiva a un utente che non ha ancora costruito l'elenco. **Deciso il 2026-08-28: un solo ingresso, nella card. Nessuna voce nell'hamburger.**
 
 Conseguenze obbligatorie, regola stabilita in #30 e già applicata tre volte:
 - **Gate `AuthGateManager`** all'inizio del `body` (`LockScreenView()` al posto del contenuto reale), perché una scena di primo livello nasce fuori da `ContentView` e quindi fuori dal gate — e questa elencherebbe percorsi, nomi e miniature di tutte le foto.
@@ -153,7 +153,13 @@ Ordine di precedenza proposto:
 3. **A parità, vince la più vecchia** (mtime minore). Motivo: «tengo la più vecchia».
 4. **A parità piena, ordine deterministico**: percorso più corto, poi ordine alfabetico della chiave normalizzata. Non è una regola di prodotto, è la garanzia che la proposta **non cambi** fra due aperture del pannello a parità di dati. Una proposta instabile è una proposta di cui non ci si può fidare, e va provata con un test che permuta l'ordine dell'input.
 
-**Questa regola è un'ipotesi, non una misura.** È costruita su ciò che il progetto sa delle proprie cartelle (`Foto iPhone/` è la destinazione di Mac→SSD; `Import/<etichetta>/` è la destinazione di #27-A; esistono estrazioni Takeout, cartelle storiche e una cartella `Zip`), ma **il layout reale dell'SSD non è mai stato censito**. Va verificato con un `ls -1` al primo collegamento, prima di considerarla chiusa. Se il layout reale la smentisce, cambia una funzione pura e i suoi test, non il design.
+**Questa regola è un'ipotesi, non una misura.** È costruita su ciò che il progetto sa delle proprie cartelle (`Foto iPhone/` è la destinazione di Mac→SSD; `Import/<etichetta>/` è la destinazione di #27-A; esistono estrazioni Takeout, cartelle storiche e una cartella `Zip`).
+
+**Correzione del 2026-08-28 — il layout non è "mai stato censito"**, come diceva questa riga. Risulta verificato il 2026-07-29/30, e le cartelle di primo livello erano: `Foto iPhone`, `Foto Google Drive`, `Other`, `Takeout`, `Takeout 2`, `Zip`. È un rilievo di un mese fa e va riconfermato con un `ls -1`, ma la regola non parte da zero. Provata contro quel layout regge nei due punti alti (`Foto iPhone/` vince — ed è giusto, perché è la cartella che Mac→SSD riscriverebbe comunque; `Zip/` non entra nell'indice perché gli archivi non sono media per `UTType`, quindi esce da sé).
+
+**Punto lasciato deliberatamente aperto (decisione di Enrico, 2026-08-28): dove stanno `Takeout/` e `Takeout 2/` nella gerarchia.** Sono estrazioni automatiche di Google, non organizzazione fatta a mano — quindi hanno lo stesso profilo di `Import/` e l'argomento per declassarle è forte; ma è anche il gruppo di doppioni potenzialmente più grosso dell'SSD, e Enrico ha scelto di deciderlo **con il layout reale davanti** invece che a tavolino. Finché non è deciso, vale l'ordine scritto sopra (Takeout alla pari delle altre cartelle, disambiguato dalla data più vecchia) **come regola provvisoria dichiarata tale**, isolata in una funzione pura con i propri test: fissarla dopo costa un cambio lì e nient'altro.
+
+Non è un blocco all'implementazione: il pannello richiede l'indice, l'indice richiede l'SSD collegato e non è mai stato costruito, quindi questa decisione cade sullo stesso gate delle altre verifiche manuali pendenti. Va nella lista di `Docs/CLAUDE.md`.
 
 **In ogni caso la proposta è solo una proposta**: l'utente può cambiare quale copia tenere dentro ogni gruppo, e nessun gruppo entra in un blocco senza che lui l'abbia spuntato.
 
@@ -178,7 +184,11 @@ Due invarianti da blindare con i test, perché sono quelle che un'ottimizzazione
 - **L'unico modo in cui questo codice tocca un file foto è `trashItem`.** Mai `removeItem`, in nessun ramo, nemmeno di errore. Mai una scrittura dentro `.Trashes`. Mai uno svuotamento del Cestino.
 - **Il file tenuto non viene mai passato a `trashItem`.**
 
-**Tetto per blocco.** Un blocco è limitato a un numero massimo di file (proposta: **500 file o 50 GB**, il primo che scatta). Ragioni: il ritmo misurato è ~56 file/s nel caso peggiore, quindi un blocco da 3.000 file è un minuto di lavoro difficilmente reversibile a mano; e la misura 3 mostra che un guasto a metà blocco è uno stato reale, il cui raggio va tenuto piccolo. Oltre il tetto la UI dice «fallo in più volte» invece di rifiutare e basta. *(Numero da confermare con Enrico.)*
+**Tetto per blocco: 500 file o 50 GB**, il primo che scatta — **confermato da Enrico il 2026-08-28**. Ragioni: la misura 3 mostra che un guasto a metà blocco è uno stato reale, il cui raggio va tenuto piccolo. Oltre il tetto la UI dice «fallo in più volte» invece di rifiutare e basta.
+
+Nota sul tempo, per non fraintendere il tetto: il costo di un blocco **non** è il cestinamento (~56 file/s misurati, quindi 500 file ≈ 9 secondi) ma la **rilettura e il rihash** che lo precedono — 50 GB da un SSD USB sono grosso modo 2-4 minuti di barra di progresso. Il tetto è quindi scelto sul raggio del danno, non sulla durata.
+
+Il numero è prudente e scelto **senza sapere quanti doppioni ci siano davvero**: alla prima passata reale con l'SSD si vedrà il volume vero, e alzarlo è una costante da cambiare, non un redesign.
 
 **Progresso e interruzione.** Il blocco mostra avanzamento ed è interrompibile. Un'interruzione lascia un blocco parziale — è uno stato legittimo, va detto con un numero, e tutto ciò che era stato cestinato resta annullabile.
 
@@ -219,7 +229,7 @@ Nota collaterale: `.Trashes` è già in `LibraryExclusions` **e** comincia con u
 - **Pigre**: solo per le righe davvero a schermo (`LazyVStack` + `.task` per riga), con un token di richiesta che scarta le miniature arrivate su righe già superate — stesso meccanismo di `thumbnailRequestID`.
 - **Cache limitata** (proposta: 200 miniature a 96 px). Senza tetto, scorrere 600 gruppi tiene in RAM 600 `NSImage`: su questo progetto una lettura senza tetto è già costata 41 GB una volta.
 - **La miniatura si legge dal file tenuto**, quello che resterà.
-- **Video: icona di sistema**, non fotogramma. `AVAssetImageGenerator` su centinaia di video da un SSD USB è un costo e una superficie API nuova per un beneficio marginale in questa versione. Riga onesta nella lista dei limiti, non nascosta. *(Domanda per Enrico: gli basta?)*
+- **Video: icona di sistema**, non fotogramma — **confermato da Enrico il 2026-08-28**. `AVAssetImageGenerator` su centinaia di video da un SSD USB è un costo e una superficie API nuova per un beneficio marginale in questa versione. Regge anche perché i membri di un gruppo sono byte-identici per definizione: la miniatura non serve a distinguerli fra loro, e di un gruppo video restano comunque visibili nome, cartella, dimensione e numero di copie. Riga onesta nella lista dei limiti, non nascosta. Se alla prima passata reale non basta, il fotogramma si aggiunge dopo senza toccare il resto.
 - **Se la miniatura non si genera, non è un errore**: si mostra l'icona di sistema. Un doppione senza anteprima resta un doppione.
 
 ### Ordinamento e priorità
@@ -248,9 +258,9 @@ Da fare nel Task 7 del piano, prima di considerare la feature chiusa.
 
 Entrambe diventano false con questa feature. **Vanno riscritte come modifica consapevole di una regola assoluta, con la data e il motivo, non lasciate lì come eccezione silenziosa** — un'eccezione non scritta è un'eccezione che qualcuno estenderà.
 
-Testo proposto (da approvare parola per parola: è la regola più importante del progetto):
+**Testo approvato da Enrico il 2026-08-28**, parola per parola. Rispetto alla prima stesura è stata aggiunta la clausola sulla rilettura: il testo originale nominava solo la doppia conferma dell'utente, e non la garanzia tecnica che impedisce davvero di cestinare una foto che non è un doppione — chi avesse letto solo la regola avrebbe potuto credere di rispettarla con un alert e nient'altro.
 
-> 1. **Zero delete.** Nessun percorso di codice cancella un file foto. **Unica porta, aperta il 2026-08-27**: il pannello Doppioni può spostare nel **Cestino del volume** (`FileManager.trashItem`) copie byte-identiche di file che restano presenti sull'SSD, e solo dopo che l'utente ha spuntato i gruppi, letto un riepilogo dettagliato e confermato. Anche lì: mai `removeItem` su un file foto, mai uno svuotamento del Cestino, mai un file la cui unica copia sparisce. Tutto il resto del progetto resta a zero delete.
+> 1. **Zero delete.** Nessun percorso di codice cancella un file foto. **Unica porta, aperta il 2026-08-27**: il pannello Doppioni può spostare nel **Cestino del volume** (`FileManager.trashItem`) copie byte-identiche di file che restano presenti sull'SSD — e solo dopo che ogni membro del gruppo, **la copia tenuta compresa**, è stato riletto e rihashato dal disco con esito unanime, e dopo che l'utente ha spuntato i gruppi, letto un riepilogo dettagliato e confermato. Anche lì: mai `removeItem` su un file foto, mai uno svuotamento del Cestino, mai un file la cui unica copia sparisce. Tutto il resto del progetto resta a zero delete.
 > 3. **Read-only sulla sorgente.** La Libreria Foto del Mac non viene mai modificata, in nessun caso. Sull'SSD l'unica scrittura ammessa oltre alle copie di backup è lo spostamento nel Cestino del punto 1. Nessun'altra funzione scrive sull'SSD.
 
 Va aggiunto anche il ramo mancante nella checklist di revisione AI dello stesso file, che oggi copre `removeItem`/`moveItem`/`copyItem` ma non conosce `trashItem`:
@@ -282,13 +292,15 @@ Va aggiunto anche il ramo mancante nella checklist di revisione AI dello stesso 
 - **Regole automatiche** («cestina sempre le copie sotto `Import/`»): l'automazione è esattamente ciò che la doppia conferma esiste per impedire.
 - **Cancellazione di file non doppioni** da questo pannello (file singoli, file grandi, file vecchi). Il pannello ha una sola competenza.
 
-## Domande aperte, da porre a Enrico prima dell'approvazione
+## Risposte alle domande aperte (2026-08-28)
 
-Sono elencate anche nel messaggio di consegna. Nessuna è bloccante per la lettura della spec, tutte lo sono per l'implementazione.
+Le sei domande lasciate aperte dalla fase Architect, chiuse da Enrico in un giro one-question-at-a-time. Sono decisioni prese: non vanno rimesse in discussione senza un motivo nuovo.
 
-1. La voce «Doppioni» va anche nell'hamburger, o solo dentro la card di Diagnostica?
-2. Tetto per blocco: 500 file / 50 GB va bene?
-3. La seconda conferma è un `.alert` con bottone distruttivo, o una **stringa da ridigitare** come in `DiskPrepView`?
-4. Video con icona di sistema invece del fotogramma: accettabile per la prima versione?
-5. Il testo nuovo della regola assoluta in `Docs/CLAUDE.md`, parola per parola.
-6. La regola di proposta (`Foto iPhone/` → non-`Import/` → più vecchia) regge contro il layout reale dell'SSD, che nessuno ha ancora censito?
+1. **Ingresso: solo nella card di Diagnostica.** Nessuna voce nell'hamburger, nemmeno disattivata. Un unico ingresso per una funzione che può cestinare foto, e il percorso continua a raccontare la dipendenza dall'indice.
+2. **Tetto per blocco: 500 file / 50 GB**, il primo che scatta. Da ritarare, se serve, col numero vero di doppioni misurato alla prima passata reale.
+3. **Seconda conferma: `.alert` con bottone distruttivo**, non la stringa da ridigitare di `DiskPrepView`. Il peso della conferma sta nel riepilogo dettagliato che la precede. La motivazione è che il cestinamento è reversibile due volte (Cestino di sistema + registro di ripristino dell'app), mentre la ridigitazione resta **il segnale esclusivo dell'unica operazione irreversibile del progetto**, la formattazione di un disco: usarla anche qui la svaluterebbe proprio dove serve.
+4. **Video: icona di sistema**, nessun fotogramma in questa versione.
+5. **Testo della regola assoluta approvato**, nella variante che include la clausola sulla rilettura unanime (vedi sezione «La regola assoluta cambia»).
+6. **Gerarchia di `Takeout/` e `Takeout 2/`: decisione rimandata al layout reale.** Enrico ha scelto di fissarla con un `ls -1` davanti invece che a tavolino. Fino ad allora vale la regola provvisoria descritta sopra. Non blocca l'implementazione — il pannello richiede comunque l'SSD collegato, quindi la decisione cade sullo stesso gate delle altre verifiche pendenti.
+
+Correzione emersa nello stesso giro, già riportata nella sezione della regola di proposta: **la spec affermava che il layout dell'SSD non fosse mai stato censito, e non è vero** — risulta rilevato il 2026-07-29/30. Vale come promemoria che una domanda aperta va cercata nella storia del progetto prima di essere girata a Enrico.
