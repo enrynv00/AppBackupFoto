@@ -116,7 +116,7 @@ Logica **pura**: nessun filesystem, nessun database. È la decisione 3 di Enrico
 - Consuma: `DuplicateGroup` (Task 1).
 - Produce: `enum DuplicateKeepReason { case mainLibrary, notAnImport, oldest, deterministicTieBreak }`, `struct DuplicateKeepChoice { let keeper: LibraryIndexEntry; let reason: DuplicateKeepReason }`, `func duplicateKeepChoice(_ group: DuplicateGroup) -> DuplicateKeepChoice`, e `func duplicateKeepExplanation(_ choice:, in group:) -> String`. Consumati dai Task 3, 4, 6.
 
-- [ ] **Step 1: Scrivi il file di test** (~18 test):
+- [x] **Step 1: Scrivi il file di test** (~18 test):
   - un membro sotto `Foto iPhone/` e uno sotto `Import/Scheda/` ⇒ vince il primo, `reason == .mainLibrary`
   - due membri sotto `Foto iPhone/` ⇒ si scende alla regola successiva
   - un membro sotto `Import/` e uno sotto `2019 Vacanze/` ⇒ vince il secondo, `.notAnImport`
@@ -130,21 +130,34 @@ Logica **pura**: nessun filesystem, nessun database. È la decisione 3 di Enrico
   - `Foto iPhone` con maiuscole diverse / in NFD: riconosciuta comunque (le chiavi dell'indice sono già NFC + minuscole, ma il confronto va fatto sulla **chiave normalizzata**, non su `displayPath`)
   - `Fotografie iPhone/` **non** è `Foto iPhone/`: confronto per **componente di percorso**, mai `hasPrefix` sulla stringa
 
-- [ ] **Step 2–3: registra il file, verifica il fallimento atteso.**
+- [x] **Step 2–3: registra il file, verifica il fallimento atteso.** *(Ottenuto `error: cannot find type 'DuplicateKeepChoice' in scope`, con la classe di test gia' compilata dal target: la registrazione ha funzionato.)*
 
-- [ ] **Step 4: Implementa.** Precedenza: `mainLibrary` → `notAnImport` → `oldest` → tie-break deterministico (percorso più corto, poi ordine della chiave normalizzata). Il confronto delle cartelle passa dalla **prima componente della chiave normalizzata**, non da `hasPrefix`.
+- [x] **Step 4: Implementa.** Precedenza: `mainLibrary` → `notAnImport` → `oldest` → tie-break deterministico (percorso più corto, poi ordine della chiave normalizzata). Il confronto delle cartelle passa dalla **prima componente della chiave normalizzata**, non da `hasPrefix`.
   Commento accanto al codice, obbligatorio: **questa regola è provvisoria e dichiarata tale.** Il layout di primo livello dell'SSD risulta rilevato il 2026-07-29/30 (`Foto iPhone`, `Foto Google Drive`, `Other`, `Takeout`, `Takeout 2`, `Zip`) ma non riconfermato da allora. In particolare **la posizione di `Takeout/` e `Takeout 2/` nella gerarchia è una decisione che Enrico ha esplicitamente rimandato al momento in cui avrà il layout reale davanti** (risposta 6 del 2026-08-28): sono estrazioni automatiche, quindi l'argomento per declassarle accanto a `Import/` è forte, ma finché non è deciso restano alla pari delle altre cartelle e disambigua la data più vecchia. Se il layout vero smentisce la regola, cambiano questa funzione e i suoi test, non il design.
 
-- [ ] **Step 5–6: test verdi, build, suite, commit** — attesi **378 test** (360 + 18).
+- [x] **Step 5–6: test verdi, build, suite, commit** — `Executed 23 tests, with 0 failures` sulla sola classe, **387 test** in suite completa.
+
+**Correzione del conteggio (2026-08-28).** Questo step diceva «attesi 378 test (360 + 18)» ed era stantio: la baseline reale al commit `2c87976` e' **364** (il Task 1 ha prodotto 18 test invece di 14). Il Task 2 ne ha scritti **23** invece di 18 — i cinque in piu' nascono tutti dalla corsa sui mutanti, nessuno e' stato aggiunto per far quadrare un numero: `testMainLibraryBeatsImportFolder`, `testFotoIPhone2_isNotTheMainLibrary`, `testImportante_isNotAnImportFolder`, `testFileAtTheRootIsNotAFolder`, `testComparisonUsesTheNormalizedKeyNotTheDisplayPath`. Cumulativo reale: **387**.
 
 **Il mutante che deve morire:**
-| Mutante | Test rosso |
-| :---- | :---- |
-| Precedenza `mainLibrary`/`notAnImport` invertita | `testMainLibraryBeatsOrganizedFolder` |
-| «più vecchia» → «più recente» | `testSameFolder_keepsOldest` |
-| Tie-break rimosso (ordine di input) | `testTieBreak_isStableAcrossPermutations` |
-| `hasPrefix` al posto del confronto per componenti | `testFotografieIPhone_isNotTheMainLibrary` |
-| La spiegazione non nomina il numero delle altre copie | `testExplanation_namesTheNumberOfOtherCopies` |
+| Mutante | Test rosso | Esito misurato (2026-08-28) |
+| :---- | :---- | :---- |
+| Precedenza `mainLibrary`/`notAnImport` invertita | ~~`testMainLibraryBeatsOrganizedFolder`~~ → `testMainLibraryBeatsImportFolder` | **ucciso** (4 test rossi) |
+| «più vecchia» → «più recente» | `testSameFolder_keepsOldest` | **ucciso** (6 test rossi) |
+| Tie-break rimosso (ordine di input) | `testTieBreak_isStableAcrossPermutations` | **ucciso** (6 test rossi) |
+| `hasPrefix` al posto del confronto per componenti | ~~`testFotografieIPhone_isNotTheMainLibrary`~~ → `testFotoIPhone2_isNotTheMainLibrary` | **ucciso** (4 test rossi) |
+| La spiegazione non nomina il numero delle altre copie | `testExplanation_namesTheNumberOfOtherCopies` | **ucciso** |
+| Confronto su `displayPath` invece che sulla chiave normalizzata | `testMainLibraryFolder_isRecognizedWhateverTheCase` | **ucciso** |
+| Un file nella root conta come cartella di primo livello | `testFileAtTheRootIsNotAFolder` | **ucciso** |
+| La cartella nella spiegazione viene dalla chiave minuscola | `testExplanation_namesTheRealFolderOfTheKeptFile` | **ucciso** |
+| Il motivo non scende alla regola successiva (la prima che tocca vince) | `testExplanation_coversAllFourReasons` | **ucciso** (19 test rossi) |
+
+**Nota (2026-08-28) — due righe di questa tabella erano cieche, e la corsa sui mutanti lo ha confermato.** Il Task 2 non prevedeva mutation testing (il piano lo chiede solo ai Task 4 e 5); e' stato fatto lo stesso, su una copia nello scratchpad, perche' due accoppiamenti mutante/test non reggevano alla lettura:
+
+- **Precedenza invertita.** Con `Foto iPhone/` contro `2019 Vacanze/` — il caso di `testMainLibraryBeatsOrganizedFolder` — nessuna delle due copie sta in un import, quindi la regola 2 non discrimina e invertire l'ordine lascia identici sia la copia tenuta sia il motivo: **il mutante sopravvive**. Serve una copia in `Import/`, dove l'inversione produce lo stesso file ma con motivo `.notAnImport`, cioe' una frase sbagliata sulla schermata che precede la cancellazione. Da qui `testMainLibraryBeatsImportFolder`.
+- **`hasPrefix`.** `Fotografie iPhone/` **non** ha come prefisso `Foto iPhone`, quindi quel test passa anche col confronto per prefisso. Il caso che lo uccide e' la cartella sorella `Foto iPhone 2/`, che il prefisso accetta — la stessa trappola per cui `/Volumes/SSD` non e' un prefisso di `/Volumes/SSD 2`. Entrambi i test restano: il primo documenta l'intento, il secondo e' la rete.
+
+Le due cartelle di primo livello (`Foto iPhone`, `Import`) restano scritte **due volte** nel progetto: come chiave normalizzata accanto alla regola di proposta e come letterale nel job di copia (`appendingPathComponent("Foto iPhone")`, `appendingPathComponent("Import")`). Non sono state unificate in questo task — la modifica toccherebbe il codice di copia, che il Task 2 non prevede — ma il debito e' segnalato nel commento accanto alle due costanti.
 
 ---
 
@@ -364,14 +377,14 @@ Nessun test. Va fatto **prima** di considerare la feature chiusa, non dopo: una 
 | :---- | ----: | ----: |
 | baseline (`310efa5`) | — | **346** |
 | 1 — `duplicateGroups()` | ~~14~~ **18 (reale)** | ~~360~~ **364 (reale)** |
-| 2 — `duplicateKeepChoice` | 18 | 378 → **382** |
-| 3 — `DuplicateBatch` | 14 | 392 → **396** |
-| 4 — `DuplicateTrasher` | 30 | 422 → **426** |
-| 5 — `TrashManifest` | 18 | 440 → **444** |
-| 6 — `DuplicatesView` / `DuplicatesStatus` | 12 | 452 → **456** |
-| 7 — documentazione | 0 | 452 → **456** |
+| 2 — `duplicateKeepChoice` | ~~18~~ **23 (reale)** | ~~378~~ **387 (reale)** |
+| 3 — `DuplicateBatch` | 14 | 392 → **401** |
+| 4 — `DuplicateTrasher` | 30 | 422 → **431** |
+| 5 — `TrashManifest` | 18 | 440 → **449** |
+| 6 — `DuplicatesView` / `DuplicatesStatus` | 12 | 452 → **461** |
+| 7 — documentazione | 0 | 452 → **461** |
 
-I cumulativi dei Task 2-7 sono scalati di **+4** dopo il Task 1: 18 test invece dei 14 previsti, tutti nati dalla corsa sui mutanti (guardia Swift sui gruppi ridotti a un membro leggibile, file da 0 byte che non devono nascondere i gruppi veri, file da 0 byte dentro un gruppo sano, dimensione minima su indice incoerente). Restano target, non profezie.
+I cumulativi dei Task 3-7 sono scalati di **+9** rispetto al piano originale: **+4** dopo il Task 1 e **+5** dopo il Task 2, a parita' di incrementi previsti per i task successivi. Il Task 1 ha scritto 18 test invece dei 14 previsti, tutti nati dalla corsa sui mutanti (guardia Swift sui gruppi ridotti a un membro leggibile, file da 0 byte che non devono nascondere i gruppi veri, file da 0 byte dentro un gruppo sano, dimensione minima su indice incoerente). Restano target, non profezie.
 
 I numeri per task sono **target**, non profezie: se la copertura reale ne richiede di più, si aggiornano qui. Quello che non si aggiusta è il metodo — **si verifica il conteggio totale nel log a ogni task**, mai il solo `** TEST SUCCEEDED **`.
 

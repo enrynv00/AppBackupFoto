@@ -18,6 +18,7 @@
 		AA11BB22CC33DD44EE55FF62 /* LibraryIndexStatusTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA11BB22CC33DD44EE55FF63 /* LibraryIndexStatusTests.swift */; };
 		592D43F6584F41BB9DF7F42A /* LibraryIndexStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 348051B7D93B457CBDDC3F88 /* LibraryIndexStoreTests.swift */; };
 		D0C1BB22CC33DD44EE55FF70 /* DuplicateGroupsStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D0C1BB22CC33DD44EE55FF71 /* DuplicateGroupsStoreTests.swift */; };
+		D0C1BB22CC33DD44EE55FF72 /* DuplicateKeepChoiceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D0C1BB22CC33DD44EE55FF73 /* DuplicateKeepChoiceTests.swift */; };
 		16B663F58F404767A12C6849 /* LibraryIndexerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CCEF8448621C46CBB6C12F0E /* LibraryIndexerTests.swift */; };
 		D410EC994EB540A8B398CD50 /* ImportDedupTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 35EACF13F6B04D3D9D4ED269 /* ImportDedupTests.swift */; };
 		1A2B3C4D5E6F47188A9B0C1D /* FileSyncerHashVerificationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2B3C4D5E6F70481899AB0C1E /* FileSyncerHashVerificationTests.swift */; };
@@ -66,6 +67,7 @@
 		AA11BB22CC33DD44EE55FF63 /* LibraryIndexStatusTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = LibraryIndexStatusTests.swift; sourceTree = "<group>"; };
 		348051B7D93B457CBDDC3F88 /* LibraryIndexStoreTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = LibraryIndexStoreTests.swift; sourceTree = "<group>"; };
 		D0C1BB22CC33DD44EE55FF71 /* DuplicateGroupsStoreTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = DuplicateGroupsStoreTests.swift; sourceTree = "<group>"; };
+		D0C1BB22CC33DD44EE55FF73 /* DuplicateKeepChoiceTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = DuplicateKeepChoiceTests.swift; sourceTree = "<group>"; };
 		CCEF8448621C46CBB6C12F0E /* LibraryIndexerTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = LibraryIndexerTests.swift; sourceTree = "<group>"; };
 		35EACF13F6B04D3D9D4ED269 /* ImportDedupTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ImportDedupTests.swift; sourceTree = "<group>"; };
 		2B3C4D5E6F70481899AB0C1E /* FileSyncerHashVerificationTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = FileSyncerHashVerificationTests.swift; sourceTree = "<group>"; };
@@ -141,6 +143,7 @@
 				AA11BB22CC33DD44EE55FF63 /* LibraryIndexStatusTests.swift */,
 				348051B7D93B457CBDDC3F88 /* LibraryIndexStoreTests.swift */,
 				D0C1BB22CC33DD44EE55FF71 /* DuplicateGroupsStoreTests.swift */,
+				D0C1BB22CC33DD44EE55FF73 /* DuplicateKeepChoiceTests.swift */,
 				CCEF8448621C46CBB6C12F0E /* LibraryIndexerTests.swift */,
 				35EACF13F6B04D3D9D4ED269 /* ImportDedupTests.swift */,
 				2B3C4D5E6F70481899AB0C1E /* FileSyncerHashVerificationTests.swift */,
@@ -309,6 +312,7 @@
 				AA11BB22CC33DD44EE55FF62 /* LibraryIndexStatusTests.swift in Sources */,
 				592D43F6584F41BB9DF7F42A /* LibraryIndexStoreTests.swift in Sources */,
 				D0C1BB22CC33DD44EE55FF70 /* DuplicateGroupsStoreTests.swift in Sources */,
+				D0C1BB22CC33DD44EE55FF72 /* DuplicateKeepChoiceTests.swift in Sources */,
 				16B663F58F404767A12C6849 /* LibraryIndexerTests.swift in Sources */,
 				D410EC994EB540A8B398CD50 /* ImportDedupTests.swift in Sources */,
 				1A2B3C4D5E6F47188A9B0C1D /* FileSyncerHashVerificationTests.swift in Sources */,

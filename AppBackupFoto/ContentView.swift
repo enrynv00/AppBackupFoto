@@ -1787,6 +1787,178 @@ func normalizedIndexKey(_ relativePath: String) -> String {
         .joined(separator: "/")
 }
 
+// MARK: - Quale copia si tiene, e perche'
+
+/// Il nome della cartella di primo livello che il job Mac -> SSD riempie: e' la libreria
+/// principale, quella da cui partono i mirror su HDD e su Cubbit.
+///
+/// Scritto qui in forma di **chiave normalizzata** (NFC + minuscole) perche' e' cosi' che
+/// lo si confronta. La stessa stringa compare come letterale nel job di copia
+/// (`grep -n 'appendingPathComponent("Foto iPhone")'`): se un giorno quel nome cambia,
+/// vanno cambiati entrambi i punti — qui e li'.
+let mainLibraryFolderKey = normalizedIndexKey("Foto iPhone")
+
+/// La cartella di primo livello dove atterrano gli import da schede e dischi
+/// (`<SSD>/Import/<etichetta>`, roadmap #27-A). Stessa nota di sopra sul letterale.
+let importFolderKey = normalizedIndexKey("Import")
+
+/// Perche' la copia proposta e' quella proposta. Fa parte del risultato e non e' un
+/// commento: la decisione 3 di Enrico chiede che la proposta sia **spiegata a parole**, e
+/// una spiegazione ricostruita a posteriori dalla UI divergerebbe dalla regola alla prima
+/// modifica di una delle due.
+enum DuplicateKeepReason {
+    /// Sta nella libreria principale, e le altre copie no.
+    case mainLibrary
+    /// Sta in una cartella organizzata a mano, e le altre copie stanno in un import.
+    case notAnImport
+    /// Nessuna delle due regole sopra discrimina: e' la piu' vecchia.
+    case oldest
+    /// Le copie si equivalgono su tutte le regole di prodotto. Non e' una preferenza:
+    /// e' la garanzia che la proposta non cambi fra due aperture del pannello.
+    case deterministicTieBreak
+}
+
+/// La copia che si propone di tenere, con il motivo.
+struct DuplicateKeepChoice {
+    let keeper: LibraryIndexEntry
+    let reason: DuplicateKeepReason
+}
+
+/// La cartella di primo livello di una chiave, oppure `nil` per un file che sta nella
+/// root della libreria.
+///
+/// Confronto **per componente**, mai `hasPrefix`: `Foto iPhone 2/` ha come prefisso
+/// testuale `Foto iPhone` ma e' un'altra cartella, e con un `hasPrefix` le sue copie
+/// verrebbero trattate come libreria principale — cioe' proposte per essere TENUTE al
+/// posto di quelle vere. Stessa trappola, gia' pagata altrove nel progetto, per cui
+/// `/Volumes/SSD` non e' un prefisso di `/Volumes/SSD 2`.
+///
+/// Un file nella root non ha cartella: la sua unica componente e' il proprio nome, e un
+/// file chiamato "Foto iPhone" non e' la libreria principale.
+private func topLevelFolderKey(of key: String) -> String? {
+    // `normalizedIndexKey` e' idempotente sulle chiavi dell'indice, che sono gia' NFC +
+    // minuscole. Riapplicarlo costa nulla e rende la regola vera anche se un chiamante
+    // futuro costruisse un gruppo da percorsi grezzi. Non si guarda MAI `displayPath`:
+    // quello conserva maiuscole e forma Unicode originali, quindi confrontarlo
+    // renderebbe la regola dipendente da come e' scritto il nome sul disco.
+    let components = normalizedIndexKey(key).split(separator: "/", omittingEmptySubsequences: true)
+    guard components.count > 1 else { return nil }
+    return String(components[0])
+}
+
+private func isInMainLibrary(_ entry: LibraryIndexEntry) -> Bool {
+    topLevelFolderKey(of: entry.path) == mainLibraryFolderKey
+}
+
+private func isInImportFolder(_ entry: LibraryIndexEntry) -> Bool {
+    topLevelFolderKey(of: entry.path) == importFolderKey
+}
+
+/// Sceglie quale copia di un gruppo di doppioni tenere, e dice perche'.
+///
+/// Funzione **pura**: nessun filesystem, nessun database, nessun ordine di input che conti.
+/// Precedenza: libreria principale -> cartella organizzata invece che import -> la piu'
+/// vecchia -> tie-break deterministico (percorso piu' corto, poi ordine della chiave).
+/// Il motivo riportato e' quello dell'**ultima** regola che ha davvero discriminato: due
+/// copie entrambe in `Foto iPhone/` non si distinguono per la prima regola, quindi la
+/// scelta (e la frase mostrata all'utente) scende a quella dopo.
+///
+/// ATTENZIONE — **questa regola e' provvisoria, ed e' dichiarata tale.** Poggia sul layout
+/// di primo livello dell'SSD rilevato il 2026-07-29/30 (`Foto iPhone`, `Foto Google Drive`,
+/// `Other`, `Takeout`, `Takeout 2`, `Zip`) e **mai riconfermato da allora**: va rivista con
+/// un `ls -1` del volume vero davanti, che e' fra le verifiche manuali pendenti.
+/// In particolare **la posizione di `Takeout/` e `Takeout 2/` nella gerarchia e' una
+/// decisione che Enrico ha esplicitamente rimandato** al momento in cui avra' il layout
+/// reale davanti (risposta 6 del 2026-08-28): sono estrazioni automatiche di Google, quindi
+/// l'argomento per declassarle accanto a `Import/` e' forte, ma finche' non e' deciso
+/// restano **alla pari delle altre cartelle** e a disambiguare e' la data piu' vecchia.
+/// Se il layout vero smentisce la regola, cambiano questa funzione e i suoi test, non il
+/// design: la proposta resta comunque solo una proposta, che l'utente puo' cambiare gruppo
+/// per gruppo prima di confermare.
+///
+/// - Precondition: `group.members` non e' vuoto. E' l'invariante di `DuplicateGroup`
+///   (almeno due membri), garantita dall'unico costruttore reale,
+///   `LibraryIndexStore.duplicateGroups()`. Un gruppo svuotato dai filtri di un chiamante
+///   futuro va **saltato** prima di arrivare qui, non passato in cerca di una risposta.
+func duplicateKeepChoice(_ group: DuplicateGroup) -> DuplicateKeepChoice {
+    precondition(!group.members.isEmpty, "un gruppo di doppioni senza membri non ha una copia da tenere")
+
+    var candidates = group.members
+    var reason = DuplicateKeepReason.deterministicTieBreak
+
+    // Una regola "discrimina" solo se lascia in piedi qualcuno E scarta qualcun altro.
+    // Senza la seconda condizione ogni regola sembrerebbe aver deciso — tutte le copie
+    // nella libreria principale direbbero "la tengo perche' e' in libreria principale",
+    // che non spiega perche' proprio quella.
+    func narrow(_ survivors: [LibraryIndexEntry], _ because: DuplicateKeepReason) {
+        guard !survivors.isEmpty, survivors.count < candidates.count else { return }
+        candidates = survivors
+        reason = because
+    }
+
+    // 1. La libreria principale vince: e' la cartella che il job Mac -> SSD riscriverebbe
+    //    comunque, e da cui partono i mirror su HDD e su Cubbit.
+    narrow(candidates.filter(isInMainLibrary), .mainLibrary)
+    // 2. Una cartella organizzata a mano batte uno scarico da scheda o disco.
+    narrow(candidates.filter { !isInImportFolder($0) }, .notAnImport)
+    // 3. A parita', la piu' vecchia: e' quella che l'utente ha da piu' tempo, e le copie
+    //    piu' recenti sono quasi sempre il risultato di una ricopiatura.
+    if let oldest = candidates.map(\.mtime).min() {
+        narrow(candidates.filter { $0.mtime == oldest }, .oldest)
+    }
+
+    // 4. Tie-break. Non e' una regola di prodotto: e' cio' che impedisce alla proposta di
+    //    cambiare fra due aperture del pannello a parita' di dati. Senza, l'ordine di
+    //    arrivo dei membri deciderebbe quale foto finisce nel Cestino, e una proposta
+    //    instabile e' una proposta di cui l'utente non puo' fidarsi.
+    let keeper = candidates.min { a, b in
+        if a.path.count != b.path.count { return a.path.count < b.path.count }
+        return a.path < b.path
+    }
+    // `min` restituisce nil solo su array vuoto, escluso dalla precondition; il fallback
+    // esiste per non far dipendere da un `!` la funzione che decide cosa NON cestinare.
+    return DuplicateKeepChoice(keeper: keeper ?? candidates[0], reason: reason)
+}
+
+/// Come si dice all'utente la scelta di `duplicateKeepChoice`.
+///
+/// Registro anti-gergo, come per `LibraryIndexStatus`: niente "hash", "indice", "SHA256",
+/// "scansione". Chi legge questa frase sta per confermare uno spostamento nel Cestino, e
+/// deve capire **quale** copia resta, **dove** sta e **quante** altre ce ne sono.
+/// Una frase diversa per ciascuno dei quattro motivi: se due motivi condividessero il
+/// testo, l'utente vedrebbe la stessa spiegazione per due decisioni diverse.
+func duplicateKeepExplanation(_ choice: DuplicateKeepChoice, in group: DuplicateGroup) -> String {
+    let others = group.members.count - 1
+    let copies: String
+    switch others {
+    case ..<1: copies = "Non risultano altre copie di questo file."
+    case 1: copies = "C'è 1 altra copia identica di questo file."
+    default: copies = "Ci sono \(others) altre copie identiche di questo file."
+    }
+
+    // La cartella si dice come e' scritta su disco (`displayPath`), non nella forma
+    // minuscola della chiave: l'utente la deve poter ritrovare nel Finder.
+    let folders = choice.keeper.displayPath.split(separator: "/", omittingEmptySubsequences: true).dropLast()
+    let place = folders.isEmpty
+        ? "direttamente sull'SSD, fuori da ogni cartella"
+        : "in «\(folders.joined(separator: "/"))»"
+
+    switch choice.reason {
+    case .mainLibrary:
+        return "Tengo la copia che si trova \(place): è la tua libreria principale, "
+            + "quella che l'app riempie a ogni backup delle foto del Mac. \(copies)"
+    case .notAnImport:
+        return "Tengo la copia che si trova \(place): le altre stanno in una cartella di scarico, "
+            + "dove i file arrivano alla rinfusa da schede e dischi. \(copies)"
+    case .oldest:
+        return "Tengo la copia che si trova \(place): è la più vecchia, quindi è quella che hai "
+            + "da più tempo. \(copies)"
+    case .deterministicTieBreak:
+        return "Le copie si equivalgono: stanno in cartelle dello stesso tipo e hanno la stessa data. "
+            + "Tengo quella \(place), che ha il percorso più corto, così la proposta resta sempre la stessa. \(copies)"
+    }
+}
+
 /// Persistenza SQLite dell'indice. Scelta su JSON monolitico perche' un aggiornamento
 /// incrementale costa O(log n) invece di riscrivere l'intero file, e perche' una
 /// corruzione degrada parzialmente invece di rendere tutto illeggibile.
