@@ -55,7 +55,7 @@ Primo perché tutto il resto lo consuma, e perché è la sola parte che tocca SQ
 - Consuma: `LibraryIndexEntry`, la coda seriale privata e gli helper `prepare`/`stepRow`/`bind*` già esistenti nello store.
 - Produce: `struct DuplicateGroup { let hash: String; let size: Int64; let members: [LibraryIndexEntry] }` e `func duplicateGroups() throws -> [DuplicateGroup]`. Consumato dai Task 2, 3, 4, 6.
 
-- [ ] **Step 1: Scrivi il file di test** (~14 test) su un database temporaneo reale, come già fa `LibraryIndexStoreTests`. Copertura minima:
+- [x] **Step 1: Scrivi il file di test** (~14 test) su un database temporaneo reale, come già fa `LibraryIndexStoreTests`. Copertura minima:
   - due entry stesso hash ⇒ un gruppo con due membri; tre entry ⇒ un gruppo con tre membri
   - entry con hash unico ⇒ nessun gruppo
   - due gruppi distinti ⇒ due gruppi, membri non mescolati
@@ -66,25 +66,29 @@ Primo perché tutto il resto lo consuma, e perché è la sola parte che tocca SQ
   - risultato **stabile fra due chiamate** sugli stessi dati (ordinamento deterministico)
   - un database corrotto ⇒ **lancia**, non restituisce un array vuoto
 
-- [ ] **Step 2: Registra il file in `project.pbxproj`** (4 punti; usa `grep -n "LibraryIndexStoreTests" AppBackupFoto.xcodeproj/project.pbxproj` per copiare il formato esatto).
+- [x] **Step 2: Registra il file in `project.pbxproj`** (4 punti; usa `grep -n "LibraryIndexStoreTests" AppBackupFoto.xcodeproj/project.pbxproj` per copiare il formato esatto).
 
-- [ ] **Step 3: Verifica il fallimento atteso** — `cannot find 'DuplicateGroup' in scope`. Se il comando non trova affatto la classe di test, la registrazione non ha funzionato: **fermati e segnalalo**.
+- [x] **Step 3: Verifica il fallimento atteso** — `cannot find 'DuplicateGroup' in scope`. Se il comando non trova affatto la classe di test, la registrazione non ha funzionato: **fermati e segnalalo**. *(Ottenuto esattamente `error: cannot find type 'DuplicateGroup' in scope`: il file era già compilato dal target, quindi la registrazione aveva funzionato.)*
 
-- [ ] **Step 4: Implementa.** Una sola query, dentro la coda seriale, con i vincoli già stabiliti per lo store:
+- [x] **Step 4: Implementa.** Una sola query, dentro la coda seriale, con i vincoli già stabiliti per lo store:
   - `SELECT ... FROM entries WHERE size > 0 AND hash IN (SELECT hash FROM entries WHERE size > 0 GROUP BY hash HAVING COUNT(*) > 1) ORDER BY hash, path`
   - **nessun ciclo `while sqlite3_step(...) == SQLITE_ROW` nudo**: esce identico su `SQLITE_DONE` e su `SQLITE_ERROR`/`CORRUPT`/`BUSY`, cioè può restituire un elenco **troncato senza errore** — e qui un elenco troncato è un gruppo che non compare, non un dato sbagliato, ma la regola dello store è unica e non si deroga. Usa `stepRow`, che lancia.
   - guardia nil su ogni colonna `TEXT` letta con `String(cString:)`: un puntatore nil termina il processo (SIGTRAP).
   - doc-comment che scrive il **contratto**: risultato corretto ma **potenzialmente stantio**, esattamente come `entries(withHash:)`. Serve a mostrare una lista, **mai** a decidere una cancellazione senza rilettura (ADR-0003 + ADR-0005).
 
-- [ ] **Step 5: Test verdi** — `Executed 14 tests, with 0 failures`.
-- [ ] **Step 6: Build, suite completa, commit** — attesi **360 test** (346 + 14).
+- [x] **Step 5: Test verdi** — `Executed 16 tests, with 0 failures` (16 e non 14: vedi la nota sui mutanti qui sotto).
+- [x] **Step 6: Build, suite completa, commit** — **362 test** (346 + 16), `** BUILD SUCCEEDED **` + `** TEST SUCCEEDED **`.
 
 **Il mutante che deve morire:**
-| Mutante | Test che deve diventare rosso |
-| :---- | :---- |
-| `size > 0` rimosso | `testZeroByteFiles_areNotAGroup` |
-| `HAVING COUNT(*) > 1` → `>= 1` | `testUniqueHash_isNotAGroup` |
-| `stepRow` sostituito da un `while sqlite3_step == SQLITE_ROW` | `testCorruptDatabase_throws` |
+| Mutante | Test che deve diventare rosso | Esito misurato (2026-08-28) |
+| :---- | :---- | :---- |
+| `size > 0` rimosso (entrambe le occorrenze) | `testZeroByteFiles_areNotAGroup` | **ucciso** (3 test rossi) |
+| `HAVING COUNT(*) > 1` → `>= 1`, **da solo** | `testUniqueHash_isNotAGroup` | **sopravvissuto — mutante equivalente**, vedi sotto |
+| Regola «almeno due copie» rimossa da **entrambi** i punti (SQL + Swift) | `testUniqueHash_isNotAGroup` | **ucciso** (5 test rossi) |
+| Guardia Swift `members.count > 1` rimossa, da sola | `testGroupReducedToASingleReadableMember_isNotAGroup` | **ucciso** |
+| `stepRow` sostituito da un `while sqlite3_step == SQLITE_ROW` | `testCorruptDatabase_throws` | **ucciso** |
+
+**Nota (2026-08-28) — perché il secondo mutante è equivalente e cosa si è fatto al suo posto.** La regola «almeno due copie» finisce scritta in **due** punti, esattamente come il `size > 0`: l'`HAVING COUNT(*) > 1` della query e il conteggio dei membri **leggibili** in Swift. Il secondo non è ridondanza: la query conta le *righe*, ma una riga malformata (colonna TEXT a NULL) viene saltata in lettura, quindi un gruppo di due righe può arrivare all'utente con un solo membro leggibile — e un gruppo da un membro solo mostrerebbe come doppione un file che copie non ne ha. Con quella guardia presente, mutare da solo l'`HAVING` in `>= 1` **non cambia il risultato** (cambia solo quante righe si leggono: tutto l'indice invece dei soli doppioni), quindi nessun test può ucciderlo — è un mutante equivalente, non un buco nella rete. Lo stesso vale, in modo simmetrico, per la rimozione di **una sola** delle due occorrenze di `size > 0`. Al posto suo sono stati verificati i due mutanti che *sono* osservabili: la rimozione della regola da entrambi i punti e la rimozione della sola guardia Swift, coperta da un test nuovo (da cui 16 test invece di 14). Nessun test è stato indebolito per far quadrare il conteggio.
 
 ---
 
@@ -348,13 +352,15 @@ Nessun test. Va fatto **prima** di considerare la feature chiusa, non dopo: una 
 | Task | Test nuovi | Cumulativo atteso |
 | :---- | ----: | ----: |
 | baseline (`310efa5`) | — | **346** |
-| 1 — `duplicateGroups()` | 14 | 360 |
-| 2 — `duplicateKeepChoice` | 18 | 378 |
-| 3 — `DuplicateBatch` | 14 | 392 |
-| 4 — `DuplicateTrasher` | 30 | 422 |
-| 5 — `TrashManifest` | 18 | 440 |
-| 6 — `DuplicatesView` / `DuplicatesStatus` | 12 | 452 |
-| 7 — documentazione | 0 | 452 |
+| 1 — `duplicateGroups()` | ~~14~~ **16 (reale)** | ~~360~~ **362 (reale)** |
+| 2 — `duplicateKeepChoice` | 18 | 378 → **380** |
+| 3 — `DuplicateBatch` | 14 | 392 → **394** |
+| 4 — `DuplicateTrasher` | 30 | 422 → **424** |
+| 5 — `TrashManifest` | 18 | 440 → **442** |
+| 6 — `DuplicatesView` / `DuplicatesStatus` | 12 | 452 → **454** |
+| 7 — documentazione | 0 | 452 → **454** |
+
+I cumulativi dei Task 2-7 sono scalati di **+2** dopo il Task 1 (16 test invece dei 14 previsti: due test in più per coprire la guardia Swift sui gruppi ridotti a un membro leggibile e i file da 0 byte che non devono nascondere i gruppi veri — vedi la nota sui mutanti del Task 1). Restano target, non profezie.
 
 I numeri per task sono **target**, non profezie: se la copertura reale ne richiede di più, si aggiornano qui. Quello che non si aggiusta è il metodo — **si verifica il conteggio totale nel log a ogni task**, mai il solo `** TEST SUCCEEDED **`.
 

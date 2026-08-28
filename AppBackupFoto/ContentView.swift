@@ -1731,6 +1731,21 @@ struct LibraryIndexEntry {
     let hashedAt: Double
 }
 
+/// Un insieme di entry dell'indice che condividono lo stesso hash: le copie
+/// byte-identiche di uno stesso contenuto gia' presenti nella libreria.
+///
+/// Ha sempre **almeno due membri** e dimensione **maggiore di zero** — chi lo costruisce e'
+/// `LibraryIndexStore.duplicateGroups()`, che esclude entrambi i casi (vedi li' il perche'
+/// dei file da 0 byte).
+struct DuplicateGroup {
+    let hash: String
+    /// La dimensione condivisa dai membri: hash uguale significa contenuto uguale, quindi
+    /// dimensione uguale. Chi cancella non si fida comunque di questo numero e rilegge la
+    /// dimensione dal disco insieme all'hash, dallo stesso descrittore (ADR-0005).
+    let size: Int64
+    let members: [LibraryIndexEntry]
+}
+
 /// Normalizza un percorso relativo per usarlo come chiave dell'indice.
 /// ExFAT e' case-insensitive/case-preserving e non normalizza l'Unicode; APFS preserva
 /// la normalizzazione originale. Senza questo passaggio lo stesso file potrebbe
@@ -2098,6 +2113,26 @@ final class LibraryIndexStore {
         try queue.sync { try entriesUnsynchronized(withHash: hash) }
     }
 
+    /// Tutti i gruppi di copie byte-identiche presenti nell'indice: stesso hash, almeno
+    /// due membri, dimensione maggiore di zero. Ordine deterministico (per hash, poi per
+    /// chiave), cosi' l'elenco mostrato non cambia fra due aperture a parita' di dati.
+    ///
+    /// CONTRATTO (ADR-0003 + ADR-0005): il risultato e' **corretto ma potenzialmente
+    /// stantio**, esattamente come `entries(withHash:)`. Dice che cosa l'indice ha visto
+    /// l'ultima volta che ha guardato, non che cosa c'e' sul disco adesso: un file puo'
+    /// essere stato modificato conservando dimensione e mtime (exiftool, `rsync -t`, un
+    /// restore da Finder li preservano tutti e tre), e allora la sua entry resta `.fresh`
+    /// pur non descrivendo piu' il contenuto reale.
+    ///
+    /// Serve quindi a **mostrare una lista** — il livello di fiducia 1, quello a basso
+    /// danno. **Mai** a decidere una cancellazione: prima di cestinare, ogni membro del
+    /// gruppo, **la copia tenuta compresa**, va riletto e rihashato dal disco con esito
+    /// unanime. Fidarsi di questo risultato per cestinare significherebbe mandare nel
+    /// Cestino una foto che non e' un doppione.
+    func duplicateGroups() throws -> [DuplicateGroup] {
+        try queue.sync { try duplicateGroupsUnsynchronized() }
+    }
+
     /// Filtro dimensione-prima: se nessun file indicizzato ha questa dimensione,
     /// il file in arrivo non va nemmeno hashato. E' lo stadio 1 del pipeline su cui
     /// convergono rmlint, jdupes e rdfind.
@@ -2176,6 +2211,58 @@ final class LibraryIndexStore {
             if let entry = readEntry(stmt) { out.append(entry) }
         }
         return out
+    }
+
+    private func duplicateGroupsUnsynchronized() throws -> [DuplicateGroup] {
+        // `size > 0` compare DUE volte, e servono entrambe. Tutti i file vuoti condividono
+        // lo stesso SHA256, e nell'indice ci sono solo media (`IndexableKind`): un media da
+        // 0 byte e' troncato o corrotto, non la copia di qualcos'altro. Senza l'esclusione
+        // nella sottoquery i vuoti farebbero COUNT, gonfiando il numero di copie di file che
+        // copie non ne hanno; senza quella esterna comparirebbero fra i membri. Proporre di
+        // cestinarli significherebbe proporre di cestinare file **diversi** credendoli
+        // copie — lo stesso buco gia' trovato e chiuso una volta con i sidecar `.AAE`.
+        let sql = """
+        SELECT path,display_path,size,mtime,hash,hashed_at FROM entries
+        WHERE size > 0 AND hash IN (
+            SELECT hash FROM entries WHERE size > 0 GROUP BY hash HAVING COUNT(*) > 1
+        )
+        ORDER BY hash, path;
+        """
+        let stmt = try prepare(sql)
+        defer { sqlite3_finalize(stmt) }
+
+        var groups: [DuplicateGroup] = []
+        var currentHash: String?
+        var members: [LibraryIndexEntry] = []
+
+        // Un gruppo si chiude quando cambia l'hash: l'ORDER BY li tiene contigui.
+        // `members.count > 1` non e' ridondante rispetto all'HAVING: una riga malformata
+        // saltata da `readEntry` puo' ridurre a uno i membri leggibili, e un gruppo da un
+        // membro solo non e' un gruppo — mostrarlo proporrebbe di cestinare l'unica copia.
+        func flush() {
+            if let hash = currentHash, members.count > 1 {
+                groups.append(DuplicateGroup(hash: hash, size: members[0].size, members: members))
+            }
+            members = []
+        }
+
+        // `stepRow` e non `while sqlite3_step(...) == SQLITE_ROW`: quel ciclo esce identico
+        // su SQLITE_DONE e su SQLITE_ERROR/CORRUPT/BUSY, cioe' restituirebbe un elenco
+        // troncato **senza segnalare niente** — gruppi di doppioni spariti dalla schermata
+        // e nessuno che sappia perche'.
+        while try stepRow(stmt) {
+            // Guardia nil su ogni colonna TEXT: `String(cString:)` su un puntatore nil
+            // termina il processo (SIGTRAP), e il NOT NULL dello schema non protegge le
+            // righe scritte prima o da un'altra connessione. La riga si salta.
+            guard let entry = readEntry(stmt) else { continue }
+            if entry.hash != currentHash {
+                flush()
+                currentHash = entry.hash
+            }
+            members.append(entry)
+        }
+        flush()
+        return groups
     }
 
     private func hasAnyEntryUnsynchronized(withSize size: Int64) throws -> Bool {
