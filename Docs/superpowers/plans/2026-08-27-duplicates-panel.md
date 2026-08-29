@@ -207,7 +207,7 @@ Logica **pura**. È la prima delle due conferme richieste dalla decisione 4 di E
 - Consuma: `DuplicateGroup`, `DuplicateKeepChoice`.
 - Produce: `struct DuplicateBatch { let groups: [...]; let fileCount: Int; let reclaimableBytes: Int64; let folderBreakdown: [(folder: String, count: Int)]; let exceedsCap: Bool }` e `DuplicateBatch.summaryLines(...) -> [String]` (testo puro del riepilogo). Consumati dai Task 4 e 6.
 
-- [ ] **Step 1: Scrivi il file di test** (~14 test):
+- [x] **Step 1: Scrivi il file di test** (~14 test):
   - **spazio recuperabile = `size × (numero di copie − 1)`**, non `size × numero di copie`: la copia che resta occupa comunque il suo spazio. È l'errore aritmetico più facile della feature.
   - somma su più gruppi di dimensioni diverse
   - conteggio file da cestinare = somma di `(membri − 1)`
@@ -220,17 +220,25 @@ Logica **pura**. È la prima delle due conferme richieste dalla decisione 4 di E
   - il riepilogo contiene la riga **«le copie su HDD e su Cubbit restano dove sono»** — i mirror non cancellano mai
   - registro anti-gergo: nessun «hash», «indice», «SHA256»
 
-- [ ] **Step 2–3: registra, verifica il fallimento atteso.**
-- [ ] **Step 4: Implementa.** Tetto **500 file / 50 GB**, il primo che scatta — confermato da Enrico il 2026-08-28. È una costante nominata, con un commento che dice **perché** quel numero: non la durata (il cestinamento misura ~56 file/s, quindi 500 file ≈ 9 secondi; il tempo vero se lo prende la rilettura che lo precede) ma il **raggio di un guasto a metà blocco**, che la misura 3 della spec mostra essere uno stato reale. Il commento deve dire anche che il numero è prudente e ritarabile alla prima passata reale con l'SSD.
-- [ ] **Step 5–6:** attesi **410 test** (396 + 14).
+- [x] **Step 2–3: registra, verifica il fallimento atteso.** *(Ottenuto `cannot find 'DuplicateBatch' in scope`: la classe di test veniva gia' compilata dal target, quindi la registrazione nei 4 punti aveva funzionato.)*
+- [x] **Step 4: Implementa.** Tetto **500 file / 50 GB**, il primo che scatta — confermato da Enrico il 2026-08-28. È una costante nominata, con un commento che dice **perché** quel numero: non la durata (il cestinamento misura ~56 file/s, quindi 500 file ≈ 9 secondi; il tempo vero se lo prende la rilettura che lo precede) ma il **raggio di un guasto a metà blocco**, che la misura 3 della spec mostra essere uno stato reale. Il commento deve dire anche che il numero è prudente e ritarabile alla prima passata reale con l'SSD.
+- [x] **Step 5–6:** **416 test** (396 + **20**, non 14 — sei test in piu' nati dalla corsa sui mutanti e dalla precisione delle asserzioni). `Executed 20 tests, with 0 failures` sulla classe, `** BUILD SUCCEEDED **` + `** TEST SUCCEEDED **`.
 
 **Il mutante che deve morire:**
-| Mutante | Test rosso |
-| :---- | :---- |
-| `size × count` invece di `size × (count − 1)` | `testReclaimableSpace_excludesTheKeptCopy` |
-| Tetto non applicato / `>` invece di `>=` | `testCap_boundary` |
-| Il riepilogo conta i gruppi invece dei file | `testSummary_countsFilesNotGroups` |
-| Le due righe di avvertimento rimosse | `testSummary_saysSpaceIsFreedOnlyWhenTrashIsEmptied`, `testSummary_saysMirrorsKeepTheirCopies` |
+| Mutante | Test rosso | Esito misurato (2026-08-29) |
+| :---- | :---- | :---- |
+| `size × count` invece di `size × (count − 1)` | `testReclaimableSpace_excludesTheKeptCopy` | **ucciso** (7 test rossi) |
+| Tetto `>` diventa `>=` (il confine esatto) | `testCap_boundary` | **ucciso** (2 test rossi) |
+| Il riepilogo conta i gruppi invece dei file | `testSummary_countsFilesNotGroups` | **ucciso** (2 test rossi) |
+| La riga «lo spazio si libera svuotando il Cestino» rimossa | `testSummary_saysSpaceIsFreedOnlyWhenTrashIsEmptied` | **ucciso** |
+| La riga «HDD e Cubbit restano dove sono» rimossa | `testSummary_saysMirrorsKeepTheirCopies` | **ucciso** (2 test rossi) |
+| Ordinamento non applicato (ordine di arrivo) | `testOrder_isByReclaimableSpaceDescending` | **ucciso** (2 test rossi) |
+| La ripartizione per cartella conta anche la copia **tenuta** | `testFolderBreakdown_countsOnlyTheCopiesThatLeave` | **ucciso** (5 test rossi) |
+| Terza chiave di ordinamento (l'hash) sostituita da `false` | `testOrder_isTotal_whenSpaceAndCopiesBothTie` | **sopravvissuto al primo giro**, poi ucciso — vedi sotto |
+
+**Il mutante sopravvissuto, e perche' e' lo stesso buco del Task 2 (2026-08-29).** Con i 19 test scritti seguendo la lista del piano, **cancellare la terza chiave di ordinamento lasciava tutto verde**: nessuna fixture aveva due gruppi identici *sia* sullo spazio recuperabile *sia* sul numero di copie, quindi le prime due chiavi decidevano sempre e la terza non veniva mai interrogata. E' esattamente il pattern del tie-break di `duplicateKeepChoice`: **la fixture rendeva indistinguibili due formule diverse**. Aggiunto `testOrder_isTotal_whenSpaceAndCopiesBothTie` (due gruppi da 2 membri da 200 byte, hash diversi, provati in entrambi gli ordini di input). Conseguenza per l'utente, se il buco fosse rimasto: l'elenco che si spunta si riordina fra due aperture del pannello, e le spunte finiscono su gruppi diversi da quelli scelti.
+
+**Corsa finale: 8 mutanti, 8 uccisi** (baseline 20 verdi), su copia nello scratchpad con `derivedDataPath` separato, repo verificato per hash prima e dopo. Il piano non chiedeva mutation testing su questo task — chiesto solo ai Task 4 e 5 — ma il Task 2 ha prodotto sei test ciechi, quindi da qui in avanti la corsa e' un **gate prima del commit** e non un controllo a posteriori.
 
 ---
 
@@ -293,7 +301,7 @@ Logica **pura**. È la prima delle due conferme richieste dalla decisione 4 di E
 
 - [ ] **Step 6: Mutation testing sui mutanti elencati sotto.** Un mutante sopravvissuto significa **riscrivere il test**, non il codice. Riporta il conteggio (`N mutanti, N uccisi`) nel commit.
 
-- [ ] **Step 7: Build, suite completa, commit** — attesi **440 test** (410 + 30).
+- [ ] **Step 7: Build, suite completa, commit** — attesi **446 test** (416 + 30).
 
 **Il mutante che deve morire:**
 | Mutante | Test rosso |
@@ -342,7 +350,7 @@ La rete di sicurezza della decisione 2 di Enrico non può poggiare sul Finder: *
 - [ ] **Step 4: Implementa.**
 - [ ] **Step 5: Test verdi.**
 - [ ] **Step 6: Mutation testing** sui mutanti sotto.
-- [ ] **Step 7: Build, suite, commit** — attesi **458 test** (440 + 18).
+- [ ] **Step 7: Build, suite, commit** — attesi **464 test** (446 + 18).
 
 **Il mutante che deve morire:**
 | Mutante | Test rosso |
@@ -390,7 +398,7 @@ La parte SwiftUI non è testabile senza una corsa reale; **è testato tutto ciò
   - Ingresso: bottone dentro `LibraryIndexCard` in Diagnostica (`openWindow(id: "duplicates")`), **unico** — nessuna voce nell'hamburger, nemmeno disattivata (deciso il 2026-08-28).
   - **I membri a pari merito vanno marcati visivamente nella lista** (requisito nato dall'audit del Task 2, 2026-08-28). `DuplicateKeepChoice.tiedCandidates` dice **che** un'altra copia vale quanto quella tenuta, ma non **quale**: in un gruppo da tre membri l'utente legge «Un'altra copia va bene quanto questa» davanti a **due** righe, e sta per cestinarle entrambe senza sapere a quale si riferisce. L'informazione è vera ma non azionabile finché la riga corrispondente non è riconoscibile. Se la view non può marcarle, allora è la frase a dover nominare il percorso invece del numero.
 
-- [ ] **Step 5–6: test verdi, build, suite, commit** — attesi **470 test** (458 + 12).
+- [ ] **Step 5–6: test verdi, build, suite, commit** — attesi **476 test** (464 + 12).
 
 - [ ] **Step 7: Dichiara esplicitamente cosa NON è coperto da test** nel commento in testa alla view e in `.claude/rules/architecture.md`: la view, i due sheet di conferma, il gate, l'apertura della finestra, le miniature. Sono SwiftUI e bookmark veri, non raggiungibili senza una corsa.
 

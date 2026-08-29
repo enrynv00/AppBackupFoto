@@ -1,0 +1,248 @@
+import XCTest
+@testable import AppBackupFoto
+
+/// Il riepilogo che l'utente legge **prima** della conferma distruttiva.
+///
+/// Le fixture di questo file sono costruite a partire dal **mutante** e non dall'intento:
+/// nel Task 2 sei test si sono rivelati ciechi perche' la fixture rendeva indistinguibili
+/// due formule diverse (la copia tenuta sempre in prima posizione, lunghezza e alfabeto
+/// sempre concordi, `contains` di una sottostringa invece della frase intera). Qui ogni
+/// caso e' scelto in modo che le due formule in gara si **contraddicano**.
+final class DuplicateBatchTests: XCTestCase {
+
+    private func entry(_ path: String, size: Int64 = 1_000, mtime: Double = 1_700_000_000) -> LibraryIndexEntry {
+        LibraryIndexEntry(path: normalizedIndexKey(path),
+                          displayPath: path,
+                          size: size,
+                          mtime: mtime,
+                          hash: "h",
+                          hashedAt: 1_700_000_000)
+    }
+
+    /// Un gruppo con hash distinto, cosi' due gruppi non si confondono mai fra loro.
+    private func group(_ members: [LibraryIndexEntry], hash: String = "h", size: Int64? = nil) -> DuplicateGroup {
+        DuplicateGroup(hash: hash,
+                       size: size ?? (members.map(\.size).min() ?? 0),
+                       members: members.map {
+                           LibraryIndexEntry(path: $0.path, displayPath: $0.displayPath, size: $0.size,
+                                             mtime: $0.mtime, hash: hash, hashedAt: $0.hashedAt)
+                       })
+    }
+
+    // MARK: - Aritmetica
+
+    /// L'errore aritmetico piu' facile della feature: la copia che resta occupa comunque il
+    /// suo spazio, quindi si liberano `size × (copie − 1)` byte e non `size × copie`.
+    /// La fixture usa **3** membri: con 2 membri `count` e `count − 1` valgono 2 e 1, ma un
+    /// mutante `size × count / 2` darebbe comunque il risultato giusto. Con 3 membri
+    /// 2×size e' distinguibile sia da 3×size sia da 1.5×size.
+    func testReclaimableSpace_excludesTheKeptCopy() {
+        let b = DuplicateBatch(groups: [group([entry("Foto iPhone/a.jpg", size: 100),
+                                               entry("Other/b.jpg", size: 100),
+                                               entry("Other/c.jpg", size: 100)])])
+        XCTAssertEqual(b.reclaimableBytes, 200)
+        XCTAssertNotEqual(b.reclaimableBytes, 300, "conta anche la copia tenuta")
+    }
+
+    /// Dimensioni **diverse** fra i gruppi: con due gruppi da 100 un mutante che somma il
+    /// primo due volte darebbe lo stesso totale.
+    func testReclaimableSpace_sumsGroupsOfDifferentSizes() {
+        let b = DuplicateBatch(groups: [group([entry("A/a.jpg", size: 100), entry("A/b.jpg", size: 100)], hash: "h1"),
+                                        group([entry("B/a.jpg", size: 700), entry("B/b.jpg", size: 700)], hash: "h2")])
+        XCTAssertEqual(b.reclaimableBytes, 800)
+    }
+
+    /// Gruppi di **cardinalita' diverse** (2 e 3): con due gruppi da 2 membri il conteggio
+    /// dei file e quello dei gruppi coincidono, e il test sarebbe cieco.
+    func testFileCount_isTheNumberOfFilesToTrash_notOfGroups() {
+        let b = DuplicateBatch(groups: [group([entry("A/a.jpg"), entry("A/b.jpg")], hash: "h1"),
+                                        group([entry("B/a.jpg"), entry("B/b.jpg"), entry("B/c.jpg")], hash: "h2")])
+        XCTAssertEqual(b.fileCount, 3, "1 + 2 file da cestinare, non 2 gruppi")
+        XCTAssertEqual(b.groups.count, 2)
+    }
+
+    /// La dimensione del gruppo e' la **minima** fra i membri (vedi `DuplicateGroup.size`):
+    /// lo spazio recuperabile va calcolato da quella, mai dal primo membro incontrato.
+    func testReclaimableSpace_usesTheGroupSize_notTheFirstMember() {
+        let g = group([entry("A/grande.jpg", size: 900), entry("A/piccola.jpg", size: 100)], size: 100)
+        XCTAssertEqual(DuplicateBatch(groups: [g]).reclaimableBytes, 100)
+    }
+
+    // MARK: - Ripartizione per cartella
+
+    /// Due gruppi che pescano dalla stessa cartella producono **una** riga con conteggio 2.
+    func testFolderBreakdown_mergesGroupsThatShareAFolder() {
+        let b = DuplicateBatch(groups: [group([entry("Foto iPhone/a.jpg"), entry("Other/vecchie/a.jpg")], hash: "h1"),
+                                        group([entry("Foto iPhone/b.jpg"), entry("Other/vecchie/b.jpg")], hash: "h2")])
+        XCTAssertEqual(b.folderBreakdown.count, 1)
+        XCTAssertEqual(b.folderBreakdown.first?.folder, "Other/vecchie")
+        XCTAssertEqual(b.folderBreakdown.first?.count, 2)
+    }
+
+    /// La ripartizione riguarda i file che **si spostano**, non quelli che restano: la
+    /// cartella della copia tenuta non compare se da li' non si cestina niente.
+    func testFolderBreakdown_countsOnlyTheCopiesThatLeave() {
+        let b = DuplicateBatch(groups: [group([entry("Foto iPhone/a.jpg"), entry("Import/Scheda/a.jpg")])])
+        XCTAssertEqual(b.folderBreakdown.map(\.folder), ["Import/Scheda"])
+        XCTAssertFalse(b.folderBreakdown.contains { $0.folder == "Foto iPhone" },
+                       "la cartella della copia tenuta non perde file")
+    }
+
+    /// Ordine deterministico anche fra cartelle a pari conteggio: e' la lezione del
+    /// tie-break del Task 2, dove un ordine "stabile abbastanza" non lo era.
+    func testFolderBreakdown_isDeterministicOnTies() {
+        let members = [entry("Foto iPhone/a.jpg"), entry("Zeta/a.jpg"), entry("Alfa/a.jpg")]
+        let first = DuplicateBatch(groups: [group(members)]).folderBreakdown.map(\.folder)
+        let second = DuplicateBatch(groups: [group(members.reversed())]).folderBreakdown.map(\.folder)
+        XCTAssertEqual(first, second)
+        XCTAssertEqual(first, ["Alfa", "Zeta"], "a pari conteggio decide il nome, in ordine")
+    }
+
+    // MARK: - Ordinamento
+
+    /// Spazio recuperabile **decrescente**. La fixture mette il gruppo piccolo per primo in
+    /// input: con l'ordine gia' giusto in partenza il mutante "non ordinare" sopravvive.
+    func testOrder_isByReclaimableSpaceDescending() {
+        let b = DuplicateBatch(groups: [group([entry("A/a.jpg", size: 10), entry("A/b.jpg", size: 10)], hash: "h1"),
+                                        group([entry("B/a.jpg", size: 900), entry("B/b.jpg", size: 900)], hash: "h2")])
+        XCTAssertEqual(b.groups.map(\.group.hash), ["h2", "h1"])
+    }
+
+    /// A parita' di spazio, decide il numero di copie, decrescente. I due gruppi hanno lo
+    /// stesso spazio recuperabile (200) con cardinalita' diverse, quindi il criterio
+    /// primario non puo' decidere ed e' davvero il secondo a essere misurato.
+    func testOrder_breaksSpaceTiesByNumberOfCopies() {
+        let due = group([entry("A/a.jpg", size: 200), entry("A/b.jpg", size: 200)], hash: "h1")
+        let tre = group([entry("B/a.jpg", size: 100), entry("B/b.jpg", size: 100), entry("B/c.jpg", size: 100)], hash: "h2")
+        XCTAssertEqual(DuplicateBatch(groups: [due, tre]).groups.map(\.group.hash), ["h2", "h1"])
+        XCTAssertEqual(DuplicateBatch(groups: [tre, due]).groups.map(\.group.hash), ["h2", "h1"],
+                       "l'ordine di input non deve contare")
+    }
+
+    /// Due gruppi identici su **entrambi** i criteri di prodotto (stesso spazio, stesso
+    /// numero di copie): a decidere resta solo la terza chiave, e senza di quella l'ordine
+    /// dipende da come sono arrivati. Un elenco che si riordina fra due aperture del
+    /// pannello e' un elenco su cui l'utente rimette le spunte a caso.
+    ///
+    /// Misurato il 2026-08-29: senza questo test, sostituire la terza chiave con `false`
+    /// lasciava tutti e 19 gli altri test verdi. E' lo stesso buco del tie-break del Task 2.
+    func testOrder_isTotal_whenSpaceAndCopiesBothTie() {
+        let alfa = group([entry("A/a.jpg", size: 200), entry("A/b.jpg", size: 200)], hash: "h-alfa")
+        let zeta = group([entry("Z/a.jpg", size: 200), entry("Z/b.jpg", size: 200)], hash: "h-zeta")
+        XCTAssertEqual(DuplicateBatch(groups: [alfa, zeta]).groups.map(\.group.hash), ["h-alfa", "h-zeta"])
+        XCTAssertEqual(DuplicateBatch(groups: [zeta, alfa]).groups.map(\.group.hash), ["h-alfa", "h-zeta"],
+                       "l'ordine di input decide: la terza chiave non sta ordinando")
+    }
+
+    // MARK: - Tetto
+
+    /// Il confine esatto, in entrambi i versi: **alla** soglia non scatta, **oltre** si'.
+    /// E' il test che uccide `>=` al posto di `>` e viceversa.
+    func testCap_boundary() {
+        // 501 file da cestinare: 501 gruppi da 2 membri, 1 file ciascuno.
+        func batch(files: Int) -> DuplicateBatch {
+            DuplicateBatch(groups: (0..<files).map {
+                group([entry("A/\($0)-a.jpg", size: 1), entry("A/\($0)-b.jpg", size: 1)], hash: "h\($0)")
+            })
+        }
+        XCTAssertEqual(batch(files: duplicateBatchFileCap).fileCount, duplicateBatchFileCap)
+        XCTAssertFalse(batch(files: duplicateBatchFileCap).exceedsCap, "alla soglia il tetto non scatta")
+        XCTAssertTrue(batch(files: duplicateBatchFileCap + 1).exceedsCap)
+    }
+
+    /// Il tetto sui byte e' indipendente da quello sui file: **un solo** file, sopra la
+    /// soglia di spazio. Con un gruppo grande e molti file entrambi i tetti scatterebbero e
+    /// il test non distinguerebbe quale dei due e' stato applicato.
+    func testCap_bytesTripIndependentlyOfFileCount() {
+        let sopra = group([entry("A/a.jpg", size: duplicateBatchByteCap + 1),
+                           entry("A/b.jpg", size: duplicateBatchByteCap + 1)])
+        let alSoglia = group([entry("A/a.jpg", size: duplicateBatchByteCap),
+                              entry("A/b.jpg", size: duplicateBatchByteCap)])
+        XCTAssertEqual(DuplicateBatch(groups: [sopra]).fileCount, 1)
+        XCTAssertTrue(DuplicateBatch(groups: [sopra]).exceedsCap)
+        XCTAssertFalse(DuplicateBatch(groups: [alSoglia]).exceedsCap, "alla soglia il tetto non scatta")
+    }
+
+    // MARK: - Il riepilogo
+
+    /// Il numero che conta e' quello dei **file** che si spostano, non dei gruppi. La
+    /// fixture ha 2 gruppi e 3 file: con numeri uguali il test sarebbe cieco.
+    func testSummary_countsFilesNotGroups() {
+        let b = DuplicateBatch(groups: [group([entry("A/a.jpg"), entry("A/b.jpg")], hash: "h1"),
+                                        group([entry("B/a.jpg"), entry("B/b.jpg"), entry("B/c.jpg")], hash: "h2")])
+        // Solo la **prima** riga, non il testo intero: la ripartizione per cartella dice
+        // legittimamente "2 file" (i due che escono da B), e un `contains` sul tutto sarebbe
+        // rosso col codice giusto. E' il titolo il posto dove i gruppi si spaccerebbero per
+        // file.
+        let titolo = b.summaryLines()[0]
+        XCTAssertTrue(titolo.contains("3 file"), titolo)
+        XCTAssertFalse(titolo.contains("2 file"), "sta contando i gruppi: \(titolo)")
+    }
+
+    /// Cestinare **non** libera spazio finche' il Cestino non si svuota: misurato nella
+    /// spec su ExFAT esterno. Senza questa riga il riepilogo promette GB che non arrivano.
+    func testSummary_saysSpaceIsFreedOnlyWhenTrashIsEmptied() {
+        let b = DuplicateBatch(groups: [group([entry("A/a.jpg"), entry("A/b.jpg")])])
+        XCTAssertTrue(b.summaryLines().contains { $0.contains("svuoti il Cestino") },
+                      b.summaryLines().joined(separator: "\n"))
+    }
+
+    /// I mirror non cancellano mai: le copie su HDD e su Cubbit restano dove sono.
+    func testSummary_saysMirrorsKeepTheirCopies() {
+        let b = DuplicateBatch(groups: [group([entry("A/a.jpg"), entry("A/b.jpg")])])
+        let testo = b.summaryLines().joined(separator: "\n")
+        XCTAssertTrue(testo.contains("HDD"), testo)
+        XCTAssertTrue(testo.contains("Cubbit"), testo)
+    }
+
+    /// Un blocco vuoto lo **dice**, invece di mostrare "0 file" e una riga sul Cestino che
+    /// non serve a nessuno.
+    func testSummary_emptyBatchSaysSoInsteadOfShowingZero() {
+        let b = DuplicateBatch(groups: [])
+        XCTAssertEqual(b.fileCount, 0)
+        XCTAssertEqual(b.reclaimableBytes, 0)
+        XCTAssertFalse(b.exceedsCap)
+        let testo = b.summaryLines().joined(separator: "\n")
+        XCTAssertFalse(testo.contains("0 file"), testo)
+        XCTAssertFalse(testo.contains("svuoti il Cestino"), "niente da cestinare: \(testo)")
+    }
+
+    /// Il riepilogo nomina le cartelle da cui i file se ne vanno: e' l'informazione che
+    /// permette di accorgersi che si sta per svuotare la cartella sbagliata.
+    func testSummary_namesTheFoldersLosingFiles() {
+        let b = DuplicateBatch(groups: [group([entry("Foto iPhone/a.jpg"), entry("Import/Scheda/a.jpg")])])
+        XCTAssertTrue(b.summaryLines().contains { $0.contains("Import/Scheda") },
+                      b.summaryLines().joined(separator: "\n"))
+    }
+
+    /// Il riepilogo dice quando il blocco supera il tetto, invece di troncare in silenzio.
+    func testSummary_saysWhenTheBatchIsTooBig() {
+        let b = DuplicateBatch(groups: (0...duplicateBatchFileCap).map {
+            group([entry("A/\($0)-a.jpg", size: 1), entry("A/\($0)-b.jpg", size: 1)], hash: "h\($0)")
+        })
+        XCTAssertTrue(b.exceedsCap)
+        XCTAssertTrue(b.summaryLines().contains { $0.contains("troppi file in una volta sola") },
+                      b.summaryLines().joined(separator: "\n"))
+    }
+
+    /// Registro anti-gergo, come per `LibraryIndexStatus` e `duplicateKeepExplanation`.
+    func testSummary_hasNoJargon() {
+        let b = DuplicateBatch(groups: [group([entry("A/a.jpg"), entry("A/b.jpg")])])
+        let testo = b.summaryLines().joined(separator: "\n").lowercased()
+        for parola in ["hash", "indice", "sha256", "scansione", "byte"] {
+            XCTAssertFalse(testo.contains(parola), "gergo «\(parola)» nel riepilogo: \(testo)")
+        }
+    }
+
+    /// La copia tenuta di ogni gruppo e' **congelata** dentro il blocco al momento in cui il
+    /// blocco si costruisce, ed e' quella che l'utente conferma. Ricalcolarla a valle e'
+    /// esattamente il buco che il Task 4 non deve riaprire.
+    func testBatch_freezesTheKeptCopyOfEachGroup() {
+        let g = group([entry("Import/Scheda/a.jpg"), entry("Foto iPhone/a.jpg")])
+        let b = DuplicateBatch(groups: [g])
+        XCTAssertEqual(b.groups.first?.choice.keeper.path, normalizedIndexKey("Foto iPhone/a.jpg"))
+        XCTAssertEqual(b.groups.first?.choice.keeper.path,
+                       duplicateKeepChoice(g).keeper.path,
+                       "la scelta congelata deve essere la stessa che la regola produce ora")
+    }
+}

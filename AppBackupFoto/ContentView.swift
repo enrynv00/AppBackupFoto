@@ -2062,6 +2062,169 @@ func duplicateKeepExplanation(_ choice: DuplicateKeepChoice, in group: Duplicate
     return lead + tie + copies
 }
 
+/// Quanti file al massimo si cestinano in un blocco solo.
+///
+/// Il numero **non** viene dalla durata: il cestinamento misura ~56 file/s, quindi 500 file
+/// sono ~9 secondi, e il tempo vero se lo prende la rilettura che li precede. Viene dal
+/// **raggio di un guasto a meta' blocco**, che la misura 3 della spec mostra essere uno
+/// stato reale e non teorico: lo scollegamento dell'SSD a meta' produce lo stesso errore di
+/// "file inesistente" (2672 casi indistinguibili misurati), quindi un blocco interrotto
+/// lascia un registro di ripristino da leggere a mano. Piu' e' piccolo il blocco, meno c'e'
+/// da rimettere a posto.
+///
+/// Prudente e **ritarabile alla prima passata reale con l'SSD collegato**: nessuno ha ancora
+/// visto quanti doppioni ci siano davvero, e 500 potrebbe rivelarsi scomodo in eccesso.
+let duplicateBatchFileCap = 500
+
+/// Stesso ragionamento del tetto sui file, sull'altra grandezza che conta.
+///
+/// **Decimale** (50 × 1000⁴) e non binario, per coerenza con `ByteCountFormatter(.file)`,
+/// che e' il modo in cui questa app scrive i byte all'utente ovunque: un tetto binario
+/// scatterebbe a un numero diverso da quello mostrato nel riepilogo.
+let duplicateBatchByteCap: Int64 = 50_000_000_000
+
+/// Il blocco di doppioni che l'utente sta per confermare: quali gruppi, quale copia si
+/// tiene di ognuno, quanti file si spostano, quanto spazio si libera e da quali cartelle.
+///
+/// E' la **prima delle due conferme** (decisione 4 di Enrico): il riepilogo dettagliato
+/// viene prima della conferma vera. Il peso della conferma sta tutto qui — l'alert
+/// distruttivo che segue e' corto per definizione, quindi se questo riepilogo e' vago non
+/// c'e' alert che tenga.
+///
+/// **Congela la copia tenuta di ogni gruppo.** `duplicateKeepChoice` gira una volta sola,
+/// qui, e il risultato viaggia dentro il blocco fino al `DuplicateTrasher`. Non e' un
+/// dettaglio di efficienza: fra il riepilogo che l'utente legge e il cestinamento l'indice
+/// puo' essere cambiato, e una scelta ricalcolata su dati nuovi puo' nominare **un'altra
+/// copia** — l'utente acconsente a cestinare A e viene cestinato B. Chi consuma questo tipo
+/// non deve mai ricalcolare la scelta: deve usare quella che trova qui dentro.
+///
+/// Logica **pura**: nessun filesystem, nessun database.
+struct DuplicateBatch {
+
+    /// Un gruppo insieme alla copia che si e' deciso di tenere. I due viaggiano appaiati
+    /// proprio perche' non si possano disallineare.
+    struct Entry {
+        let group: DuplicateGroup
+        let choice: DuplicateKeepChoice
+
+        /// Le copie che se ne vanno: tutte tranne quella tenuta, ricavate **per differenza**
+        /// e non con un `dropFirst()`. Nel Task 2 quella scorciatoia e' sopravvissuta a 31
+        /// test perche' in ogni fixture la tenuta era il primo membro.
+        var leaving: [LibraryIndexEntry] {
+            group.members.filter { $0.path != choice.keeper.path }
+        }
+
+        /// `size × (copie − 1)`, mai `size × copie`: la copia che resta occupa comunque il
+        /// suo spazio. E' l'errore aritmetico piu' facile della feature, ed e' un errore
+        /// nella direzione pericolosa — promette all'utente piu' spazio di quanto ne
+        /// arrivera'. La dimensione e' quella del gruppo, cioe' la **minima** fra i membri
+        /// (vedi `DuplicateGroup.size`), per lo stesso motivo.
+        var reclaimableBytes: Int64 {
+            group.size * Int64(leaving.count)
+        }
+    }
+
+    let groups: [Entry]
+    /// I **file** che si spostano, non i gruppi: e' il numero che l'utente deve leggere.
+    let fileCount: Int
+    let reclaimableBytes: Int64
+    /// Da quali cartelle se ne vanno, e quanti file per cartella. Solo le cartelle che
+    /// **perdono** file: quella della copia tenuta non compare se da li' non esce niente.
+    let folderBreakdown: [(folder: String, count: Int)]
+    let exceedsCap: Bool
+
+    init(groups: [DuplicateGroup]) {
+        // La scelta si calcola qui, una volta, e da qui in poi non si ricalcola piu'.
+        // I gruppi ridotti a un solo membro si scartano prima: `duplicateKeepChoice` ha una
+        // precondition su almeno due membri, e questo e' il confine dove il filtro va messo
+        // (non ammorbidendo la guardia).
+        let entries = groups
+            .filter { $0.members.count > 1 }
+            .map { Entry(group: $0, choice: duplicateKeepChoice($0)) }
+
+        // Ordine: spazio recuperabile decrescente, poi numero di copie decrescente, poi
+        // l'hash. La terza chiave non e' decorativa: senza, due gruppi equivalenti sulle
+        // prime due si disporrebbero secondo l'ordine di arrivo, e l'elenco che l'utente
+        // spunta cambierebbe fra due aperture del pannello. Stessa lezione del tie-break
+        // di `duplicateKeepChoice`.
+        self.groups = entries.sorted { a, b in
+            if a.reclaimableBytes != b.reclaimableBytes { return a.reclaimableBytes > b.reclaimableBytes }
+            if a.group.members.count != b.group.members.count { return a.group.members.count > b.group.members.count }
+            return a.group.hash < b.group.hash
+        }
+
+        self.fileCount = entries.reduce(0) { $0 + $1.leaving.count }
+        self.reclaimableBytes = entries.reduce(0) { $0 + $1.reclaimableBytes }
+
+        var perFolder: [String: Int] = [:]
+        for entry in entries {
+            for file in entry.leaving {
+                perFolder[DuplicateBatch.folder(of: file), default: 0] += 1
+            }
+        }
+        // A pari conteggio decide il nome: l'ordine di un dizionario non e' stabile fra due
+        // esecuzioni, e un riepilogo che si riordina da solo e' un riepilogo di cui non ci
+        // si fida.
+        self.folderBreakdown = perFolder
+            .map { (folder: $0.key, count: $0.value) }
+            .sorted { $0.count != $1.count ? $0.count > $1.count : $0.folder < $1.folder }
+
+        // Il primo dei due che scatta. `>` e non `>=`: alla soglia esatta il blocco passa.
+        self.exceedsCap = self.fileCount > duplicateBatchFileCap
+            || self.reclaimableBytes > duplicateBatchByteCap
+    }
+
+    /// La cartella che contiene il file, come e' scritta su disco: l'utente la deve poter
+    /// ritrovare nel Finder, quindi `displayPath` e non la chiave minuscola.
+    private static func folder(of entry: LibraryIndexEntry) -> String {
+        let components = entry.displayPath.split(separator: "/", omittingEmptySubsequences: true).dropLast()
+        return components.isEmpty ? "(sull'SSD, fuori da ogni cartella)" : components.joined(separator: "/")
+    }
+
+    /// Il testo del riepilogo. Puro, cosi' e' verificabile senza aprire la finestra.
+    ///
+    /// Registro anti-gergo come `LibraryIndexStatus` e `duplicateKeepExplanation`: niente
+    /// "hash", "indice", "SHA256", "scansione". Chi legge sta per spostare le proprie foto.
+    func summaryLines() -> [String] {
+        // Un blocco vuoto lo dice. "0 file" seguito da una riga sul Cestino sarebbe una
+        // schermata che chiede di confermare il nulla.
+        guard fileCount > 0 else {
+            return ["Non c'è niente da spostare: non hai selezionato nessun gruppo di copie."]
+        }
+
+        var out: [String] = []
+
+        out.append("Sposto nel Cestino \(DuplicateBatch.count(fileCount, "file", "file")), "
+            + "tenendo una copia di ognuna delle \(DuplicateBatch.count(groups.count, "foto", "foto")) interessate.")
+
+        out.append("Si libereranno circa "
+            + "\(ByteCountFormatter.string(fromByteCount: reclaimableBytes, countStyle: .file)), "
+            + "ma solo quando svuoti il Cestino: fino a quel momento i file restano sul disco e "
+            + "lo spazio non torna disponibile.")
+
+        // Le cartelle che perdono file: e' l'informazione che permette di accorgersi in
+        // tempo che si sta per svuotare la cartella sbagliata.
+        for riga in folderBreakdown {
+            out.append("Da «\(riga.folder)»: \(DuplicateBatch.count(riga.count, "file", "file")).")
+        }
+
+        out.append("Le copie che stanno sull'HDD e su Cubbit restano dove sono: questa operazione "
+            + "tocca soltanto l'SSD.")
+
+        if exceedsCap {
+            out.append("Hai selezionato troppi file in una volta sola. Togli qualche gruppo e "
+                + "procedi in più passaggi: se qualcosa va storto a metà, un blocco più piccolo "
+                + "è molto più facile da rimettere a posto.")
+        }
+
+        return out
+    }
+
+    private static func count(_ n: Int, _ singular: String, _ plural: String) -> String {
+        "\(n.formatted()) \(n == 1 ? singular : plural)"
+    }
+}
+
 /// Persistenza SQLite dell'indice. Scelta su JSON monolitico perche' un aggiornamento
 /// incrementale costa O(log n) invece di riscrivere l'intero file, e perche' una
 /// corruzione degrada parzialmente invece di rendere tutto illeggibile.
