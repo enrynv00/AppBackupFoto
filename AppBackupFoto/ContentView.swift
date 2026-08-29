@@ -2225,6 +2225,282 @@ struct DuplicateBatch {
     }
 }
 
+/// Una foto spostata nel Cestino, con tutto il necessario per rimetterla al suo posto.
+///
+/// `hash` e `size` non sono decorativi: sono il patto fra il momento del cestinamento e
+/// quello dell'annullamento. Ripristinare senza riverificarli significherebbe rimettere al
+/// posto della foto dell'utente un file che nel frattempo e' diventato un altro file.
+struct TrashedItem: Codable, Equatable {
+    /// Tutti gli item cestinati nello stesso blocco condividono questo identificatore: e'
+    /// cio' che rende «Annulla l'ultimo spostamento» un'operazione su un blocco e non su un
+    /// file solo.
+    var batchId: String
+    /// Il percorso originale come era scritto su disco: e' li' che il file deve tornare.
+    var originalDisplayPath: String
+    /// La chiave normalizzata corrispondente, per rimettere la riga nell'indice.
+    var originalKey: String
+    var trashedPath: String
+    var size: Int64
+    var hash: String
+    var trashedAt: Date
+}
+
+/// Perche' una voce non e' stata rimessa al suo posto. Ogni caso ha una frase propria:
+/// l'utente che preme «Annulla» e non vede tornare tutto deve poter capire quale dei motivi
+/// lo riguarda, e cosa puo' farci.
+enum RestoreSkipReason: Equatable {
+    /// Il file non e' piu' nel Cestino: quasi sempre il Cestino e' stato svuotato.
+    case missingInTrash
+    /// Il file nel Cestino non e' piu' quello che ci era stato messo.
+    case alteredInTrash
+    /// Al posto originale c'e' di nuovo qualcosa: non si sovrascrive mai.
+    case originalPathOccupied
+    /// Lo spostamento e' fallito per un motivo del filesystem.
+    case moveFailed(String)
+
+    var explanation: String {
+        switch self {
+        case .missingInTrash:
+            return "Questa foto non è più nel Cestino: probabilmente il Cestino è stato svuotato. "
+                + "Una volta svuotato, l'app non può più rimetterla a posto."
+        case .alteredInTrash:
+            return "La foto che si trova nel Cestino non è più identica a quella che era stata "
+                + "spostata, quindi l'app non la rimette al suo posto: preferisce lasciarla dov'è "
+                + "e fartelo sapere."
+        case .originalPathOccupied:
+            return "Al posto di questa foto c'è di nuovo un file con lo stesso nome. L'app non "
+                + "sovrascrive mai niente, quindi ha lasciato tutto com'è: la copia nel Cestino "
+                + "è ancora lì e puoi spostarla a mano dove preferisci."
+        case .moveFailed(let dettaglio):
+            return "Non è stato possibile rimettere a posto questa foto (\(dettaglio)). "
+                + "La copia nel Cestino non è stata toccata."
+        }
+    }
+}
+
+struct RestoreOutcome {
+    var restored: [TrashedItem] = []
+    var skipped: [(item: TrashedItem, reason: RestoreSkipReason)] = []
+}
+
+/// Il contenuto del registro su disco.
+struct TrashManifest: Codable {
+    /// Quante voci sono state registrate in tutto. Resta veritiero anche quando `items` e'
+    /// stata potata dal tetto: e' questo il numero da mostrare, `items.count` non lo e'.
+    /// Stessa forma di `UnverifiedCopies.totalCount`, per lo stesso motivo.
+    var totalRecorded: Int = 0
+    var items: [TrashedItem] = []
+}
+
+extension TrashManifest {
+    private enum CodingKeys: String, CodingKey { case totalRecorded, items }
+
+    /// `init(from:)` esplicita con `decodeIfPresent`, **obbligatoria** su ogni tipo
+    /// persistito di questo progetto: i default sulle proprieta' non li usa la decodifica
+    /// sintetizzata, che lancia `keyNotFound` (fatto misurato n. 5 di #31). Qui il prezzo di
+    /// sbagliare e' piu' alto che altrove — un campo aggiunto in una versione futura
+    /// farebbe sparire in silenzio **il registro di ripristino**, cioe' la rete di sicurezza
+    /// della sola operazione distruttiva dell'app.
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        totalRecorded = try c.decodeIfPresent(Int.self, forKey: .totalRecorded) ?? 0
+        items = try c.decodeIfPresent([TrashedItem].self, forKey: .items) ?? []
+    }
+}
+
+extension TrashedItem {
+    private enum CodingKeys: String, CodingKey {
+        case batchId, originalDisplayPath, originalKey, trashedPath, size, hash, trashedAt
+    }
+
+    /// Stessa ragione del tipo contenitore. Qui la decodifica e' **tollerante sui campi
+    /// accessori e severa su quelli portanti**: senza `trashedPath`, `size` o `hash` la voce
+    /// non e' ripristinabile in sicurezza e non deve entrare nel registro fingendo di
+    /// esserlo. `originalKey` invece degrada: serve a rimettere la riga nell'indice, e un
+    /// indice incompleto si ricostruisce da solo.
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        batchId = try c.decodeIfPresent(String.self, forKey: .batchId) ?? ""
+        originalDisplayPath = try c.decode(String.self, forKey: .originalDisplayPath)
+        originalKey = try c.decodeIfPresent(String.self, forKey: .originalKey) ?? ""
+        trashedPath = try c.decode(String.self, forKey: .trashedPath)
+        size = try c.decode(Int64.self, forKey: .size)
+        hash = try c.decode(String.self, forKey: .hash)
+        trashedAt = try c.decodeIfPresent(Date.self, forKey: .trashedAt) ?? Date(timeIntervalSince1970: 0)
+    }
+}
+
+/// Il registro di ripristino del pannello Doppioni, e l'annullamento che ne dipende.
+///
+/// **Perche' non ci si appoggia al Finder.** Il record «Rimetti a posto» che macOS scrive
+/// quando un file finisce nel Cestino e' scritto in modo **asincrono**: misurato che si
+/// perde se il processo muore subito dopo (226/300 e 85/100 in due misure indipendenti;
+/// 100/100 solo col processo vivo). Delegargli l'annullamento significherebbe che, proprio
+/// nel caso in cui serve — un guasto a meta' blocco — non c'e' piu' nessuna traccia di dove
+/// stessero le foto.
+///
+/// Da cui la regola di questa classe: **`record` scrive subito**, una voce alla volta. Un
+/// registro bufferizzato e salvato a fine blocco avrebbe esattamente lo stesso difetto di
+/// quello che sta sostituendo.
+final class TrashManifestStore {
+
+    enum StoreError: Error, LocalizedError {
+        case invalidLocation(String)
+        var errorDescription: String? {
+            switch self {
+            case .invalidLocation(let p): return "Posizione non consentita per il registro: \(p)"
+            }
+        }
+    }
+
+    /// Tetto alle voci conservate. Sopra questo numero si potano le **piu' vecchie**: le
+    /// piu' recenti sono le sole per cui l'annullamento ha ancora senso. `totalRecorded`
+    /// resta a parte, cosi' il numero mostrato non mente a lista troncata.
+    static let maxItems = 2000
+
+    private let url: URL
+    private var manifest: TrashManifest
+    /// `record` puo' arrivare dalla coda di lavoro del `DuplicateTrasher` mentre la UI
+    /// legge `lastBatch()`: e' un leggi-modifica-scrivi, e senza lock due cestinamenti
+    /// ravvicinati ne perderebbero uno — cioe' un file nel Cestino senza voce nel registro,
+    /// il caso peggiore per una rete di sicurezza.
+    private let lock = NSLock()
+
+    init(url: URL) throws {
+        // Stessa allow-list di `LibraryIndexStore`, non una seconda: il registro nomina i
+        // percorsi delle foto e non deve mai finire sul volume sorgente.
+        guard isAllowedStoreLocation(url) else { throw StoreError.invalidLocation(url.path) }
+        self.url = url
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
+                                                withIntermediateDirectories: true)
+        // Un registro illeggibile riparte da vuoto e resta usabile: bloccare l'app su un
+        // file corrotto toglierebbe anche la possibilita' di registrare i cestinamenti
+        // futuri. Stessa disciplina di `LibraryIndexStore` su `SQLITE_NOTADB`.
+        if let data = try? Data(contentsOf: url),
+           let decoded = try? JSONDecoder().decode(TrashManifest.self, from: data) {
+            manifest = decoded
+        } else {
+            manifest = TrashManifest()
+        }
+    }
+
+    var totalRecorded: Int { lock.withLock { manifest.totalRecorded } }
+    var itemCount: Int { lock.withLock { manifest.items.count } }
+
+    /// Registra una voce e **la scrive su disco prima di tornare**.
+    func record(_ item: TrashedItem) throws {
+        try lock.withLock {
+            manifest.items.append(item)
+            manifest.totalRecorded += 1
+            // Si potano le piu' vecchie, mai le piu' recenti: `suffix` e non `prefix`.
+            if manifest.items.count > Self.maxItems {
+                manifest.items = Array(manifest.items.suffix(Self.maxItems))
+            }
+            try writeUnsynchronized()
+        }
+    }
+
+    /// Le voci dell'ultimo blocco registrato — quello che «Annulla l'ultimo spostamento»
+    /// rimette a posto. L'ultimo e' quello **registrato per ultimo**, non quello con la data
+    /// piu' alta: due blocchi possono condividere l'istante, l'ordine di scrittura no.
+    func lastBatch() -> [TrashedItem] {
+        lock.withLock {
+            guard let ultimo = manifest.items.last?.batchId else { return [] }
+            return manifest.items.filter { $0.batchId == ultimo }
+        }
+    }
+
+    /// Rimette al loro posto le voci indicate. Non lancia mai: ogni voce che non si riesce a
+    /// ripristinare finisce fra gli `skipped` **con il motivo**, e le altre proseguono. Una
+    /// voce rotta che interrompesse il ciclo lascerebbe l'annullamento a meta' senza dirlo.
+    func restore(_ items: [TrashedItem]) -> RestoreOutcome {
+        var outcome = RestoreOutcome()
+        let fm = FileManager.default
+
+        for item in items {
+            let trashed = URL(fileURLWithPath: item.trashedPath)
+            let original = URL(fileURLWithPath: item.originalDisplayPath)
+
+            guard fm.fileExists(atPath: trashed.path) else {
+                outcome.skipped.append((item, .missingInTrash)); continue
+            }
+
+            // Zero-overwrite, che vale anche in questa direzione. La guardia e' **nostra** e
+            // non si delega al rifiuto di `moveItem` (misurato `NSCocoaErrorDomain/516`):
+            // due implementazioni della stessa regola divergono, e questa e' la regola piu'
+            // importante del progetto.
+            guard !fm.fileExists(atPath: original.path) else {
+                outcome.skipped.append((item, .originalPathOccupied)); continue
+            }
+
+            // Si rilegge e si riverifica **prima** di spostare: il file nel Cestino puo'
+            // essere stato modificato da quando ce l'abbiamo messo, e rimettere al posto
+            // della foto dell'utente un file diverso sarebbe una sostituzione silenziosa.
+            // Dimensione e hash vengono dallo **stesso descrittore aperto** (`sha256Measured`).
+            guard let measured = sha256Measured(of: trashed),
+                  measured.hash == item.hash, measured.size == item.size else {
+                outcome.skipped.append((item, .alteredInTrash)); continue
+            }
+
+            do {
+                // Le cartelle intermedie possono essere state cancellate fra il cestinamento
+                // e l'annullamento: senza ricrearle il ripristino fallirebbe proprio nel
+                // caso in cui l'utente ha fatto pulizia e vuole tornare indietro.
+                try fm.createDirectory(at: original.deletingLastPathComponent(),
+                                       withIntermediateDirectories: true)
+                try fm.moveItem(at: trashed, to: original)
+                outcome.restored.append(item)
+            } catch {
+                outcome.skipped.append((item, .moveFailed(error.localizedDescription)))
+            }
+        }
+        return outcome
+    }
+
+    private func writeUnsynchronized() throws {
+        try JSONEncoder().encode(manifest).write(to: url, options: .atomic)
+        // `0600` come l'indice, e per lo stesso motivo: il file non contiene foto, ma
+        // contiene i **percorsi** di tutte le foto toccate, in chiaro. Best-effort — un
+        // registro scritto e' piu' importante di un registro con i permessi giusti.
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    }
+}
+
+/// Dove un archivio interno dell'app puo' stare: **mai** sul volume sorgente.
+///
+/// Allow-list e non deny-list su `/Volumes`: una posizione nuova e' vietata per default
+/// invece di esserlo solo se qualcuno si ricorda di aggiungerla. Fonte unica, condivisa da
+/// `LibraryIndexStore` e da `TrashManifestStore`: il progetto ha gia' pagato due volte la
+/// duplicazione della stessa regola (`LibraryExclusions`, `realResolvedPath`), e due guardie
+/// diverse per lo stesso problema divergono alla prima modifica di una sola delle due.
+func isAllowedStoreLocation(_ url: URL) -> Bool {
+    let dir = url.deletingLastPathComponent()
+    let candidates = [dir.standardizedFileURL.path,
+                      dir.standardizedFileURL.resolvingSymlinksInPath().path]
+    return candidates.contains { candidate in
+        storeAllowedRoots().contains { isPathInside(candidate, root: $0) }
+    }
+}
+
+private func storeAllowedRoots() -> [String] {
+    var roots = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
+    // La directory temporanea di sistema e' ammessa perche' i test aprono uno store
+    // usa-e-getta per ogni caso: e' comunque sul disco interno del Mac, per-utente,
+    // e non e' mai un volume esterno — l'invariante che conta resta intatta.
+    roots.append(URL(fileURLWithPath: NSTemporaryDirectory()))
+    return roots.flatMap {
+        [$0.standardizedFileURL.path, $0.standardizedFileURL.resolvingSymlinksInPath().path]
+    }
+}
+
+/// Contenimento per **componenti**, non per prefisso di stringa: `/Volumes/SSD` non
+/// contiene `/Volumes/SSD 2`.
+private func isPathInside(_ path: String, root: String) -> Bool {
+    let p = path.hasSuffix("/") ? path : path + "/"
+    let r = root.hasSuffix("/") ? root : root + "/"
+    return p.hasPrefix(r)
+}
+
 /// Persistenza SQLite dell'indice. Scelta su JSON monolitico perche' un aggiornamento
 /// incrementale costa O(log n) invece di riscrivere l'intero file, e perche' una
 /// corruzione degrada parzialmente invece di rendere tutto illeggibile.
@@ -2324,31 +2600,7 @@ final class LibraryIndexStore {
     /// allow-list e non una deny-list su `/Volumes`: cosi' una posizione nuova e' vietata
     /// per default invece di esserlo solo se qualcuno si ricorda di aggiungerla.
     private static func validateLocation(_ url: URL) throws {
-        let dir = url.deletingLastPathComponent()
-        let candidates = [dir.standardizedFileURL.path,
-                          dir.standardizedFileURL.resolvingSymlinksInPath().path]
-        let roots = allowedRoots()
-        for candidate in candidates where roots.contains(where: { isInside(candidate, root: $0) }) {
-            return
-        }
-        throw StoreError.invalidLocation(url.path)
-    }
-
-    private static func allowedRoots() -> [String] {
-        var roots = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
-        // La directory temporanea di sistema e' ammessa perche' i test aprono uno store
-        // usa-e-getta per ogni caso: e' comunque sul disco interno del Mac, per-utente,
-        // e non e' mai un volume esterno — l'invariante che conta resta intatta.
-        roots.append(URL(fileURLWithPath: NSTemporaryDirectory()))
-        return roots.flatMap {
-            [$0.standardizedFileURL.path, $0.standardizedFileURL.resolvingSymlinksInPath().path]
-        }
-    }
-
-    private static func isInside(_ path: String, root: String) -> Bool {
-        let p = path.hasSuffix("/") ? path : path + "/"
-        let r = root.hasSuffix("/") ? root : root + "/"
-        return p.hasPrefix(r)
+        guard isAllowedStoreLocation(url) else { throw StoreError.invalidLocation(url.path) }
     }
 
     /// L'unica cancellazione di file di tutta la classe. Tre cinture, tutte necessarie:

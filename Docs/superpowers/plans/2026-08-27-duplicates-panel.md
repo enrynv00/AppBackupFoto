@@ -301,7 +301,7 @@ Logica **pura**. È la prima delle due conferme richieste dalla decisione 4 di E
 
 - [ ] **Step 6: Mutation testing sui mutanti elencati sotto.** Un mutante sopravvissuto significa **riscrivere il test**, non il codice. Riporta il conteggio (`N mutanti, N uccisi`) nel commit.
 
-- [ ] **Step 7: Build, suite completa, commit** — attesi **446 test** (416 + 30).
+- [ ] **Step 7: Build, suite completa, commit** — attesi **464 test** (434 + 30).
 
 **Il mutante che deve morire:**
 | Mutante | Test rosso |
@@ -331,7 +331,7 @@ La rete di sicurezza della decisione 2 di Enrico non può poggiare sul Finder: *
 - Consuma: `sha256Measured`, `FileManager.moveItem`, la stessa directory di Application Support già usata da `LibraryIndexStore`.
 - Produce: `struct TrashManifest: Codable`, `struct TrashedItem: Codable { originalDisplayPath, originalKey, trashedPath, size, hash, trashedAt }`, `final class TrashManifestStore { func record(_:); func lastBatch() -> [TrashedItem]; func restore(_:) -> RestoreOutcome }`. Consumato dai Task 4 e 6.
 
-- [ ] **Step 1: Scrivi il file di test** (~18 test), su directory temporanee reali:
+- [x] **Step 1: Scrivi il file di test** (~18 test), su directory temporanee reali:
   - una voce registrata è rileggibile dopo un ciclo apri/scrivi/chiudi/riapri
   - **la voce è su disco subito dopo `record`, non a fine blocco**: il test registra una voce, riapre lo store da zero e la trova. È la lezione diretta della misura: un registro differito ha lo stesso difetto di quello del Finder
   - ripristino di un file: torna al percorso originale, dimensione e contenuto intatti
@@ -346,21 +346,28 @@ La rete di sicurezza della decisione 2 di Enrico non può poggiare sul Finder: *
   - il registro è dentro `~/Library/Application Support/AppBackupFoto/`, **mai sull'SSD**: allow-list riusata, non riscritta
   - tetto alle voci conservate, con il conteggio totale a parte, così il numero mostrato resta veritiero a lista troncata (stessa forma di `UnverifiedCopies.maxPaths`)
 
-- [ ] **Step 2–3: registra, verifica il fallimento atteso.**
-- [ ] **Step 4: Implementa.**
-- [ ] **Step 5: Test verdi.**
-- [ ] **Step 6: Mutation testing** sui mutanti sotto.
-- [ ] **Step 7: Build, suite, commit** — attesi **464 test** (446 + 18).
+- [x] **Step 2–3: registra, verifica il fallimento atteso.** *(`cannot find type 'TrashedItem' in scope`.)*
+- [x] **Step 4: Implementa.**
+- [x] **Step 5: Test verdi.** `Executed 18 tests, with 0 failures`.
+- [x] **Step 6: Mutation testing** sui mutanti sotto: **9 mutanti, 9 uccisi**, uno dei quali solo dopo aver riscritto un test cieco (vedi sotto).
+- [x] **Step 7: Build, suite, commit** — **434 test** (416 + 18), `** BUILD SUCCEEDED **` + `** TEST SUCCEEDED **`.
 
 **Il mutante che deve morire:**
-| Mutante | Test rosso |
-| :---- | :---- |
-| `record` bufferizzato e scritto a fine blocco | `testRecordIsOnDiskImmediately` |
-| Ripristino senza verifica dell'hash | `testAlteredTrashedFile_isNotRestored` |
-| Ripristino che sovrascrive il percorso originale | `testOccupiedOriginalPath_isNotOverwritten` |
-| Una voce non ripristinabile interrompe le altre | `testOneBadEntry_doesNotBlockTheOthers` |
-| `init(from:)` sintetizzata al posto di quella esplicita | `testOldRecordWithoutNewField_stillDecodes` |
-| Registro scritto sotto la root della libreria | `testManifestLocation_isRefusedOutsideAppSupport` |
+| Mutante | Test rosso | Esito misurato (2026-08-29) |
+| :---- | :---- | :---- |
+| `record` bufferizzato e scritto a fine blocco | `testRecordIsOnDiskImmediately` | **ucciso** (8 test rossi) |
+| Ripristino senza verifica dell'hash | `testAlteredTrashedFile_isNotRestored` | **ucciso** (5 test rossi) |
+| Ripristino che sovrascrive il percorso originale | `testOccupiedOriginalPath_isNotOverwritten` | **ucciso** |
+| Una voce non ripristinabile interrompe le altre | `testOneBadEntry_doesNotBlockTheOthers` | **ucciso** (2 test rossi) |
+| `init(from:)` sintetizzata al posto di quella esplicita | `testOldRecordWithoutNewField_stillDecodes` | **ucciso** (3 test rossi) |
+| Registro scritto fuori dalle posizioni consentite | `testManifestLocation_isRefusedOutsideAppSupport` | **sopravvissuto al primo giro**, poi ucciso — vedi sotto |
+| Il tetto pota le voci **piu' recenti** (`prefix` invece di `suffix`) | `testCap_keepsTheNewestAndKeepsTheTotalTruthful` | **ucciso** |
+| Permessi `0600` non applicati | `testManifestFile_is0600AfterAFullCycle` | **ucciso** |
+| `totalRecorded` calcolato da `items.count` (mente a lista troncata) | `testCap_keepsTheNewestAndKeepsTheTotalTruthful` | **ucciso** |
+
+**Il mutante sopravvissuto, e perche' il test era cieco (2026-08-29).** `testManifestLocation_isRefusedOutsideAppSupport` puntava a `/Volumes/SSD - Enri/trash-manifest.json`. Con l'SSD scollegato — cioe' sempre, in questo periodo — l'`init` falliva **comunque**, per l'impossibilita' di creare la directory: `XCTAssertThrowsError` era verde anche cancellando del tutto `isAllowedStoreLocation`. Il test non stava provando la guardia, stava provando che l'SSD non c'e'.
+
+Riscritto con due correzioni, entrambe necessarie: la posizione ora e' **scrivibile davvero** (una cartella creata dal test sotto `~/Library/Caches/`, fuori dalla allow-list), cosi' senza la guardia il registro ci verrebbe creato per davvero; e si pretende **quale** errore (`StoreError.invalidLocation`), perche' un `throws` qualsiasi non distingue «rifiutato dalla regola» da «fallito per caso». **Lezione generale, la terza volta in questo piano: un test negativo va scritto in modo che il caso positivo sia raggiungibile**, altrimenti verifica l'ambiente invece del codice.
 
 ---
 
@@ -398,7 +405,7 @@ La parte SwiftUI non è testabile senza una corsa reale; **è testato tutto ciò
   - Ingresso: bottone dentro `LibraryIndexCard` in Diagnostica (`openWindow(id: "duplicates")`), **unico** — nessuna voce nell'hamburger, nemmeno disattivata (deciso il 2026-08-28).
   - **I membri a pari merito vanno marcati visivamente nella lista** (requisito nato dall'audit del Task 2, 2026-08-28). `DuplicateKeepChoice.tiedCandidates` dice **che** un'altra copia vale quanto quella tenuta, ma non **quale**: in un gruppo da tre membri l'utente legge «Un'altra copia va bene quanto questa» davanti a **due** righe, e sta per cestinarle entrambe senza sapere a quale si riferisce. L'informazione è vera ma non azionabile finché la riga corrispondente non è riconoscibile. Se la view non può marcarle, allora è la frase a dover nominare il percorso invece del numero.
 
-- [ ] **Step 5–6: test verdi, build, suite, commit** — attesi **476 test** (464 + 12).
+- [ ] **Step 5–6: test verdi, build, suite, commit** — attesi **476 test** (464 + 12). *(Il Task 4 si esegue dopo questo Task 5, quindi il cumulativo passa da 434 → 464 (Task 4) → 476.)*
 
 - [ ] **Step 7: Dichiara esplicitamente cosa NON è coperto da test** nel commento in testa alla view e in `.claude/rules/architecture.md`: la view, i due sheet di conferma, il gate, l'apertura della finestra, le miniature. Sono SwiftUI e bookmark veri, non raggiungibili senza una corsa.
 
