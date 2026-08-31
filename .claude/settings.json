@@ -19,6 +19,24 @@
             "timeout": 5
           }
         ]
+      },
+      {
+        "matcher": "Bash|Grep",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/enriconannivicenzi/.local/bin/graphify hook-guard search"
+          }
+        ]
+      },
+      {
+        "matcher": "Read|Glob",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/enriconannivicenzi/.local/bin/graphify hook-guard read"
+          }
+        ]
       }
     ],
     "Stop": [

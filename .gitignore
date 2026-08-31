@@ -25,3 +25,9 @@ build/
 # è invece versionata: Docs/agents/ e .claude/hooks/.
 .claude/skills/
 .claude/hooks/*.orig
+
+# Grafo di conoscenza graphify (rigenerabile in locale con `graphify extract . --code-only`,
+# nessuna chiamata a modello). graph.json da solo pesa ~2 MB e cambia a ogni commit
+# via hook post-commit: fuori da git. Backup automatico creato da `graphify claude install`.
+graphify-out/
+.claude/settings.json.graphify-bak

@@ -140,7 +140,7 @@ Storico bug (risolti e aperti): vedi `.claude/rules/bug-history.md`.
 
 Questo progetto usa il workflow a ruoli espliciti descritto in `~/.claude/docs/specs/2026-08-11-agent-role-orchestration-design.md`: fase Architect (brainstorming → spec → piano, sempre con approvazione esplicita di Enrico) seguita da un team autonomo (Implementer + Code Reviewer + Security/Rules Auditor, ruoli globali in `~/.claude/agents/`) che esegue tutti i task del piano fino in fondo, con un solo checkpoint umano a fine intervento (eccetto blocchi reali che richiedono una decisione di Enrico).
 
-**Sostituisce la vecchia regola "Pattern Advisor"**: il costo non è più un vincolo per Enrico — non serve chiedere conferma prima di ogni dispatch. Dal 2026-08-16 Implementer, Code Reviewer e Security/Rules Auditor girano tutti su Opus 5 (non più Sonnet 5/Fable 5), solo Architect era già su Opus 5.
+**Sostituisce la vecchia regola "Pattern Advisor"**: non serve chiedere conferma prima di ogni dispatch. Dal 2026-08-31 Implementer, Code Reviewer e Security/Rules Auditor girano su **Sonnet 5** — scrivere codice su una spec già decisa, cercare pattern noti e fare audit di sicurezza sono lavori meccanici, e i subagenti sono la quasi totalità del consumo. **Architect resta su Opus 5**: il ragionamento architetturale è l'unico punto in cui il modello grande si ripaga, ed è circa il 2% del consumo. (Fino al 2026-08-30 giravano tutti su Opus 5.)
 
 Gate automatici attivi su questo progetto (vedi `.claude/settings.json`): un hook blocca la scrittura sotto `Log/`, un hook blocca la fine sessione se `ContentView.swift`/i test sono stati modificati senza un build/test verde successivo, e un hook blocca i comandi git distruttivi (`push`, `reset --hard`, `clean -f`, `branch -D`, `checkout .`, `restore .`) prima che vengano eseguiti — `git add` e `git commit` restano liberi.
 
@@ -168,6 +168,43 @@ Layout single-context, tutto sotto `Docs/` (non alla root). Vedi `Docs/agents/do
 - **`/research`**: non usarla, ha un bug di ricorsione noto (#530) che spawna run duplicate. Usa la `deep-research` globale.
 - **`/wizard`**: in fase di scoping legge i file `.env*`. Qui non ce ne sono, ma le credenziali S3 stanno in `rclone.conf` e nel Keychain: tienilo presente se un giorno ne aggiungi uno.
 - **`/diagnosing-bugs`**: fa incollare output e artefatti di debug nei ticket. Redigi tu i segreti — l'issue upstream sul redacting automatico (#674) è aperta.
+
+---
+
+## Progettazione prima dell'implementazione
+
+Il rapporto da tenere è: **più progettazione a monte, meno implementazione a caso**. Regole vincolanti.
+
+**Quando serve l'Architect.** Per ogni modifica non banale si consulta *prima* l'Architect per un piano, e solo dopo si passa il piano all'Implementer. Una modifica è non banale se ricade in almeno uno di questi casi:
+
+- tocca più di un file;
+- cambia un'interfaccia (firma pubblica, protocollo, contratto fra tipi);
+- cambia uno schema dati (schema SQLite dell'indice, formato di un file su disco, formato di un ticket o di un log);
+- tocca un flusso di autenticazione o di credenziali (Keychain, `rclone.conf`, chiavi S3, firma/notarizzazione);
+- aggiunge una dipendenza (package Swift, tool esterno, servizio).
+
+Sotto questa soglia — fix di una riga, rinomina locale, correzione di un commento o di un test isolato — si va diretti all'Implementer senza piano.
+
+**L'Implementer esegue piani, non li inventa.** Riceve un task alla volta, con il testo esatto preso dal piano. Se la richiesta è ambigua, incompleta o in conflitto con il codice che trova, **non improvvisa e non "interpreta"**: la rimanda all'Architect (via `SendMessage`) e aspetta un piano aggiornato. Scoprire a metà task che serve una decisione di design è un motivo valido per fermarsi e rimbalzare, non per scegliere da soli.
+
+**Le decisioni architetturali si scrivono.** Ogni decisione di design presa dall'Architect e approvata va registrata in `Docs/adr/` come file numerato progressivamente (`NNNN-titolo-in-kebab-case.md`, continuando la numerazione esistente). Ogni ADR contiene:
+
+1. **Contesto** — qual era il problema e quali vincoli erano in gioco;
+2. **Opzioni valutate** — le alternative considerate davvero, non solo quella scelta;
+3. **Decisione e motivo** — cosa si è scelto e *perché*, incluso cosa si accetta di perdere.
+
+Un ADR si scrive prima che l'Implementer parta, non dopo. Gli ADR esistenti (`0001`–`0004`) sono il modello di riferimento per tono e lunghezza.
+
+---
+
+## Regole di lettura dei file
+
+Regole operative per non sprecare contesto (e token) durante una sessione.
+
+- **Non rileggere file interi già letti in questa sessione.** Se serve ricontrollare un punto preciso, rileggi solo quel punto.
+- **Per cercare si usa Grep, non Read.** Read serve quando sai già dove guardare; se stai ancora cercando *dove* si trova qualcosa, la risposta è Grep (o Glob per i nomi di file).
+- **Sui file grandi leggi porzioni mirate**, con `offset`/`limit` attorno alla zona che ti interessa, invece di caricare tutto il file. Vale in particolare per `ContentView.swift`.
+- **Non incollare output lunghi nel contesto** — log, dump, elenchi di file, output di build. Filtra prima alla fonte con `grep`, `head`, `tail`, `wc -l`, e porta dentro solo le righe che servono davvero.
 
 ---
 
