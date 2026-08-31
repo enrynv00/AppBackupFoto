@@ -262,7 +262,7 @@ Logica **pura**. È la prima delle due conferme richieste dalla decisione 4 di E
 > 1. **La coppia (gruppo, copia tenuta) va congelata al momento della conferma dell'utente** e passata così al `DuplicateTrasher`, **mai ricalcolata all'esecuzione**. Fra il riepilogo che l'utente legge e il cestinamento l'indice può essere cambiato (mtime diversi, membri diversi), e una `duplicateKeepChoice` ricalcolata su dati nuovi può nominare **un'altra copia**: l'utente acconsente a cestinare A e viene cestinato B. Attenzione: la `precondition` di appartenenza dentro `duplicateKeepExplanation` **non intercetta questo caso**, perché confronta solo il `path` — una `choice` stantia su un gruppo ricaricato la passa indenne, prendendo il conteggio dai membri nuovi e la cartella dalla copia tenuta vecchia.
 > 2. **`duplicateKeepChoice` non va chiamata dentro il ciclo di cestinamento.** Ha due `precondition`, e un crash fra `trashItem` e la scrittura del registro di ripristino lascia un file nel Cestino **non registrato** — la spec ha misurato che il record «Rimetti a posto» del Finder è asincrono e si perde proprio quando il processo muore (74/300 persi in un caso). Tutte le scelte vanno risolte **prima** di aprire il ciclo. Il filtro difensivo sui gruppi ridotti a un solo membro (`groups.filter { $0.members.count > 1 }`) va messo al confine del Task 3/6, non ammorbidendo le guardie del Task 2.
 
-- [ ] **Step 1: Scrivi il file di test** (~30 test), su directory temporanee reali (nessun mock del filesystem — convenzione del progetto).
+- [x] **Step 1: Scrivi il file di test** (~30 test), su directory temporanee reali (nessun mock del filesystem — convenzione del progetto).
 
   **Verifica prima della cancellazione:**
   - gruppo sano di 3 file identici ⇒ 2 cestinati, il tenuto resta, indice aggiornato
@@ -293,15 +293,15 @@ Logica **pura**. È la prima delle due conferme richieste dalla decisione 4 di E
   **Invariante strutturale:**
   - con una `trashFunction` iniettata **che non fa nulla**, tutti i file del gruppo **esistono ancora** a fine corsa. Se il codice chiamasse anche `removeItem` da qualche parte, questo test diventerebbe rosso — è il modo di provare che `trashItem` è l'unica porta senza affidarsi a una lettura del codice
 
-- [ ] **Step 2–3: registra il file, verifica il fallimento atteso.**
+- [x] **Step 2–3: registra il file, verifica il fallimento atteso.**
 
-- [ ] **Step 4: Implementa** seguendo alla lettera la sequenza della sezione «La cancellazione — il percorso ad alto danno» della spec (8 punti). Ogni guardia ha accanto un commento di **una riga** che dice cosa succederebbe senza — la convenzione già usata in tutto `ContentView.swift` per le guardie non ovvie.
+- [x] **Step 4: Implementa** seguendo alla lettera la sequenza della sezione «La cancellazione — il percorso ad alto danno» della spec (8 punti). Ogni guardia ha accanto un commento di **una riga** che dice cosa succederebbe senza — la convenzione già usata in tutto `ContentView.swift` per le guardie non ovvie.
 
-- [ ] **Step 5: Test verdi** — `Executed 30 tests, with 0 failures`.
+- [x] **Step 5: Test verdi** — `Executed 30 tests, with 0 failures`.
 
-- [ ] **Step 6: Mutation testing sui mutanti elencati sotto.** Un mutante sopravvissuto significa **riscrivere il test**, non il codice. Riporta il conteggio (`N mutanti, N uccisi`) nel commit.
+- [x] **Step 6: Mutation testing sui mutanti elencati sotto.** Un mutante sopravvissuto significa **riscrivere il test**, non il codice. Riporta il conteggio (`N mutanti, N uccisi`) nel commit.
 
-- [ ] **Step 7: Build, suite completa, commit** — attesi **464 test** (434 + 30).
+- [x] **Step 7: Build, suite completa, commit** — attesi **464 test** (434 + 30).
 
 **Il mutante che deve morire:**
 | Mutante | Test rosso |

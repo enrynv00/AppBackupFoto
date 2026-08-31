@@ -1566,6 +1566,40 @@ nonisolated func realResolvedPath(_ url: URL) -> String {
     return String(cString: r)
 }
 
+/// Identificativo del dispositivo (`st_dev`) su cui vive `url`, `nil` se `stat`
+/// fallisce (percorso sparito).
+///
+/// E' l'UNICO dei tre candidati provati che rileva davvero lo scollegamento di un
+/// volume esterno (misurato il 2026-08-26 su un'immagine exFAT staccata con
+/// `hdiutil detach -force` a meta' scansione):
+///
+/// | candidato | esito |
+/// |---|---|
+/// | `FileManager.fileExists(atPath:)` | puo' rispondere `true` per secondi dopo lo scollegamento (smontaggio asincrono) |
+/// | `URLResourceValues.volumeIdentifier` | invariato, Foundation lo serve dalla cache dell'URL |
+/// | `st_dev` inizio vs fine | **cambia** (16777237 -> 16777230), oppure `stat` fallisce |
+///
+/// Per lo scollegamento di un volume esterno il rilevatore principale resta
+/// l'`errorHandler` dell'enumeratore, che non dipende da nessun timing. Ma NON e'
+/// una seconda cintura sempre e comunque: se la root sparisce o viene rinominata
+/// mentre la scansione gira, l'`errorHandler` **non viene chiamato affatto**
+/// (misurato il 2026-08-26 — i fallimenti finiscono in `progress.errors`, che non
+/// concorre a `traversalIncomplete`). In quello scenario questo controllo e'
+/// l'**unico** che impedisce di scambiare la traversata troncata per completa e di
+/// rimuovere le entry non viste. E' il caso coperto da
+/// `testRootRenamedDuringScan_...`.
+/// Secondo consumatore dal 2026-08-31: `DuplicateTrasher`, che se ne serve per
+/// distinguere «il file non c'era» da «il volume e' sparito a meta' blocco» — due
+/// guasti che presentano lo **stesso** `NSCocoaErrorDomain/4`. Funzione libera e non
+/// metodo privato di `LibraryIndexer` per non pagare una terza volta il prezzo gia'
+/// pagato con `LibraryExclusions` e `realResolvedPath`: due copie della stessa logica
+/// che divergono in silenzio.
+nonisolated func deviceIdentifier(of url: URL) -> dev_t? {
+    var info = stat()
+    guard stat(url.path, &info) == 0 else { return nil }
+    return info.st_dev
+}
+
 /// Componenti del percorso canonico di `url`, per confronti fra percorsi.
 /// Il confronto va fatto per COMPONENTI, mai per lunghezza di stringa o con
 /// `hasPrefix`: `/Volumes/SSD` non e' un prefisso di `/Volumes/SSD 2`, ma lo e'
@@ -2466,6 +2500,311 @@ final class TrashManifestStore {
     }
 }
 
+// MARK: - Il motore di cancellazione
+
+/// Perche' un gruppo di doppioni non e' stato smaltito. Ogni caso ha una frase propria: chi
+/// vede un gruppo restare nell'elenco dopo aver confermato deve capire se il problema e'
+/// suo, del disco o dell'indice — e cosa puo' farci. Stessa disciplina di
+/// `RestoreSkipReason`.
+enum DuplicateTrashSkipReason: Equatable {
+    /// Un membro — la copia tenuta compresa — non ha piu' lo stesso contenuto degli altri.
+    case contentDisagrees(displayPath: String)
+    /// Un membro non e' stato rileggibile: sparito, illeggibile, o cambiato durante la lettura.
+    case unreadable(displayPath: String)
+    /// Un membro ha una dimensione diversa da quella indicizzata.
+    case sizeChanged(displayPath: String)
+    /// Un membro risolve fuori dalla root della libreria.
+    case outsideLibrary(displayPath: String)
+    /// Un membro non e' una foto ne' un video.
+    case notMedia(displayPath: String)
+    /// Il gruppo si e' ridotto a una copia sola: non c'e' niente da cestinare.
+    case nothingToTrash
+    /// Il cestinamento e' fallito con il volume ancora al suo posto.
+    case trashFailed(displayPath: String, detail: String)
+    /// La copia da tenere e' sparita a cestinamento gia' iniziato: quanto era stato
+    /// spostato e' stato rimesso a posto.
+    case keeperVanished(displayPath: String)
+
+    var explanation: String {
+        switch self {
+        case .contentDisagrees(let p):
+            return "Le copie di questo gruppo non sono più identiche fra loro (\(p) è cambiata). "
+                + "Non è stato spostato niente: l'app cancella solo quando ogni copia, inclusa "
+                + "quella che resta, si rilegge uguale alle altre."
+        case .unreadable(let p):
+            return "Non è stato possibile rileggere \(p), quindi il gruppo è stato lasciato "
+                + "intatto. L'app non cestina mai «quelle che è riuscita a verificare»."
+        case .sizeChanged(let p):
+            return "La dimensione di \(p) non coincide più con quella registrata: il gruppo è "
+                + "stato lasciato intatto."
+        case .outsideLibrary(let p):
+            return "Il percorso \(p) risolve fuori dalla cartella della libreria: l'app non "
+                + "tocca niente che stia fuori."
+        case .notMedia(let p):
+            return "\(p) non è una foto né un video, quindi non viene mai cestinato."
+        case .nothingToTrash:
+            return "Di questo gruppo è rimasta una copia sola: non c'era niente da spostare."
+        case .trashFailed(let p, let dettaglio):
+            return "Non è stato possibile spostare \(p) nel Cestino (\(dettaglio)). "
+                + "Il gruppo è stato chiuso qui; quanto era già stato spostato resta annullabile."
+        case .keeperVanished(let p):
+            return "La copia da tenere (\(p)) è sparita mentre il gruppo veniva smaltito. "
+                + "Le copie appena spostate sono state rimesse al loro posto: non sei rimasto "
+                + "senza nessuna copia."
+        }
+    }
+}
+
+/// L'esito di un blocco. `trashedFiles` e' il numero **onesto** di file spostati, anche
+/// quando il blocco si e' interrotto a meta': e' quello che va mostrato, non il numero di
+/// file che si era chiesto di smaltire.
+struct DuplicateTrashOutcome {
+    var trashedFiles: [TrashedItem] = []
+    var skippedGroups: [(group: DuplicateGroup, reason: DuplicateTrashSkipReason)] = []
+    /// Il volume e' sparito a meta' blocco: si e' fermato tutto, non solo il gruppo.
+    var stoppedBecauseVolumeVanished: Bool = false
+    /// L'utente ha interrotto. Un blocco parziale e' uno stato legittimo, va detto.
+    var interrupted: Bool = false
+}
+
+/// L'unico componente del progetto che sposta un file foto.
+///
+/// Due invarianti che i test blindano, perche' sono quelle che un'ottimizzazione futura
+/// romperebbe per prime:
+///
+/// - **L'unico modo in cui questo codice tocca un file foto e' `trashItem`.** Mai
+///   `removeItem`, in nessun ramo, nemmeno di errore. Mai una scrittura dentro `.Trashes`.
+///   Mai uno svuotamento del Cestino. Coperto da `testNoOpTrashFunction_leavesEveryFileOnDisk`.
+/// - **La copia tenuta non viene mai passata a `trashItem`.** Coperto da
+///   `testKeeperIsNeverPassedToTrash`.
+///
+/// `trashFunction` e `hashFunction` hanno per default le funzioni reali e sono iniettate
+/// **solo dai test**: gli esiti da coprire (un hash che cambia fra la visualizzazione e la
+/// cancellazione, uno scollegamento a meta' blocco) non sono producibili su file veri senza
+/// una corsa fra thread, e un test basato su una corsa e' verde col bug ogni volta che la
+/// corsa va nell'altro verso. Stesso pattern gia' in `FileSyncer.init(hashFunction:)`.
+final class DuplicateTrasher {
+
+    /// Cio' che l'utente ha confermato: il gruppo **e** la copia che resta, congelati
+    /// insieme al momento della conferma.
+    ///
+    /// La copia tenuta arriva da fuori e non viene mai ricalcolata qui. Fra il riepilogo che
+    /// l'utente legge e il cestinamento l'indice puo' essere cambiato, e una
+    /// `duplicateKeepChoice` ricalcolata su dati nuovi puo' nominare **un'altra copia**:
+    /// l'utente acconsente a cestinare A e viene cestinato B. La `precondition` di
+    /// appartenenza dentro `duplicateKeepExplanation` non intercetta quel caso, perche'
+    /// confronta solo il `path`.
+    struct Decision {
+        let group: DuplicateGroup
+        let keeper: LibraryIndexEntry
+    }
+
+    private let libraryRoot: URL
+    private let store: LibraryIndexStore
+    private let manifest: TrashManifestStore
+    private let trashFunction: (URL) throws -> URL?
+    private let hashFunction: (URL) -> MeasuredHash?
+    /// Le due forme canoniche della root, calcolate una volta. Stessa coppia usata da
+    /// `isAlreadyInLibrary`: la root puo' essere raggiunta per symlink.
+    private let rootForms: [[String]]
+
+    init(libraryRoot: URL,
+         store: LibraryIndexStore,
+         manifest: TrashManifestStore,
+         trashFunction: @escaping (URL) throws -> URL? = { url in
+             var resulting: NSURL?
+             try FileManager.default.trashItem(at: url, resultingItemURL: &resulting)
+             return resulting as URL?
+         },
+         hashFunction: @escaping (URL) -> MeasuredHash? = { sha256Measured(of: $0) }) {
+        self.libraryRoot = libraryRoot
+        self.store = store
+        self.manifest = manifest
+        self.trashFunction = trashFunction
+        self.hashFunction = hashFunction
+        self.rootForms = [libraryRoot.standardizedFileURL.path, realResolvedPath(libraryRoot)].map {
+            $0.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+        }
+    }
+
+    /// Smaltisce un blocco di gruppi gia' confermati, nell'ordine della sequenza «percorso
+    /// ad alto danno» della spec. Non lancia mai: ogni gruppo che non si puo' smaltire
+    /// finisce fra gli `skippedGroups` con il motivo, e gli altri proseguono.
+    func run(_ decisions: [Decision],
+             batchId: String = UUID().uuidString,
+             isCancelled: () -> Bool = { false }) -> DuplicateTrashOutcome {
+        var outcome = DuplicateTrashOutcome()
+        // `st_dev` della root letto una volta prima di iniziare. Senza questo valore
+        // «il file non c'era» e «il volume e' sparito» restano indistinguibili: presentano
+        // lo stesso `NSCocoaErrorDomain/4`.
+        let deviceAtStart = deviceIdentifier(of: libraryRoot)
+
+        for decision in decisions {
+            // Un'interruzione lascia un blocco parziale: e' uno stato legittimo, e i gruppi
+            // gia' chiusi restano chiusi.
+            if isCancelled() {
+                outcome.interrupted = true
+                break
+            }
+
+            let group = decision.group
+            guard group.members.contains(where: { $0.path != decision.keeper.path }) else {
+                outcome.skippedGroups.append((group, .nothingToTrash))
+                continue
+            }
+
+            // Si rilegge e si rihasha OGNI membro, la copia tenuta compresa, e si pretende
+            // unanimita'. Rileggere solo i file da cestinare direbbe che sono uguali fra
+            // loro, non che sono uguali a quello che resta.
+            let resolved: [(entry: LibraryIndexEntry, url: URL)]
+            switch verify(group) {
+            case .skip(let reason):
+                outcome.skippedGroups.append((group, reason))
+                continue
+            case .ok(let members):
+                resolved = members
+            }
+
+            guard let keeperURL = resolved.first(where: { $0.entry.path == decision.keeper.path })?.url else {
+                // La copia tenuta non e' fra i membri del gruppo: la coppia e' incoerente e
+                // non si tocca niente, invece di indovinare quale tenere.
+                outcome.skippedGroups.append((group, .keeperVanished(displayPath: decision.keeper.displayPath)))
+                continue
+            }
+
+            var trashedInGroup: [TrashedItem] = []
+            var groupFailure: DuplicateTrashSkipReason?
+            var volumeVanished = false
+
+            for (entry, url) in resolved where entry.path != decision.keeper.path {
+                do {
+                    let resultingURL = try trashFunction(url)
+                    // Percorso **assoluto**: e' quello che `TrashManifestStore.restore`
+                    // riapre con `URL(fileURLWithPath:)` per rimettere il file al suo posto.
+                    // Il `displayPath` dell'indice e' relativo alla root e li' non serve;
+                    // la sua forma normalizzata viaggia a parte, in `originalKey`.
+                    let item = TrashedItem(batchId: batchId,
+                                           originalDisplayPath: url.path,
+                                           originalKey: entry.path,
+                                           trashedPath: resultingURL?.path ?? "",
+                                           size: entry.size,
+                                           hash: group.hash,
+                                           trashedAt: Date())
+                    // Registrato SUBITO, prima di passare al file successivo. Un registro
+                    // scritto a fine blocco si perderebbe proprio nel caso in cui serve — un
+                    // guasto a meta' — che e' il difetto misurato del record del Finder.
+                    // Se la scrittura fallisce si finisce nel `catch`: il file resta nel
+                    // Cestino e recuperabile a mano, ma non viene contato fra i cestinati e
+                    // la sua chiave resta nell'indice. E' il verso sicuro.
+                    try manifest.record(item)
+                    trashedInGroup.append(item)
+                } catch {
+                    // Stesso errore, due guasti diversi: `NSCocoaErrorDomain/4` arriva sia da
+                    // «il file non c'era» sia da «il volume e' sparito», e a distinguerli e'
+                    // solo `st_dev`. Non e' mai «era gia' fatto, tutto a posto».
+                    if deviceIdentifier(of: libraryRoot) != deviceAtStart {
+                        volumeVanished = true
+                    } else {
+                        groupFailure = .trashFailed(displayPath: entry.displayPath,
+                                                    detail: (error as NSError).localizedDescription)
+                    }
+                    break
+                }
+            }
+
+            // Lo scollegamento interrompe TUTTO il blocco, e viene prima della
+            // post-condizione sul tenuto: se il volume non c'e' piu', il tenuto risulta
+            // sparito anche lui e un tentativo di ripristino sposterebbe file su un disco
+            // che non e' montato. Il conteggio dei file gia' spostati resta onesto.
+            if volumeVanished {
+                outcome.trashedFiles.append(contentsOf: trashedInGroup)
+                // Le chiavi restano nell'indice: il gruppo non e' chiuso con successo. Una
+                // entry fantasma e' innocua (chi salta un file rilegge e rihasha comunque il
+                // candidato, ADR-0003, e la rilettura di un file inesistente fallisce);
+                // l'ordine inverso lascerebbe un file sul disco senza entry, che al primo
+                // import verrebbe ricopiato ricreando il doppione.
+                outcome.stoppedBecauseVolumeVanished = true
+                break
+            }
+
+            // La copia tenuta deve esistere ancora. Se non c'e' — caso che non dovrebbe
+            // accadere, e proprio per questo gestito — si rimette a posto subito quanto si e'
+            // appena spostato, invece di lasciare l'utente senza nessuna copia.
+            if !FileManager.default.fileExists(atPath: keeperURL.path) {
+                _ = manifest.restore(trashedInGroup)
+                outcome.skippedGroups.append((group, .keeperVanished(displayPath: decision.keeper.displayPath)))
+                continue
+            }
+
+            outcome.trashedFiles.append(contentsOf: trashedInGroup)
+
+            // Si rimuovono SOLO le chiavi dei file davvero cestinati, e nient'altro. Prima si
+            // cestina, poi si rimuove: l'ordine inverso e' quello che ricrea i doppioni.
+            if !trashedInGroup.isEmpty {
+                try? store.remove(keys: trashedInGroup.map { $0.originalKey })
+            }
+            if let groupFailure {
+                outcome.skippedGroups.append((group, groupFailure))
+            }
+        }
+
+        return outcome
+    }
+
+    private enum Verification {
+        case ok([(entry: LibraryIndexEntry, url: URL)])
+        case skip(DuplicateTrashSkipReason)
+    }
+
+    /// Rilettura e rihash di tutti i membri, con unanimita' obbligatoria. Se anche un solo
+    /// membro non soddisfa, l'intero gruppo viene saltato: mai «cestino quelli che ho potuto
+    /// verificare».
+    private func verify(_ group: DuplicateGroup) -> Verification {
+        var resolved: [(entry: LibraryIndexEntry, url: URL)] = []
+        for entry in group.members {
+            // Confinamento per COMPONENTI canoniche, mai con `hasPrefix`: `/Volumes/SSD` non
+            // e' un prefisso di `/Volumes/SSD 2`, ma lo e' testualmente. Senza questa guardia
+            // un `displayPath` con `..` uscirebbe dalla libreria e si cestinerebbe un file
+            // che non e' nostro.
+            guard let url = resolve(entry) else {
+                return .skip(.outsideLibrary(displayPath: entry.displayPath))
+            }
+            // Senza questa guardia un sidecar `.aae` o un `.txt` finito nell'indice verrebbe
+            // cestinato come se fosse una foto.
+            guard IndexableKind.of(url: url) != .notIndexable else {
+                return .skip(.notMedia(displayPath: entry.displayPath))
+            }
+            // Rilettura dal filesystem: e' il livello di fiducia 3 di ADR-0003, l'unico
+            // ammesso sul percorso ad alto danno. Senza, ci si fiderebbe della cache.
+            // `nil` non significa mai «coincide»: significa «non lo so», e non si cestina.
+            guard let measured = hashFunction(url) else {
+                return .skip(.unreadable(displayPath: entry.displayPath))
+            }
+            guard measured.size == entry.size else {
+                return .skip(.sizeChanged(displayPath: entry.displayPath))
+            }
+            // Confronto con l'hash del GRUPPO, non fra i membri: cosi' un indice stantio su
+            // tutti i membri insieme (hash unanimi fra loro ma diversi da quello del gruppo)
+            // viene intercettato invece di essere scambiato per unanimita'.
+            guard measured.hash == group.hash else {
+                return .skip(.contentDisagrees(displayPath: entry.displayPath))
+            }
+            resolved.append((entry, url))
+        }
+        return .ok(resolved)
+    }
+
+    /// L'URL di una entry, o `nil` se risolve fuori dalla root della libreria.
+    private func resolve(_ entry: LibraryIndexEntry) -> URL? {
+        let candidate = libraryRoot.appendingPathComponent(entry.displayPath).standardizedFileURL
+        guard rootForms.contains(where: { relativePath(of: candidate.path, under: $0) != nil }) else {
+            return nil
+        }
+        return candidate
+    }
+}
+
+
 /// Dove un archivio interno dell'app puo' stare: **mai** sul volume sorgente.
 ///
 /// Allow-list e non deny-list su `/Volumes`: una posizione nuova e' vietata per default
@@ -3111,34 +3450,6 @@ final class LibraryIndexer {
     init(store: LibraryIndexStore) { self.store = store }
 
     func cancel() { cancelled = true }
-
-    /// Identificativo del dispositivo (`st_dev`) su cui vive `url`, `nil` se `stat`
-    /// fallisce (percorso sparito).
-    ///
-    /// E' l'UNICO dei tre candidati provati che rileva davvero lo scollegamento di un
-    /// volume esterno (misurato il 2026-08-26 su un'immagine exFAT staccata con
-    /// `hdiutil detach -force` a meta' scansione):
-    ///
-    /// | candidato | esito |
-    /// |---|---|
-    /// | `FileManager.fileExists(atPath:)` | puo' rispondere `true` per secondi dopo lo scollegamento (smontaggio asincrono) |
-    /// | `URLResourceValues.volumeIdentifier` | invariato, Foundation lo serve dalla cache dell'URL |
-    /// | `st_dev` inizio vs fine | **cambia** (16777237 -> 16777230), oppure `stat` fallisce |
-    ///
-    /// Per lo scollegamento di un volume esterno il rilevatore principale resta
-    /// l'`errorHandler` dell'enumeratore, che non dipende da nessun timing. Ma NON e'
-    /// una seconda cintura sempre e comunque: se la root sparisce o viene rinominata
-    /// mentre la scansione gira, l'`errorHandler` **non viene chiamato affatto**
-    /// (misurato il 2026-08-26 — i fallimenti finiscono in `progress.errors`, che non
-    /// concorre a `traversalIncomplete`). In quello scenario questo controllo e'
-    /// l'**unico** che impedisce di scambiare la traversata troncata per completa e di
-    /// rimuovere le entry non viste. E' il caso coperto da
-    /// `testRootRenamedDuringScan_...`.
-    private func deviceIdentifier(of url: URL) -> dev_t? {
-        var info = stat()
-        guard stat(url.path, &info) == 0 else { return nil }
-        return info.st_dev
-    }
 
     // Le esclusioni NON sono ridichiarate qui: `LibraryExclusions` e' la fonte unica
     // condivisa con FileSyncer e ReviewEngine. Una seconda copia "da tenere allineata"
