@@ -195,6 +195,16 @@ struct BackupFotoEnricoApp: App {
         // automatico di macOS prima dello sblocco.
         .restorationBehavior(.disabled)
 
+        Window("Doppioni", id: "duplicates") {
+            DuplicatesView()
+                .environmentObject(runner)
+        }
+        .defaultSize(width: 720, height: 640)
+        // Stessa regola di #30, applicata qui perche' e' la scena piu' sensibile del
+        // progetto: elenca percorsi, nomi e miniature di tutte le foto, e puo' spostarle
+        // nel Cestino. Il gate vero e' dentro DuplicatesView.
+        .restorationBehavior(.disabled)
+
         MenuBarExtra {
             MenuBarContent()
                 .environmentObject(runner)
@@ -1600,6 +1610,24 @@ nonisolated func deviceIdentifier(of url: URL) -> dev_t? {
     return info.st_dev
 }
 
+/// Miniatura leggera via ImageIO, **mai** l'immagine intera in memoria (stessa lezione del
+/// bug di memoria di `sha256(of:)`). Nata come `BackupRunner.makeThumbnail` per la miniatura
+/// live del file corrente (#17, 2026-08-09); estratta qui a funzione libera il 2026-08-31
+/// perché il pannello Doppioni (Task 6, #31) ne ha bisogno anche per le miniature dei
+/// gruppi, e questo progetto ha già pagato due volte il prezzo di due implementazioni della
+/// stessa logica che divergono in silenzio (`LibraryExclusions`, `realResolvedPath`). Fonte
+/// unica: nessun secondo `CGImageSourceCreateThumbnailAtIndex` da nessuna parte.
+nonisolated func makeThumbnail(url: URL, maxPixelSize: Int) -> NSImage? {
+    guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+    let options: [CFString: Any] = [
+        kCGImageSourceCreateThumbnailFromImageAlways: true,
+        kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
+        kCGImageSourceCreateThumbnailWithTransform: true
+    ]
+    guard let cgThumb = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
+    return NSImage(cgImage: cgThumb, size: .zero)
+}
+
 /// Componenti del percorso canonico di `url`, per confronti fra percorsi.
 /// Il confronto va fatto per COMPONENTI, mai per lunghezza di stringa o con
 /// `hasPrefix`: `/Volumes/SSD` non e' un prefisso di `/Volumes/SSD 2`, ma lo e'
@@ -1867,6 +1895,17 @@ struct DuplicateKeepChoice {
     /// copie in libreria principale — di cui una finisce nel Cestino — ha deciso il
     /// tie-break, e la frase deve dirlo.
     let tiedCandidates: Int
+
+    /// Le chiavi normalizzate dei membri rimasti in gara fino al tie-break, copia tenuta
+    /// compresa: cioe' **quali** copie sono a pari merito, non solo quante.
+    ///
+    /// Aggiunto nel Task 6 (2026-08-31) per lo stesso motivo per cui `tiedCandidates` e'
+    /// stato aggiunto nel Task 2: senza, la view non ha modo di dire *a quale riga* si
+    /// riferisce «un'altra copia va bene quanto questa» in un gruppo di piu' di due membri —
+    /// l'utente legge la frase davanti a piu' righe e non sa quale delle altre e' quella
+    /// nominata. Nessun chiamante esistente costruisce `DuplicateKeepChoice` a mano (solo
+    /// `duplicateKeepChoice` lo fa), quindi il campo e' additivo e non rompe niente a monte.
+    let tiedPaths: Set<String>
 }
 
 /// La cartella di primo livello di una chiave, oppure `nil` per un file che sta nella
@@ -1984,7 +2023,8 @@ func duplicateKeepChoice(_ group: DuplicateGroup) -> DuplicateKeepChoice {
     // esiste per non far dipendere da un `!` la funzione che decide cosa NON cestinare.
     return DuplicateKeepChoice(keeper: keeper ?? candidates[0],
                                reason: reason,
-                               tiedCandidates: candidates.count)
+                               tiedCandidates: candidates.count,
+                               tiedPaths: Set(candidates.map(\.path)))
 }
 
 /// Come si dice all'utente la scelta di `duplicateKeepChoice`.
@@ -2567,6 +2607,151 @@ struct DuplicateTrashOutcome {
     var interrupted: Bool = false
 }
 
+// MARK: - Righe di stato del pannello Doppioni (Task 6, 2026-08-31)
+
+/// Cosa dire in cima al pannello Doppioni, perche' la cancellazione e' disattivata in questo
+/// momento, e come si racconta l'esito di un blocco appena smaltito. Logica **pura**,
+/// verificabile senza aprire la finestra — stessa disciplina di `LibraryIndexStatus` e di
+/// `duplicateKeepExplanation`: niente "hash", "indice", "SHA256", "entry", "scansione".
+enum DuplicatesStatus {
+    enum Tone { case ok, info, warning }
+
+    struct Line: Identifiable {
+        /// Identita' stabile, non un UUID: le righe si ricalcolano a ogni ridisegno.
+        let id: String
+        let tone: Tone
+        let text: String
+    }
+
+    /// La riga in cima al pannello. Non e' la lista dei gruppi: e' quello che l'utente legge
+    /// aprendo la finestra, prima di scorrere qualunque cosa.
+    ///
+    /// `indexBuilt == false` **deve** rimandare alla card, mai leggersi come "non hai
+    /// doppioni": e' la stessa classe di errore gia' corretta con `sawNothing` in #31 — un
+    /// elenco che non esiste e un elenco costruito e vuoto sono due situazioni opposte.
+    static func headerLine(indexBuilt: Bool, groupCount: Int, reclaimableBytes: Int64) -> Line {
+        guard indexBuilt else {
+            return Line(id: "no-index", tone: .info, text:
+                "Non hai ancora creato l'elenco delle foto già salvate sull'SSD. Vai in "
+                + "Diagnostica → «Foto già salvate sull'SSD» e crealo da lì, poi torna qui.")
+        }
+        guard groupCount > 0 else {
+            return Line(id: "zero-groups", tone: .ok, text:
+                "In base all'ultimo controllo dell'elenco, non ci sono copie doppie da smaltire "
+                + "sull'SSD.")
+        }
+        return Line(id: "groups", tone: .info, text:
+            "In base all'ultimo controllo dell'elenco risultano "
+            + "\(count(groupCount, "gruppo di copie doppie", "gruppi di copie doppie")), per circa "
+            + "\(ByteCountFormatter.string(fromByteCount: reclaimableBytes, countStyle: .file)) "
+            + "recuperabili sull'SSD.")
+    }
+
+    /// Perche' il bottone di cancellazione e' disattivato adesso. `nil` = niente lo impedisce
+    /// da qui (restano comunque le due conferme). Stessa disciplina di `RestoreView`: un
+    /// bottone disattivato dice sempre perche', non un semplice grigiore.
+    static func trashDisabledReason(isRunning: Bool, isIndexing: Bool, ssdMounted: Bool) -> String? {
+        guard ssdMounted else {
+            return "L'SSD non è collegato in questo momento: senza, l'app non può né "
+                + "riverificare né spostare niente."
+        }
+        guard !isRunning else {
+            return "C'è un backup in corso: aspetta che finisca prima di smaltire le copie "
+                + "doppie."
+        }
+        guard !isIndexing else {
+            return "L'elenco delle foto già salvate si sta aggiornando in questo momento: "
+                + "aspetta che finisca."
+        }
+        return nil
+    }
+
+    /// Se il blocco selezionato puo' procedere alla conferma vera. Sopra il tetto la UI lo
+    /// dice invece di rifiutare senza spiegare (deciso il 2026-08-28).
+    static func confirmationBlockedReason(exceedsCap: Bool) -> String? {
+        guard exceedsCap else { return nil }
+        return "Hai selezionato troppi file in una volta sola: procedi in più passaggi più "
+            + "piccoli, così un eventuale intoppo a metà resta facile da rimettere a posto."
+    }
+
+    /// Come si racconta l'esito di un blocco appena smaltito: mai un silenzio, sempre un
+    /// numero onesto — sia sui file gia' spostati sia sui gruppi rimasti intatti.
+    static func outcomeLines(_ outcome: DuplicateTrashOutcome) -> [Line] {
+        var out: [Line] = []
+
+        if outcome.stoppedBecauseVolumeVanished {
+            out.append(Line(id: "volume-vanished", tone: .warning, text:
+                "L'SSD si è scollegato mentre spostavo le copie, quindi mi sono fermato subito: "
+                + "\(count(outcome.trashedFiles.count, "file era già stato spostato nel Cestino", "file erano già stati spostati nel Cestino")) "
+                + "prima dello stop."))
+        }
+        if outcome.interrupted {
+            out.append(Line(id: "interrupted", tone: .info, text:
+                "Hai fermato tu lo spostamento: "
+                + "\(count(outcome.trashedFiles.count, "file è stato spostato nel Cestino", "file sono stati spostati nel Cestino")) "
+                + "prima che ti fermassi."))
+        }
+        if !outcome.skippedGroups.isEmpty {
+            out.append(Line(id: "skipped-count", tone: .warning, text:
+                "\(count(outcome.skippedGroups.count, "gruppo non è stato smaltito", "gruppi non sono stati smaltiti")): "
+                + "trovi il motivo di ciascuno qui sotto."))
+            for (index, skipped) in outcome.skippedGroups.enumerated() {
+                out.append(Line(id: "skipped-\(index)", tone: .warning, text: skipped.reason.explanation))
+            }
+        }
+        // Nessun problema da segnalare, ma qualcosa e' comunque successo: un esito pulito lo
+        // dice, non resta muto.
+        if out.isEmpty, !outcome.trashedFiles.isEmpty {
+            out.append(Line(id: "done", tone: .ok, text:
+                "Fatto: \(count(outcome.trashedFiles.count, "file spostato nel Cestino", "file spostati nel Cestino"))."))
+        }
+        return out
+    }
+
+    private static func count(_ n: Int, _ singular: String, _ plural: String) -> String {
+        "\(n.formatted()) \(n == 1 ? singular : plural)"
+    }
+}
+
+/// Cache delle miniature del pannello Doppioni: una per gruppo, letta dal file tenuto, pigra.
+/// Tetto fisso: senza, scorrere centinaia di gruppi terrebbe in RAM altrettante `NSImage` — su
+/// questo progetto una lettura senza tetto e' gia' costata 41 GB una volta (bug di
+/// `sha256(of:)`, 2026-07-30). Thread-safe: le richieste arrivano da `.task` di righe diverse
+/// della `LazyVStack`, potenzialmente in corse concorrenti fra loro.
+final class DuplicateThumbnailCache {
+    static let defaultCapacity = 200
+
+    private let capacity: Int
+    private let lock = NSLock()
+    /// Ordine di uso: il primo elemento e' il piu' vecchio, il prossimo a essere sfrattato.
+    private var order: [String] = []
+    private var images: [String: NSImage] = [:]
+
+    init(capacity: Int = DuplicateThumbnailCache.defaultCapacity) {
+        self.capacity = max(1, capacity)
+    }
+
+    func image(for key: String) -> NSImage? {
+        lock.withLock { images[key] }
+    }
+
+    func insert(_ image: NSImage, for key: String) {
+        lock.withLock {
+            if let existingIndex = order.firstIndex(of: key) { order.remove(at: existingIndex) }
+            order.append(key)
+            images[key] = image
+            // Si sfratta la piu' vecchia, mai una a caso: `removeFirst` sull'ordine di uso,
+            // non sull'ordine del dizionario (che in Swift non e' garantito).
+            while order.count > capacity {
+                let oldest = order.removeFirst()
+                images.removeValue(forKey: oldest)
+            }
+        }
+    }
+
+    var count: Int { lock.withLock { images.count } }
+}
+
 /// L'unico componente del progetto che sposta un file foto.
 ///
 /// Due invarianti che i test blindano, perche' sono quelle che un'ottimizzazione futura
@@ -2630,8 +2815,14 @@ final class DuplicateTrasher {
     /// Smaltisce un blocco di gruppi gia' confermati, nell'ordine della sequenza «percorso
     /// ad alto danno» della spec. Non lancia mai: ogni gruppo che non si puo' smaltire
     /// finisce fra gli `skippedGroups` con il motivo, e gli altri proseguono.
+    ///
+    /// `onProgress` (Task 6, 2026-08-31): quanti gruppi sono stati **processati** (smaltiti o
+    /// saltati che siano) sul totale del blocco, per la barra di avanzamento della finestra.
+    /// Default no-op, stesso pattern di `FileSyncer.onProgress`: nessun chiamante dei Task 1-5
+    /// lo passa, e i loro test restano verdi senza modifiche.
     func run(_ decisions: [Decision],
              batchId: String = UUID().uuidString,
+             onProgress: (_ completed: Int, _ total: Int) -> Void = { _, _ in },
              isCancelled: () -> Bool = { false }) -> DuplicateTrashOutcome {
         var outcome = DuplicateTrashOutcome()
         // `st_dev` della root letto una volta prima di iniziare. Senza questo valore
@@ -2639,13 +2830,18 @@ final class DuplicateTrasher {
         // lo stesso `NSCocoaErrorDomain/4`.
         let deviceAtStart = deviceIdentifier(of: libraryRoot)
 
-        for decision in decisions {
+        for (index, decision) in decisions.enumerated() {
             // Un'interruzione lascia un blocco parziale: e' uno stato legittimo, e i gruppi
             // gia' chiusi restano chiusi.
             if isCancelled() {
                 outcome.interrupted = true
                 break
             }
+            // Il gruppo che sta per essere processato conta come "fatto" alla fine di questa
+            // iterazione, qualunque sia l'esito (smaltito, saltato, o interrotto a meta' dallo
+            // scollegamento): la barra di avanzamento misura quanto lavoro e' stato fatto, non
+            // quanti gruppi sono stati smaltiti con successo.
+            defer { onProgress(index + 1, decisions.count) }
 
             let group = decision.group
             guard group.members.contains(where: { $0.path != decision.keeper.path }) else {
@@ -6121,6 +6317,14 @@ final class BackupRunner: ObservableObject {
             .appendingPathComponent("AppBackupFoto")
         return try? LibraryIndexStore(url: dir.appendingPathComponent("library-index.sqlite"))
     }()
+    /// Registro di ripristino del pannello Doppioni (Task 6, #31). Stesso pattern lazy di
+    /// `libraryIndexStore`, stessa cartella: e' la rete di sicurezza dell'unica operazione
+    /// distruttiva del progetto, quindi anche lei sul disco interno, mai sull'SSD.
+    private(set) lazy var trashManifestStore: TrashManifestStore? = {
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("AppBackupFoto")
+        return try? TrashManifestStore(url: dir.appendingPathComponent("trash-manifest.json"))
+    }()
     private var syncTask: Task<Void, Never>?
     private var wasStopped = false
 
@@ -6863,7 +7067,7 @@ final class BackupRunner: ObservableObject {
         thumbnailRequestID = requestID
         if FileKind.isImage(url: url) {
             Task.detached(priority: .utility) { [weak self] in
-                let thumb = Self.makeThumbnail(url: url, maxPixelSize: 88)
+                let thumb = makeThumbnail(url: url, maxPixelSize: 88)
                 await MainActor.run {
                     guard let self, self.thumbnailRequestID == requestID else { return }
                     self.currentThumbnail = thumb
@@ -6872,17 +7076,6 @@ final class BackupRunner: ObservableObject {
         } else {
             currentThumbnail = NSWorkspace.shared.icon(forFile: url.path)
         }
-    }
-
-    nonisolated private static func makeThumbnail(url: URL, maxPixelSize: Int) -> NSImage? {
-        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
-        let options: [CFString: Any] = [
-            kCGImageSourceCreateThumbnailFromImageAlways: true,
-            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
-            kCGImageSourceCreateThumbnailWithTransform: true
-        ]
-        guard let cgThumb = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
-        return NSImage(cgImage: cgThumb, size: .zero)
     }
 
     private func appendSpeedSample(_ value: Double) {
@@ -9356,6 +9549,7 @@ struct ToolsSheet: View {
 struct LibraryIndexCard: View {
     @ObservedObject var runner: BackupRunner
     @Binding var pendingAlert: SimpleAlert?
+    @Environment(\.openWindow) private var openWindow
 
     /// Il canale d'avviso di QUESTA finestra. Ogni comando della card lo passa a `runner`:
     /// `runner.pendingAlert` e' presentato solo da `ContentView`, che sta in un'altra scena
@@ -9427,6 +9621,16 @@ struct LibraryIndexCard: View {
                         }
                     }
                 }
+
+                Divider()
+
+                // Unico ingresso al pannello Doppioni (roadmap #31, Task 6): niente voce
+                // nell'hamburger, nemmeno disattivata (deciso il 2026-08-28). Il pannello
+                // richiede l'elenco, quindi vive accanto a dove l'elenco si crea e si
+                // racconta — se non e' mai stato costruito, la finestra stessa lo dice e
+                // rimanda qui, invece di offrire una lista vuota.
+                Button("Vedi le copie doppie…") { openWindow(id: "duplicates") }
+                    .buttonStyle(.bordered).controlSize(.small)
             }.padding(4)
         }
     }
@@ -9494,5 +9698,458 @@ struct DiagRow: View {
             Text(value).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
             Spacer()
         }
+    }
+}
+
+// MARK: - Pannello Doppioni (roadmap #31, Task 6)
+
+/// Piccola scatola di riferimento con lock: l'interruzione arriva da un bottone sul thread
+/// principale, la lettura arriva dal thread in background che sta eseguendo
+/// `DuplicateTrasher.run`. Stesso schema gia' in uso in `LibraryIndexer.cancelled`, qui come
+/// tipo a parte perche' `DuplicatesView` e' una `struct` e non puo' tenere un lock su una sua
+/// proprieta' di valore.
+private final class CancelFlag {
+    private let lock = NSLock()
+    private var flag = false
+    func cancel() { lock.withLock { flag = true } }
+    var isCancelled: Bool { lock.withLock { flag } }
+}
+
+/// La finestra "Doppioni": elenca i gruppi di copie byte-identiche gia' presenti sull'SSD,
+/// propone e spiega quale copia tenere, e — dopo che l'utente ha spuntato i gruppi, letto un
+/// riepilogo dettagliato e confermato con un alert distruttivo — sposta le copie in eccesso
+/// nel Cestino del volume, in modo annullabile.
+///
+/// **NON coperto da test** (Step 7 del Task 6, stessa dichiarazione gia' fatta per la card di
+/// #31): questa view, i due sheet/alert di conferma, il gate Touch ID, l'apertura della
+/// finestra, e il caricamento/rendering delle miniature. Sono SwiftUI e bookmark veri, non
+/// raggiungibili senza una corsa reale. **E' testato tutto cio' che sta ai due capi del
+/// cablaggio**: `DuplicatesStatus` (le righe di stato pure) e `DuplicateThumbnailCache` (la
+/// cache), in `DuplicatesStatusTests.swift` — piu' tutta la logica dei Task 1-5 che questa
+/// view si limita a orchestrare (`LibraryIndexStore.duplicateGroups()`,
+/// `duplicateKeepChoice`/`duplicateKeepExplanation`, `DuplicateBatch`, `DuplicateTrasher`,
+/// `TrashManifestStore`), gia' coperta nei rispettivi file di test.
+struct DuplicatesView: View {
+    @ObservedObject private var gate = AuthGateManager.shared
+    @EnvironmentObject private var runner: BackupRunner
+    @StateObject private var volumes = VolumeMonitor()
+
+    private enum LoadState {
+        case idle, loading, loaded([DuplicateGroup]), failed(String)
+    }
+
+    @State private var loadState: LoadState = .idle
+    @State private var selectedHashes: Set<String> = []
+
+    /// Avvisi **locali della view**, mai `runner.pendingAlert`: quello ha un solo
+    /// presentatore, il `.alert` di `ContentView` nella scena `main` (sezione `AlertSink` in
+    /// `.claude/rules/architecture.md`). Un secondo presentatore mostrerebbe lo stesso avviso
+    /// due volte con entrambe le finestre aperte.
+    @State private var pendingAlert: SimpleAlert? = nil
+
+    @State private var showSummarySheet = false
+    /// Il blocco congelato nell'istante in cui l'utente ha spuntato i gruppi e ha premuto
+    /// "Sposta nel Cestino…": la STESSA istanza alimenta sia il riepilogo sia — se confermato
+    /// — il `DuplicateTrasher`, e non si ricalcola mai in mezzo. E' il vincolo nato dall'audit
+    /// del Task 2 e ripreso nel Task 4: fra il riepilogo e il cestinamento la scelta di quale
+    /// copia tenere non deve poter cambiare sotto i piedi dell'utente.
+    @State private var pendingBatch: DuplicateBatch? = nil
+    @State private var showDestructiveConfirm = false
+
+    @State private var isTrashing = false
+    @State private var trashProgress: (done: Int, total: Int)? = nil
+    @State private var activeCancelFlag: CancelFlag? = nil
+    @State private var lastOutcome: DuplicateTrashOutcome? = nil
+
+    @State private var thumbnailCache = DuplicateThumbnailCache()
+
+    var body: some View {
+        if gate.touchIDEnabled && !gate.unlocked {
+            LockScreenView()
+        } else {
+            content
+        }
+    }
+
+    private var content: some View {
+        VStack(alignment: .leading, spacing: AppSpacing.md) {
+            Text("Doppioni").font(AppFont.title)
+
+            headerLine
+
+            if let reason = trashDisabledReasonNow {
+                Label(reason, systemImage: "info.circle")
+                    .font(AppFont.caption).foregroundStyle(.secondary)
+            }
+
+            listArea
+
+            if isTrashing, let progress = trashProgress {
+                trashProgressBar(progress)
+            }
+
+            if let lastOutcome {
+                VStack(alignment: .leading, spacing: AppSpacing.xs) {
+                    ForEach(DuplicatesStatus.outcomeLines(lastOutcome)) { line in
+                        Text(line.text).font(AppFont.caption).foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+
+            HStack {
+                Button("Annulla l'ultimo spostamento") { undoLastBatch() }
+                    .buttonStyle(.bordered).controlSize(.small)
+                    .disabled(!hasRestorableBatch)
+
+                Spacer()
+
+                Button("Sposta nel Cestino…") { beginConfirmation() }
+                    .buttonStyle(.borderedProminent).controlSize(.small)
+                    .disabled(!canRequestTrash)
+            }
+        }
+        .padding(AppSpacing.lg)
+        .frame(minWidth: 640, minHeight: 520)
+        .task { if case .idle = loadState { loadGroups() } }
+        .sheet(isPresented: $showSummarySheet) {
+            if let batch = pendingBatch { summarySheet(batch) }
+        }
+        .alert("Spostare queste copie nel Cestino?",
+               isPresented: $showDestructiveConfirm,
+               presenting: pendingBatch) { batch in
+            Button("Sposta nel Cestino", role: .destructive) { startTrashing(batch) }
+            Button("Annulla", role: .cancel) {}
+        } message: { _ in
+            Text("Ogni copia viene riverificata sul disco un'ultima volta prima di essere "
+                + "spostata. Puoi annullare lo spostamento dopo, con «Annulla l'ultimo "
+                + "spostamento».")
+        }
+        .alert(pendingAlert?.title ?? "", isPresented: Binding(
+            get: { pendingAlert != nil },
+            set: { if !$0 { pendingAlert = nil } }
+        ), presenting: pendingAlert) { a in
+            Button(a.confirmTitle, role: a.isDestructive ? .destructive : nil) { a.onConfirm?() }
+            if let cancelTitle = a.cancelTitle {
+                Button(cancelTitle, role: .cancel) {}
+            }
+        } message: { a in
+            Text(a.message)
+        }
+    }
+
+    // MARK: - Intestazione e stato
+
+    private var headerLine: some View {
+        let indexBuilt = runner.indexedFileCount > 0
+        let (groupCount, reclaimableBytes): (Int, Int64) = {
+            guard case .loaded(let groups) = loadState else { return (0, 0) }
+            let batch = DuplicateBatch(groups: groups)
+            return (batch.groups.count, batch.reclaimableBytes)
+        }()
+        return Text(DuplicatesStatus.headerLine(indexBuilt: indexBuilt,
+                                                groupCount: groupCount,
+                                                reclaimableBytes: reclaimableBytes).text)
+            .font(AppFont.body).foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var trashDisabledReasonNow: String? {
+        DuplicatesStatus.trashDisabledReason(isRunning: runner.isRunning,
+                                             isIndexing: runner.isIndexing,
+                                             ssdMounted: volumes.ssdMounted)
+    }
+
+    private var canRequestTrash: Bool {
+        trashDisabledReasonNow == nil && !selectedHashes.isEmpty && !isTrashing
+    }
+
+    private var hasRestorableBatch: Bool {
+        !(runner.trashManifestStore?.lastBatch() ?? []).isEmpty
+    }
+
+    @ViewBuilder
+    private var listArea: some View {
+        switch loadState {
+        case .idle:
+            Color.clear
+        case .loading:
+            ProgressView("Sto leggendo l'elenco…")
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        case .failed(let message):
+            Text(message).foregroundStyle(AppColor.error)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        case .loaded(let groups):
+            let batch = DuplicateBatch(groups: groups)
+            if batch.groups.isEmpty {
+                Spacer()
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: AppSpacing.sm) {
+                        ForEach(batch.groups, id: \.group.hash) { entry in
+                            DuplicateGroupRow(entry: entry,
+                                              isSelected: selectedHashes.contains(entry.group.hash),
+                                              libraryRootPath: BookmarkManager.shared.urls[.ssd]?.path,
+                                              cache: thumbnailCache) {
+                                toggleSelection(entry.group.hash)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func trashProgressBar(_ progress: (done: Int, total: Int)) -> some View {
+        VStack(alignment: .leading, spacing: AppSpacing.xs) {
+            ProgressView(value: Double(progress.done), total: Double(max(progress.total, 1)))
+            HStack {
+                Text("Sposto le copie nel Cestino: \(progress.done) di \(progress.total) gruppi")
+                    .font(AppFont.caption).foregroundStyle(.secondary)
+                Spacer()
+                Button("Interrompi") { activeCancelFlag?.cancel() }
+                    .buttonStyle(.bordered).controlSize(.small)
+            }
+        }
+    }
+
+    // MARK: - Riepilogo (prima conferma)
+
+    private func summarySheet(_ batch: DuplicateBatch) -> some View {
+        VStack(alignment: .leading, spacing: AppSpacing.md) {
+            Text("Riepilogo dello spostamento").font(AppFont.title)
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: AppSpacing.sm) {
+                    ForEach(Array(batch.summaryLines().enumerated()), id: \.offset) { _, line in
+                        Text(line).font(AppFont.body)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            if let capReason = DuplicatesStatus.confirmationBlockedReason(exceedsCap: batch.exceedsCap) {
+                Text(capReason).font(AppFont.caption).foregroundStyle(AppColor.warning)
+            }
+
+            HStack {
+                Spacer()
+                Button("Annulla") { showSummarySheet = false }.buttonStyle(.bordered)
+                Button("Continua…") {
+                    showSummarySheet = false
+                    showDestructiveConfirm = true
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(batch.exceedsCap)
+            }
+        }
+        .padding(AppSpacing.xl)
+        .frame(minWidth: 480, minHeight: 420)
+    }
+
+    // MARK: - Azioni
+
+    private func toggleSelection(_ hash: String) {
+        if selectedHashes.contains(hash) { selectedHashes.remove(hash) } else { selectedHashes.insert(hash) }
+    }
+
+    /// Carica i gruppi **fuori dal main thread**: `duplicateGroups()` passa dalla coda
+    /// seriale dello store, occupata dalle scritture a batch dello scanner, e sul main
+    /// thread bloccherebbe la finestra a ogni ridisegno (stessa regola gia' applicata a
+    /// `BackupRunner.indexedFileCount`).
+    private func loadGroups() {
+        guard let store = runner.libraryIndexStore else {
+            loadState = .failed("Non è stato possibile aprire l'elenco delle foto già salvate.")
+            return
+        }
+        loadState = .loading
+        Task.detached(priority: .utility) {
+            do {
+                let groups = try store.duplicateGroups()
+                await MainActor.run { loadState = .loaded(groups) }
+            } catch {
+                await MainActor.run {
+                    loadState = .failed("Non è stato possibile leggere l'elenco delle copie doppie: "
+                        + error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    /// Congela il blocco selezionato e apre il riepilogo — la prima delle due conferme
+    /// (decisione 4 di Enrico). Il blocco non viene piu' ricalcolato da qui in avanti: la
+    /// stessa istanza arriva fino a `startTrashing(_:)`.
+    private func beginConfirmation() {
+        guard case .loaded(let groups) = loadState else { return }
+        let selected = groups.filter { selectedHashes.contains($0.hash) }
+        guard !selected.isEmpty else { return }
+        pendingBatch = DuplicateBatch(groups: selected)
+        showSummarySheet = true
+    }
+
+    /// La conferma vera: smaltisce il blocco congelato. Gira fuori dal main thread — la
+    /// rilettura/rihash di ogni membro puo' richiedere minuti su un SSD USB (spec: 50 GB
+    /// sono grosso modo 2-4 minuti) e bloccherebbe la finestra per tutta la durata.
+    private func startTrashing(_ batch: DuplicateBatch) {
+        guard let store = runner.libraryIndexStore,
+              let manifest = runner.trashManifestStore,
+              let root = BookmarkManager.shared.urls[.ssd] else {
+            pendingAlert = SimpleAlert(
+                title: "Non è stato possibile procedere",
+                message: "L'elenco delle foto, il registro di ripristino o l'SSD non sono "
+                    + "disponibili in questo momento. Riprova dopo aver ricontrollato "
+                    + "Diagnostica.")
+            return
+        }
+
+        let decisions = batch.groups.map { DuplicateTrasher.Decision(group: $0.group, keeper: $0.choice.keeper) }
+        let trasher = DuplicateTrasher(libraryRoot: root, store: store, manifest: manifest)
+        let cancelFlag = CancelFlag()
+        activeCancelFlag = cancelFlag
+
+        isTrashing = true
+        lastOutcome = nil
+        trashProgress = (0, decisions.count)
+
+        Task.detached(priority: .utility) {
+            let outcome = trasher.run(decisions, onProgress: { done, total in
+                Task { @MainActor in trashProgress = (done, total) }
+            }, isCancelled: { cancelFlag.isCancelled })
+
+            await MainActor.run {
+                isTrashing = false
+                trashProgress = nil
+                activeCancelFlag = nil
+                lastOutcome = outcome
+                selectedHashes.removeAll()
+                pendingBatch = nil
+                // Le chiavi dei file davvero cestinati sono gia' state rimosse dallo store
+                // dentro `run(...)`: si ricarica l'elenco per riflettere i gruppi rimasti.
+                loadGroups()
+            }
+        }
+    }
+
+    /// «Annulla l'ultimo spostamento»: rimette a posto l'ultimo blocco registrato, se ce n'e'
+    /// uno ripristinabile. `TrashManifestStore.restore` non lancia mai: ogni voce che non si
+    /// puo' ripristinare finisce fra gli `skipped`, le altre proseguono comunque.
+    private func undoLastBatch() {
+        guard let manifest = runner.trashManifestStore else { return }
+        let items = manifest.lastBatch()
+        guard !items.isEmpty else { return }
+        let outcome = manifest.restore(items)
+        let restoredCount = outcome.restored.count
+        let skippedCount = outcome.skipped.count
+        pendingAlert = SimpleAlert(
+            title: "Spostamento annullato",
+            message: skippedCount == 0
+                ? "\(restoredCount.formatted()) file sono tornati al loro posto."
+                : "\(restoredCount.formatted()) file sono tornati al loro posto. "
+                    + "\(skippedCount.formatted()) non sono stati ripristinati: guarda il "
+                    + "Cestino del volume per recuperarli a mano.")
+        // Il ripristino non reinserisce le entry a mano nell'elenco: la prossima lettura le
+        // rivedra' come file nuovi e le rihashera' da sola (stessa regola di ADR-0005).
+        loadGroups()
+    }
+}
+
+/// Una riga della lista: checkbox, miniatura del file tenuto, spiegazione della scelta, e le
+/// copie che se ne andrebbero — con quelle a pari merito con la tenuta marcate visivamente
+/// (`DuplicateKeepChoice.tiedPaths`), cosi' la frase di `duplicateKeepExplanation` non deve
+/// indovinare a quale riga si riferisce.
+private struct DuplicateGroupRow: View {
+    let entry: DuplicateBatch.Entry
+    let isSelected: Bool
+    let libraryRootPath: String?
+    let cache: DuplicateThumbnailCache
+    let toggle: () -> Void
+
+    @State private var thumbnail: NSImage?
+    /// Token di richiesta: scarta una miniatura arrivata su una riga gia' superata, stesso
+    /// meccanismo di `BackupRunner.thumbnailRequestID`. Serve perche' la lettura gira in un
+    /// `Task.detached`, che non eredita la cancellazione automatica del `.task` della view.
+    @State private var loadToken = UUID()
+
+    private var keeperURL: URL? {
+        guard let libraryRootPath else { return nil }
+        return URL(fileURLWithPath: libraryRootPath).appendingPathComponent(entry.choice.keeper.displayPath)
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: AppSpacing.sm) {
+            Button(action: toggle) {
+                Image(systemName: isSelected ? "checkmark.square.fill" : "square")
+            }.buttonStyle(.plain)
+
+            thumbnailView
+
+            VStack(alignment: .leading, spacing: AppSpacing.xs) {
+                Text(entry.choice.keeper.displayPath).font(AppFont.body)
+                    .lineLimit(1).truncationMode(.middle)
+
+                Text(duplicateKeepExplanation(entry.choice, in: entry.group))
+                    .font(AppFont.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                ForEach(entry.leaving, id: \.path) { leaving in
+                    HStack(spacing: AppSpacing.xs) {
+                        Image(systemName: "arrow.turn.down.right")
+                            .font(.caption2).foregroundStyle(.secondary)
+                        Text(leaving.displayPath).font(.caption).foregroundStyle(.secondary)
+                            .lineLimit(1).truncationMode(.middle)
+                        if entry.choice.tiedPaths.contains(leaving.path) {
+                            Text("· pari merito con la tenuta")
+                                .font(.caption2).italic().foregroundStyle(AppColor.warning)
+                        }
+                    }
+                }
+            }
+            Spacer()
+        }
+        .padding(AppSpacing.sm)
+        .cardBackground()
+        .task(id: entry.group.hash) { await loadThumbnail() }
+    }
+
+    @ViewBuilder
+    private var thumbnailView: some View {
+        if let thumbnail {
+            Image(nsImage: thumbnail)
+                .resizable().scaledToFill()
+                .frame(width: 48, height: 48)
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+        } else {
+            Image(systemName: isVideo ? "video.fill" : "photo")
+                .frame(width: 48, height: 48)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var isVideo: Bool {
+        IndexableKind.of(url: keeperURL ?? URL(fileURLWithPath: entry.choice.keeper.displayPath)) == .video
+    }
+
+    /// Miniatura pigra: `makeThumbnail` esistente, mai una seconda implementazione, mai
+    /// l'immagine intera. Video: solo l'icona di sistema, nessun fotogramma (deciso il
+    /// 2026-08-28) — i membri di un gruppo sono byte-identici per definizione, quindi la
+    /// miniatura non serve a distinguerli fra loro.
+    private func loadThumbnail() async {
+        guard let url = keeperURL else { return }
+        let key = entry.group.hash
+        if let cached = cache.image(for: key) {
+            thumbnail = cached
+            return
+        }
+        guard IndexableKind.of(url: url) == .image else { return }
+        let token = UUID()
+        loadToken = token
+        let image = await Task.detached(priority: .utility) {
+            makeThumbnail(url: url, maxPixelSize: 96)
+        }.value
+        // Scartata se questa riga e' stata riusata per un altro gruppo nel frattempo
+        // (scroll di una `LazyVStack`).
+        guard loadToken == token else { return }
+        if let image { cache.insert(image, for: key) }
+        thumbnail = image
     }
 }
