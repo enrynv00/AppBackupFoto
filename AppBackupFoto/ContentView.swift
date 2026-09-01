@@ -1527,6 +1527,100 @@ func importStartDisabledReason(jobIsRunning: Bool) -> String? {
         + "Aspetta che finisca, poi riprova."
 }
 
+/// Le righe che il wizard di import mostra nel passo `.preview` (roadmap #27-A, Task 3 del
+/// piano `2026-09-01-import-preview-dedup.md`). Logica **pura**: nessun filesystem, nessun
+/// database, nessuna View — stesso ruolo di `LibraryIndexStatus.lines` e di `DuplicatesStatus`.
+/// **Nessuna stringa duplicata fra questo enum e `ImportView`**: se una riga esiste, esiste
+/// qui, è la sola fonte.
+enum ImportPreviewStatus {
+    enum Tone: Equatable { case ok, info, warning }
+
+    struct Line: Identifiable {
+        /// Identità stabile e non un UUID: le righe si ricalcolano a ogni ridisegno, e con
+        /// un UUID SwiftUI le vedrebbe tutte nuove ogni volta.
+        let id: String
+        let tone: Tone
+        let text: String
+    }
+
+    /// Perché l'anteprima non può nemmeno partire. `nil` quando può. I due motivi sono
+    /// DISTINTI apposta: "non configurato" e "non collegato" chiedono all'utente due azioni
+    /// diverse (aprire le Impostazioni vs collegare fisicamente il volume), e confonderle
+    /// manda a cercare il rimedio sbagliato.
+    static func unavailableReason(ssdConfigured: Bool, ssdMounted: Bool) -> String? {
+        guard ssdConfigured else {
+            return "Non hai ancora scelto l'SSD di destinazione: aprilo nelle Impostazioni prima "
+                + "di poter vedere quali foto verranno davvero importate."
+        }
+        guard ssdMounted else {
+            return "L'SSD non è collegato in questo momento: collegalo per vedere quali foto "
+                + "verranno davvero importate."
+        }
+        return nil
+    }
+
+    /// Le righe del passo `.preview`. `toAdd`/`toSkipDuplicates` sono conteggi già dedotti dal
+    /// motore dell'anteprima (`BackupRunner.importPreviewDuplicates`), `toAddBytes` e
+    /// `estimatedSec` vengono da `FileSyncer.previewSync`.
+    ///
+    /// Quattro diramazioni, non due: "sorgente vuota" (nessun file trovato) e "tutto già
+    /// presente sull'SSD" (reimport) sono situazioni OPPOSTE — la prima dice "non ho guardato
+    /// niente di utile", la seconda "ho guardato e non c'è niente di nuovo" — e vanno tenute
+    /// distinte per la stessa ragione per cui `sawNothing` in #31 non si legge come "libreria
+    /// vuota" quando in realtà la lettura non e' arrivata in fondo.
+    static func lines(toAdd: Int, toSkipDuplicates: Int, toAddBytes: Int64, estimatedSec: Int) -> [Line] {
+        var out: [Line] = []
+
+        if toAdd == 0 && toSkipDuplicates == 0 {
+            // Sorgente vuota: nessun file trovato da controllare. Riga isolata, MAI insieme
+            // alla riga "già presenti" (che qui non ha nulla da dire, essendo anch'essa zero).
+            out.append(Line(id: "empty-source", tone: .warning, text:
+                "Non ho trovato nessuna foto da controllare in questa cartella: forse è vuota, "
+                + "oppure non contiene foto o video che l'app riconosce."))
+            return out
+        }
+
+        if toAdd == 0 {
+            // toSkipDuplicates > 0: e' lo scenario del reimport, la ragione stessa per cui
+            // esiste questo lavoro. Va detto a parole, mai lasciato leggere come un silenzio o
+            // un errore: e' una buona notizia, non un guasto.
+            out.append(Line(id: "toAdd", tone: .ok, text:
+                "Non c'è nessuna foto nuova da importare: le hai già tutte sull'SSD."))
+        } else {
+            let bytes = ByteCountFormatter.string(fromByteCount: toAddBytes, countStyle: .file)
+            out.append(Line(id: "toAdd", tone: .info, text:
+                "\(count(toAdd, "file nuovo da importare", "file nuovi da importare")), circa "
+                + "\(bytes), tempo stimato circa \(FileSyncer.SyncResult.hms(estimatedSec))."))
+        }
+
+        if toSkipDuplicates > 0 {
+            let already = count(toSkipDuplicates,
+                                 "file è già presente sull'SSD: non verrà ricopiato",
+                                 "file sono già presenti sull'SSD: non verranno ricopiati")
+            out.append(Line(id: "already-present", tone: .info, text: "\(already)."))
+        }
+
+        return out
+    }
+
+    /// La riga di avanzamento durante il controllo. Deve dire **quanti su quanti**, e nominare
+    /// anche il totale della sorgente quando il denominatore (i soli candidati che superano il
+    /// prefiltro sulla dimensione) è molto più piccolo: è l'informazione che dice all'utente se
+    /// aspetterà 3 secondi o 3 minuti — metà della condizione posta da Enrico per accettare
+    /// questo lavoro (vedi le «Risposte di Enrico» nella spec).
+    static func progressLine(done: Int, total: Int, sourceFileCount: Int) -> String {
+        let base = "Controllati \(number(done)) di \(number(total))"
+        guard sourceFileCount > total else { return base + "." }
+        return base + ", su \(number(sourceFileCount)) file della sorgente."
+    }
+
+    private static func number(_ n: Int) -> String { n.formatted() }
+
+    private static func count(_ n: Int, _ singular: String, _ plural: String) -> String {
+        "\(number(n)) \(n == 1 ? singular : plural)"
+    }
+}
+
 /// File e cartelle di sistema da non trattare come contenuto dell'utente.
 ///
 /// **Chi la usa davvero, oggi**: `FileSyncer` (Mac→SSD e SSD→HDD) e
