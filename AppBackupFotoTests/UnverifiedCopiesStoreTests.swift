@@ -219,4 +219,67 @@ final class UnverifiedCopiesStoreTests: XCTestCase {
         XCTAssertEqual(entry?.recordedAt?.timeIntervalSince1970 ?? 0,
                        quando.timeIntervalSince1970, accuracy: 0.001)
     }
+
+    // MARK: - Orologio di sistema (rilievo minore di #31, affrontato il 2026-09-01)
+
+    /// Il caso **univoco**: l'orologio e' tornato indietro dall'ultima scrittura. Nessun
+    /// trascorrere del tempo puo' produrre questa lettura, quindi le date non sono
+    /// affidabili e in quel giro non si pota niente.
+    func testClockWentBackwards_isDetected() {
+        let scritto = Date(timeIntervalSince1970: 1_700_000_000)
+        XCTAssertTrue(UnverifiedCopiesStore.clockWentBackwards(
+            lastSeenAt: scritto, now: scritto.addingTimeInterval(-3600)))
+        XCTAssertFalse(UnverifiedCopiesStore.clockWentBackwards(
+            lastSeenAt: scritto, now: scritto.addingTimeInterval(3600)))
+    }
+
+    /// Un record scritto dalla versione precedente non ha `lastSeenAt` e non e' giudicabile:
+    /// si pota normalmente, come si e' sempre fatto.
+    func testARecordWithoutLastSeen_isPrunedAsBefore() {
+        XCTAssertFalse(UnverifiedCopiesStore.clockWentBackwards(lastSeenAt: nil, now: Date()))
+    }
+
+    /// Con l'orologio all'indietro il debito **resta**, invece di sparire per una data che
+    /// non vuol dire niente.
+    func testClockGoingBackwards_keepsTheDebt() {
+        let d = defaults!
+        let scritto = Date(timeIntervalSince1970: 1_700_000_000)
+        UnverifiedCopiesStore.record(URL(fileURLWithPath: "/a.jpg"), now: scritto, defaults: d)
+
+        // L'orologio crolla indietro di anni (batteria dell'RTC, ripristino da backup): da
+        // li' ogni voce risulterebbe "nel futuro", e senza guardia il record verrebbe letto
+        // e riscritto su basi false.
+        let crollato = scritto.addingTimeInterval(-5 * 365 * 24 * 3600)
+        let stato = UnverifiedCopiesStore.load(now: crollato, defaults: d)
+        XCTAssertEqual(stato.paths, ["/a.jpg"])
+        XCTAssertEqual(stato.totalCount, 1)
+    }
+
+    /// Una data nel futuro non e' una voce scaduta — l'altra faccia dello stesso caso.
+    func testAnEntryDatedInTheFuture_isNotExpired() {
+        let registrata = Date(timeIntervalSince1970: 1_700_000_000)
+        let adesso = registrata.addingTimeInterval(-90 * 24 * 3600)
+        let voce = UnverifiedCopies.Entry(path: "/a.jpg", recordedAt: registrata)
+        XCTAssertFalse(UnverifiedCopiesStore.isExpired(voce, now: adesso))
+    }
+
+    /// **Limite accettato, non difetto risolto.** Un salto in avanti fa ancora scadere i
+    /// debiti in blocco, perche' dai soli timestamp e' indistinguibile da un'app rimasta
+    /// chiusa a lungo. Questo test **codifica il limite** invece di lasciarlo implicito: se
+    /// un giorno qualcuno trovera' un riferimento monotono che sopravvive ai riavvii, sara'
+    /// questo test a dover cambiare, e cambiandolo leggera' il perche'.
+    func testForwardJump_stillExpiresInBulk_acceptedLimit() {
+        let d = defaults!
+        let inizio = Date(timeIntervalSince1970: 1_700_000_000)
+        UnverifiedCopiesStore.record(URL(fileURLWithPath: "/a.jpg"), now: inizio, defaults: d)
+        UnverifiedCopiesStore.record(URL(fileURLWithPath: "/b.jpg"), now: inizio, defaults: d)
+
+        let unAnnoDopo = inizio.addingTimeInterval(365 * 24 * 3600)
+        let stato = UnverifiedCopiesStore.load(now: unAnnoDopo, defaults: d)
+
+        XCTAssertTrue(stato.entries.isEmpty,
+                      "limite noto: un salto in avanti resta indistinguibile da una lunga assenza")
+        XCTAssertEqual(stato.totalCount, 0)
+    }
+
 }

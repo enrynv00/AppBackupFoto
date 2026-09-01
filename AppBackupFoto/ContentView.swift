@@ -3021,21 +3021,38 @@ final class DuplicateTrasher {
 /// `LibraryIndexStore` e da `TrashManifestStore`: il progetto ha gia' pagato due volte la
 /// duplicazione della stessa regola (`LibraryExclusions`, `realResolvedPath`), e due guardie
 /// diverse per lo stesso problema divergono alla prima modifica di una sola delle due.
-func isAllowedStoreLocation(_ url: URL) -> Bool {
+func isAllowedStoreLocation(_ url: URL,
+                            includingTemporary: Bool = isRunningUnderTests()) -> Bool {
     let dir = url.deletingLastPathComponent()
     let candidates = [dir.standardizedFileURL.path,
                       dir.standardizedFileURL.resolvingSymlinksInPath().path]
     return candidates.contains { candidate in
-        storeAllowedRoots().contains { isPathInside(candidate, root: $0) }
+        storeAllowedRoots(includingTemporary: includingTemporary)
+            .contains { isPathInside(candidate, root: $0) }
     }
 }
 
-private func storeAllowedRoots() -> [String] {
+/// Vero solo dentro una corsa di XCTest. La variabile e' impostata dal test runner, non
+/// dall'app: in produzione non esiste, e non e' impostabile da chi lancia l'app normalmente.
+///
+/// Serve a una cosa sola — tenere `NSTemporaryDirectory()` fuori dall'allow-list quando
+/// l'app gira davvero (rilievo minore di #31, chiuso il 2026-09-01). Prima la directory
+/// temporanea era ammessa **sempre**, con accanto un commento che diceva che serviva ai
+/// test: una posizione ammessa "perche' serve ai test" resta una posizione ammessa, e
+/// un'allow-list esiste per essere stretta. L'invariante che conta — mai sul volume delle
+/// foto — reggeva comunque, perche' `$TMPDIR` e' sul disco interno: questo e' igiene, non
+/// la chiusura di un buco.
+func isRunningUnderTests() -> Bool {
+    ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+}
+
+private func storeAllowedRoots(includingTemporary: Bool) -> [String] {
     var roots = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
-    // La directory temporanea di sistema e' ammessa perche' i test aprono uno store
-    // usa-e-getta per ogni caso: e' comunque sul disco interno del Mac, per-utente,
-    // e non e' mai un volume esterno — l'invariante che conta resta intatta.
-    roots.append(URL(fileURLWithPath: NSTemporaryDirectory()))
+    if includingTemporary {
+        // I test aprono uno store usa-e-getta per ogni caso. Fuori dai test questa riga non
+        // viene eseguita.
+        roots.append(URL(fileURLWithPath: NSTemporaryDirectory()))
+    }
     return roots.flatMap {
         [$0.standardizedFileURL.path, $0.standardizedFileURL.resolvingSymlinksInPath().path]
     }
@@ -4130,6 +4147,39 @@ enum LibraryIndexStatus {
 
     private static func count(_ n: Int, _ singular: String, _ plural: String) -> String {
         "\(number(n)) \(n == 1 ? singular : plural)"
+    }
+}
+
+/// Quando i comandi manuali della card possono essere usati, e **perche' no** quando non
+/// possono.
+///
+/// Nasce da un rilievo minore di #31 chiuso il 2026-09-01: l'aggiornamento automatico
+/// sapeva di un job di copia in corso (`LibraryIndexAutoRefresh.shouldRun`, parametro
+/// `jobIsRunning`) mentre i bottoni della card no — erano disattivati solo durante una
+/// lettura. Chi premeva «\(LibraryIndexCommands.refresh)» durante un backup faceva leggere
+/// e rihashare per intero l'SSD mentre una copia ci stava scrivendo sopra: le due operazioni
+/// si rallentano a vicenda e i file che la copia sta scrivendo proprio ora finiscono contati
+/// come illeggibili. E' la stessa classe di problema chiusa il 2026-09-01 nel pannello
+/// Doppioni, dove le precondizioni del blocco venivano valutate una volta sola.
+///
+/// Restituisce **il motivo scritto**, non un booleano: disattivare un bottone senza dire
+/// perche' e' la disciplina che questo progetto ha gia' scelto contro, in `RestoreView`
+/// (fonti non disponibili) e nel pannello Doppioni.
+enum LibraryIndexCommandGate {
+    /// `nil` quando i comandi si possono usare. La lettura in corso ha la precedenza sul job
+    /// perche' e' la causa piu' vicina a quello che l'utente sta guardando: se sta scorrendo
+    /// la barra di avanzamento, la frase sul backup lo confonderebbe.
+    static func disabledReason(isIndexing: Bool, jobIsRunning: Bool) -> String? {
+        if isIndexing {
+            return "L'app sta già leggendo le foto sull'SSD. Aspetta che finisca, "
+                + "oppure fermala con «\(LibraryIndexCommands.stop)»."
+        }
+        if jobIsRunning {
+            return "C'è un backup in corso. Leggere tutte le foto dell'SSD mentre una copia "
+                + "ci sta scrivendo sopra rallenta entrambe le cose, e i file che vengono "
+                + "scritti proprio ora risulterebbero illeggibili. Riprova a backup finito."
+        }
+        return nil
     }
 }
 
@@ -7238,6 +7288,10 @@ struct UnverifiedCopies: Codable, Equatable {
     /// questo record sta in `UserDefaults` e senza limite crescerebbe con il numero di file
     /// copiati, non con il numero di problemi reali.
     var entries: [Entry] = []
+    /// L'ultimo istante in cui l'app ha scritto questo record. Serve **solo** a riconoscere
+    /// un orologio che salta (vedi `UnverifiedCopiesStore.isImplausibleClockJump`), non alla
+    /// scadenza. `nil` nei record scritti dalla versione che non aveva questo campo.
+    var lastSeenAt: Date? = nil
 
     /// Percorsi conservati, nell'ordine di registrazione. Derivata da `entries`: non e' un
     /// secondo elenco da tenere allineato.
@@ -7245,7 +7299,7 @@ struct UnverifiedCopies: Codable, Equatable {
 }
 
 extension UnverifiedCopies {
-    private enum CodingKeys: String, CodingKey { case totalCount, entries }
+    private enum CodingKeys: String, CodingKey { case totalCount, entries, lastSeenAt }
     /// Chiavi della forma **vecchia** del record. Enum separata perche' la sintesi di
     /// `encode(to:)` pretende che ogni caso di `CodingKeys` corrisponda a una proprieta'
     /// memorizzata: tenere qui `paths` (che oggi e' derivata) e' l'unico modo per leggerla
@@ -7264,6 +7318,7 @@ extension UnverifiedCopies {
     init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         totalCount = try c.decodeIfPresent(Int.self, forKey: .totalCount) ?? 0
+        lastSeenAt = try c.decodeIfPresent(Date.self, forKey: .lastSeenAt)
         if let decoded = try c.decodeIfPresent([Entry].self, forKey: .entries) {
             entries = decoded
         } else {
@@ -7307,7 +7362,41 @@ enum UnverifiedCopiesStore {
               let decoded = try? JSONDecoder().decode(UnverifiedCopies.self, from: data) else {
             return UnverifiedCopies()
         }
+        // Se l'orologio e' tornato indietro dall'ultima scrittura, le date non sono
+        // affidabili e non si pota niente in questo giro.
+        guard !clockWentBackwards(lastSeenAt: decoded.lastSeenAt, now: now) else {
+            return decoded
+        }
         return pruningExpired(decoded, now: now)
+    }
+
+    /// L'orologio di sistema e' tornato indietro rispetto all'ultima scrittura di questo
+    /// record: le date non sono affidabili, e in questo giro non si pota niente.
+    ///
+    /// **Perche' solo all'indietro, e non anche in avanti.** Il rilievo originale era che un
+    /// salto in avanti fa scadere tutti i debiti nello stesso istante. E' vero, ma dai soli
+    /// timestamp **un salto in avanti e' indistinguibile da un'app rimasta chiusa a lungo**:
+    /// un utente che non apre l'app per 40 giorni produce esattamente la stessa lettura di un
+    /// orologio spostato di 40 giorni. Rifiutare di potare in quel caso non "corregge un
+    /// difetto": spegne la scadenza, che e' una funzione voluta e testata (tre test la
+    /// coprono). Provato e scartato il 2026-09-01, con quei tre test rossi a dimostrarlo.
+    ///
+    /// All'indietro invece il segnale e' **univoco**: nessun trascorrere del tempo puo'
+    /// produrre un `now` precedente all'ultima scrittura. Ed e' anche la prima meta' dello
+    /// scenario reale — batteria dell'RTC scarica, ripristino da backup — dove l'orologio
+    /// prima crolla e poi viene rimesso in pari da NTP.
+    ///
+    /// **Limite accettato e dichiarato**: un salto in avanti che non sia preceduto da uno
+    /// all'indietro osservabile continua a far scadere i debiti in blocco. Il verso resta
+    /// innocuo per i file — non se ne perde nessuno, la lista e' solo una precedenza per il
+    /// campione d'integrita' — e chiuderlo davvero richiederebbe un riferimento monotono che
+    /// sopravviva ai riavvii, che non abbiamo.
+    ///
+    /// Un record senza `lastSeenAt` (scritto dalla versione precedente) non e' giudicabile:
+    /// si pota normalmente, come si e' sempre fatto.
+    static func clockWentBackwards(lastSeenAt: Date?, now: Date) -> Bool {
+        guard let lastSeenAt else { return false }
+        return now < lastSeenAt
     }
 
     /// Una voce e' scaduta quando ha piu' di `expiryDays` giorni. Il confine (esattamente
@@ -7344,7 +7433,7 @@ enum UnverifiedCopiesStore {
         if state.entries.count < maxPaths {
             state.entries.append(UnverifiedCopies.Entry(path: url.path, recordedAt: now))
         }
-        save(state, defaults: defaults)
+        save(state, now: now, defaults: defaults)
     }
 
     /// Il debito si chiude: il file e' stato ricontrollato e corrisponde alla sorgente.
@@ -7356,10 +7445,15 @@ enum UnverifiedCopiesStore {
         guard let i = state.entries.firstIndex(where: { $0.path == path }) else { return }
         state.entries.remove(at: i)
         state.totalCount = max(0, state.totalCount - 1)
-        save(state, defaults: defaults)
+        save(state, now: now, defaults: defaults)
     }
 
-    private static func save(_ state: UnverifiedCopies, defaults: UserDefaults) {
+    /// `now` viene registrato a ogni scrittura: e' il riferimento con cui la lettura
+    /// successiva riconosce un salto dell'orologio. Senza, `lastSeenAt` resterebbe `nil` per
+    /// sempre e la guardia non si accenderebbe mai.
+    private static func save(_ state: UnverifiedCopies, now: Date, defaults: UserDefaults) {
+        var state = state
+        state.lastSeenAt = now
         guard let data = try? JSONEncoder().encode(state) else { return }
         defaults.set(data, forKey: key)
     }
@@ -9381,9 +9475,16 @@ struct ToolsSheet: View {
                                     do {
                                         let config = try S3Syncer.readConfigFromFile(remoteName: "Cubbit", bucket: "backupfoto")
                                         try S3Syncer.writeToKeychain(config: config, remoteName: "Cubbit")
-                                        pendingAlert = SimpleAlert(title: "Credenziali aggiornate nel Keychain.")
+                                        // Stesso motivo di `LibraryIndexCard.alertSink`: qui
+                                        // si sta assegnando il binding mentre SwiftUI smonta
+                                        // l'alert che ha eseguito questo `onConfirm`.
+                                        DispatchQueue.main.async {
+                                            pendingAlert = SimpleAlert(title: "Credenziali aggiornate nel Keychain.")
+                                        }
                                     } catch {
-                                        pendingAlert = SimpleAlert(title: "Errore", message: error.localizedDescription)
+                                        DispatchQueue.main.async {
+                                            pendingAlert = SimpleAlert(title: "Errore", message: error.localizedDescription)
+                                        }
                                     }
                                 })
                         }.buttonStyle(.bordered).controlSize(.small).padding(.top, AppSpacing.xs)
@@ -9569,7 +9670,34 @@ struct LibraryIndexCard: View {
     /// (vedi `AlertSink`), quindi un errore lasciato li' non comparirebbe mai qui — e la card
     /// resterebbe muta proprio nei casi in cui non e' successo niente (SSD non accessibile,
     /// elenco non apribile, svuotamento fallito).
-    private var alertSink: AlertSink { { pendingAlert = $0 } }
+    /// Perche' i comandi manuali sono disattivati, oppure `nil`. Fonte unica per lo stato
+    /// dei bottoni e per la riga che lo spiega: due condizioni separate divergerebbero alla
+    /// prima modifica di una sola delle due, ed e' gia' successo altrove in questo progetto.
+    private var commandsDisabledReason: String? {
+        LibraryIndexCommandGate.disabledReason(isIndexing: runner.isIndexing,
+                                               jobIsRunning: runner.isRunning)
+    }
+
+    private var commandsDisabled: Bool { commandsDisabledReason != nil }
+
+    /// L'avviso viene pubblicato **al giro di runloop successivo**.
+    ///
+    /// Rilievo minore di #31, chiuso il 2026-09-01: questi avvisi nascono dentro l'`onConfirm`
+    /// di un altro alert (`confirmFirstBuild`, `confirmFullRecheck`, `confirmReset` passano
+    /// tutti `alertSink` a `rebuildLibraryIndex`/`resetLibraryIndex`, che possono richiamarlo
+    /// **sincronicamente** — per esempio quando l'SSD non e' collegato). Assegnare il binding
+    /// mentre SwiftUI sta smontando l'alert che lo ha prodotto e' la ricetta perche' la
+    /// seconda presentazione venga inghiottita: l'utente preme «Crea l'elenco», l'elenco non
+    /// parte, e non compare niente che spieghi perche'.
+    ///
+    /// **Non e' stato misurato** e non e' misurabile da un test: servono due presentazioni
+    /// SwiftUI vere. Il rinvio di un giro di runloop non e' un rimedio a un difetto
+    /// dimostrato, e' cio' che rende la domanda irrilevante — costa un frame e toglie di
+    /// mezzo l'unico ordine di eventi in cui il problema puo' esistere. Resta fra le
+    /// verifiche manuali: aprire Diagnostica senza SSD e premere «Crea l'elenco».
+    private var alertSink: AlertSink {
+        { alert in DispatchQueue.main.async { pendingAlert = alert } }
+    }
 
     /// Stima dichiarata prima di partire. Non e' mai stata misurata sul volume vero: e'
     /// scritta come un ordine di grandezza, non come una promessa.
@@ -9614,18 +9742,31 @@ struct LibraryIndexCard: View {
                             confirmFirstBuild()
                         }
                     }
-                    .buttonStyle(.bordered).controlSize(.small).disabled(runner.isIndexing)
+                    .buttonStyle(.bordered).controlSize(.small).disabled(commandsDisabled)
 
                     Button(LibraryIndexCommands.fullRecheck) { confirmFullRecheck() }
                         .buttonStyle(.bordered).controlSize(.small)
-                        .disabled(runner.isIndexing || runner.indexedFileCount == 0)
+                        .disabled(commandsDisabled || runner.indexedFileCount == 0)
 
                     Spacer()
 
                     Button(LibraryIndexCommands.reset) { confirmReset() }
                         .buttonStyle(.bordered).controlSize(.small)
                         .tint(AppColor.error)
-                        .disabled(runner.isIndexing || runner.indexedFileCount == 0)
+                        .disabled(commandsDisabled || runner.indexedFileCount == 0)
+                }
+
+                // Disattivare **e** dire perche', come `RestoreView` con le fonti non
+                // disponibili e come il pannello Doppioni: un bottone grigio senza motivo
+                // e' una risposta che l'utente non puo' usare.
+                if let reason = commandsDisabledReason, !runner.isIndexing {
+                    HStack(alignment: .top, spacing: AppSpacing.sm) {
+                        Image(systemName: icon(.info)).foregroundStyle(color(.info))
+                            .font(.system(size: 12))
+                        Text(reason).font(AppFont.caption).foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer()
+                    }
                 }
 
                 if !runner.isIndexing, let progress = runner.indexProgress {

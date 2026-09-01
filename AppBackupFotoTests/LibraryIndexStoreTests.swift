@@ -522,4 +522,47 @@ final class LibraryIndexStoreTests: XCTestCase {
         XCTAssertEqual(try fresh.count(), 0)
         XCTAssertNil(try fresh.entry(forKey: normalizedIndexKey("Foto/fantasma.jpg")))
     }
+
+    // MARK: - Allow-list delle posizioni (rilievo minore di #31, chiuso il 2026-09-01)
+
+    /// Il difetto: `NSTemporaryDirectory()` stava nell'allow-list **anche in produzione**,
+    /// mentre il commento accanto diceva che serviva ai test. Una posizione ammessa "perche'
+    /// serve ai test" e' una posizione ammessa, punto: l'allow-list esiste per essere
+    /// stretta, e una voce di comodo che resta accesa in produzione e' esattamente il tipo
+    /// di eccezione che poi qualcuno estende.
+    ///
+    /// L'invariante che conta — mai sul volume sorgente — reggeva comunque, perche' la
+    /// directory temporanea e' sul disco interno. Questo e' un restringimento di igiene,
+    /// non la chiusura di un buco.
+    func testTemporaryDirectory_isNotAllowedInProduction() {
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("indice.sqlite")
+        XCTAssertFalse(isAllowedStoreLocation(tmp, includingTemporary: false),
+                       "in produzione la directory temporanea non e' una posizione valida")
+    }
+
+    /// E resta ammessa quando i test la chiedono esplicitamente: senza, ogni test che apre
+    /// uno store usa-e-getta smetterebbe di funzionare.
+    func testTemporaryDirectory_staysAllowedForTests() {
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("indice.sqlite")
+        XCTAssertTrue(isAllowedStoreLocation(tmp, includingTemporary: true))
+    }
+
+    /// Application Support resta valida in entrambi i regimi: e' la posizione vera.
+    func testApplicationSupport_isAllowedEitherWay() {
+        guard let support = FileManager.default.urls(for: .applicationSupportDirectory,
+                                                     in: .userDomainMask).first else {
+            return XCTFail("Application Support non raggiungibile")
+        }
+        let file = support.appendingPathComponent("AppBackupFoto/indice.sqlite")
+        XCTAssertTrue(isAllowedStoreLocation(file, includingTemporary: false))
+        XCTAssertTrue(isAllowedStoreLocation(file, includingTemporary: true))
+    }
+
+    /// La regola che conta davvero, in entrambi i regimi: mai sul volume delle foto.
+    func testTheSourceVolume_isNeverAllowed() {
+        let sullSSD = URL(fileURLWithPath: "/Volumes/SSD - Enri/indice.sqlite")
+        XCTAssertFalse(isAllowedStoreLocation(sullSSD, includingTemporary: false))
+        XCTAssertFalse(isAllowedStoreLocation(sullSSD, includingTemporary: true))
+    }
+
 }

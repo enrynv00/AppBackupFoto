@@ -339,4 +339,164 @@ final class LibraryIndexStatusTests: XCTestCase {
         defaults.set(true, forKey: LibraryIndexAutoRefresh.defaultsKey)
         XCTAssertTrue(LibraryIndexAutoRefresh.isEnabled(defaults: defaults))
     }
+
+    // MARK: - Rilievi minori di #31, chiusi il 2026-09-01
+
+    /// Una diramazione per ogni `id` prodotto da `lines`, con il nome del caso accanto.
+    /// Esiste perche' i tre test qui sotto devono girare sulle **stesse** diramazioni: una
+    /// lista costruita a mano dentro ognuno divergerebbe dagli altri alla prima riga nuova,
+    /// ed e' esattamente cosi' che il registro anti-gergo era finito a coprirne 6 su 10.
+    private func tutteLeDiramazioni() -> [(nome: String, p: LibraryIndexer.Progress, interrotto: Bool)] {
+        func base(_ mutate: (inout LibraryIndexer.Progress) -> Void) -> LibraryIndexer.Progress {
+            var p = LibraryIndexer.Progress()
+            p.traversalIncomplete = false
+            p.scanned = 120
+            p.total = 120
+            mutate(&p)
+            return p
+        }
+        return [
+            ("volume",     base { $0.volumeVanished = true; $0.traversalIncomplete = true }, false),
+            ("interrotto", base { $0.traversalIncomplete = true }, true),
+            ("illeggibili", base { $0.unreadableItems = 3; $0.traversalIncomplete = true }, false),
+            ("vuoto",      base { $0.scanned = 0; $0.total = 42; $0.traversalIncomplete = true }, false),
+            ("incompleta", base { $0.traversalIncomplete = true }, false),
+            ("sparite",    base { $0.vanishedKept = 4 }, false),
+            ("errori",     base { $0.errors = 2 }, false),
+            ("fuori",      base { $0.outsideRoot = 5 }, false),
+            ("fuso",       base { $0.rebasedByTimezone = 6 }, false),
+            ("ok",         base { _ in }, false),
+        ]
+    }
+
+    /// La diramazione che il caso dichiara di esercitare deve davvero comparire: senza
+    /// questa verifica i tre test sotto potrebbero girare tutti sulla riga "ok" e restare
+    /// verdi senza provare niente.
+    func testEveryBranchIsActuallyReachedByItsCase() {
+        for caso in tutteLeDiramazioni() {
+            let ids = lines(caso.p, interrupted: caso.interrotto).map(\.id)
+            XCTAssertTrue(ids.contains(caso.nome),
+                          "il caso «\(caso.nome)» non produce la riga omonima: \(ids)")
+        }
+    }
+
+    /// Rilievo minore di #31: il registro anti-gergo era verificato su 6 diramazioni su 10.
+    /// Un registro verificato a meta' non e' un registro verificato — le righe scoperte sono
+    /// esattamente quelle rare, cioe' quelle che nessuno rilegge prima di spedire.
+    func testAntiJargonRegister_reachesEveryBranch() {
+        let gergo = ["indice", "hash", "sha", "scansione", "sqlite", "mtime", "cache",
+                     "entry", "traversata", "incrementale"]
+        for caso in tutteLeDiramazioni() {
+            let detto = text(caso.p, interrupted: caso.interrotto).lowercased()
+            for parola in gergo {
+                XCTAssertFalse(detto.contains(parola),
+                               "gergo nella diramazione «\(caso.nome)»: '\(parola)' in «\(detto)»")
+            }
+        }
+    }
+
+    /// Rilievo minore di #31: i plurali non erano testati. Ogni riga che porta un numero ha
+    /// due forme, e la forma sbagliata («1 foto risultano sparite») e' il genere di dettaglio
+    /// che fa sembrare l'app scritta male proprio nel momento in cui sta dando una notizia
+    /// che l'utente deve prendere sul serio.
+    func testCountedLines_agreeWithTheirNumber() {
+        func riga(_ id: String, _ mutate: (inout LibraryIndexer.Progress) -> Void) -> String {
+            var p = LibraryIndexer.Progress()
+            p.traversalIncomplete = false
+            p.scanned = 120; p.total = 120
+            mutate(&p)
+            return lines(p).first { $0.id == id }?.text ?? ""
+        }
+
+        XCTAssertTrue(riga("illeggibili") { $0.unreadableItems = 1 }.contains("cartella non si è lasciata aprire"))
+        XCTAssertTrue(riga("illeggibili") { $0.unreadableItems = 2 }.contains("cartelle non si sono lasciate aprire"))
+
+        let unaSparita = riga("sparite") { $0.vanishedKept = 1 }
+        XCTAssertTrue(unaSparita.contains("foto risulta sparita"))
+        XCTAssertTrue(unaSparita.contains("ed è stata lasciata"))
+        let dueSparite = riga("sparite") { $0.vanishedKept = 2 }
+        XCTAssertTrue(dueSparite.contains("foto risultano sparite"))
+        XCTAssertTrue(dueSparite.contains("e sono state lasciate"))
+
+        let unErrore = riga("errori") { $0.errors = 1 }
+        XCTAssertTrue(unErrore.contains("file non si è lasciato leggere"))
+        XCTAssertTrue(unErrore.contains("è entrato"))
+        XCTAssertTrue(unErrore.contains("verrà copiato"))
+        let dueErrori = riga("errori") { $0.errors = 2 }
+        XCTAssertTrue(dueErrori.contains("file non si sono lasciati leggere"))
+        XCTAssertTrue(dueErrori.contains("sono entrati"))
+        XCTAssertTrue(dueErrori.contains("verranno copiati"))
+
+        let unoFuori = riga("fuori") { $0.outsideRoot = 1 }
+        XCTAssertTrue(unoFuori.contains("file si trovava"))
+        XCTAssertTrue(unoFuori.contains("ed è stato ignorato"))
+        let dueFuori = riga("fuori") { $0.outsideRoot = 2 }
+        XCTAssertTrue(dueFuori.contains("file si trovavano"))
+        XCTAssertTrue(dueFuori.contains("e sono stati ignorati"))
+
+        XCTAssertTrue(riga("fuso") { $0.rebasedByTimezone = 1 }.contains("foto rimessa in pari"))
+        XCTAssertTrue(riga("fuso") { $0.rebasedByTimezone = 2 }.contains("foto rimesse in pari"))
+    }
+
+    /// Rilievo minore di #31: gli `id` non erano testati. Il doc-comment di `Line.id` dice
+    /// che l'identita' e' stabile apposta, perche' con un UUID SwiftUI vedrebbe tutte le
+    /// righe come nuove a ogni ridisegno. Un'identita' duplicata e' l'altro verso dello
+    /// stesso guasto: `ForEach` mostrerebbe una riga sola al posto di due.
+    func testLineIds_areUniqueAndStableAcrossRedraws() {
+        var tutto = LibraryIndexer.Progress()
+        tutto.traversalIncomplete = true
+        tutto.scanned = 10; tutto.total = 100
+        tutto.volumeVanished = true; tutto.unreadableItems = 3; tutto.vanishedKept = 4
+        tutto.errors = 2; tutto.outsideRoot = 5; tutto.rebasedByTimezone = 6
+
+        let primo = lines(tutto, interrupted: true).map(\.id)
+        let secondo = lines(tutto, interrupted: true).map(\.id)
+        XCTAssertEqual(primo, secondo, "gli id devono essere gli stessi a ogni ridisegno")
+        XCTAssertEqual(Set(primo).count, primo.count, "id duplicati: \(primo)")
+
+        for caso in tutteLeDiramazioni() {
+            let ids = lines(caso.p, interrupted: caso.interrotto).map(\.id)
+            XCTAssertEqual(Set(ids).count, ids.count, "id duplicati in «\(caso.nome)»: \(ids)")
+        }
+    }
+
+    // MARK: I comandi della card e il job di copia
+
+    /// Rilievo minore di #31: i bottoni della card non sapevano di un job in corso, mentre
+    /// l'aggiornamento automatico si'. Chi premeva "Aggiorna" durante un backup faceva
+    /// leggere per intero l'SSD mentre una copia ci scriveva sopra.
+    func testCommandGate_blocksWhileACopyJobIsRunning() {
+        XCTAssertNotNil(LibraryIndexCommandGate.disabledReason(isIndexing: false, jobIsRunning: true))
+    }
+
+    func testCommandGate_blocksWhileTheListIsBeingRead() {
+        XCTAssertNotNil(LibraryIndexCommandGate.disabledReason(isIndexing: true, jobIsRunning: false))
+    }
+
+    func testCommandGate_allowsWhenNothingElseIsGoingOn() {
+        XCTAssertNil(LibraryIndexCommandGate.disabledReason(isIndexing: false, jobIsRunning: false))
+    }
+
+    /// Le due cause hanno due frasi diverse: un bottone grigio senza motivo, o con il motivo
+    /// sbagliato, e' la stessa disciplina gia' applicata a `RestoreView` e al pannello
+    /// Doppioni — disattivare **e** dire perche'.
+    func testCommandGate_tellsTheTwoCausesApart() {
+        let job = LibraryIndexCommandGate.disabledReason(isIndexing: false, jobIsRunning: true)
+        let lettura = LibraryIndexCommandGate.disabledReason(isIndexing: true, jobIsRunning: false)
+        XCTAssertNotEqual(job, lettura)
+    }
+
+    /// Il motivo finisce a schermo come tutte le altre righe della card.
+    func testCommandGate_reasonsCarryNoJargon() {
+        let gergo = ["indice", "hash", "sha", "scansione", "sqlite", "mtime", "cache", "entry"]
+        for reason in [LibraryIndexCommandGate.disabledReason(isIndexing: true, jobIsRunning: false),
+                       LibraryIndexCommandGate.disabledReason(isIndexing: false, jobIsRunning: true),
+                       LibraryIndexCommandGate.disabledReason(isIndexing: true, jobIsRunning: true)] {
+            let detto = (reason ?? "").lowercased()
+            for parola in gergo {
+                XCTAssertFalse(detto.contains(parola), "gergo nel motivo: '\(parola)' in «\(detto)»")
+            }
+        }
+    }
+
 }
