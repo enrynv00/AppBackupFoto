@@ -1568,10 +1568,27 @@ enum ImportPreviewStatus {
     /// niente di utile", la seconda "ho guardato e non c'è niente di nuovo" — e vanno tenute
     /// distinte per la stessa ragione per cui `sawNothing` in #31 non si legge come "libreria
     /// vuota" quando in realtà la lettura non e' arrivata in fondo.
-    static func lines(toAdd: Int, toSkipDuplicates: Int, toAddBytes: Int64, estimatedSec: Int) -> [Line] {
+    ///
+    /// - Parameter interrupted: l'utente ha premuto "Interrompi" (Task 4, requisito 3 della
+    ///   condizione di Enrico: "interrompi" ferma davvero la lettura e degrada al conteggio
+    ///   grezzo, MAI a uno schermo vuoto — spec, «Risposte di Enrico», risposta 4). Richiesto e
+    ///   non con default, come `LibraryIndexStatus.lines(for:interruptedByUser:)`: `toAdd`/
+    ///   `toSkipDuplicates` da soli non possono saperlo, e un default silenzierebbe una
+    ///   dimenticanza invece di farla fallire in compilazione. Quando `true`:
+    ///   - la diramazione "sorgente vuota" non scatta MAI, anche con `toAdd`/`toSkipDuplicates`
+    ///     entrambi a zero: quella riga e' un'affermazione confidente ("non c'e' niente qui")
+    ///     che un controllo troncato non ha il diritto di fare — potrebbe semplicemente non
+    ///     essere arrivato abbastanza lontano da trovare qualcosa;
+    ///   - la diramazione "le hai già tutte" (`toAdd == 0`, buona notizia confidente sul
+    ///     reimport COMPLETO) non scatta nemmeno lei, per lo stesso motivo;
+    ///   - viene sempre aggiunta una riga dedicata che dice la verita': il controllo si e'
+    ///     fermato prima della fine, e il numero sopra potrebbe contare foto gia' sull'SSD che
+    ///     l'importazione vera salterebbe comunque (verso non-sicuro dichiarato, mai nascosto).
+    static func lines(toAdd: Int, toSkipDuplicates: Int, toAddBytes: Int64, estimatedSec: Int,
+                      interrupted: Bool) -> [Line] {
         var out: [Line] = []
 
-        if toAdd == 0 && toSkipDuplicates == 0 {
+        if !interrupted && toAdd == 0 && toSkipDuplicates == 0 {
             // Sorgente vuota: nessun file trovato da controllare. Riga isolata, MAI insieme
             // alla riga "già presenti" (che qui non ha nulla da dire, essendo anch'essa zero).
             out.append(Line(id: "empty-source", tone: .warning, text:
@@ -1580,10 +1597,11 @@ enum ImportPreviewStatus {
             return out
         }
 
-        if toAdd == 0 {
-            // toSkipDuplicates > 0: e' lo scenario del reimport, la ragione stessa per cui
-            // esiste questo lavoro. Va detto a parole, mai lasciato leggere come un silenzio o
-            // un errore: e' una buona notizia, non un guasto.
+        if toAdd == 0 && toSkipDuplicates > 0 && !interrupted {
+            // e' lo scenario del reimport COMPLETO, la ragione stessa per cui esiste questo
+            // lavoro. Va detto a parole, mai lasciato leggere come un silenzio o un errore:
+            // e' una buona notizia, non un guasto. Solo a controllo arrivato in fondo:
+            // interrotto, non si puo' affermare con la stessa sicurezza (vedi sopra).
             out.append(Line(id: "toAdd", tone: .ok, text:
                 "Non c'è nessuna foto nuova da importare: le hai già tutte sull'SSD."))
         } else {
@@ -1600,18 +1618,34 @@ enum ImportPreviewStatus {
             out.append(Line(id: "already-present", tone: .info, text: "\(already)."))
         }
 
+        if interrupted {
+            out.append(Line(id: "interrupted", tone: .warning, text:
+                "Il controllo è stato interrotto prima della fine: il numero qui sopra potrebbe "
+                + "contare foto già presenti sull'SSD, che l'importazione vera salterà comunque."))
+        }
+
         return out
     }
 
     /// La riga di avanzamento durante il controllo. Deve dire **quanti su quanti**, e nominare
     /// anche il totale della sorgente quando il denominatore (i soli candidati che superano il
     /// prefiltro sulla dimensione) è molto più piccolo: è l'informazione che dice all'utente se
-    /// aspetterà 3 secondi o 3 minuti — metà della condizione posta da Enrico per accettare
+    /// aspetterà 3 secondi o 3 minuti — un terzo della condizione posta da Enrico per accettare
     /// questo lavoro (vedi le «Risposte di Enrico» nella spec).
-    static func progressLine(done: Int, total: Int, sourceFileCount: Int) -> String {
+    ///
+    /// - Parameter elapsedSec: il tempo trascorso dall'inizio del controllo, formattato con
+    ///   **la stessa** `FileSyncer.SyncResult.hms` usata dai job — non riscritta apposta (Task
+    ///   4, secondo requisito della condizione di Enrico: *"ci deve essere timer... per far
+    ///   capire che sta procedendo"*). Il trascorso, non lo stimato-rimanente: quest'ultimo
+    ///   richiederebbe una seconda copia della formula di ETA gia' presente due volte su
+    ///   `SyncResult` (una duplicazione che questo progetto ha gia' pagato piu' volte), mentre
+    ///   il trascorso basta da solo a soddisfare la richiesta di Enrico ed e' un dato che questa
+    ///   funzione pura puo' calcolare da un solo numero, senza velocita' o medie mobili.
+    static func progressLine(done: Int, total: Int, sourceFileCount: Int, elapsedSec: Int) -> String {
         let base = "Controllati \(number(done)) di \(number(total))"
-        guard sourceFileCount > total else { return base + "." }
-        return base + ", su \(number(sourceFileCount)) file della sorgente."
+        let elapsed = ", trascorsi \(FileSyncer.SyncResult.hms(elapsedSec))."
+        guard sourceFileCount > total else { return base + elapsed }
+        return base + ", su \(number(sourceFileCount)) file della sorgente" + elapsed
     }
 
     private static func number(_ n: Int) -> String { n.formatted() }
@@ -7246,13 +7280,23 @@ final class BackupRunner: ObservableObject {
         }
         Task { @MainActor [weak self] in
             guard let self else { return }
+            // Questo `previewSync` NON passa `duplicateFilter` di proposito (spec, "Cosa NON
+            // cambia": il controllo di spazio resta senza dedup). Vuole un LIMITE SUPERIORE —
+            // sovrastimare rifiuta un import che sarebbe entrato, sottostimare riempie il
+            // disco — e renderlo esatto costerebbe una TERZA lettura completa della sorgente
+            // (dopo quella dell'anteprima del wizard e quella dell'import vero) per rendere
+            // *meno* conservativa una guardia di sicurezza: non è mai stata la direzione
+            // giusta per una guardia. Da qui in avanti `preview.toAddBytes` può quindi essere
+            // più alto del numero già mostrato al wizard (che invece dedup lo applica), e
+            // l'alert sotto lo dice esplicitamente ("al massimo") per non contraddire quanto
+            // l'utente ha appena letto un passo prima.
             let preview = await self.syncer.previewSync(from: source, to: dst, deep: false)
             let space = self.hasSufficientSpace(bytesNeeded: preview.toAddBytes, atVolumeOf: ssdURL)
             guard space.ok else {
                 self.bm.stopAccessing(.ssd)
                 pendingAlert = SimpleAlert(
                     title: "Spazio insufficiente sull'SSD",
-                    message: "Servono circa \(ByteCountFormatter.string(fromByteCount: preview.toAddBytes, countStyle: .file)), "
+                    message: "Servono al massimo circa \(ByteCountFormatter.string(fromByteCount: preview.toAddBytes, countStyle: .file)), "
                         + "liberi \(ByteCountFormatter.string(fromByteCount: space.availableBytes, countStyle: .file)) su \(ssdURL.path).")
                 return
             }
@@ -8635,10 +8679,62 @@ struct RestoreView: View {
 }
 
 // MARK: - ImportView
+/// Wizard di import a tre passi (source -> preview -> label), roadmap #27-A. Il passo
+/// `.preview` fa girare l'anteprima VERA del wizard di import (roadmap #27-A / #31, terza
+/// parte — spec `2026-09-01-import-preview-dedup-design.md`, piano
+/// `2026-09-01-import-preview-dedup.md`, Task 4): il numero mostrato e' quello che
+/// l'importazione copierebbe davvero, dedup per contenuto incluso, e non solo lo
+/// zero-overwrite.
+///
+/// **La doppia lettura della sorgente e' stata accettata da Enrico a UNA condizione**
+/// (spec, «Risposte di Enrico», risposta 1): *"il processo deve essere interrompibile, ci
+/// deve essere timer o figura che gira per far capire che sta procedendo"*. Tre requisiti
+/// separati, tutti cablati qui:
+/// 1. **Avanzamento determinato** — `previewProgressView` mostra un `ProgressView(value:
+///    total:)` non appena `BackupRunner.importPreviewDuplicates` conosce il denominatore
+///    (`onProgress`, chiamato PRIMA di leggere un solo byte), non uno spinner indeterminato
+///    che gira a vuoto.
+/// 2. **Tempo trascorso** — `ImportPreviewStatus.progressLine(elapsedSec:)`, calcolato da
+///    `previewStartDate` e formattato con `FileSyncer.SyncResult.hms`, MAI riscritta.
+/// 3. **"Interrompi" che ferma davvero la lettura** — DUE meccanismi distinti, perche' la
+///    camminata della sorgente vive dentro `FileSyncer` (`previewSyncer.cancel()`) e
+///    l'hashing vive nella closure `duplicateFilter` (`previewCancelFlag.cancel()`, letto
+///    da `isCancelled` dentro `importPreviewDuplicates`): alzarne uno solo lascia in piedi
+///    l'altra meta' della lettura. Vanno alzati insieme, ovunque compaia il bottone.
+///
+/// **L'interruzione non torna indietro e non lascia una schermata vuota** (spec, risposta
+/// 4): degrada al conteggio grezzo — il risultato parziale gia' calcolato, che puo'
+/// sovrastimare `toAdd` perche' non tutti i doppioni sono stati verificati in tempo — con
+/// una riga dedicata che lo dichiara (`ImportPreviewStatus.lines(interrupted:)`). La riga,
+/// non una frase scritta qui: nessuna stringa duplicata fra questo file e l'enum.
+///
+/// **Token di richiesta** (`previewToken`, stesso schema di `DuplicateGroupRow.loadToken`):
+/// l'utente puo' tornare indietro o scegliere un'altra sorgente mentre l'anteprima gira in
+/// background. Un risultato — o anche un solo aggiornamento di avanzamento — arrivato per
+/// un token non piu' corrente viene scartato, mai mostrato: e' per costruzione riferito a
+/// una sorgente che non e' piu' quella in vista.
+///
+/// **Gate obbligatorio: SSD montato** (spec, "Gate obbligatorio: SSD montato"). Senza il
+/// volume `isAlreadyInLibrary` fallirebbe la rilettura per ogni candidato e l'anteprima
+/// dichiarerebbe tutto nuovo — cioe' ricadrebbe esattamente nel difetto che questo lavoro
+/// chiude, senza dirlo. `ImportPreviewStatus.unavailableReason` distingue "non configurato"
+/// da "non collegato" (due azioni diverse per l'utente), controllato sia all'avvio
+/// dell'anteprima sia — via `onChange(of: volumes.ssdMounted)` — se il volume viene
+/// scollegato mentre il wizard e' gia' aperto sul passo `.preview`: senza, un numero gia'
+/// mostrato resterebbe a schermo anche dopo che l'SSD non c'e' piu', silenziosamente
+/// sbagliato (verifica manuale n. 4 del piano).
+///
+/// **NON coperto da test** (stessa disciplina di `LibraryIndexCard` e `DuplicatesView`):
+/// questa view, la barra di avanzamento, il bottone "Interrompi", il gate `VolumeMonitor`.
+/// Sono SwiftUI e volumi veri, non raggiungibili senza una corsa reale. **E' testato tutto
+/// cio' che sta ai due capi del cablaggio**: `FileSyncer.previewSync(duplicateFilter:)`
+/// (`FileSyncerPreviewDedupTests`), `BackupRunner.importPreviewDuplicates`
+/// (`ImportPreviewDedupTests`), e `ImportPreviewStatus` (`ImportPreviewStatusTests`).
 struct ImportView: View {
     @Environment(\.dismiss) private var dismiss
     @EnvironmentObject private var runner: BackupRunner
     @ObservedObject private var bm = BookmarkManager.shared
+    @StateObject private var volumes = VolumeMonitor()
     private let previewSyncer = FileSyncer()
 
     enum Step { case chooseSource, preview, label }
@@ -8648,6 +8744,19 @@ struct ImportView: View {
     @State private var guardErrorMessage: String?
     @State private var isLoadingPreview = false
     @State private var previewResult: (toAdd: Int, toSkip: Int, toSkipDuplicates: Int, toAddBytes: Int64, estimatedSec: Int)?
+    @State private var previewUnavailableReason: String?
+    @State private var previewInterrupted = false
+    @State private var previewProgress: (done: Int, total: Int, sourceFileCount: Int, elapsedSec: Int)?
+    @State private var previewStartDate: Date?
+    /// Token di richiesta (vedi doc-comment della struct): incrementato ogni volta che si
+    /// riparte da `.chooseSource`, cosi' un risultato o un avanzamento della vecchia
+    /// anteprima arrivato in ritardo viene riconosciuto come non piu' pertinente e scartato.
+    @State private var previewToken = UUID()
+    /// Vive per la durata di UNA sola anteprima (nuova istanza a ogni `pickSource()`), mai
+    /// condivisa fra job. Riusa la classe gia' esistente (vedi in coda al file) — non
+    /// scriverne una seconda, e' la lezione gia' pagata tre volte da `LibraryExclusions`/
+    /// `realResolvedPath`/`makeThumbnail`.
+    @State private var previewCancelFlag: CancelFlag?
     @State private var label: String = ""
 
     private static let dateFormatter: DateFormatter = {
@@ -8666,6 +8775,21 @@ struct ImportView: View {
         }
         .padding(32)
         .frame(minWidth: 460, minHeight: 360)
+        .onChange(of: volumes.ssdMounted) { _, mounted in
+            // Il volume e' stato scollegato mentre il wizard era gia' aperto sul passo di
+            // anteprima: ferma subito la lettura (entrambi i meccanismi, come "Interrompi")
+            // e mostra il motivo scritto al posto di un numero che l'assenza del volume
+            // renderebbe silenziosamente sbagliato (verifica manuale n. 4 del piano).
+            guard step == .preview, !mounted else { return }
+            previewCancelFlag?.cancel()
+            previewSyncer.cancel()
+            previewToken = UUID()
+            isLoadingPreview = false
+            previewResult = nil
+            previewProgress = nil
+            previewUnavailableReason = ImportPreviewStatus.unavailableReason(
+                ssdConfigured: bm.urls[.ssd] != nil, ssdMounted: false)
+        }
     }
 
     private var chooseSourceStep: some View {
@@ -8694,30 +8818,91 @@ struct ImportView: View {
     private var previewStep: some View {
         VStack(spacing: AppSpacing.lg) {
             Text("Anteprima").font(AppFont.title)
-            if isLoadingPreview {
-                ProgressView("Conteggio file in corso…")
+            if let previewUnavailableReason {
+                Text(previewUnavailableReason).font(AppFont.caption).foregroundStyle(AppColor.error)
+                    .multilineTextAlignment(.center)
+            } else if isLoadingPreview {
+                previewProgressView
             } else if let previewResult {
                 VStack(alignment: .leading, spacing: AppSpacing.sm) {
-                    Text("File da importare: \(previewResult.toAdd)")
-                    Text("Spazio necessario: \(ByteCountFormatter.string(fromByteCount: previewResult.toAddBytes, countStyle: .file))")
-                    if previewResult.estimatedSec > 0 {
-                        Text("Tempo stimato: \(FileSyncer.SyncResult.hms(previewResult.estimatedSec))")
+                    ForEach(ImportPreviewStatus.lines(
+                        toAdd: previewResult.toAdd,
+                        toSkipDuplicates: previewResult.toSkipDuplicates,
+                        toAddBytes: previewResult.toAddBytes,
+                        estimatedSec: previewResult.estimatedSec,
+                        interrupted: previewInterrupted)) { line in
+                        HStack(alignment: .top, spacing: AppSpacing.sm) {
+                            Image(systemName: icon(line.tone))
+                                .foregroundStyle(color(line.tone)).font(.system(size: 12))
+                            Text(line.text).fixedSize(horizontal: false, vertical: true)
+                            Spacer()
+                        }
                     }
                 }
                 .font(AppFont.body)
             }
-            if bm.urls[.ssd] == nil {
-                Text("SSD non configurato — vai in Impostazioni per configurarlo prima di importare.")
-                    .font(AppFont.caption).foregroundStyle(AppColor.error)
-            }
             Spacer()
             HStack {
-                Button("Indietro") { step = .chooseSource }.buttonStyle(.bordered)
+                Button("Indietro") {
+                    // Il token cambia comunque (vedi sotto), ma senza fermare anche la
+                    // lettura in corso l'anteprima abbandonata continuerebbe a leggere e
+                    // hashare in background per conto di nessuno: stessi due meccanismi di
+                    // "Interrompi", stesso motivo.
+                    previewCancelFlag?.cancel()
+                    previewSyncer.cancel()
+                    previewToken = UUID()
+                    step = .chooseSource
+                }.buttonStyle(.bordered)
                 Spacer()
                 Button("Continua") { step = .label }
                     .buttonStyle(.borderedProminent)
-                    .disabled(isLoadingPreview || bm.urls[.ssd] == nil)
+                    .disabled(isLoadingPreview || previewUnavailableReason != nil)
             }
+        }
+    }
+
+    @ViewBuilder
+    private var previewProgressView: some View {
+        VStack(spacing: AppSpacing.sm) {
+            if let p = previewProgress, p.total > 0 {
+                // Barra DETERMINATA (requisito 1 di Enrico): il denominatore e' noto prima
+                // di leggere un solo byte (`BackupRunner.importPreviewDuplicates`), non uno
+                // spinner che gira mentre non si muove niente.
+                ProgressView(value: Double(p.done), total: Double(p.total))
+                Text(ImportPreviewStatus.progressLine(
+                    done: p.done, total: p.total, sourceFileCount: p.sourceFileCount, elapsedSec: p.elapsedSec))
+                    .font(AppFont.caption).foregroundStyle(.secondary)
+            } else {
+                // Fase iniziale: la sola camminata della sorgente (stat, nessun hash), il
+                // cui denominatore per la dedup non e' ancora noto. Misurata trascurabile
+                // rispetto all'hashing (spec): uno spinner indeterminato qui è accettabile,
+                // il requisito di Enrico riguarda la fase costosa che segue.
+                ProgressView("Conteggio file in corso…")
+            }
+            // Requisito 3 di Enrico: SEMPRE premibile durante l'attesa, in entrambe le fasi
+            // sopra. Alza ENTRAMBI i meccanismi di interruzione — la camminata vive dentro
+            // `FileSyncer`, l'hashing vive nella closure — perche' non si sa in quale delle
+            // due fasi ci si trova quando l'utente preme il bottone.
+            Button("Interrompi") {
+                previewCancelFlag?.cancel()
+                previewSyncer.cancel()
+            }.buttonStyle(.bordered).tint(AppColor.error)
+        }
+    }
+
+    private func icon(_ tone: ImportPreviewStatus.Tone) -> String {
+        switch tone {
+        case .ok: return "checkmark.circle.fill"
+        case .info: return "info.circle.fill"
+        case .warning: return "exclamationmark.triangle.fill"
+        }
+    }
+
+    private func color(_ tone: ImportPreviewStatus.Tone) -> Color {
+        switch tone {
+        case .ok: return AppColor.success
+        case .info: return .secondary
+        case .warning: return AppColor.warning
         }
     }
 
@@ -8765,16 +8950,73 @@ struct ImportView: View {
         sourceURL = url
         label = "\(url.lastPathComponent) - \(Self.dateFormatter.string(from: Date()))"
         previewResult = nil
+        previewInterrupted = false
+        previewProgress = nil
+        previewUnavailableReason = nil
         step = .preview
+
+        // Gate obbligatorio (spec, "Gate obbligatorio: SSD montato"): senza il volume,
+        // `isAlreadyInLibrary` fallirebbe la rilettura per ogni candidato e l'anteprima
+        // dichiarerebbe tutto nuovo — cioè ricadrebbe esattamente nel difetto che questo
+        // lavoro chiude, senza dirlo. I due motivi sono DISTINTI apposta (configurare vs
+        // collegare — `ImportPreviewStatus.unavailableReason`).
+        let ssdConfigured = bm.urls[.ssd] != nil
+        if let reason = ImportPreviewStatus.unavailableReason(ssdConfigured: ssdConfigured, ssdMounted: volumes.ssdMounted) {
+            previewUnavailableReason = reason
+            return
+        }
+        // `ssdConfigured` è già vero qui: il guard resta solo per non forzare l'unwrap.
         guard let ssdURL = bm.urls[.ssd] else { return }
+        // Letta QUI, sul MainActor, PRIMA di entrare nel Task qui sotto: `bm.urls` è
+        // `@Published`, e leggerla da un thread di background è il difetto già chiuso una
+        // volta in `isAlreadyInLibrary` col parametro `libraryRoot`.
+        let libraryRoot = ssdURL
+        // Stesso motivo: `runner.libraryIndexStore` catturato una volta sola qui, non
+        // riletto dentro la closure che gira sulla coda di lavoro di `previewSync` — stesso
+        // pattern già in uso in `BackupRunner.runImport`, che cattura `store` sul MainActor
+        // prima di passarlo al job vero e proprio.
+        let store = runner.libraryIndexStore
+
         isLoadingPreview = true
+        previewStartDate = Date()
+        let token = UUID()
+        previewToken = token
+        let flag = CancelFlag()
+        previewCancelFlag = flag
+
         // La cartella di destinazione è sempre nuova/vuota (Import/<slug> non esiste ancora),
         // quindi toSkip sarà sempre 0 qui indipendentemente dallo slug esatto usato: il numero
         // non cambia se l'utente modifica l'etichetta al passo successivo.
         let dst = ssdURL.appendingPathComponent("Import").appendingPathComponent(importFolderSlug(label))
         Task { @MainActor in
-            let result = await previewSyncer.previewSync(from: url, to: dst, deep: false)
+            let result = await previewSyncer.previewSync(from: url, to: dst, deep: false, duplicateFilter: { candidates in
+                // Gira sulla coda di lavoro di `previewSync`, MAI sul MainActor: qualunque
+                // cosa tocchi lo stato della View passa da un `Task { @MainActor in }`
+                // separato — stessa regola di `DuplicatesView`/`BackupRunner.indexedFileCount`.
+                BackupRunner.importPreviewDuplicates(
+                    candidates: candidates,
+                    store: store,
+                    libraryRoot: libraryRoot,
+                    isCancelled: { flag.isCancelled },
+                    onProgress: { done, total in
+                        Task { @MainActor in
+                            // Token di richiesta: scarta anche un solo aggiornamento di
+                            // avanzamento arrivato per una sorgente non più corrente, non
+                            // solo il risultato finale — altrimenti la barra di UNA
+                            // anteprima abbandonata continuerebbe a muoversi sullo schermo
+                            // di quella nuova.
+                            guard token == previewToken else { return }
+                            let elapsed = previewStartDate.map { Int(Date().timeIntervalSince($0)) } ?? 0
+                            previewProgress = (done: done, total: total, sourceFileCount: candidates.count, elapsedSec: elapsed)
+                        }
+                    })
+            })
+            // Token di richiesta (vedi doc-comment della struct): un risultato arrivato per
+            // una sorgente non più corrente non va MAI mostrato — è per costruzione
+            // riferito a un'altra scelta dell'utente.
+            guard token == previewToken else { return }
             isLoadingPreview = false
+            previewInterrupted = flag.isCancelled
             previewResult = result
         }
     }
