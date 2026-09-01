@@ -4181,6 +4181,23 @@ enum LibraryIndexCommandGate {
         }
         return nil
     }
+
+    /// Lo svuotamento ha un motivo **suo**: non legge l'SSD, quindi la frase sulla lettura
+    /// concorrente sarebbe falsa. Il danno e' un altro — un'importazione in corso si appoggia
+    /// all'elenco per non ricopiare foto che ci sono gia', e togliergielo sotto significa
+    /// ricopiarle.
+    static func resetDisabledReason(isIndexing: Bool, jobIsRunning: Bool) -> String? {
+        if isIndexing {
+            return "L'app sta leggendo le foto sull'SSD proprio ora. Fermala con "
+                + "«\(LibraryIndexCommands.stop)» prima di svuotare l'elenco."
+        }
+        if jobIsRunning {
+            return "C'è un backup in corso, e si sta appoggiando a questo elenco per non "
+                + "ricopiare foto che hai già. Svuotarlo adesso gliele farebbe ricopiare. "
+                + "Riprova a backup finito."
+        }
+        return nil
+    }
 }
 
 /// Quando l'elenco puo' aggiornarsi da solo. Pura e in un punto solo perche' i richiami sono
@@ -6446,7 +6463,22 @@ final class BackupRunner: ObservableObject {
     /// `onAlert` = dove mostrare gli avvisi (vedi `AlertSink`): la card della finestra
     /// Diagnostica passa il proprio canale, l'aggiornamento automatico non passa niente.
     func rebuildLibraryIndex(full: Bool = false, onAlert: AlertSink? = nil) {
-        guard !isIndexing else { return }
+        // Precondizioni rivalutate **qui**, all'avvio vero, non solo sul bottone che ha
+        // aperto il flusso. Rilievo di review del 2026-09-01: fra il click e la conferma sta
+        // un alert che l'utente puo' lasciare aperto per minuti (il messaggio stesso parla di
+        // 15-25 minuti di lettura, quindi ci si pensa), e in quel tempo puo' partire un
+        // backup — a mano o da solo al ricollegamento dell'SSD. Il gate sul bottone da solo
+        // riaprirebbe esattamente il difetto che questo commit dichiara chiuso. E' la stessa
+        // lezione gia' pagata nel pannello Doppioni, dove le precondizioni del blocco erano
+        // valutate una volta sola: qui non era stata applicata a se stessa.
+        //
+        // Silenzioso quando non c'e' un canale: l'aggiornamento automatico ha gia' deciso di
+        // suo con `LibraryIndexAutoRefresh.shouldRun` e non deve far comparire niente.
+        if let reason = LibraryIndexCommandGate.disabledReason(isIndexing: isIndexing,
+                                                              jobIsRunning: isRunning) {
+            onAlert?(SimpleAlert(title: "Meglio non farlo adesso", message: reason))
+            return
+        }
         // L'elenco e' una cache, mai un prerequisito (ADR-0002): se non si apre, si dice e
         // basta. Niente nell'app smette di funzionare.
         guard let store = libraryIndexStore else {
@@ -6530,7 +6562,15 @@ final class BackupRunner: ObservableObject {
     /// Svuota l'elenco (solo l'elenco: il file SQLite sul Mac, mai le foto) e lo riapre
     /// vuoto. La ricostruzione **non** parte da sola: la prima creazione resta manuale.
     func resetLibraryIndex(onAlert: AlertSink? = nil) {
-        guard !isIndexing, let store = libraryIndexStore else { return }
+        // Stessa rivalutazione di `rebuildLibraryIndex`, con il motivo proprio dello
+        // svuotamento: qui non si legge l'SSD, si toglie l'elenco a un'importazione che ci si
+        // sta appoggiando per non ricopiare foto gia' presenti.
+        if let reason = LibraryIndexCommandGate.resetDisabledReason(isIndexing: isIndexing,
+                                                                   jobIsRunning: isRunning) {
+            onAlert?(SimpleAlert(title: "Meglio non farlo adesso", message: reason))
+            return
+        }
+        guard let store = libraryIndexStore else { return }
         do {
             try store.deleteIndexAndRecreate()
             indexProgress = nil

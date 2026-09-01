@@ -499,4 +499,36 @@ final class LibraryIndexStatusTests: XCTestCase {
         }
     }
 
+
+    // MARK: Lo svuotamento ha un motivo suo (rilievo di review del 2026-09-01)
+
+    /// Lo svuotamento non legge l'SSD: la frase sulla lettura concorrente sarebbe **falsa**.
+    /// Il danno e' un altro — un'importazione in corso usa l'elenco per non ricopiare foto
+    /// gia' presenti, e togliergielo sotto significa fargliele ricopiare.
+    func testResetGate_hasItsOwnReason_notTheReadingOne() {
+        let lettura = LibraryIndexCommandGate.disabledReason(isIndexing: false, jobIsRunning: true)
+        let svuota = LibraryIndexCommandGate.resetDisabledReason(isIndexing: false, jobIsRunning: true)
+        XCTAssertNotNil(svuota)
+        XCTAssertNotEqual(svuota, lettura, "svuotare e rileggere non hanno lo stesso motivo")
+        XCTAssertFalse(svuota!.lowercased().contains("illeggibili"),
+                       "lo svuotamento non legge niente: non puo' parlare di file illeggibili")
+    }
+
+    func testResetGate_blocksDuringAReadAndDuringAJob() {
+        XCTAssertNotNil(LibraryIndexCommandGate.resetDisabledReason(isIndexing: true, jobIsRunning: false))
+        XCTAssertNotNil(LibraryIndexCommandGate.resetDisabledReason(isIndexing: false, jobIsRunning: true))
+        XCTAssertNil(LibraryIndexCommandGate.resetDisabledReason(isIndexing: false, jobIsRunning: false))
+    }
+
+    func testResetGate_reasonsCarryNoJargon() {
+        let gergo = ["indice", "hash", "sha", "scansione", "sqlite", "mtime", "cache", "entry"]
+        for reason in [LibraryIndexCommandGate.resetDisabledReason(isIndexing: true, jobIsRunning: false),
+                       LibraryIndexCommandGate.resetDisabledReason(isIndexing: false, jobIsRunning: true)] {
+            let detto = (reason ?? "").lowercased()
+            for parola in gergo {
+                XCTAssertFalse(detto.contains(parola), "gergo nel motivo: '\(parola)' in «\(detto)»")
+            }
+        }
+    }
+
 }
