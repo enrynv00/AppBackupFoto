@@ -4576,22 +4576,83 @@ final class FileSyncer {
     func cancel() { cancelled = true }
 
     // MARK: - Dry-run preview (solo stat, nessuna copia)
-    func previewSync(from src: URL, to dst: URL, deep: Bool) async
-        -> (toAdd: Int, toSkip: Int, toAddBytes: Int64, estimatedSec: Int) {
+    /// Un file che `previewSync` conterebbe fra i `toAdd`. Coppia neutra: nessun
+    /// riferimento all'indice, a `IndexableKind` o allo store — `FileSyncer` resta
+    /// ignaro di cos'è un doppione.
+    ///
+    /// `size` viene dalla stessa `resourceValues(forKeys: [.fileSizeKey])` già usata da
+    /// `previewFile` per calcolare `toAddBytes` — nessuna lettura di dimensione nuova
+    /// (fatto misurato n. 1: può essere servita dalla cache dell'istanza di URL). Ed è
+    /// sicuro perché questo numero non decide mai niente: fa solo da chiave di bucket e
+    /// da stima di byte per chi riceve i candidati. A decidere se un file è un doppione
+    /// è sempre e solo `sha256`, a valle, su un descrittore riaperto — mai questo campo.
+    struct PreviewCandidate {
+        let url: URL
+        let size: Int64
+    }
+
+
+    /// - Parameters:
+    ///   - duplicateFilter: dedup per contenuto nell'anteprima (roadmap #27-A/#31, terza
+    ///     parte). Riceve **tutti** i `PreviewCandidate` in un solo lotto — mai uno per
+    ///     volta — e restituisce gli indici di quelli che sono doppioni. E' un lotto e
+    ///     non un predicato `(PreviewCandidate) -> Bool` chiamato in streaming *per
+    ///     costruzione*: per riconoscere due file byte-identici dentro la stessa sorgente
+    ///     bisogna sapere, **prima** di hashare il primo dei due, che esiste un secondo
+    ///     file di quella dimensione — un predicato in streaming non può saperlo, perché
+    ///     il primo del paio non verrebbe mai hashato e quindi mai ricordato. Indici fuori
+    ///     intervallo sono ignorati: la closure è codice esterno. Default `nil`: `FileSyncer`
+    ///     non impara cos'è un doppione, non conosce l'indice né `IndexableKind` — la
+    ///     decisione vive fuori, in `BackupRunner` (Task 2). `runMacToSSD`, `runSSDToHDD`,
+    ///     `RestoreEngine` e il controllo spazio di `runImport` non lo passano: si
+    ///     comportano identici a prima, perché quando è `nil` **non si alloca l'array dei
+    ///     candidati e non si appende niente** — vedi `previewDir`/`previewFile`.
+    func previewSync(from src: URL, to dst: URL, deep: Bool,
+                      duplicateFilter: (([PreviewCandidate]) -> Set<Int>)? = nil) async
+        -> (toAdd: Int, toSkip: Int, toSkipDuplicates: Int, toAddBytes: Int64, estimatedSec: Int) {
         return await withCheckedContinuation { [self] cont in
             DispatchQueue.global(qos: .userInitiated).async {
                 self.cancelled = false
                 var toAdd = 0
                 var toSkip = 0
                 var toAddBytes: Int64 = 0
-                self.previewDir(src: src, dst: dst, deep: deep, toAdd: &toAdd, toSkip: &toSkip, toAddBytes: &toAddBytes)
-                let estimatedSec = toAdd > 0 ? max(1, toAdd / 50) : 0
-                cont.resume(returning: (toAdd: toAdd, toSkip: toSkip, toAddBytes: toAddBytes, estimatedSec: estimatedSec))
+                // Alloca l'array SOLO se qualcuno ha chiesto un duplicateFilter: è questo,
+                // non un `if` a valle, a rendere il default davvero a costo zero per i
+                // chiamanti che non optano in.
+                var candidates: [PreviewCandidate]? = duplicateFilter != nil ? [] : nil
+                self.previewDir(src: src, dst: dst, deep: deep, toAdd: &toAdd, toSkip: &toSkip,
+                                 toAddBytes: &toAddBytes, candidates: &candidates)
+                var toSkipDuplicates = 0
+                if let duplicateFilter, let candidates {
+                    let duplicateIndices = duplicateFilter(candidates)
+                    for i in duplicateIndices where candidates.indices.contains(i) {
+                        toAdd -= 1
+                        toSkipDuplicates += 1
+                        toAddBytes -= candidates[i].size
+                    }
+                }
+                // Un doppione costa al job una lettura completa del file sorgente,
+                // esattamente come una copia (vedi doc-comment su duplicateFilter): la
+                // stima del tempo conta anche i doppioni, non solo toAdd. Con la vecchia
+                // formula (toAdd / 50) un reimport interamente duplicato mostrerebbe
+                // "Tempo stimato: 00:00:00" per un job che in realtà dura minuti —
+                // avremmo corretto il numero di file e lasciato sbagliato il tempo.
+                // toSkipDuplicates è 0 per chi non passa duplicateFilter, quindi la
+                // formula non cambia per loro.
+                let workUnits = toAdd + toSkipDuplicates
+                let estimatedSec = workUnits > 0 ? max(1, workUnits / 50) : 0
+                cont.resume(returning: (toAdd: toAdd, toSkip: toSkip, toSkipDuplicates: toSkipDuplicates,
+                                         toAddBytes: toAddBytes, estimatedSec: estimatedSec))
             }
         }
     }
 
-    private func previewDir(src: URL, dst: URL, deep: Bool, toAdd: inout Int, toSkip: inout Int, toAddBytes: inout Int64) {
+    // Niente valori di default su `previewDir`/`previewFile`, che sono privati: un
+    // default trasformerebbe una propagazione dimenticata in un cambio di comportamento
+    // silenzioso invece che in un errore di compilazione (stessa regola già scritta
+    // accanto a `syncDir`/`syncFile`).
+    private func previewDir(src: URL, dst: URL, deep: Bool, toAdd: inout Int, toSkip: inout Int,
+                             toAddBytes: inout Int64, candidates: inout [PreviewCandidate]?) {
         if cancelled { return }
         guard let items = try? fm.contentsOfDirectory(
             at: src,
@@ -4603,21 +4664,35 @@ final class FileSyncer {
             let vals = try? item.resourceValues(forKeys: [.isRegularFileKey, .isDirectoryKey])
             let destItem = dst.appendingPathComponent(item.lastPathComponent)
             if vals?.isDirectory == true {
-                previewDir(src: item, dst: destItem, deep: deep, toAdd: &toAdd, toSkip: &toSkip, toAddBytes: &toAddBytes)
+                previewDir(src: item, dst: destItem, deep: deep, toAdd: &toAdd, toSkip: &toSkip,
+                           toAddBytes: &toAddBytes, candidates: &candidates)
             } else if vals?.isRegularFile == true {
-                previewFile(src: item, dst: destItem, toAdd: &toAdd, toSkip: &toSkip, toAddBytes: &toAddBytes)
+                previewFile(src: item, dst: destItem, toAdd: &toAdd, toSkip: &toSkip,
+                            toAddBytes: &toAddBytes, candidates: &candidates)
             }
         }
     }
 
-    private func previewFile(src: URL, dst: URL, toAdd: inout Int, toSkip: inout Int, toAddBytes: inout Int64) {
+    private func previewFile(src: URL, dst: URL, toAdd: inout Int, toSkip: inout Int,
+                              toAddBytes: inout Int64, candidates: inout [PreviewCandidate]?) {
         // Zero-overwrite rule: se il file esiste gia a destinazione sara sempre skippato
         if fm.fileExists(atPath: dst.path) {
             toSkip += 1
         } else {
             toAdd += 1
+            // Stessa lettura già presente prima di questa modifica — nessuna lettura di
+            // dimensione nuova (fatto misurato n. 1: `resourceValues` può essere servita
+            // dalla cache dell'istanza di URL, ed è sicuro perché qui la dimensione non
+            // decide mai niente, vedi doc-comment su `PreviewCandidate`).
             let size = (try? src.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
             toAddBytes += Int64(size)
+            // Candidato raccolto SOLO se `candidates` non è nil (qualcuno ha chiesto un
+            // duplicateFilter) — e SOLO qui, dopo la guardia zero-overwrite: un file già
+            // a destinazione non deve mai comparire fra i candidati, stesso ordine dei
+            // rami già rispettato da `syncFile`.
+            if candidates != nil {
+                candidates!.append(PreviewCandidate(url: src, size: Int64(size)))
+            }
         }
     }
 
@@ -8333,7 +8408,7 @@ struct ImportView: View {
     @State private var sourceURL: URL?
     @State private var guardErrorMessage: String?
     @State private var isLoadingPreview = false
-    @State private var previewResult: (toAdd: Int, toSkip: Int, toAddBytes: Int64, estimatedSec: Int)?
+    @State private var previewResult: (toAdd: Int, toSkip: Int, toSkipDuplicates: Int, toAddBytes: Int64, estimatedSec: Int)?
     @State private var label: String = ""
 
     private static let dateFormatter: DateFormatter = {
