@@ -56,3 +56,33 @@ Quindi:
 - Il terzo livello non annulla né indebolisce niente di quanto scritto sopra. Le tre difese (regola anti-racy, tolleranza DST, verifica completa) e la distinzione fra `.needsVerification` e `.timezoneShift` restano esattamente come sono.
 
 Il ragionamento completo, le misure che lo giustificano e la contro-domanda per chi vorrà togliere la rilettura del file tenuto stanno in **ADR-0005**.
+
+## Nota (2026-09-01): l'anteprima dell'import sta al livello 2, non al livello 1
+
+Il wizard di import mostra «File da importare: N». Fino al 2026-09-01 quel numero veniva da `FileSyncer.previewSync`, che non conosceva il dedup: **prometteva più file di quanti ne venivano copiati**, e nel caso del reimport di una scheda già importata — cioè precisamente lo scenario da cui #31 è nato — poteva promettere 400 file e copiarne 0.
+
+Sembrerebbe naturale collocare quella lettura al **livello 1**: è un numero in una schermata, un errore non perde nessuna foto, e l'indice ha già tutti gli hash. **È sbagliato, e il motivo non è ovvio.**
+
+L'indice contiene, **per decisione di prodotto e in modo permanente**, file che sul disco non ci sono più. È la regola «traversata incompleta ⇒ nessuna rimozione dall'indice» (`vanishedKept`): le righe stantie sono innocue per l'import, che rilegge comunque, e cancellarle per errore costerebbe il dedup spento e una ricostruzione da quindici minuti. Quelle entry fantasma **restano**, ed è giusto così.
+
+Ma un'anteprima che si fidasse della cache le conterebbe come doppioni presenti. Direbbe «di questi 400 file, 380 li hai già» quando 100 di quei 380 sull'SSD non ci sono più. Il numero diventerebbe **sotto-promettente**: l'utente vedrebbe 20 file da importare e ne verrebbero copiati 120.
+
+Avremmo scambiato un errore in eccesso con uno in difetto — e quello in difetto è peggiore, perché una promessa mantenuta *in più* si nota e si perdona, una foto che l'utente non si aspettava di importare no. Quindi: **l'anteprima rilegge e rihasha il candidato**, esattamente come lo skip in import. Livello 2.
+
+Costo misurato: ~15 s su ~95 s nel caso peggiore. Il prefiltro sulla dimensione lo tiene basso — le dimensioni di una libreria fotografica sono quasi uniche (72,7% distinte, misurato) — tranne nel reimport, dove ogni file collide perché ogni file è davvero un doppione.
+
+**La contro-domanda, per chi un giorno vorrà spostare questa lettura al livello 1** — «è solo un numero a schermo, l'indice ce l'ha già»:
+
+> L'indice ha l'hash dei file che ha visto **l'ultima volta che è arrivato in fondo**, e per regola esplicita tiene anche quelli che nel frattempo sono spariti dal disco. Quante di quelle entry corrispondono ancora a un file che esiste? Non lo sai senza guardare. E il numero che stai per mostrare dice all'utente quante foto **non** verranno importate: se lo sbagli in difetto, gli stai dicendo che ha già delle foto che non ha.
+
+## Nota (2026-09-01): gli hash calcolati per l'anteprima non vengono riusati dall'import
+
+Conseguenza diretta della nota sopra, e va scritta perché è un'ottimizzazione che verrà riproposta.
+
+L'anteprima hasha i candidati. Pochi minuti dopo, `runImport` li hasha di nuovo per decidere lo skip. Su una scheda da 7 GiB sono ~78 s pagati due volte, e la tentazione di passare avanti gli hash dell'anteprima è forte.
+
+**Rifiutato**, e non per purismo: fra i due momenti passa **un passo del wizard**. L'utente sceglie l'etichetta, ci pensa, magari va a prendere un caffè. Può scollegare la scheda e attaccarne un'altra. Può spostare i file. E **non esiste nessun controllo di identità del volume** fra l'anteprima e l'avvio: gli hash riportati avanti sarebbero hash di un insieme di file che nessuno ha verificato essere ancora lo stesso.
+
+Non c'è nemmeno una via di mezzo utile: l'unica parte davvero riportabile avanti sarebbe il filtro sulla dimensione, che però costa già **4,7 µs a chiamata** — è gratis, e non c'è niente da risparmiare.
+
+È il caso concreto per cui la regola «prima di decidere si rilegge» esiste in forma assoluta invece che con delle eccezioni: un'eccezione qui sarebbe stata ragionevole in ogni singolo passaggio del ragionamento, e sbagliata alla fine.

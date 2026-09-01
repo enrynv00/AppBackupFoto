@@ -65,7 +65,7 @@ Primo perché il Task 4 lo consuma, ed è l'unica parte che tocca un tipo condiv
   - tupla di ritorno con il campo nuovo `toSkipDuplicates: Int`
   Consumati dai Task 3 e 4.
 
-- [ ] **Step 1: Scrivi il file di test** (~12 test). Copertura minima:
+- [x] **Step 1: Scrivi il file di test** (~12 test). Copertura minima:
   - **senza `duplicateFilter`**: `toAdd`, `toSkip`, `toAddBytes` identici a oggi su una sorgente mista, e `toSkipDuplicates == 0` (è il test che protegge i tre job che non optano in)
   - **senza `duplicateFilter`**: la closure non viene mai chiamata e nessun array viene costruito — verificabile passando `nil` e asserendo sui soli conteggi; la parte «nessun array» si copre col mutante (vedi sotto)
   - con una closure che restituisce l'insieme vuoto: risultato identico al caso `nil`
@@ -79,11 +79,11 @@ Primo perché il Task 4 lo consuma, ed è l'unica parte che tocca un tipo condiv
   - indici **ripetuti** non sottraggono due volte (è un `Set`, ma il test fissa il contratto)
   - `estimatedSec` conta i doppioni insieme ai file da copiare (vedi Step 4)
 
-- [ ] **Step 2: Registra il file in `project.pbxproj`** (4 punti; `grep -n "FileSyncerPreviewBytesTests" AppBackupFoto.xcodeproj/project.pbxproj` per copiare il formato esatto).
+- [x] **Step 2: Registra il file in `project.pbxproj`** (4 punti; `grep -n "FileSyncerPreviewBytesTests" AppBackupFoto.xcodeproj/project.pbxproj` per copiare il formato esatto).
 
-- [ ] **Step 3: Verifica il fallimento atteso** — `cannot find type 'PreviewCandidate' in scope` o `extra argument 'duplicateFilter'`. Se il comando non trova affatto la classe di test, la registrazione non ha funzionato: **fermati e segnalalo**.
+- [x] **Step 3: Verifica il fallimento atteso** — `cannot find type 'PreviewCandidate' in scope` o `extra argument 'duplicateFilter'`. Se il comando non trova affatto la classe di test, la registrazione non ha funzionato: **fermati e segnalalo**.
 
-- [ ] **Step 4: Implementa.**
+- [x] **Step 4: Implementa.**
   - `previewDir`/`previewFile` guadagnano un parametro `candidates: inout [PreviewCandidate]?`. **Quando è `nil` non si alloca e non si appende niente**: è questo, non un `if` a valle, a rendere il default davvero a costo zero. Niente valori di default su questi due, che sono privati — stessa regola già scritta accanto a `syncDir`: un default trasformerebbe una propagazione dimenticata in un cambio di comportamento silenzioso invece che in un errore di compilazione.
   - `previewSync` alloca l'array **solo se** `duplicateFilter != nil`, esegue la camminata, poi chiama la closure una volta sola e sottrae: `for i in indices where candidates.indices.contains(i) { toAdd -= 1; toSkipDuplicates += 1; toAddBytes -= candidates[i].size }`.
   - **`estimatedSec` conta anche i doppioni**: `max(1, (toAdd + toSkipDuplicates) / 50)` quando la somma è > 0. Un doppione costa al job una lettura completa del file sorgente, esattamente come una copia; con la formula di oggi un reimport interamente duplicato mostrerebbe «Tempo stimato: 00:00:00» per un job da tre minuti — cioè avremmo corretto un numero falso e ne avremmo lasciato un secondo. `toSkipDuplicates` è 0 per gli altri chiamanti, quindi la formula non cambia per loro.
@@ -91,8 +91,8 @@ Primo perché il Task 4 lo consuma, ed è l'unica parte che tocca un tipo condiv
   - Doc-comment su `PreviewCandidate.size` che dica da dove viene la dimensione (la `resourceValues` già presente in `previewFile`, potenzialmente servita dalla cache dell'URL) e che **non decide niente**: è chiave di bucket e stima di byte, a decidere è `sha256` a valle. Vedi il fatto misurato n. 1.
   - Aggiorna l'annotazione di tipo di `ImportView.previewResult` e i riferimenti al nuovo campo. `RestoreEngine.runLocal` usa `preview.toAdd + preview.toSkip` e **non va toccato**: `toSkipDuplicates` è 0 lì.
 
-- [ ] **Step 5: Test verdi.**
-- [ ] **Step 6: Build, suite completa, commit** — **515 test attesi** (503 + 12).
+- [x] **Step 5: Test verdi.**
+- [x] **Step 6: Build, suite completa, commit** — **515 test attesi** (503 + 12).
 
 **Il mutante che deve morire:**
 
@@ -123,7 +123,7 @@ Indipendente dal Task 1: si può eseguire in parallelo. È il cuore del lavoro e
   - `nonisolated static func importPreviewDuplicates(candidates:store:libraryRoot:isCancelled:onProgress:) -> Set<Int>`
   Consumati dal Task 4.
 
-- [ ] **Step 1: Scrivi il file di test** (~18 test), su file veri in una directory temporanea e su un `LibraryIndexStore` reale, come già fa `ImportDedupTests`. Copertura minima:
+- [x] **Step 1: Scrivi il file di test** (~18 test), su file veri in una directory temporanea e su un `LibraryIndexStore` reale, come già fa `ImportDedupTests`. Copertura minima:
 
   *`onSourceHash`:*
   - viene chiamato con l'hash reale del file sorgente quando lo Stadio 2 è raggiunto
@@ -152,11 +152,11 @@ Indipendente dal Task 1: si può eseguire in parallelo. È il cuore del lavoro e
   - `isCancelled` che diventa vero a metà ⇒ ritorna presto, e il risultato è parziale (il test asserisce che è parziale, così nessuno lo scambi per completo)
   - `isCancelled` sempre vero ⇒ nessuna lettura, insieme vuoto
 
-- [ ] **Step 2: Registra il file in `project.pbxproj`** (4 punti; `grep -n "ImportDedupTests" AppBackupFoto.xcodeproj/project.pbxproj` per il formato).
+- [x] **Step 2: Registra il file in `project.pbxproj`** (4 punti; `grep -n "ImportDedupTests" AppBackupFoto.xcodeproj/project.pbxproj` per il formato).
 
-- [ ] **Step 3: Verifica il fallimento atteso** — `cannot find 'importPreviewDuplicates' in scope`.
+- [x] **Step 3: Verifica il fallimento atteso** — `cannot find 'importPreviewDuplicates' in scope`.
 
-- [ ] **Step 4: Implementa.** Nell'ordine della sezione «Il motore dell'anteprima» della spec:
+- [x] **Step 4: Implementa.** Nell'ordine della sezione «Il motore dell'anteprima» della spec:
   - istogramma delle dimensioni dei candidati ⇒ `sourceRepeatedSizes` (dimensioni con conteggio ≥ 2). Solo memoria, nessun I/O.
   - `ImportSessionIndex` **locale alla chiamata**, mai condivisa con un job.
   - `total` calcolato in un primo giro che chiama **solo** lo Stadio 1 (dimensione), senza hash. Serve alla barra determinata e va calcolato prima, non stimato.
@@ -166,8 +166,8 @@ Indipendente dal Task 1: si può eseguire in parallelo. È il cuore del lavoro e
   - Doc-comment che dica esplicitamente: **livello di fiducia 2, non 1** (rileggere il candidato sull'SSD è ciò che rende il numero vero in presenza di entry fantasma, che l'indice contiene per decisione di prodotto), e **risultato parziale se interrotto** — chi interrompe deve scartarlo, mai mostrarlo.
   - Doc-comment sul motivo per cui `importPreviewDuplicates` **non** aggiunge query allo store: misurato, 2.000 `hasAnyEntry` costano 9,3 ms totali contro 9,1 ms di un'unica `SELECT DISTINCT size`. Serve a impedire che qualcuno "ottimizzi" reintroducendo una seconda copia della decisione.
 
-- [ ] **Step 5: Test verdi.**
-- [ ] **Step 6: Build, suite completa, commit** — **533 test attesi** (515 + 18).
+- [x] **Step 5: Test verdi.**
+- [x] **Step 6: Build, suite completa, commit** — **533 test attesi** (515 + 18).
 
 **Il mutante che deve morire:**
 
@@ -199,7 +199,7 @@ Logica **pura**: nessun filesystem, nessun database, nessuna View. Stesso ruolo 
   - `static func progressLine(done: Int, total: Int, sourceFileCount: Int) -> String`
   Consumati dal Task 4.
 
-- [ ] **Step 1: Scrivi il file di test** (~10 test). Copertura minima:
+- [x] **Step 1: Scrivi il file di test** (~10 test). Copertura minima:
   - SSD non configurato ⇒ motivo scritto, e **non** lo stesso di «non collegato»: sono due azioni diverse per l'utente (configurare vs collegare)
   - SSD configurato ma non montato ⇒ motivo scritto, che nomina il collegamento
   - SSD configurato e montato ⇒ `nil`
@@ -212,11 +212,11 @@ Logica **pura**: nessun filesystem, nessun database, nessuna View. Stesso ruolo 
   - **registro anti-gergo**: nessuna riga contiene «hash», «indice», «SHA256», «dedup», «scansione». Test esplicito su tutte le diramazioni, come `LibraryIndexStatusTests`
   - **`id` stabili** fra due chiamate con gli stessi dati
 
-- [ ] **Step 2: Registra il file in `project.pbxproj`** (4 punti).
-- [ ] **Step 3: Verifica il fallimento atteso.**
-- [ ] **Step 4: Implementa.** Nessuna stringa duplicata fra qui e la View: se una riga esiste, esiste qui.
-- [ ] **Step 5: Test verdi.**
-- [ ] **Step 6: Build, suite completa, commit** — **543 test attesi** (533 + 10).
+- [x] **Step 2: Registra il file in `project.pbxproj`** (4 punti).
+- [x] **Step 3: Verifica il fallimento atteso.**
+- [x] **Step 4: Implementa.** Nessuna stringa duplicata fra qui e la View: se una riga esiste, esiste qui.
+- [x] **Step 5: Test verdi.**
+- [x] **Step 6: Build, suite completa, commit** — **543 test attesi** (533 + 10).
 
 **Il mutante che deve morire:**
 
@@ -242,27 +242,27 @@ Ultimo perché consuma i tre precedenti. **Non coperto da test**, e va dichiarat
 - Consuma: `FileSyncer.previewSync(duplicateFilter:)`, `BackupRunner.importPreviewDuplicates`, `ImportPreviewStatus`, `VolumeMonitor.ssdMounted`, `runner.libraryIndexStore`.
 - Produce: niente di riusabile altrove.
 
-- [ ] **Step 1: `@StateObject private var volumes = VolumeMonitor()`** in `ImportView`, come già fanno `ContentView`, `RestoreView` e `DuplicatesView`. Serve a distinguere «SSD non configurato» da «SSD non collegato».
+- [x] **Step 1: `@StateObject private var volumes = VolumeMonitor()`** in `ImportView`, come già fanno `ContentView`, `RestoreView` e `DuplicatesView`. Serve a distinguere «SSD non configurato» da «SSD non collegato».
 
-- [ ] **Step 2: `CancelFlag`.** Riusa la classe già presente (`grep -n "final class CancelFlag"`): è `private` a livello di file, quindi è già visibile. **Non scriverne una seconda** — è la lezione di `LibraryExclusions`/`realResolvedPath`/`makeThumbnail`, pagata tre volte. Se il compilatore si lamenta della visibilità, il rimedio è spostarla, non duplicarla.
+- [x] **Step 2: `CancelFlag`.** Riusa la classe già presente (`grep -n "final class CancelFlag"`): è `private` a livello di file, quindi è già visibile. **Non scriverne una seconda** — è la lezione di `LibraryExclusions`/`realResolvedPath`/`makeThumbnail`, pagata tre volte. Se il compilatore si lamenta della visibilità, il rimedio è spostarla, non duplicarla.
 
-- [ ] **Step 3: Aggancia l'anteprima vera in `pickSource()`.** Il `Task` esistente diventa:
+- [x] **Step 3: Aggancia l'anteprima vera in `pickSource()`.** Il `Task` esistente diventa:
   - se `ImportPreviewStatus.unavailableReason(...)` non è `nil` ⇒ mostra il motivo, nessun numero, nessuna lettura;
   - altrimenti chiama `previewSync(..., duplicateFilter: { candidates in BackupRunner.importPreviewDuplicates(candidates: candidates, store: runner.libraryIndexStore, libraryRoot: bm.urls[.ssd], isCancelled: { flag.isCancelled }, onProgress: { d, t in Task { @MainActor in ... } }) })`.
   - La closure gira **sulla coda di lavoro di `previewSync`**, non sul MainActor: qualunque cosa tocchi lo stato della View deve passare da `await MainActor.run` / `Task { @MainActor in }`. Stessa regola di `DuplicatesView` e di `BackupRunner.indexedFileCount`.
   - `libraryRoot` passata **esplicita** da `bm.urls[.ssd]`, letta sul MainActor **prima** di entrare nel `Task`: `urls` è `@Published` e leggerla da un thread di background è il difetto che `isAlreadyInLibrary` ha già chiuso una volta col parametro `libraryRoot`.
 
-- [ ] **Step 4: Token di richiesta.** L'utente può tornare indietro e scegliere un'altra sorgente mentre l'anteprima gira. Al ritorno del `Task`, scarta il risultato se il token non è più quello corrente — pattern già in uso in `DuplicateGroupRow` per le miniature, che esiste perché `Task.detached`/le closure di lavoro non ereditano la cancellazione della View. **Un risultato interrotto non va mai mostrato**: è parziale per costruzione.
+- [x] **Step 4: Token di richiesta.** L'utente può tornare indietro e scegliere un'altra sorgente mentre l'anteprima gira. Al ritorno del `Task`, scarta il risultato se il token non è più quello corrente — pattern già in uso in `DuplicateGroupRow` per le miniature, che esiste perché `Task.detached`/le closure di lavoro non ereditano la cancellazione della View. **Un risultato interrotto non va mai mostrato**: è parziale per costruzione.
 
-- [ ] **Step 5: Barra determinata + «Interrompi»** nel passo `.preview`, con il testo di `ImportPreviewStatus.progressLine`. «Interrompi» alza il `CancelFlag` **e** chiama `previewSyncer.cancel()` (l'interruzione della camminata e quella della fase di hashing sono due meccanismi distinti: il primo è dentro `FileSyncer`, il secondo è nella closure, e servono entrambi).
+- [x] **Step 5: Barra determinata + «Interrompi»** nel passo `.preview`, con il testo di `ImportPreviewStatus.progressLine`. «Interrompi» alza il `CancelFlag` **e** chiama `previewSyncer.cancel()` (l'interruzione della camminata e quella della fase di hashing sono due meccanismi distinti: il primo è dentro `FileSyncer`, il secondo è nella closure, e servono entrambi).
 
-- [ ] **Step 6: Le righe** del passo `.preview` vengono da `ImportPreviewStatus.lines`, nessuna stringa scritta nella View.
+- [x] **Step 6: Le righe** del passo `.preview` vengono da `ImportPreviewStatus.lines`, nessuna stringa scritta nella View.
 
-- [ ] **Step 7: `runImport` — una parola sola.** Nell'alert «Spazio insufficiente sull'SSD», «Servono circa X» diventa «Servono **al massimo** circa X». Il controllo resta **senza dedup**, di proposito: vuole un limite superiore, e renderlo esatto costerebbe una terza lettura completa della sorgente per rendere *meno* conservativa una guardia di sicurezza. Aggiungi un commento accanto che lo dica, altrimenti il prossimo lettore lo prenderà per la svista che questo piano ha appena corretto altrove.
+- [x] **Step 7: `runImport` — una parola sola.** Nell'alert «Spazio insufficiente sull'SSD», «Servono circa X» diventa «Servono **al massimo** circa X». Il controllo resta **senza dedup**, di proposito: vuole un limite superiore, e renderlo esatto costerebbe una terza lettura completa della sorgente per rendere *meno* conservativa una guardia di sicurezza. Aggiungi un commento accanto che lo dica, altrimenti il prossimo lettore lo prenderà per la svista che questo piano ha appena corretto altrove.
 
-- [ ] **Step 8: Dichiara ciò che non è testato**, in un commento su `ImportView`: questa View, la barra, il bottone «Interrompi», il gate `VolumeMonitor`. Sono SwiftUI e volumi veri, non raggiungibili senza una corsa. **È testato tutto ciò che sta ai due capi del cablaggio.**
+- [x] **Step 8: Dichiara ciò che non è testato**, in un commento su `ImportView`: questa View, la barra, il bottone «Interrompi», il gate `VolumeMonitor`. Sono SwiftUI e volumi veri, non raggiungibili senza una corsa. **È testato tutto ciò che sta ai due capi del cablaggio.**
 
-- [ ] **Step 9: Build, suite completa, commit** — **543 test**, invariati. Se il numero cambia, qualcosa si è rotto altrove.
+- [x] **Step 9: Build, suite completa, commit** — **543 test**, invariati. Se il numero cambia, qualcosa si è rotto altrove.
 
 **Verifica manuale obbligatoria** (nessuno di questi punti è raggiungibile da un test):
 1. Scheda/cartella **nuova** ⇒ l'anteprima resta rapida e il numero coincide con quello copiato a fine job.
@@ -281,30 +281,54 @@ Ultimo perché consuma i tre precedenti. **Non coperto da test**, e va dichiarat
 - Modify: `Docs/adr/0003-due-livelli-di-fiducia-sullo-stesso-indice.md`
 - Modify: `Docs/superpowers/plans/2026-09-01-import-preview-dedup.md` (esiti, conteggi reali, mutanti sopravvissuti)
 
-- [ ] **Step 1: `architecture.md`.** Nella sezione «Il dedup entra in `FileSyncer` senza toccare i job esistenti», **sostituisci** la frase «Nota nota e accettata: `previewSync` non è allineato e sovrastima lo spazio necessario quando la sorgente contiene doppioni — verso sicuro»: non è più vera per il wizard, e lasciarla lì manderebbe fuori strada. Al suo posto: `previewSync` ha un `duplicateFilter` opzionale; lo passa **solo** il wizard; il controllo di spazio di `runImport` continua di proposito a usare il limite superiore, **e perché**.
+- [x] **Step 1: `architecture.md`.** Nella sezione «Il dedup entra in `FileSyncer` senza toccare i job esistenti», **sostituisci** la frase «Nota nota e accettata: `previewSync` non è allineato e sovrastima lo spazio necessario quando la sorgente contiene doppioni — verso sicuro»: non è più vera per il wizard, e lasciarla lì manderebbe fuori strada. Al suo posto: `previewSync` ha un `duplicateFilter` opzionale; lo passa **solo** il wizard; il controllo di spazio di `runImport` continua di proposito a usare il limite superiore, **e perché**.
 
-- [ ] **Step 2: `architecture.md`, fatti misurati.** Aggiungi i numeri del 2026-09-01: 34.513 dimensioni distinte su 47.482 media (72,7%), collisione fra cartelle non-doppione **sotto l'1%** con il rihash che lo dimostra (40/40 e 39/40 byte-identici sulle coppie sopra il 25%, 7/19 e 21/40 su quelle sotto l'1%), doppioni interni al 2,7% su `Foto iPhone` e 36,0% su `Foto Google Drive`, lettura+SHA256 dall'SSD a 279-616 MiB/s, e **2.000 `hasAnyEntry` = 9,3 ms contro 9,1 ms di una `SELECT DISTINCT size`**. Quest'ultimo è il fatto che impedisce a un futuro «ottimizziamo con una query sola» di ripartire da zero.
+- [x] **Step 2: `architecture.md`, fatti misurati.** Aggiungi i numeri del 2026-09-01: 34.513 dimensioni distinte su 47.482 media (72,7%), collisione fra cartelle non-doppione **sotto l'1%** con il rihash che lo dimostra (40/40 e 39/40 byte-identici sulle coppie sopra il 25%, 7/19 e 21/40 su quelle sotto l'1%), doppioni interni al 2,7% su `Foto iPhone` e 36,0% su `Foto Google Drive`, lettura+SHA256 dall'SSD a 279-616 MiB/s, e **2.000 `hasAnyEntry` = 9,3 ms contro 9,1 ms di una `SELECT DISTINCT size`**. Quest'ultimo è il fatto che impedisce a un futuro «ottimizziamo con una query sola» di ripartire da zero.
 
-- [ ] **Step 3: ADR-0003, nota nuova.** «L'anteprima dell'import sta al livello 2, non al livello 1», con l'argomento delle entry fantasma: l'indice contiene per decisione di prodotto file che sul disco non ci sono più (`vanishedKept`), quindi la fiducia di livello 1 produrrebbe un numero **sotto**-promettente — l'errore opposto a quello appena corretto. E la contro-domanda per chi vorrà togliere la rilettura, sul modello di ADR-0005.
+- [x] **Step 3: ADR-0003, nota nuova.** «L'anteprima dell'import sta al livello 2, non al livello 1», con l'argomento delle entry fantasma: l'indice contiene per decisione di prodotto file che sul disco non ci sono più (`vanishedKept`), quindi la fiducia di livello 1 produrrebbe un numero **sotto**-promettente — l'errore opposto a quello appena corretto. E la contro-domanda per chi vorrà togliere la rilettura, sul modello di ADR-0005.
 
-- [ ] **Step 4: ADR-0003, seconda nota.** «Gli hash calcolati per l'anteprima non vengono riusati dall'import», con il costo che si accetta (~78 s in più su una scheda da 7 GiB) e il motivo: fra i due momenti passa un passo del wizard, l'utente può cambiare scheda, e non esiste un controllo di identità del volume fra i due. È il caso «X» che la regola «si rilegge sempre» esiste per non dover ricordare.
+- [x] **Step 4: ADR-0003, seconda nota.** «Gli hash calcolati per l'anteprima non vengono riusati dall'import», con il costo che si accetta (~78 s in più su una scheda da 7 GiB) e il motivo: fra i due momenti passa un passo del wizard, l'utente può cambiare scheda, e non esiste un controllo di identità del volume fra i due. È il caso «X» che la regola «si rilegge sempre» esiste per non dover ricordare.
 
-- [ ] **Step 5: Aggiorna questo piano** con i conteggi reali, i mutanti sopravvissuti e gli esiti della verifica manuale.
+- [x] **Step 5: Aggiorna questo piano** con i conteggi reali, i mutanti sopravvissuti e gli esiti della verifica manuale.
 
-- [ ] **Step 6: Commit.** Nessun test nuovo.
+- [x] **Step 6: Commit.** Nessun test nuovo.
 
 ---
 
 ## Riepilogo dei conteggi
 
-| Task | Test nuovi | Cumulativo atteso |
-| :---- | ---: | ---: |
-| baseline `main` | — | **503** (da riverificare) |
-| Task 1 — `previewSync(duplicateFilter:)` | 12 | 515 |
-| Task 2 — `importPreviewDuplicates` | 18 | 533 |
-| Task 3 — `ImportPreviewStatus` | 10 | 543 |
-| Task 4 — `ImportView` | 0 (dichiarato) | 543 |
-| Task 5 — documentazione | 0 | 543 |
+| Task | Test nuovi previsti | **Reali** | Cumulativo atteso | **Reale** |
+| :---- | ---: | ---: | ---: | ---: |
+| baseline `main` | — | — | **503** (da riverificare) | **503** ✅ |
+| Task 1 — `previewSync(duplicateFilter:)` | 12 | **11** | 515 | **514** |
+| Task 2 — `importPreviewDuplicates` | 18 | **20** | 533 | **534** |
+| *review Task 2 — copertura mancante* | — | **1** | — | **535** |
+| Task 3 — `ImportPreviewStatus` | 10 | **16** | 543 | **551** |
+| Task 4 — `ImportView` | 0 (dichiarato) | **8** | 543 | **559** |
+| Task 5 — documentazione | 0 | 0 | 543 | **559** |
+
+**Ogni cumulativo è stato riverificato dall'orchestratore con una corsa completa**, non ereditato dal report dell'implementer: 503, 514, 534, 535, 551, 559, tutti letti nel log come `Executed N tests, with 0 failures`.
+
+Gli scostamenti, e perché nessuno è stato aggiustato per far quadrare la tabella:
+- **Task 1: 11 invece di 12.** Due voci del piano erano formulate in modo quasi identico e una sola asserzione le copre entrambe. Dichiarato invece di inventare un dodicesimo test vuoto.
+- **Task 2: 20 invece di 18.** Un test in più per fissare la guardia `IndexableKind` sul ramo di seeding nuovo — il test previsto dal piano non raggiungeva quel ramo.
+- **+1 dalla review del Task 2.** Vedi sotto: un ramo di bookkeeping su due era scoperto.
+- **Task 3: 16 invece di 10.** Separare «raggiungi ogni diramazione» da «nessun gergo in nessuna diramazione» richiede due test che condividono la stessa lista di casi — la disciplina nata quando il registro anti-gergo di `LibraryIndexStatus` era finito a coprirne 6 su 10.
+- **Task 4: 8 invece di 0.** L'unico caso legittimo in cui un task «senza test» ne aggiunge: i requisiti di Enrico hanno richiesto due parametri nuovi su `ImportPreviewStatus` (`interrupted:`, `elapsedSec:`), che è logica pura e quindi va testata. La View resta a 0, dichiarata non testabile.
+
+## Esiti della corsa sui mutanti
+
+**Task 3 — un mutante è sopravvissuto alla prima corsa, ed è il risultato più utile di questo piano.** Rompendo la concordanza dei plurali, uno dei due test è diventato rosso e **l'altro è passato**: verificava la sostituzione della cifra invece della parola coniugata, cioè dava la risposta giusta per il motivo sbagliato. Riscritto per asserire su «nuovo»/«nuovi», la stessa mutazione li fa cadere entrambi. Senza la corsa sui mutanti sarebbe rimasto in suite come rete di protezione **finta**. È la lezione «un test può codificare il bug invece di trovarlo» di `Docs/CONTEXT.md`, alla quarta occorrenza documentata su questo progetto.
+
+Gli altri mutanti dei Task 1, 2 e 3 sono morti come previsto.
+
+## Buco chiuso dalla review del Task 2
+
+`importPreviewDuplicates` ha **due** rami che seminano la sessione, e solo uno era esercitato: tutti i test sui doppioni interni passavano `store: nil`, quindi imboccavano sempre il ramo che hasha da sé. L'altro — quello che registra l'hash già calcolato quando è stato lo **store** ad aprire lo Stadio 1 — si poteva cancellare e la suite restava verde. Caso realistico: una scheda con foto in parte nuove e in parte già note per dimensione. Chiuso con `testInternalPairWhoseSizeIsKnownToTheStore_isStillRecognized`, **verificato neutralizzando il ramo**: va rosso quel test e nessun altro, che è ciò che prova che il ramo era davvero scoperto.
+
+## Un errore della spec, trovato dall'implementer del Task 2
+
+La spec prescriveva di chiamare `isAlreadyInLibrary` e registrare l'hash «se calcolato». **Applicata alla lettera non avrebbe mai riconosciuto i doppioni interni**: per il primo file di una coppia gemella, `isAlreadyInLibrary` esce al proprio Stadio 1 — né la sessione né lo store hanno mai visto quella dimensione — e torna `false` **senza hashare**, quindi non c'è nessun hash da registrare. L'anteprima avrebbe continuato a mentire, spostando il difetto dai doppioni contro la libreria a quelli interni alla sorgente: il 2,7%-36,0% misurato. Diagnosi e correzione verificate in review.
 
 ## Nota sull'ordine dei task
 
