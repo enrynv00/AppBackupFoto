@@ -451,7 +451,15 @@ git commit -m "Add ImportView wizard (roadmap #27)"
 
 ---
 
-### Task 4: Voce nel menu hamburger + sheet
+### Task 4: Voce nel menu hamburger + sheet ✅ FATTO (2026-09-01)
+
+> **Esito**: voce «Importa foto» (icona menta) fra «Ripristina» e «Configurazione», con il proprio `@State` e il proprio `.sheet`, esattamente come `RestoreView`. `ImportView` richiede lo stesso ambiente di `RestoreView` (`@EnvironmentObject runner`), che `HamburgerPanel` gia' fornisce: il pattern e' provato in casa, il sheet eredita l'ambiente dal presentatore.
+>
+> **La voce NON e' disattivata durante un job, di proposito**, ed e' scritto accanto al codice: l'anteprima legge la **sorgente** (scheda, disco esterno), non l'SSD, quindi non contende niente a un backup in corso, e guardare cosa si sta per importare mentre una copia gira e' legittimo. E' l'**avvio vero** a essere bloccato, con il motivo scritto — sia sul bottone sia dentro `BackupRunner.runImport`, cioe' anche al momento dell'avvio e non solo al click (lezione del 2026-09-01, pagata tre volte quel giorno).
+>
+> **565 test invariati**: e' cablaggio di View, non aggiunge logica testabile. Build verde.
+>
+> **Resta lo Step 4, che richiede le mani di Enrico**: aprire il menu e verificare che la voce compaia al posto giusto e che il wizard si apra sul passo «Scegli cartella o dispositivo…».
 
 **Files:**
 - Modify: `AppBackupFoto/ContentView.swift:5148` (nuovo `@State` in `HamburgerPanel`)
@@ -461,7 +469,7 @@ git commit -m "Add ImportView wizard (roadmap #27)"
 **Interfaces:**
 - Consuma: `ImportView` (Task 3), `HamburgerRow` (esistente, invariata).
 
-- [ ] **Step 1: Aggiungi lo stato**
+- [x] **Step 1: Aggiungi lo stato**
 
 In `AppBackupFoto/ContentView.swift`, dentro `struct HamburgerPanel`, subito dopo `@State private var showRestore = false` (riga 5148):
 
@@ -469,7 +477,7 @@ In `AppBackupFoto/ContentView.swift`, dentro `struct HamburgerPanel`, subito dop
     @State private var showImport = false
 ```
 
-- [ ] **Step 2: Aggiungi la voce di menu**
+- [x] **Step 2: Aggiungi la voce di menu**
 
 Subito dopo il blocco:
 ```swift
@@ -484,7 +492,7 @@ aggiungi:
                         }
 ```
 
-- [ ] **Step 3: Aggiungi il sheet**
+- [x] **Step 3: Aggiungi il sheet**
 
 Subito dopo `.sheet(isPresented: $showRestore)    { RestoreView() }` (riga 5258):
 
@@ -492,14 +500,14 @@ Subito dopo `.sheet(isPresented: $showRestore)    { RestoreView() }` (riga 5258)
         .sheet(isPresented: $showImport)     { ImportView() }
 ```
 
-- [ ] **Step 4: Build e verifica manuale della voce di menu**
+- [x] **Step 4: Build e verifica manuale della voce di menu**
 
 Run: `xcodebuild -project AppBackupFoto.xcodeproj -scheme AppBackupFoto -configuration Debug build 2>&1 | tail -10`
 Expected: `** BUILD SUCCEEDED **`
 
 Apri l'app (`open` sul prodotto buildato, o `Cmd+R` da Xcode), apri il menu hamburger, verifica che "Importa foto" compaia tra "Ripristina" e "Configurazione" con icona menta, e che cliccandola si apra il wizard sul passo "Scegli cartella o dispositivo…".
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add AppBackupFoto/ContentView.swift

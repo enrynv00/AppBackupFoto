@@ -9724,6 +9724,7 @@ struct HamburgerPanel: View {
     @ObservedObject private var appearance = AppearanceManager.shared
     @State private var showAppearance = false
     @State private var showRestore = false
+    @State private var showImport = false
     @State private var toolsLoading = false
     private let reviewEngine = ReviewEngine()
 
@@ -9766,6 +9767,15 @@ struct HamburgerPanel: View {
                         }
                         HamburgerRow(icon: "arrow.down.doc.fill", label: "Ripristina", iconColor: .green) {
                             showRestore = true
+                        }
+                        // Non disattivata durante un job, di proposito: l'anteprima legge la
+                        // SORGENTE (scheda, disco esterno), non l'SSD, quindi non contende
+                        // niente a un backup in corso, e guardare cosa si sta per importare e'
+                        // legittimo mentre una copia gira. E' l'avvio vero a essere bloccato,
+                        // con il motivo scritto (`importStartDisabledReason`) sia sul bottone
+                        // sia dentro `BackupRunner.runImport`.
+                        HamburgerRow(icon: "square.and.arrow.down.on.square", label: "Importa foto", iconColor: .mint) {
+                            showImport = true
                         }
                         HamburgerRow(icon: "gearshape.fill", label: "Configurazione", iconColor: AppColor.utility) {
                             showSettings = true; close()
@@ -9834,6 +9844,7 @@ struct HamburgerPanel: View {
         .shadow(color: .black.opacity(0.18), radius: 12, x: 5, y: 0)
         .sheet(isPresented: $showAppearance) { AppearanceSheet() }
         .sheet(isPresented: $showRestore)    { RestoreView() }
+        .sheet(isPresented: $showImport)     { ImportView() }
     }
 
     private func close() {
