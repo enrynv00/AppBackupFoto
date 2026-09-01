@@ -9818,9 +9818,17 @@ struct DuplicatesView: View {
             }
 
             HStack {
+                // `isTrashing` nella condizione non e' ridondante, ed e' il rilievo di
+                // review del 2026-09-01: `lastBatch()` e' l'ultimo blocco **registrato**,
+                // e durante una corsa quello e' il blocco ancora in esecuzione. Senza
+                // questa guardia l'utente che preme qui a meta' corsa non annulla il blocco
+                // precedente, come crede: rimette a posto i gruppi gia' smaltiti di quello
+                // che sta guardando avanzare, mentre il trasher prosegue sui restanti.
+                // Nessun file si corrompe (le guardie di `restore()` reggono), ma salta il
+                // modello "blocco atomico" su cui e' costruita tutta la doppia conferma.
                 Button("Annulla l'ultimo spostamento") { undoLastBatch() }
                     .buttonStyle(.bordered).controlSize(.small)
-                    .disabled(!hasRestorableBatch)
+                    .disabled(!hasRestorableBatch || isTrashing)
 
                 Spacer()
 
@@ -9960,7 +9968,7 @@ struct DuplicatesView: View {
                     showDestructiveConfirm = true
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(batch.exceedsCap)
+                .disabled(batch.exceedsCap || trashDisabledReasonNow != nil)
             }
         }
         .padding(AppSpacing.xl)
@@ -10011,6 +10019,21 @@ struct DuplicatesView: View {
     /// rilettura/rihash di ogni membro puo' richiedere minuti su un SSD USB (spec: 50 GB
     /// sono grosso modo 2-4 minuti) e bloccherebbe la finestra per tutta la durata.
     private func startTrashing(_ batch: DuplicateBatch) {
+        // Precondizioni del blocco (item 1 della sequenza in spec: nessun job in corso,
+        // nessuna scansione dell'indice in corso, SSD montato), **rivalutate qui**.
+        // Rilievo di review del 2026-09-01: valutarle solo all'apertura del riepilogo non
+        // basta. Il riepilogo e' fatto per essere letto con calma — e' li' che sta tutto il
+        // peso della conferma — e nel frattempo puo' partire un backup automatico al
+        // ricollegamento dell'SSD, o l'aggancio automatico dell'indice a fine di un altro
+        // job. Cestinare mentre un mirror legge gli stessi file e' esattamente il modo,
+        // descritto dalla spec, di trasformare due operazioni corrette in un guasto.
+        // Lo `st_dev` del trasher non copre questo caso: intercetta lo scollegamento, non
+        // un secondo lettore sul volume ancora montato.
+        if let reason = trashDisabledReasonNow {
+            pendingAlert = SimpleAlert(title: "Meglio non farlo adesso", message: reason)
+            return
+        }
+
         guard let store = runner.libraryIndexStore,
               let manifest = runner.trashManifestStore,
               let root = BookmarkManager.shared.urls[.ssd] else {

@@ -175,6 +175,15 @@ final class DuplicatesStatusTests: XCTestCase {
         vanished.stoppedBecauseVolumeVanished = true
         allTexts.append(contentsOf: DuplicatesStatus.outcomeLines(vanished).map(\.text))
 
+        // Le due diramazioni che la prima stesura di questo test non toccava (rilievo di
+        // review del 2026-09-01). "Su tutte le diramazioni" deve voler dire tutte:
+        // un registro verificato su sette casi su nove e' un registro non verificato.
+        var interrupted = DuplicateTrashOutcome()
+        interrupted.interrupted = true
+        allTexts.append(contentsOf: DuplicatesStatus.outcomeLines(interrupted).map(\.text))
+
+        allTexts.append(contentsOf: DuplicatesStatus.outcomeLines(DuplicateTrashOutcome()).map(\.text))
+
         for text in allTexts {
             let lower = text.lowercased()
             for word in forbidden {
