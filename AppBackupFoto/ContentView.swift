@@ -1947,18 +1947,31 @@ private func isInImportFolder(_ entry: LibraryIndexEntry) -> Bool {
 /// copie entrambe in `Foto iPhone/` non si distinguono per la prima regola, quindi la
 /// scelta (e la frase mostrata all'utente) scende a quella dopo.
 ///
-/// ATTENZIONE — **questa regola e' provvisoria, ed e' dichiarata tale.** Poggia sul layout
-/// di primo livello dell'SSD rilevato il 2026-07-29/30 (`Foto iPhone`, `Foto Google Drive`,
-/// `Other`, `Takeout`, `Takeout 2`, `Zip`) e **mai riconfermato da allora**: va rivista con
-/// un `ls -1` del volume vero davanti, che e' fra le verifiche manuali pendenti.
-/// In particolare **la posizione di `Takeout/` e `Takeout 2/` nella gerarchia e' una
-/// decisione che Enrico ha esplicitamente rimandato** al momento in cui avra' il layout
-/// reale davanti (risposta 6 del 2026-08-28): sono estrazioni automatiche di Google, quindi
-/// l'argomento per declassarle accanto a `Import/` e' forte, ma finche' non e' deciso
-/// restano **alla pari delle altre cartelle** e a disambiguare e' la data piu' vecchia.
-/// Se il layout vero smentisce la regola, cambiano questa funzione e i suoi test, non il
-/// design: la proposta resta comunque solo una proposta, che l'utente puo' cambiare gruppo
-/// per gruppo prima di confermare.
+/// **Layout riconfermato e decisione chiusa il 2026-09-01**, col volume reale collegato.
+/// `ls -1` dell'SSD ha dato esattamente il layout su cui la regola era stata scritta il
+/// 2026-07-29/30, invariato: `Foto Google Drive`, `Foto iPhone`, `Other`, `Takeout`,
+/// `Takeout 2`, `Zip`. La regola **non e' piu' provvisoria**.
+///
+/// **`Takeout/` e `Takeout 2/` restano alla pari delle altre cartelle** — decisione di
+/// Enrico, presa col layout davanti (aveva rimandato la risposta 6 del 2026-08-28 proprio
+/// a questo momento). L'argomento per declassarle accanto a `Import/`, che le stesure
+/// precedenti di questo commento definivano "forte", e' **respinto**: sono due cartelle
+/// distinte, e contengono le **copie originali** di foto estratte da Google. Una copia
+/// esiste anche nel cloud, ma i file sull'SSD sono gli originali estratti, non uno scarico
+/// rigenerabile. La loro origine automatica non dice niente sul valore del contenuto.
+/// **Chi in futuro ripensasse di declassarle: la domanda e' gia' stata fatta e la risposta
+/// e' no.** Fra `Takeout/` e `Takeout 2/` decidono quindi la data piu' vecchia e, a parita',
+/// il tie-break — arbitrario ma deterministico, e innocuo perche' i membri di un gruppo
+/// sono identici per definizione ed entrambe le cartelle sono mirrorate sull'HDD.
+///
+/// **Nota misurata sulla regola 2**: `Import/` **non esiste** sull'SSD reale (2026-09-01),
+/// quindi `notAnImport` oggi non discrimina nulla. Va tenuta comunque — il wizard di #27-A
+/// creera' quella cartella — ma chi legge i test non deve credere che sia lei a decidere.
+/// Distribuzione reale dei 47.482 file media: `Foto iPhone` 18.180, `Takeout` 13.139,
+/// `Takeout 2` 10.708, `Foto Google Drive` 3.947, `Other` 1.508.
+///
+/// La proposta resta comunque solo una proposta, che l'utente puo' cambiare gruppo per
+/// gruppo prima di confermare.
 ///
 /// **Questa funzione non verifica niente.** Percorsi, dimensioni e date vengono dall'indice,
 /// che e' una cache e puo' essere stantia (ADR-0002): qui si sceglie *quale* copia proporre,
@@ -9560,7 +9573,14 @@ struct LibraryIndexCard: View {
 
     /// Stima dichiarata prima di partire. Non e' mai stata misurata sul volume vero: e'
     /// scritta come un ordine di grandezza, non come una promessa.
-    private let durata = "di solito servono dai 5 ai 15 minuti"
+    /// **Numero misurato, non stimato** (2026-09-01, primo collegamento dell'SSD dopo
+    /// la scrittura della card). Throughput reale di lettura+SHA256 dall'SSD: 224 MiB/s
+    /// su un campione di 300 file distribuiti, contro 237,4 GiB di media indicizzabili
+    /// (47.482 file) = **~18 minuti**. La prima stesura diceva "dai 5 ai 15 minuti" ed
+    /// era un ordine di grandezza scritto a tavolino, con l'estremo superiore sotto la
+    /// misura vera. Se il contenuto dell'SSD cambia sensibilmente, si rimisura: non si
+    /// ritocca a occhio.
+    private let durata = "di solito servono dai 15 ai 25 minuti"
 
     var body: some View {
         GroupBox("Foto già salvate sull'SSD") {

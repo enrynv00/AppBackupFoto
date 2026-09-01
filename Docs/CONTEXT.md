@@ -44,7 +44,13 @@ Le decisioni architetturali stanno in `Docs/adr/`. Lo stato e l'architettura in 
 
 **Verdetto** — l'esito della domanda "l'hash memorizzato per questo file vale ancora?". Sono **quattro**, non tre: `fresh` (sì), `stale` (no, il file è cambiato), `needsVerification` (non possiamo escluderlo, si rihasha), `timezoneShift` (cambio di ora legale, si adotta il nuovo mtime **senza** rihashare). È logica pura, senza filesystem né database.
 
-**Percorso a basso danno / percorso ad alto danno** — la distinzione che regge tutto il modello di fiducia. Segnalare un doppione nel pannello è a basso danno (una riga sbagliata in un elenco). Saltare un file durante un import è ad **alto danno** (una foto non importata, in silenzio). Sullo stesso indice si applicano due livelli di fiducia diversi: nel primo caso ci si fida della cache, nel secondo **si rilegge e si rihasha il file candidato prima di decidere lo skip**.
+**Percorso a basso danno / percorso ad alto danno** — la distinzione che regge tutto il modello di fiducia. I livelli sono **tre**, non due, dal 2026-08-27 (ADR-0005):
+
+- **Mostrare** un gruppo di doppioni nel pannello è a **basso danno**: ci si fida della cache, e un hash stantio produce una riga sbagliata in un elenco.
+- **Saltare** un file durante un import è ad **alto danno**: una foto non importata, in silenzio. Si rilegge e si rihasha **il file candidato** prima di decidere lo skip.
+- **Cestinare** un gruppo dal pannello è il **danno più alto dell'intero progetto**: si sposta nel Cestino una foto che sull'SSD era l'unica copia. Si rilegge e si rihasha **ogni membro del gruppo, la copia tenuta compresa**, e si pretende unanimità.
+
+Attenzione a una frase che questa pagina ha portato fino al 2026-08-27: «il pannello Doppioni è il percorso a basso danno». Vale ora **solo per la visualizzazione**. Da quando il pannello può cestinare, mostrare e cancellare sono due usi con due livelli di fiducia diversi dentro la stessa finestra.
 
 **Regola anti-racy** — presa da git e borg: se un file risulta modificato entro un margine da quando ne abbiamo calcolato l'hash, non possiamo escludere che sia cambiato subito dopo la lettura mantenendo lo stesso mtime. Margine 2 secondi.
 
@@ -53,6 +59,22 @@ Le decisioni architetturali stanno in `Docs/adr/`. Lo stato e l'architettura in 
 **Guardia di plausibilità** — se una scansione vede sparire più della metà dell'indice, è quasi sempre un'interruzione non riconosciuta, non una cancellazione reale: nel dubbio l'indice si tiene. La **Ricostruzione completa** è la via d'uscita, ma solo da questa guardia: **non** scavalca la regola più forte "traversata incompleta ⇒ non si toglie niente". Se l'utente ha davvero svuotato l'SSD l'unica uscita è **svuotare l'elenco** (`deleteIndexAndRecreate`), che è il solo comando distruttivo della card.
 
 **Ricostruzione completa** (`ignoringStoredHashes`) — rihasha tutto senza fidarsi di nulla di memorizzato. Azione esplicita dell'utente, che significa "fidati del disco". Tutti i tool esaminati (rsync, restic, borg, rmlint) ne offrono una.
+
+---
+
+## Pannello Doppioni (roadmap #31)
+
+**Gruppo di doppioni** — l'insieme dei file dell'SSD che condividono lo stesso SHA256, con **almeno due membri**. Un gruppo ridotto a un solo membro non è un gruppo: va saltato, non mostrato. Proporre di "tenere" l'unica copia esistente è una riga che dichiara doppione un file che copie non ne ha.
+
+**Copia tenuta** — il membro del gruppo che l'app propone di **non** cestinare. La proposta segue una gerarchia (libreria principale → cartella organizzata invece che import → la più vecchia → tie-break deterministico sul percorso), ed è **spiegata a parole**, mai solo evidenziata: una proposta evidenziata e non spiegata si conferma senza sapere cosa si sta confermando. Resta una proposta: l'utente può cambiarla gruppo per gruppo prima di confermare.
+
+**Membri a pari merito** — le copie che valgono quanto quella tenuta, e fra cui ha deciso solo il tie-break. Vanno **marcate nella lista**, non solo contate: sapere che «un'altra copia va bene quanto questa» senza sapere *quale* è un'informazione vera e non azionabile.
+
+**Blocco** — l'unità di lavoro della cancellazione: i gruppi che l'utente ha spuntato, smaltiti insieme dopo un riepilogo dettagliato e una conferma. **Tetto: 500 file o 50 GB**, il primo che scatta. Il tetto è scelto sul **raggio del danno**, non sulla durata — un guasto a metà blocco è uno stato reale e misurato. Oltre il tetto la UI dice «fallo in più volte», non rifiuta e basta. Non si lavora un gruppo alla volta (600 clic portano a confermare a occhi chiusi) né tutto insieme (la conferma diventa un rituale).
+
+**Registro di ripristino** — il file che l'app scrive, sul disco interno e mai sull'SSD, con un record per ogni file cestinato: percorso originale, percorso nel Cestino, dimensione, hash, istante. Scritto **file per file nel momento in cui il file viene spostato**, non a fine blocco, così sopravvive a un blocco interrotto. Esiste perché il record «Rimetti a posto» del Finder è asincrono e **si perde** se l'app muore subito dopo (misurato), e perché `.DS_Store` è un file che decine di strumenti cancellano di routine. È ciò che rende possibile «Annulla l'ultimo spostamento» senza dipendere dal Finder.
+
+**Cestinare non è cancellare, e non libera spazio.** I file vanno nel Cestino del volume (`.Trashes/<uid>`), restano recuperabili, e lo spazio si libera **solo** quando l'utente svuota il Cestino — cosa che l'app non fa mai e non farà. E lo spazio si recupera solo sull'SSD: HDD e Cubbit tengono la loro copia per sempre, perché i mirror non cancellano mai.
 
 ---
 

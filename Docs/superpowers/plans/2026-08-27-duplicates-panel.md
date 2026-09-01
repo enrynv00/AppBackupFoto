@@ -371,7 +371,9 @@ Riscritto con due correzioni, entrambe necessarie: la posizione ora e' **scrivib
 
 ---
 
-### Task 6: `DuplicatesView` — la finestra, le due conferme, le miniature
+### Task 6: `DuplicatesView` — la finestra, le due conferme, le miniature ✅ FATTO (2026-09-01, commit `6ada8b1`)
+
+> **Esito**: **480 test** verdi (464 + **16**, non i 12 previsti: i quattro in piu' coprono varianti aggiuntive delle stesse diramazioni). Conteggio letto nel log e **riverificato indipendentemente** dall'orchestratore: `Executed 480 tests, with 0 failures (0 unexpected)`, `** TEST SUCCEEDED **`. Security audit: **nessun rilievo confermato**, tutte e sette le invarianti richieste reggono. Quattro scelte prese dove il piano lasciava spazio, tutte documentate in `.claude/rules/architecture.md`: `makeThumbnail` estratta a funzione libera `nonisolated` (fonte unica), `DuplicateTrasher.run` con `onProgress` a default no-op, `DuplicateKeepChoice.tiedPaths` additivo per marcare i pari merito, `BackupRunner.trashManifestStore` `lazy`.
 
 La parte SwiftUI non è testabile senza una corsa reale; **è testato tutto ciò che sta ai due capi del cablaggio**, come già dichiarato per la card di #31.
 
@@ -379,7 +381,7 @@ La parte SwiftUI non è testabile senza una corsa reale; **è testato tutto ciò
 
 **Interfaces:** consuma tutti i componenti dei Task 1–5, `AuthGateManager`, `makeThumbnail`, `BackupRunner.isRunning`, `VolumeMonitor`. Produce `Window("Doppioni", id: "duplicates")`, `DuplicatesView`, `DuplicatesStatus.lines(...)` (pura), `DuplicateThumbnailCache`.
 
-- [ ] **Step 1: Scrivi il file di test** (~12 test) sulle sole parti pure:
+- [x] **Step 1: Scrivi il file di test** (~12 test) sulle sole parti pure:
   - indice mai costruito ⇒ riga che **rimanda alla card**, mai una lista vuota che si legge come «non hai doppioni» (stessa classe di errore già corretta con `sawNothing`)
   - indice costruito, zero gruppi ⇒ riga diversa dalla precedente
   - N gruppi ⇒ riga con il numero di gruppi **e** i byte recuperabili
@@ -391,9 +393,9 @@ La parte SwiftUI non è testabile senza una corsa reale; **è testato tutto ciò
   - registro anti-gergo su tutte le diramazioni: nessun «hash», «indice», «SHA256», «entry», «scansione»
   - cache miniature: oltre il tetto la più vecchia viene sfrattata; la dimensione non supera mai il tetto
 
-- [ ] **Step 2–3: registra, verifica il fallimento atteso.**
+- [x] **Step 2–3: registra, verifica il fallimento atteso.**
 
-- [ ] **Step 4: Implementa la view.** Requisiti non negoziabili:
+- [x] **Step 4: Implementa la view.** Requisiti non negoziabili:
   - **Gate `AuthGateManager`** all'inizio del `body` (`LockScreenView()` al posto del contenuto reale) e `.restorationBehavior(.disabled)`. Regola #30: una scena di primo livello nasce fuori dal gate, e questa elenca percorsi, nomi e miniature di tutte le foto.
   - Gli avvisi sono `@State` **locali della view**, mai `runner.pendingAlert` — che ha un solo presentatore, il `.alert` di `ContentView` nella scena `main` (sezione `AlertSink` in `.claude/rules/architecture.md`). Nessun secondo presentatore di `pendingAlert`.
   - **Due conferme distinte**: riepilogo dettagliato (`DuplicateBatch.summaryLines`) in uno sheet, **poi** la conferma vera, che è un **`.alert` con bottone distruttivo** (deciso il 2026-08-28). **Non** una stringa da ridigitare: quella resta il segnale esclusivo della formattazione, l'unica operazione irreversibile del progetto, e usarla anche qui — dove il cestinamento è annullabile due volte — la svaluterebbe proprio dove serve. Di conseguenza il peso della conferma sta tutto nel riepilogo: se quello è vago, non c'è alert che tenga.
@@ -405,26 +407,28 @@ La parte SwiftUI non è testabile senza una corsa reale; **è testato tutto ciò
   - Ingresso: bottone dentro `LibraryIndexCard` in Diagnostica (`openWindow(id: "duplicates")`), **unico** — nessuna voce nell'hamburger, nemmeno disattivata (deciso il 2026-08-28).
   - **I membri a pari merito vanno marcati visivamente nella lista** (requisito nato dall'audit del Task 2, 2026-08-28). `DuplicateKeepChoice.tiedCandidates` dice **che** un'altra copia vale quanto quella tenuta, ma non **quale**: in un gruppo da tre membri l'utente legge «Un'altra copia va bene quanto questa» davanti a **due** righe, e sta per cestinarle entrambe senza sapere a quale si riferisce. L'informazione è vera ma non azionabile finché la riga corrispondente non è riconoscibile. Se la view non può marcarle, allora è la frase a dover nominare il percorso invece del numero.
 
-- [ ] **Step 5–6: test verdi, build, suite, commit** — attesi **476 test** (464 + 12). *(Il Task 4 si esegue dopo questo Task 5, quindi il cumulativo passa da 434 → 464 (Task 4) → 476.)*
+- [x] **Step 5–6: test verdi, build, suite, commit** — attesi **476 test** (464 + 12). *(Il Task 4 si esegue dopo questo Task 5, quindi il cumulativo passa da 434 → 464 (Task 4) → 476.)*
 
-- [ ] **Step 7: Dichiara esplicitamente cosa NON è coperto da test** nel commento in testa alla view e in `.claude/rules/architecture.md`: la view, i due sheet di conferma, il gate, l'apertura della finestra, le miniature. Sono SwiftUI e bookmark veri, non raggiungibili senza una corsa.
+- [x] **Step 7: Dichiara esplicitamente cosa NON è coperto da test** nel commento in testa alla view e in `.claude/rules/architecture.md`: la view, i due sheet di conferma, il gate, l'apertura della finestra, le miniature. Sono SwiftUI e bookmark veri, non raggiungibili senza una corsa.
 
 ---
 
-### Task 7: Documentazione — la regola assoluta, gli ADR, il vocabolario
+### Task 7: Documentazione — la regola assoluta, gli ADR, il vocabolario ✅ FATTO (2026-09-01)
+
+> **Esito**: regola assoluta riscritta in `Docs/CLAUDE.md` (punti 1 e 3, testo approvato copiato parola per parola dalla spec), ramo `trashItem` aggiunto alla checklist di revisione AI, tabella di stato e conteggio test aggiornati, riga «Prossimo incremento naturale» corretta (diceva una cosa ora **falsa**). **ADR-0005 scritto**, con le tre misure e la contro-domanda. Note datate su ADR-0003 (i livelli sono tre) e ADR-0002 (la cache non autorizza mai un atto distruttivo; la rimozione mirata delle chiavi e' conoscenza, non inferenza). `Docs/CONTEXT.md`: sezione nuova col vocabolario del pannello e voce «basso/alto danno» corretta. `.claude/rules/architecture.md`: sei nuovi fatti misurati (7-12) in coda ai sei esistenti. Lo **Step 7 e' stato eseguito davvero**, con SSD e HDD collegati: vedi la sezione «Verifiche manuali» di `Docs/CLAUDE.md`.
 
 Nessun test. Va fatto **prima** di considerare la feature chiusa, non dopo: una regola assoluta cambiata e non scritta è un'eccezione silenziosa che qualcuno estenderà.
 
 **Files:** `Docs/CLAUDE.md`, `Docs/adr/0005-il-pannello-doppioni-puo-cestinare.md` (nuovo), `Docs/adr/0002-indice-cache-non-fonte-di-verita.md`, `Docs/adr/0003-due-livelli-di-fiducia-sullo-stesso-indice.md`, `Docs/CONTEXT.md`, `.claude/rules/architecture.md`.
 
-- [ ] **Step 1: `Docs/CLAUDE.md` — la regola assoluta.** Riscrivi i punti 1 e 3 col testo approvato da Enrico il 2026-08-28, riportato **parola per parola** nella spec, sezione «La regola assoluta cambia» — copiarlo, non riscriverlo a memoria: la clausola sulla rilettura unanime («ogni membro del gruppo, la copia tenuta compresa») è stata aggiunta apposta e non va persa. Aggiungi il ramo `trashItem` alla checklist di revisione AI, che oggi conosce `removeItem`/`moveItem`/`copyItem` ma non `trashItem`. Aggiorna la tabella di stato (pannello Doppioni non più «mai iniziato»), il conteggio dei test e la riga «Prossimo incremento naturale», che oggi descrive il pannello come «quello a basso danno, dove ci si fida della cache invece di rileggere» — **frase ora falsa**.
-- [ ] **Step 2: ADR-0005 nuovo.** Contenuto in «Cosa cambia negli ADR esistenti» nella spec. Deve contenere le tre misure del 2026-08-27 e la contro-domanda per chi un giorno proporrà di togliere la rilettura del file tenuto «perché tanto l'indice ce l'ha già».
-- [ ] **Step 3: nota datata in ADR-0003** — «pannello Doppioni = basso danno» vale ora solo per la **visualizzazione**; i livelli sono tre; rimando ad ADR-0005. Nota, non riscrittura: il ragionamento dell'ADR è ancora valido.
-- [ ] **Step 4: nota datata in ADR-0002** — la cache non può mai essere la sola base di un atto distruttivo; e la rimozione mirata delle chiavi dopo il cestinamento è **conoscenza, non inferenza**, quindi non ricade sotto «traversata incompleta ⇒ nessuna rimozione».
-- [ ] **Step 5: `Docs/CONTEXT.md`** — voci nuove (**Gruppo di doppioni**, **Copia tenuta**, **Blocco**, **Registro di ripristino**) e correzione della voce «Percorso a basso danno / percorso ad alto danno».
-- [ ] **Step 6: `.claude/rules/architecture.md`** — sezione nuova sotto quella di #31, con i componenti, le guardie, i mutanti uccisi e i fatti misurati del 2026-08-27 (che vanno nella lista «Fatti misurati — da non riscoprire pagandoli una seconda volta», in coda ai sei esistenti).
-- [ ] **Step 7: verifiche manuali pendenti.** Aggiungi a `Docs/CLAUDE.md`, accanto a quelle già in attesa dell'SSD: `trashItem` sull'SSD vero dall'app firmata; esistenza e contenuto di `.Trashes` su quel volume; `ls -1 "/Volumes/SSD - Enri"` per validare la regola di proposta del Task 2 — e con quel layout davanti, **chiudere la decisione rimandata da Enrico il 2026-08-28 su dove collocare `Takeout/` e `Takeout 2/` nella gerarchia** (alla pari delle cartelle organizzate, com'è ora in via provvisoria, oppure declassate accanto a `Import/` perché sono estrazioni automatiche); «Rimetti a posto» premuto davvero nel Finder.
-- [ ] **Step 8: commit.**
+- [x] **Step 1: `Docs/CLAUDE.md` — la regola assoluta.** Riscrivi i punti 1 e 3 col testo approvato da Enrico il 2026-08-28, riportato **parola per parola** nella spec, sezione «La regola assoluta cambia» — copiarlo, non riscriverlo a memoria: la clausola sulla rilettura unanime («ogni membro del gruppo, la copia tenuta compresa») è stata aggiunta apposta e non va persa. Aggiungi il ramo `trashItem` alla checklist di revisione AI, che oggi conosce `removeItem`/`moveItem`/`copyItem` ma non `trashItem`. Aggiorna la tabella di stato (pannello Doppioni non più «mai iniziato»), il conteggio dei test e la riga «Prossimo incremento naturale», che oggi descrive il pannello come «quello a basso danno, dove ci si fida della cache invece di rileggere» — **frase ora falsa**.
+- [x] **Step 2: ADR-0005 nuovo.** Contenuto in «Cosa cambia negli ADR esistenti» nella spec. Deve contenere le tre misure del 2026-08-27 e la contro-domanda per chi un giorno proporrà di togliere la rilettura del file tenuto «perché tanto l'indice ce l'ha già».
+- [x] **Step 3: nota datata in ADR-0003** — «pannello Doppioni = basso danno» vale ora solo per la **visualizzazione**; i livelli sono tre; rimando ad ADR-0005. Nota, non riscrittura: il ragionamento dell'ADR è ancora valido.
+- [x] **Step 4: nota datata in ADR-0002** — la cache non può mai essere la sola base di un atto distruttivo; e la rimozione mirata delle chiavi dopo il cestinamento è **conoscenza, non inferenza**, quindi non ricade sotto «traversata incompleta ⇒ nessuna rimozione».
+- [x] **Step 5: `Docs/CONTEXT.md`** — voci nuove (**Gruppo di doppioni**, **Copia tenuta**, **Blocco**, **Registro di ripristino**) e correzione della voce «Percorso a basso danno / percorso ad alto danno».
+- [x] **Step 6: `.claude/rules/architecture.md`** — sezione nuova sotto quella di #31, con i componenti, le guardie, i mutanti uccisi e i fatti misurati del 2026-08-27 (che vanno nella lista «Fatti misurati — da non riscoprire pagandoli una seconda volta», in coda ai sei esistenti).
+- [x] **Step 7: verifiche manuali pendenti.** Aggiungi a `Docs/CLAUDE.md`, accanto a quelle già in attesa dell'SSD: `trashItem` sull'SSD vero dall'app firmata; esistenza e contenuto di `.Trashes` su quel volume; `ls -1 "/Volumes/SSD - Enri"` per validare la regola di proposta del Task 2 — e con quel layout davanti, **chiudere la decisione rimandata da Enrico il 2026-08-28 su dove collocare `Takeout/` e `Takeout 2/` nella gerarchia** (alla pari delle cartelle organizzate, com'è ora in via provvisoria, oppure declassate accanto a `Import/` perché sono estrazioni automatiche); «Rimetti a posto» premuto davvero nel Finder.
+- [x] **Step 8: commit.**
 
 ---
 

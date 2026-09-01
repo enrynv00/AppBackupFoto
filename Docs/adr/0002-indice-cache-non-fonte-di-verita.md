@@ -34,3 +34,23 @@ L'indice non contiene foto, ma contiene i **percorsi** di tutte le foto di Enric
 È una misura di igiene, non una difesa crittografica: chi ha accesso alla home ha comunque accesso alle foto. Vale la pena solo perché costa una `chmod`. Coerentemente con questa ADR è **best-effort**: se la `chmod` fallisce, l'indice resta perfettamente usabile e non si lancia niente.
 
 Da misurare, non dedurre: SQLite ricrea `-wal`/`-shm` a ogni checkpoint, copiando i permessi del database. Il test che protegge questa nota verifica i permessi **dopo** un ciclo completo di apertura/scrittura/chiusura/riapertura, e si salta da solo se l'umask del processo di test è già restrittiva — altrimenti sarebbe verde senza dimostrare niente.
+
+## Nota (2026-08-27): la cache non può mai essere la sola base di un atto distruttivo
+
+«L'indice è una cache, non una fonte di verità» resta vero, e dal 2026-08-27 diventa più importante: da quella data un consumatore della cache può **spostare file nel Cestino** (pannello Doppioni, ADR-0005).
+
+La conseguenza da aggiungere è una sola, e non ammette eccezioni:
+
+> **Nessun file viene mai spostato, rinominato o rimosso sulla base di ciò che dice l'indice.** Il disco si rilegge sempre prima — ogni membro del gruppo, la copia tenuta compresa — e si pretende unanimità. L'indice serve a *proporre* i candidati, mai ad autorizzare l'operazione.
+
+Chi legge il codice del pannello troverà una rilettura che «sembra ridondante», visto che l'indice ha già gli hash. Non lo è: è questa nota, ed è ADR-0005.
+
+### Precisazione: la rimozione mirata delle chiavi dopo il cestinamento è conoscenza, non inferenza
+
+Dopo un gruppo cestinato con successo, l'app rimuove dall'indice **le chiavi dei file effettivamente cestinati, e nessun'altra**.
+
+Questo **non** ricade sotto la regola «traversata incompleta ⇒ nessuna rimozione dall'indice» stabilita durante il nucleo di #31. Quella regola protegge da un'**inferenza**: «non ho visto questo file durante la scansione, quindi probabilmente non c'è più» — un ragionamento che una traversata interrotta rende falso, e il cui costo è dedup spento e ricostruzione.
+
+Qui non si inferisce niente. L'app **sa** che quel file non è più a quel percorso, perché è stata lei a spostarlo, un file alla volta, e ha il `resultingItemURL` restituito da `trashItem` scritto nel registro di ripristino. È conoscenza diretta di un'azione appena compiuta, non una deduzione da un'assenza.
+
+Verso opposto, per completezza: dopo un **annullamento** le entry **non** vengono reinserite a mano. Ricostruirle significherebbe inventare un `hashedAt`, cioè avvelenare la regola anti-racy per risparmiare una scansione incrementale. Si segna che l'indice va aggiornato e ci pensa la scansione: i file tornati risultano nuovi e vengono rihashati.

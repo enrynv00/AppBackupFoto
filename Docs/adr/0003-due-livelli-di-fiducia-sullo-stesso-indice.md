@@ -42,3 +42,17 @@ Il ramo dell'indice persistito la rispettava già, perché `LibraryIndexer.scan`
 Il filtro sta ora in due punti, e servono entrambi: in `isAlreadyInLibrary` (lato "salto") e nella closure `onCopied` di `runImport` (lato "ricordo"). Il secondo non è ridondanza: tiene i due rami simmetrici — l'indice persistito non contiene mai non-media, e non deve contenerli nemmeno quello di sessione — mentre il primo chiude il buco per qualunque *altra* via con cui un non-media potesse finire in un indice.
 
 Il filtro non sta in `FileSyncer`, che deve restare ignaro di `IndexableKind`: il dedup è roba dell'import, e il predicato è no-op per Mac→SSD e SSD→HDD.
+
+## Nota (2026-08-27): i livelli sono tre, e «pannello Doppioni = basso danno» vale solo per la visualizzazione
+
+Il ragionamento di questa ADR **resta valido**: è la mappatura fra i due usi e i due livelli che non è più completa.
+
+Quando questa ADR è stata scritta, il pannello Doppioni **segnalava e basta**, e la frase «un hash stantio produce una riga sbagliata in un elenco» era vera. Il 2026-08-27 Enrico ha deciso che il pannello può anche **spostare i doppioni nel Cestino**. Da quel momento un hash stantio, nello stesso pannello, può mandare nel Cestino una foto che non è un doppione.
+
+Quindi:
+
+- **«Pannello Doppioni = basso danno» vale ora solo per la visualizzazione dei gruppi.** Lì la fiducia nella cache resta quella descritta qui, invariata.
+- **La cancellazione è un terzo livello, più severo del secondo**: si rilegge e si rihasha **ogni membro del gruppo, la copia tenuta compresa**, e si pretende unanimità. Rileggere solo le copie da cestinare direbbe che sono uguali *fra loro*, non che siano uguali a quella che resta.
+- Il terzo livello non annulla né indebolisce niente di quanto scritto sopra. Le tre difese (regola anti-racy, tolleranza DST, verifica completa) e la distinzione fra `.needsVerification` e `.timezoneShift` restano esattamente come sono.
+
+Il ragionamento completo, le misure che lo giustificano e la contro-domanda per chi vorrà togliere la rilettura del file tenuto stanno in **ADR-0005**.
