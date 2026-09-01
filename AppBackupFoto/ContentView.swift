@@ -1584,8 +1584,23 @@ enum ImportPreviewStatus {
     ///   - viene sempre aggiunta una riga dedicata che dice la verita': il controllo si e'
     ///     fermato prima della fine, e il numero sopra potrebbe contare foto gia' sull'SSD che
     ///     l'importazione vera salterebbe comunque (verso non-sicuro dichiarato, mai nascosto).
+    /// Come e' finito il controllo. **Non e' un booleano**, ed e' il rilievo di review del
+    /// 2026-09-01: le due interruzioni possibili sbagliano il numero in due direzioni
+    /// **opposte**, e una riga sola non puo' dire la verita' su entrambe.
+    ///
+    /// - `duringCount`: fermato mentre l'app stava ancora **contando** i file della cartella.
+    ///   `toAdd` non e' un totale sovrastimato: e' un **frammento**. Su una sorgente da 18.000
+    ///   file, fermarsi dopo due secondi puo' dare «47 file nuovi» — che l'utente legge come
+    ///   «ecco cosa importero'». Stessa classe di errore di `sawNothing` in #31.
+    /// - `duringCheck`: la camminata era finita — `toAdd` e' il totale vero — e si e' fermato
+    ///   il controllo su quali fossero gia' sull'SSD. Qui, e **solo** qui, il numero e' una
+    ///   sovrastima, e si puo' rassicurare l'utente che l'importazione vera salta comunque i
+    ///   doppioni.
+    enum PreviewInterruption: Equatable { case none, duringCount, duringCheck }
+
     static func lines(toAdd: Int, toSkipDuplicates: Int, toAddBytes: Int64, estimatedSec: Int,
-                      interrupted: Bool) -> [Line] {
+                      interruption: PreviewInterruption) -> [Line] {
+        let interrupted = interruption != .none
         var out: [Line] = []
 
         if !interrupted && toAdd == 0 && toSkipDuplicates == 0 {
@@ -1618,7 +1633,15 @@ enum ImportPreviewStatus {
             out.append(Line(id: "already-present", tone: .info, text: "\(already)."))
         }
 
-        if interrupted {
+        switch interruption {
+        case .none:
+            break
+        case .duringCount:
+            out.append(Line(id: "interrupted", tone: .warning, text:
+                "Hai fermato il controllo mentre l'app stava ancora contando: quello che vedi "
+                + "qui sopra è solo una parte di quello che c'è nella cartella, non il totale. "
+                + "Scegli di nuovo la cartella per rifare il conto da capo."))
+        case .duringCheck:
             out.append(Line(id: "interrupted", tone: .warning, text:
                 "Il controllo è stato interrotto prima della fine: il numero qui sopra potrebbe "
                 + "contare foto già presenti sull'SSD, che l'importazione vera salterà comunque."))
@@ -4737,7 +4760,8 @@ final class FileSyncer {
     ///     candidati e non si appende niente** — vedi `previewDir`/`previewFile`.
     func previewSync(from src: URL, to dst: URL, deep: Bool,
                       duplicateFilter: (([PreviewCandidate]) -> Set<Int>)? = nil) async
-        -> (toAdd: Int, toSkip: Int, toSkipDuplicates: Int, toAddBytes: Int64, estimatedSec: Int) {
+        -> (toAdd: Int, toSkip: Int, toSkipDuplicates: Int, toAddBytes: Int64, estimatedSec: Int,
+            countComplete: Bool) {
         return await withCheckedContinuation { [self] cont in
             DispatchQueue.global(qos: .userInitiated).async {
                 self.cancelled = false
@@ -4750,8 +4774,14 @@ final class FileSyncer {
                 var candidates: [PreviewCandidate]? = duplicateFilter != nil ? [] : nil
                 self.previewDir(src: src, dst: dst, deep: deep, toAdd: &toAdd, toSkip: &toSkip,
                                  toAddBytes: &toAddBytes, candidates: &candidates)
+                // Se l'utente ha fermato tutto durante la camminata, i candidati raccolti
+                // sono un frammento e non ha senso controllarli: si dichiara la camminata
+                // incompleta e si lascia al chiamante il compito di dirlo (rilievo di review
+                // del 2026-09-01 — prima si chiamava `duplicateFilter` comunque, e il numero
+                // parziale arrivava a schermo con un avviso che ne sbagliava la direzione).
+                let countComplete = !self.cancelled
                 var toSkipDuplicates = 0
-                if let duplicateFilter, let candidates {
+                if countComplete, let duplicateFilter, let candidates {
                     let duplicateIndices = duplicateFilter(candidates)
                     for i in duplicateIndices where candidates.indices.contains(i) {
                         toAdd -= 1
@@ -4770,6 +4800,7 @@ final class FileSyncer {
                 let workUnits = toAdd + toSkipDuplicates
                 let estimatedSec = workUnits > 0 ? max(1, workUnits / 50) : 0
                 cont.resume(returning: (toAdd: toAdd, toSkip: toSkip, toSkipDuplicates: toSkipDuplicates,
+                                        countComplete: countComplete,
                                          toAddBytes: toAddBytes, estimatedSec: estimatedSec))
             }
         }
@@ -8743,9 +8774,9 @@ struct ImportView: View {
     @State private var sourceURL: URL?
     @State private var guardErrorMessage: String?
     @State private var isLoadingPreview = false
-    @State private var previewResult: (toAdd: Int, toSkip: Int, toSkipDuplicates: Int, toAddBytes: Int64, estimatedSec: Int)?
+    @State private var previewResult: (toAdd: Int, toSkip: Int, toSkipDuplicates: Int, toAddBytes: Int64, estimatedSec: Int, countComplete: Bool)?
     @State private var previewUnavailableReason: String?
-    @State private var previewInterrupted = false
+    @State private var previewInterruption: ImportPreviewStatus.PreviewInterruption = .none
     @State private var previewProgress: (done: Int, total: Int, sourceFileCount: Int, elapsedSec: Int)?
     @State private var previewStartDate: Date?
     /// Token di richiesta (vedi doc-comment della struct): incrementato ogni volta che si
@@ -8780,7 +8811,16 @@ struct ImportView: View {
             // anteprima: ferma subito la lettura (entrambi i meccanismi, come "Interrompi")
             // e mostra il motivo scritto al posto di un numero che l'assenza del volume
             // renderebbe silenziosamente sbagliato (verifica manuale n. 4 del piano).
-            guard step == .preview, !mounted else { return }
+            guard step == .preview else { return }
+            guard !mounted else {
+                // Ricollegato mentre il wizard era fermo sul motivo scritto: si toglie il
+                // motivo, cosi' l'utente puo' riprovare senza tornare indietro e riscegliere
+                // la cartella. Senza questo ramo restava bloccato su «SSD non collegato»
+                // anche dopo averlo ricollegato (rilievo di review del 2026-09-01).
+                previewUnavailableReason = ImportPreviewStatus.unavailableReason(
+                    ssdConfigured: bm.urls[.ssd] != nil, ssdMounted: true)
+                return
+            }
             previewCancelFlag?.cancel()
             previewSyncer.cancel()
             previewToken = UUID()
@@ -8830,7 +8870,7 @@ struct ImportView: View {
                         toSkipDuplicates: previewResult.toSkipDuplicates,
                         toAddBytes: previewResult.toAddBytes,
                         estimatedSec: previewResult.estimatedSec,
-                        interrupted: previewInterrupted)) { line in
+                        interruption: previewInterruption)) { line in
                         HStack(alignment: .top, spacing: AppSpacing.sm) {
                             Image(systemName: icon(line.tone))
                                 .foregroundStyle(color(line.tone)).font(.system(size: 12))
@@ -8874,9 +8914,17 @@ struct ImportView: View {
                     .font(AppFont.caption).foregroundStyle(.secondary)
             } else {
                 // Fase iniziale: la sola camminata della sorgente (stat, nessun hash), il
-                // cui denominatore per la dedup non e' ancora noto. Misurata trascurabile
-                // rispetto all'hashing (spec): uno spinner indeterminato qui è accettabile,
-                // il requisito di Enrico riguarda la fase costosa che segue.
+                // cui denominatore per la dedup non e' ancora noto.
+                //
+                // **ASSUNTA** trascurabile rispetto all'hashing, **non misurata** — rilievo
+                // di review del 2026-09-01: la stesura precedente di questo commento diceva
+                // «misurata trascurabile (spec)», e nella spec quella misura non c'e'. Su un
+                // progetto che distingue con cura «misurato» da «assunto» in tutta la
+                // documentazione, citare una misura inesistente e' peggio che non citarne
+                // nessuna: la prossima persona la prende per un fatto verificato.
+                // La conferma e' la verifica manuale n. 1 del piano, ancora da fare: se su
+                // una scheda vera questa fase durasse a lungo, qui serve una barra
+                // determinata anche per la camminata, non uno spinner.
                 ProgressView("Conteggio file in corso…")
             }
             // Requisito 3 di Enrico: SEMPRE premibile durante l'attesa, in entrambe le fasi
@@ -8950,7 +8998,7 @@ struct ImportView: View {
         sourceURL = url
         label = "\(url.lastPathComponent) - \(Self.dateFormatter.string(from: Date()))"
         previewResult = nil
-        previewInterrupted = false
+        previewInterruption = .none
         previewProgress = nil
         previewUnavailableReason = nil
         step = .preview
@@ -9016,7 +9064,12 @@ struct ImportView: View {
             // riferito a un'altra scelta dell'utente.
             guard token == previewToken else { return }
             isLoadingPreview = false
-            previewInterrupted = flag.isCancelled
+            // Le due interruzioni sbagliano il numero in direzioni OPPOSTE, e la riga che
+            // l'utente legge deve dire quale delle due e' capitata (rilievo di review del
+            // 2026-09-01). `countComplete` viene da `previewSync` e dice se la camminata e'
+            // arrivata in fondo: se no, `toAdd` non e' un totale sovrastimato ma un frammento.
+            previewInterruption = flag.isCancelled ? (result.countComplete ? .duringCheck : .duringCount)
+                                                   : .none
             previewResult = result
         }
     }

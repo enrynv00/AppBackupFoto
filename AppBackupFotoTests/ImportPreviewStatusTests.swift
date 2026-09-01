@@ -40,7 +40,7 @@ final class ImportPreviewStatusTests: XCTestCase {
     /// Nessun doppione: la riga "Già presenti sull'SSD" non deve comparire affatto — non a
     /// zero, proprio assente.
     func testNoDuplicates_thenAlreadyPresentLineIsAbsent() {
-        let lines = ImportPreviewStatus.lines(toAdd: 10, toSkipDuplicates: 0, toAddBytes: 1_000_000, estimatedSec: 5, interrupted: false)
+        let lines = ImportPreviewStatus.lines(toAdd: 10, toSkipDuplicates: 0, toAddBytes: 1_000_000, estimatedSec: 5, interruption: .none)
         XCTAssertFalse(lines.contains { $0.id == "already-present" })
         for line in lines {
             XCTAssertFalse(line.text.lowercased().contains("già presenti"))
@@ -50,7 +50,7 @@ final class ImportPreviewStatusTests: XCTestCase {
 
     /// Doppioni presenti: la riga compare, col numero.
     func testDuplicatesPresent_lineAppearsWithCount() {
-        let lines = ImportPreviewStatus.lines(toAdd: 10, toSkipDuplicates: 3, toAddBytes: 1_000_000, estimatedSec: 5, interrupted: false)
+        let lines = ImportPreviewStatus.lines(toAdd: 10, toSkipDuplicates: 3, toAddBytes: 1_000_000, estimatedSec: 5, interruption: .none)
         guard let already = lines.first(where: { $0.id == "already-present" }) else {
             return XCTFail("manca la riga 'già presenti'")
         }
@@ -60,9 +60,9 @@ final class ImportPreviewStatusTests: XCTestCase {
     /// Plurale della riga "già presenti": 1 file concordato al singolare, 2 al plurale.
     /// Stessa disciplina di LibraryIndexStatus (2026-09-01).
     func testAlreadyPresentLine_pluralAgreement() {
-        let one = ImportPreviewStatus.lines(toAdd: 10, toSkipDuplicates: 1, toAddBytes: 1, estimatedSec: 1, interrupted: false)
+        let one = ImportPreviewStatus.lines(toAdd: 10, toSkipDuplicates: 1, toAddBytes: 1, estimatedSec: 1, interruption: .none)
             .first { $0.id == "already-present" }!.text
-        let two = ImportPreviewStatus.lines(toAdd: 10, toSkipDuplicates: 2, toAddBytes: 1, estimatedSec: 1, interrupted: false)
+        let two = ImportPreviewStatus.lines(toAdd: 10, toSkipDuplicates: 2, toAddBytes: 1, estimatedSec: 1, interruption: .none)
             .first { $0.id == "already-present" }!.text
         XCTAssertTrue(one.contains("1 file"))
         XCTAssertFalse(one.lowercased().contains("verranno"), "singolare: non deve usare il verbo plurale")
@@ -76,9 +76,9 @@ final class ImportPreviewStatusTests: XCTestCase {
     /// per sola sostituzione di cifre passerebbe anche con un plurale sempre uguale, se il
     /// resto della riga (byte/tempo) introduce cifre proprie che confondono il paragone.
     func testToAddLine_pluralAgreement() {
-        let one = ImportPreviewStatus.lines(toAdd: 1, toSkipDuplicates: 0, toAddBytes: 1, estimatedSec: 1, interrupted: false)
+        let one = ImportPreviewStatus.lines(toAdd: 1, toSkipDuplicates: 0, toAddBytes: 1, estimatedSec: 1, interruption: .none)
             .first { $0.id == "toAdd" }!.text
-        let two = ImportPreviewStatus.lines(toAdd: 2, toSkipDuplicates: 0, toAddBytes: 1, estimatedSec: 1, interrupted: false)
+        let two = ImportPreviewStatus.lines(toAdd: 2, toSkipDuplicates: 0, toAddBytes: 1, estimatedSec: 1, interruption: .none)
             .first { $0.id == "toAdd" }!.text
         XCTAssertTrue(one.contains("1 file nuovo "), "singolare atteso: «\(one)»")
         XCTAssertFalse(one.contains("nuovi"), "singolare: non deve usare la forma plurale: «\(one)»")
@@ -90,7 +90,7 @@ final class ImportPreviewStatusTests: XCTestCase {
     /// per cui esiste questo lavoro. La coppia di righe deve leggersi come "non c'e' niente di
     /// nuovo da importare", mai come un silenzio o un errore.
     func testNothingNewToImport_readsAsGoodNewsNotSilenceOrError() {
-        let lines = ImportPreviewStatus.lines(toAdd: 0, toSkipDuplicates: 12, toAddBytes: 0, estimatedSec: 0, interrupted: false)
+        let lines = ImportPreviewStatus.lines(toAdd: 0, toSkipDuplicates: 12, toAddBytes: 0, estimatedSec: 0, interruption: .none)
         XCTAssertFalse(lines.isEmpty, "mai un silenzio")
         guard let toAdd = lines.first(where: { $0.id == "toAdd" }) else {
             return XCTFail("manca la riga principale anche a toAdd == 0")
@@ -111,8 +111,8 @@ final class ImportPreviewStatusTests: XCTestCase {
     /// precedente — "non ho trovato foto" contro "le hai gia' tutte" — e deve produrre una
     /// riga diversa. Stessa classe di errore gia' corretta con `sawNothing` in #31.
     func testEmptySource_differsFromNothingNewToImport() {
-        let empty = ImportPreviewStatus.lines(toAdd: 0, toSkipDuplicates: 0, toAddBytes: 0, estimatedSec: 0, interrupted: false)
-        let nothingNew = ImportPreviewStatus.lines(toAdd: 0, toSkipDuplicates: 12, toAddBytes: 0, estimatedSec: 0, interrupted: false)
+        let empty = ImportPreviewStatus.lines(toAdd: 0, toSkipDuplicates: 0, toAddBytes: 0, estimatedSec: 0, interruption: .none)
+        let nothingNew = ImportPreviewStatus.lines(toAdd: 0, toSkipDuplicates: 12, toAddBytes: 0, estimatedSec: 0, interruption: .none)
 
         XCTAssertFalse(empty.isEmpty, "mai un silenzio")
         let emptyIds = Set(empty.map(\.id))
@@ -149,7 +149,7 @@ final class ImportPreviewStatusTests: XCTestCase {
         for caso in tutteLeDiramazioni() {
             let lines = ImportPreviewStatus.lines(
                 toAdd: caso.toAdd, toSkipDuplicates: caso.toSkipDuplicates,
-                toAddBytes: caso.toAddBytes, estimatedSec: caso.estimatedSec, interrupted: false)
+                toAddBytes: caso.toAddBytes, estimatedSec: caso.estimatedSec, interruption: .none)
             XCTAssertFalse(lines.isEmpty, "il caso «\(caso.nome)» non produce nessuna riga")
         }
     }
@@ -159,7 +159,7 @@ final class ImportPreviewStatusTests: XCTestCase {
         for caso in tutteLeDiramazioni() {
             let lines = ImportPreviewStatus.lines(
                 toAdd: caso.toAdd, toSkipDuplicates: caso.toSkipDuplicates,
-                toAddBytes: caso.toAddBytes, estimatedSec: caso.estimatedSec, interrupted: false)
+                toAddBytes: caso.toAddBytes, estimatedSec: caso.estimatedSec, interruption: .none)
             for line in lines {
                 let detto = line.text.lowercased()
                 for parola in gergo {
@@ -191,8 +191,8 @@ final class ImportPreviewStatusTests: XCTestCase {
     /// Stesso input, due chiamate: gli `id` devono coincidere — altrimenti SwiftUI vedrebbe
     /// tutte le righe come nuove a ogni ridisegno.
     func testStableIdsAcrossTwoCallsWithSameData() {
-        let first = ImportPreviewStatus.lines(toAdd: 7, toSkipDuplicates: 2, toAddBytes: 500, estimatedSec: 3, interrupted: false)
-        let second = ImportPreviewStatus.lines(toAdd: 7, toSkipDuplicates: 2, toAddBytes: 500, estimatedSec: 3, interrupted: false)
+        let first = ImportPreviewStatus.lines(toAdd: 7, toSkipDuplicates: 2, toAddBytes: 500, estimatedSec: 3, interruption: .none)
+        let second = ImportPreviewStatus.lines(toAdd: 7, toSkipDuplicates: 2, toAddBytes: 500, estimatedSec: 3, interruption: .none)
         XCTAssertEqual(first.map(\.id), second.map(\.id))
     }
 
@@ -202,7 +202,7 @@ final class ImportPreviewStatusTests: XCTestCase {
         for caso in tutteLeDiramazioni() {
             let lines = ImportPreviewStatus.lines(
                 toAdd: caso.toAdd, toSkipDuplicates: caso.toSkipDuplicates,
-                toAddBytes: caso.toAddBytes, estimatedSec: caso.estimatedSec, interrupted: false)
+                toAddBytes: caso.toAddBytes, estimatedSec: caso.estimatedSec, interruption: .none)
             let ids = lines.map(\.id)
             XCTAssertEqual(Set(ids).count, ids.count, "id duplicati nel caso «\(caso.nome)»: \(ids)")
         }
@@ -268,7 +268,7 @@ final class ImportPreviewStatusTests: XCTestCase {
     /// L'interruzione aggiunge una riga dedicata, che dice che il controllo si e' fermato
     /// e che il numero potrebbe includere foto gia' sull'SSD.
     func testInterrupted_addsWarningLineAboutTheInterruption() {
-        let lines = ImportPreviewStatus.lines(toAdd: 10, toSkipDuplicates: 2, toAddBytes: 1_000, estimatedSec: 1, interrupted: true)
+        let lines = ImportPreviewStatus.lines(toAdd: 10, toSkipDuplicates: 2, toAddBytes: 1_000, estimatedSec: 1, interruption: .duringCheck)
         guard let warning = lines.first(where: { $0.id == "interrupted" }) else {
             return XCTFail("manca la riga che dichiara l'interruzione")
         }
@@ -279,7 +279,7 @@ final class ImportPreviewStatusTests: XCTestCase {
 
     /// Senza interruzione, la riga non compare affatto.
     func testNotInterrupted_noWarningLine() {
-        let lines = ImportPreviewStatus.lines(toAdd: 10, toSkipDuplicates: 2, toAddBytes: 1_000, estimatedSec: 1, interrupted: false)
+        let lines = ImportPreviewStatus.lines(toAdd: 10, toSkipDuplicates: 2, toAddBytes: 1_000, estimatedSec: 1, interruption: .none)
         XCTAssertFalse(lines.contains { $0.id == "interrupted" })
     }
 
@@ -288,7 +288,7 @@ final class ImportPreviewStatusTests: XCTestCase {
     /// in fondo). Un controllo troncato non puo' dichiarare con sicurezza che la sorgente
     /// e' vuota: la riga dedicata alla sorgente vuota non deve mai comparire qui.
     func testInterrupted_neverClaimsEmptySourceEvenWithZeroCounts() {
-        let lines = ImportPreviewStatus.lines(toAdd: 0, toSkipDuplicates: 0, toAddBytes: 0, estimatedSec: 0, interrupted: true)
+        let lines = ImportPreviewStatus.lines(toAdd: 0, toSkipDuplicates: 0, toAddBytes: 0, estimatedSec: 0, interruption: .duringCheck)
         XCTAssertFalse(lines.isEmpty, "mai un silenzio, nemmeno interrotti")
         XCTAssertFalse(lines.contains { $0.id == "empty-source" },
                        "un controllo interrotto non puo' dichiarare la sorgente vuota con sicurezza")
@@ -299,7 +299,7 @@ final class ImportPreviewStatusTests: XCTestCase {
     /// confidente" del reimport completo ("le hai gia' tutte") — quella affermazione
     /// presuppone che il controllo sia arrivato in fondo.
     func testInterrupted_doesNotClaimTheConfidentGoodNewsOfACompleteRecheck() {
-        let lines = ImportPreviewStatus.lines(toAdd: 0, toSkipDuplicates: 5, toAddBytes: 0, estimatedSec: 0, interrupted: true)
+        let lines = ImportPreviewStatus.lines(toAdd: 0, toSkipDuplicates: 5, toAddBytes: 0, estimatedSec: 0, interruption: .duringCheck)
         guard let toAddLine = lines.first(where: { $0.id == "toAdd" }) else {
             return XCTFail("manca la riga principale anche interrotti")
         }
@@ -311,7 +311,7 @@ final class ImportPreviewStatusTests: XCTestCase {
     /// Registro anti-gergo sulla riga di interruzione: stessa disciplina delle altre.
     func testInterrupted_antiJargonRegister() {
         let gergo = ["indice", "hash", "sha256", "sha", "sqlite", "mtime", "cache", "entry", "dedup", "scansione"]
-        let lines = ImportPreviewStatus.lines(toAdd: 3, toSkipDuplicates: 1, toAddBytes: 10, estimatedSec: 1, interrupted: true)
+        let lines = ImportPreviewStatus.lines(toAdd: 3, toSkipDuplicates: 1, toAddBytes: 10, estimatedSec: 1, interruption: .duringCheck)
         guard let warning = lines.first(where: { $0.id == "interrupted" }) else {
             return XCTFail("manca la riga di interruzione")
         }
@@ -323,8 +323,99 @@ final class ImportPreviewStatusTests: XCTestCase {
 
     /// Gli `id` restano unici anche col ramo di interruzione attivo.
     func testInterrupted_idsRemainUnique() {
-        let lines = ImportPreviewStatus.lines(toAdd: 10, toSkipDuplicates: 2, toAddBytes: 1_000, estimatedSec: 1, interrupted: true)
+        let lines = ImportPreviewStatus.lines(toAdd: 10, toSkipDuplicates: 2, toAddBytes: 1_000, estimatedSec: 1, interruption: .duringCheck)
         let ids = lines.map(\.id)
         XCTAssertEqual(Set(ids).count, ids.count, "id duplicati col ramo di interruzione: \(ids)")
     }
+
+    // MARK: - Interrompere durante il CONTEGGIO non è come interrompere durante il CONTROLLO
+    //         (rilievo di review, 2026-09-01)
+
+    /// Il difetto trovato in review: la riga di interruzione affermava **una sola direzione
+    /// dell'errore** — «il numero potrebbe contare foto già presenti sull'SSD» — che è vera
+    /// solo se l'interruzione arriva durante la fase di controllo, quando la camminata della
+    /// cartella è già finita e `toAdd` è il totale vero.
+    ///
+    /// Se invece si interrompe durante la **camminata**, `toAdd` non è un totale sovrastimato:
+    /// è un **frammento**. Su una sorgente da 18.000 file, fermarsi dopo 2 secondi può dare
+    /// «47 file nuovi, circa 200 MB» — un numero che l'utente legge come «ecco cosa importerò»
+    /// mentre è una minuscola frazione di quello che c'è. E la vecchia riga lo rassicurava
+    /// pure, dicendogli che semmai il numero era in eccesso.
+    ///
+    /// È la stessa classe di errore di `sawNothing` in #31: una schermata che si legge come
+    /// completa quando invece significa «non ho finito di guardare».
+    func testInterruptedDuringCount_doesNotClaimTheOverestimateDirection() {
+        let lines = ImportPreviewStatus.lines(toAdd: 47, toSkipDuplicates: 0, toAddBytes: 200_000_000,
+                                              estimatedSec: 3, interruption: .duringCount)
+        guard let warning = lines.first(where: { $0.id == "interrupted" }) else {
+            return XCTFail("manca la riga che dichiara l'interruzione")
+        }
+        XCTAssertEqual(warning.tone, .warning)
+        let detto = warning.text.lowercased()
+        XCTAssertFalse(detto.contains("già presenti sull'ssd"),
+                       "interrotto durante il conteggio il numero e' un frammento, non una "
+                       + "sovrastima: «\(warning.text)» afferma la direzione sbagliata")
+        XCTAssertFalse(detto.contains("salterà comunque"),
+                       "non si puo' rassicurare l'utente su un numero che non e' un totale")
+    }
+
+    /// E deve dire la cosa che conta: quello che vede **non è il totale**.
+    func testInterruptedDuringCount_saysTheNumberIsNotTheWholeSource() {
+        let lines = ImportPreviewStatus.lines(toAdd: 47, toSkipDuplicates: 0, toAddBytes: 200_000_000,
+                                              estimatedSec: 3, interruption: .duringCount)
+        let warning = lines.first(where: { $0.id == "interrupted" })?.text.lowercased() ?? ""
+        XCTAssertTrue(warning.contains("parte") || warning.contains("tutt") || warning.contains("total"),
+                      "«\(warning)» non dice che il numero e' parziale rispetto alla sorgente")
+    }
+
+    /// Le due interruzioni producono righe **diverse**: sono due situazioni opposte, e una
+    /// riga sola che vada bene per entrambe non direbbe la verita' in nessuna delle due.
+    func testTheTwoInterruptionKinds_produceDifferentLines() {
+        func riga(_ k: ImportPreviewStatus.PreviewInterruption) -> String {
+            ImportPreviewStatus.lines(toAdd: 47, toSkipDuplicates: 3, toAddBytes: 1_000,
+                                      estimatedSec: 1, interruption: k)
+                .first { $0.id == "interrupted" }?.text ?? ""
+        }
+        let conteggio = riga(.duringCount)
+        let controllo = riga(.duringCheck)
+        XCTAssertFalse(conteggio.isEmpty)
+        XCTAssertFalse(controllo.isEmpty)
+        XCTAssertNotEqual(conteggio, controllo)
+    }
+
+    /// Entrambe le interruzioni sopprimono le due affermazioni sicure: «la cartella e' vuota»
+    /// e «le hai gia' tutte» richiedono un controllo arrivato in fondo.
+    func testBothInterruptionKinds_suppressTheConfidentClaims() {
+        for k in [ImportPreviewStatus.PreviewInterruption.duringCount, .duringCheck] {
+            let vuota = ImportPreviewStatus.lines(toAdd: 0, toSkipDuplicates: 0, toAddBytes: 0,
+                                                  estimatedSec: 0, interruption: k)
+            XCTAssertFalse(vuota.contains { $0.id == "empty-source" },
+                           "interrotto (\(k)) non si puo' affermare che la cartella sia vuota")
+            let tutte = ImportPreviewStatus.lines(toAdd: 0, toSkipDuplicates: 9, toAddBytes: 0,
+                                                  estimatedSec: 1, interruption: k)
+            XCTAssertFalse(tutte.first { $0.id == "toAdd" }?.text.contains("le hai già tutte") ?? false,
+                           "interrotto (\(k)) non si puo' affermare che le abbia gia' tutte")
+        }
+    }
+
+    /// Registro anti-gergo anche sulla diramazione nuova.
+    func testInterruptedDuringCount_carriesNoJargon() {
+        let gergo = ["hash", "indice", "sha256", "dedup", "scansione", "entry"]
+        let lines = ImportPreviewStatus.lines(toAdd: 47, toSkipDuplicates: 3, toAddBytes: 1_000,
+                                              estimatedSec: 1, interruption: .duringCount)
+        for line in lines {
+            for parola in gergo {
+                XCTAssertFalse(line.text.lowercased().contains(parola),
+                               "gergo: '\(parola)' in «\(line.text)»")
+            }
+        }
+    }
+
+    /// `id` unici anche con la diramazione nuova attiva.
+    func testInterruptedDuringCount_idsStayUnique() {
+        let ids = ImportPreviewStatus.lines(toAdd: 47, toSkipDuplicates: 3, toAddBytes: 1_000,
+                                            estimatedSec: 1, interruption: .duringCount).map(\.id)
+        XCTAssertEqual(Set(ids).count, ids.count, "id duplicati: \(ids)")
+    }
+
 }
