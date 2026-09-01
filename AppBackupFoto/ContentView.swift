@@ -6892,10 +6892,19 @@ final class BackupRunner: ObservableObject {
     ///   perche' `urls` e' `@Published` e verrebbe letta da un thread di background;
     ///   `runImport` ce l'ha gia' risolta. `nil` disattiva il solo stadio sull'indice
     ///   persistito.
+    /// - Parameter onSourceHash: notifica l'hash del file sorgente **appena calcolato**,
+    ///   chiamata SOLO quando lo Stadio 2 e' stato davvero raggiunto (mai con un valore
+    ///   inventato, mai per un file scartato allo Stadio 1 o per un `.notIndexable`).
+    ///   Serve alla sola anteprima dell'import (roadmap #27-A/#31, terza parte, Task 2):
+    ///   senza ricalcolare l'hash una seconda volta, permette al chiamante di registrare
+    ///   nella propria `ImportSessionIndex` un candidato appena hashato e risultato
+    ///   NON doppione, cosi' un suo gemello piu' avanti nella sorgente lo riconosce.
+    ///   Default no-op: `runImport` non lo passa e si comporta identico a prima.
     nonisolated static func isAlreadyInLibrary(url: URL,
                                               store: LibraryIndexStore?,
                                               session: ImportSessionIndex,
-                                              libraryRoot: URL?) -> Bool {
+                                              libraryRoot: URL?,
+                                              onSourceHash: (String) -> Void = { _ in }) -> Bool {
         // Solo i media partecipano al dedup. `LibraryIndexer.scan` gia' scarta i
         // `.notIndexable` prima di indicizzarli, quindi il ramo dell'indice persistito era
         // gia' coperto; il ramo di sessione no, ed e' li' che il buco si vedeva. Senza questa
@@ -6926,6 +6935,7 @@ final class BackupRunner: ObservableObject {
 
         // Stadio 2 — hash della sorgente, costoso.
         guard let sourceHash = sha256(of: url) else { return false }
+        onSourceHash(sourceHash)
 
         // Copie fatte in questo stesso job (l'indice persistito non le conosce ancora).
         for candidate in sessionCandidates where candidate.hash == sourceHash {
@@ -6969,6 +6979,141 @@ final class BackupRunner: ObservableObject {
     /// incidente — ma NON e' lei la difesa: chi un giorno cambiasse `sha256` deve saperlo.
     private nonisolated static func fileOnDisk(_ url: URL, matches hash: String) -> Bool {
         FileManager.default.fileExists(atPath: url.path) && sha256(of: url) == hash
+    }
+
+    /// Il motore dell'anteprima vera del wizard di import (roadmap #27-A / #31, terza
+    /// parte, Task 2): decide quali `FileSyncer.PreviewCandidate` l'import salterebbe
+    /// davvero, PRIMA di avviare il job.
+    ///
+    /// PRINCIPIO GUIDA (spec, "L'anteprima non e' un'approssimazione dell'import, e' lo
+    /// stesso predicato"): questa funzione riusa **la stessa** `isAlreadyInLibrary` che
+    /// `runImport` cabla su `FileSyncer.isDuplicate`. Nessuna logica di dedup parallela,
+    /// nessuna seconda soglia di fiducia da tenere allineata a mano.
+    ///
+    /// LIVELLO DI FIDUCIA 2, non 1 (ADR-0003; spec, sezione "A quale livello di fiducia
+    /// si colloca questa lettura"). La tentazione sarebbe fidarsi dell'indice senza
+    /// rileggere l'SSD: l'anteprima e' "a basso danno" (un numero sbagliato, non una
+    /// foto persa), e risparmierebbe tutte le letture lato libreria. Non regge: l'indice
+    /// contiene per DECISIONE DI PRODOTTO delle entry fantasma (file rimossi dal disco
+    /// la cui riga resta — "traversata incompleta => nessuna rimozione", 2026-08-26).
+    /// Con la fiducia di livello 1 ognuna di quelle entry farebbe dichiarare un doppione
+    /// che l'import non riconoscera' mai: l'anteprima SOTTO-prometterebbe, l'errore
+    /// opposto a quello che questo lavoro corregge. `isAlreadyInLibrary` rilegge e
+    /// rihasha invece il candidato sull'SSD (livello 2), esattamente come fa l'import:
+    /// stesso codice, stesso esito, nessuna seconda copia della decisione che potrebbe
+    /// divergere. Non rimuovere la rilettura per "ottimizzare".
+    ///
+    /// NESSUNA QUERY NUOVA SULLO STORE. Il prefiltro usa solo `hasAnyEntry(withSize:)`,
+    /// gia' esistente — misurato (2026-09-01): 2.000 chiamate = 9,3 ms totali, contro
+    /// 9,1 ms di una singola `SELECT DISTINCT size` che le sostituirebbe. Non c'e' nulla
+    /// da guadagnare introducendo un metodo nuovo sullo store (es. `allSizes()`), e c'e'
+    /// da perdere: un `Set` con semantica di istantanea da mantenere, e soprattutto una
+    /// seconda copia della decisione di dedup — la classe di errore che questo progetto
+    /// ha gia' pagato tre volte (`LibraryExclusions`, `realResolvedPath`, `makeThumbnail`).
+    ///
+    /// - Parameter candidates: TUTTI i candidati della sorgente, non solo quelli che
+    ///   supereranno il prefiltro: serve il lotto intero per costruire l'istogramma
+    ///   delle dimensioni e riconoscere i doppioni INTERNI alla stessa sorgente, che
+    ///   l'indice persistito non puo' ancora conoscere (misurato: 2,7% dei file su un
+    ///   rullino iPhone, 36,0% su una cartella tipo "Foto Google Drive" — vanno
+    ///   riconosciuti, non dichiarati come limite).
+    /// - Parameter isCancelled: controllata a ogni iterazione, PRIMA di leggere un solo
+    ///   byte del candidato di turno — e' cosi' che "Interrompi" ferma davvero la
+    ///   lettura, non solo l'aggiornamento della barra.
+    /// - Parameter onProgress: `total` e' noto PRIMA che venga letto un solo byte (un
+    ///   primo giro guarda solo la dimensione), e conta SOLO i candidati che superano il
+    ///   prefiltro — e' il denominatore onesto della barra determinata del wizard.
+    /// - Returns: gli indici, in `candidates`, dei file che l'import salterebbe. Se
+    ///   `isCancelled` diventa vero a meta', l'insieme restituito e' PARZIALE: il
+    ///   chiamante che ha interrotto deve SCARTARLO, mai mostrarlo (spec: "Interrompi...
+    ///   non un numero parziale con un asterisco").
+    nonisolated static func importPreviewDuplicates(
+        candidates: [FileSyncer.PreviewCandidate],
+        store: LibraryIndexStore?,
+        libraryRoot: URL?,
+        isCancelled: () -> Bool,
+        onProgress: (_ done: Int, _ total: Int) -> Void
+    ) -> Set<Int> {
+        // Istogramma delle dimensioni della sorgente — solo memoria, nessun I/O. E' il
+        // solo modo di riconoscere un doppione INTERNO prima di aver hashato il primo
+        // dei due: senza sapere in anticipo che esiste un secondo file di quella
+        // dimensione, il primo del paio non verrebbe mai selezionato per l'hash e il
+        // paio non sarebbe mai riconosciuto (vedi doc-comment su
+        // `FileSyncer.duplicateFilter`, stesso argomento).
+        var sizeCounts: [Int64: Int] = [:]
+        for c in candidates { sizeCounts[c.size, default: 0] += 1 }
+        let sourceRepeatedSizes = Set(sizeCounts.filter { $0.value >= 2 }.map { $0.key })
+
+        // Sessione LOCALE a questa chiamata — mai condivisa con un job. Registra gli URL
+        // della SORGENTE (non della destinazione: la copia non e' ancora avvenuta) dei
+        // candidati gia' hashati e risultati NON doppioni, cosi' un loro gemello piu'
+        // avanti nella stessa sorgente li trova senza bisogno di rihasharli.
+        let previewSession = ImportSessionIndex()
+
+        // Un candidato merita la lettura (Stadio 2) se la sua dimensione e' condivisa
+        // da un altro candidato della sorgente, OPPURE se lo store la conosce gia'.
+        // Ripete qui il solo Stadio 1 di `isAlreadyInLibrary` (dimensione, gratis) senza
+        // duplicarne la DECISIONE: la decisione — hash e confronto — resta sempre e solo
+        // dentro `isAlreadyInLibrary`, chiamata sotto.
+        func passesPrefilter(_ size: Int64) -> Bool {
+            if sourceRepeatedSizes.contains(size) { return true }
+            guard let store else { return false }
+            return (try? store.hasAnyEntry(withSize: size)) ?? false
+        }
+
+        // `total` calcolato in un primo giro che guarda SOLO la dimensione — noto prima
+        // di leggere un solo byte, e' il denominatore che la barra determinata del
+        // wizard mostra.
+        let total = candidates.reduce(into: 0) { count, c in
+            if passesPrefilter(c.size) { count += 1 }
+        }
+        onProgress(0, total)
+
+        var result: Set<Int> = []
+        var done = 0
+        for (index, candidate) in candidates.enumerated() {
+            // Controllata ad OGNI iterazione, anche per i candidati che il prefiltro
+            // scarterebbe subito dopo: e' cosi' che l'interruzione ferma davvero la
+            // lettura, non solo l'avanzamento della barra.
+            if isCancelled() { break }
+
+            guard passesPrefilter(candidate.size) else { continue }
+
+            var sourceHash: String?
+            let isDuplicate = isAlreadyInLibrary(url: candidate.url,
+                                                 store: store,
+                                                 session: previewSession,
+                                                 libraryRoot: libraryRoot,
+                                                 onSourceHash: { sourceHash = $0 })
+            if isDuplicate {
+                result.insert(index)
+            } else if let sourceHash {
+                // `isAlreadyInLibrary` ha raggiunto lo Stadio 2 (di solito perche' lo
+                // store conosceva gia' questa dimensione) ma il file non e' un
+                // doppione: si registra comunque il suo hash, cosi' un gemello INTERNO
+                // successivo lo trova tramite la stessa `isAlreadyInLibrary`.
+                previewSession.record(hash: sourceHash, at: candidate.url)
+            } else if sourceRepeatedSizes.contains(candidate.size),
+                      IndexableKind.of(url: candidate.url) != .notIndexable,
+                      let hash = sha256(of: candidate.url) {
+                // `isAlreadyInLibrary` e' uscita al proprio Stadio 1 (ne' lo store ne'
+                // — finora — questa sessione conoscevano questa dimensione): da sola
+                // non avrebbe MAI hashato il primo file di un paio tutto interno alla
+                // sorgente, e il paio non sarebbe mai stato riconosciuto (ne' un
+                // candidato ne' l'altro, mai). Si hasha qui — riusando la STESSA
+                // `sha256` di livello 2, non una versione piu' leggera — solo per
+                // seminare la sessione: la DECISIONE su un futuro gemello resta
+                // comunque dentro `isAlreadyInLibrary`, alla chiamata successiva. La
+                // guardia `IndexableKind` e' la stessa ragione di ADR-0003 nota
+                // 2026-08-26: senza, un sidecar non indicizzabile potrebbe "insegnare"
+                // il proprio hash a un file indicizzabile byte-identico per puro caso.
+                previewSession.record(hash: hash, at: candidate.url)
+            }
+
+            done += 1
+            onProgress(done, total)
+        }
+        return result
     }
 
     func runImport(source: URL, label: String) {
