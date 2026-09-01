@@ -1503,8 +1503,8 @@ func importFolderSlug(_ label: String) -> String {
 }
 
 /// Motivo scritto (non un bottone semplicemente grigio) quando il wizard di import non può
-/// partire perché un'altra copia è già in corso (un backup automatico scattato al collegamento
-/// dell'SSD, o un job precedente non ancora finito). `nil` quando si può procedere.
+/// partire perché un'altra copia è già in corso — un backup avviato a mano, uno scattato da
+/// solo al collegamento dell'SSD, o un'importazione precedente. `nil` quando si può procedere.
 ///
 /// Stessa lezione pagata due volte il 2026-09-01 su `LibraryIndexCommandGate` (i bottoni della
 /// card «Foto già salvate sull'SSD») e sul pannello Doppioni: fra la scelta dell'etichetta e il
@@ -1517,7 +1517,13 @@ func importFolderSlug(_ label: String) -> String {
 /// l'alert se la corsa scatta comunque fra il click e l'avvio.
 func importStartDisabledReason(jobIsRunning: Bool) -> String? {
     guard jobIsRunning else { return nil }
-    return "C'è già un'altra copia in corso (un backup automatico o un import precedente). "
+    // La parentesi elenca le cause **vere**, e la prima e' quella che il testo precedente
+    // non nominava: un backup avviato a mano da Enrico dalla finestra principale (rilievo di
+    // review del 2026-09-01). Dire "un backup automatico" a chi ha appena premuto lui stesso
+    // "SSD -> HDD" e' una spiegazione che non corrisponde a quello che sta vedendo, ed e'
+    // peggio di nessuna spiegazione: lo manda a cercare un automatismo che non c'entra.
+    return "C'è già una copia in corso: un backup che hai avviato tu, uno partito da solo al "
+        + "collegamento dell'SSD, oppure un'importazione precedente non ancora finita. "
         + "Aspetta che finisca, poi riprova."
 }
 
