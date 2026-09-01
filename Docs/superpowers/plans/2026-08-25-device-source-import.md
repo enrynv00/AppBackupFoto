@@ -32,7 +32,7 @@
 - Produce: `func importFolderSlug(_ label: String) -> String`
 - Consumate da: Task 2 (`BackupRunner.runImport`) e Task 3 (`ImportView.pickSource`)
 
-- [ ] **Step 1: Scrivi il file di test (fallirà: le funzioni non esistono ancora)**
+- [x] **Step 1: Scrivi il file di test (fallirà: le funzioni non esistono ancora)**
 
 Crea `AppBackupFotoTests/ImportSourceGuardTests.swift`:
 
@@ -92,7 +92,7 @@ final class ImportSourceGuardTests: XCTestCase {
 }
 ```
 
-- [ ] **Step 2: Registra il nuovo file di test in `project.pbxproj`**
+- [x] **Step 2: Registra il nuovo file di test in `project.pbxproj`**
 
 Genera due ID univoci a 24 caratteri esadecimali (maiuscoli), stesso formato degli ID già presenti nel file:
 
@@ -124,12 +124,12 @@ Con i due valori stampati, aggiungi 4 righe in `AppBackupFoto.xcodeproj/project.
 
 Sostituisci `<BUILDFILE_ID>`/`<FILEREF_ID>` con i valori generati sopra in tutte e 4 le righe.
 
-- [ ] **Step 3: Verifica che il progetto compili e che il nuovo file venga davvero eseguito (deve fallire: le funzioni non esistono)**
+- [x] **Step 3: Verifica che il progetto compili e che il nuovo file venga davvero eseguito (deve fallire: le funzioni non esistono)**
 
 Run: `xcodebuild -project AppBackupFoto.xcodeproj -scheme AppBackupFoto -destination 'platform=macOS' test -only-testing:AppBackupFotoTests/ImportSourceGuardTests 2>&1 | tail -30`
 Expected: FAIL — errore di compilazione "cannot find 'isSourceInsideConfiguredLocations' in scope" (conferma che il file è stato trovato e compilato dal target, non semplicemente ignorato).
 
-- [ ] **Step 4: Implementa le due funzioni**
+- [x] **Step 4: Implementa le due funzioni**
 
 In `AppBackupFoto/ContentView.swift`, subito dopo `isLikelyVolumeRoot` (riga 1367) e prima di `enum FileKind`:
 
@@ -162,12 +162,12 @@ func importFolderSlug(_ label: String) -> String {
 }
 ```
 
-- [ ] **Step 5: Esegui i test e verifica che passino tutti**
+- [x] **Step 5: Esegui i test e verifica che passino tutti**
 
 Run: `xcodebuild -project AppBackupFoto.xcodeproj -scheme AppBackupFoto -destination 'platform=macOS' test -only-testing:AppBackupFotoTests/ImportSourceGuardTests 2>&1 | tail -30`
 Expected: `** TEST SUCCEEDED **`, 9 test passati (`testExactMatch_isInside`, `testSubfolderOfConfigured_isInside`, `testParentOfConfigured_isInside`, `testUnrelatedPath_isNotInside`, `testSimilarPrefixDifferentVolume_isNotInside`, `testSlug_normalLabel_unchanged`, `testSlug_replacesSlash`, `testSlug_replacesColon`, `testSlug_emptyAfterTrim_fallsBackToImport`).
 
-- [ ] **Step 6: Build e suite completa, poi commit**
+- [x] **Step 6: Build e suite completa, poi commit**
 
 Run:
 ```bash
@@ -214,7 +214,7 @@ Test: `ImportSourceGuardTests` passa da 9 a **23** test (nuovi: `configuredURLs:
 
 Nota: questo task non ha un proprio ciclo TDD con test dedicati — coerente con `runMacToSSD()`/`runSSDToHDD()`/`runSyncS3()`, che nel codice esistente non hanno XCTest diretti (sono orchestrazione con side-effect di I/O reale, verificati manualmente e tramite i test sulle funzioni pure che chiamano). Il passo di verifica è build + suite esistente verde, più smoke test manuale in Task 5.
 
-- [ ] **Step 1: Aggiungi il metodo**
+- [x] **Step 1: Aggiungi il metodo**
 
 In `AppBackupFoto/ContentView.swift`, subito dopo la chiusura di `runSyncS3()` (dopo la riga con `alert("Errore configurazione S3", error.localizedDescription)` seguita da due `}`), prima di `func previewMacToSSD()`:
 
@@ -256,7 +256,7 @@ func runImport(source: URL, label: String) {
 }
 ```
 
-- [ ] **Step 2: Build e verifica che la suite esistente resti verde (nessuna regressione)**
+- [x] **Step 2: Build e verifica che la suite esistente resti verde (nessuna regressione)**
 
 Run:
 ```bash
@@ -265,7 +265,7 @@ xcodebuild -project AppBackupFoto.xcodeproj -scheme AppBackupFoto -destination '
 ```
 Expected: `** BUILD SUCCEEDED **`, `** TEST SUCCEEDED **`, 148 test (invariati rispetto a Task 1 — questo task non aggiunge test).
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add AppBackupFoto/ContentView.swift
@@ -273,6 +273,10 @@ git commit -m "Add BackupRunner.runImport(source:label:) (roadmap #27)"
 ```
 
 ---
+
+> **Task 1 e 2: fatti**, verificati in `main` il 2026-09-01 (`importFolderSlug` a riga ~1459, `BackupRunner.runImport(source:label:)` a riga ~6784, 31 test in `AppBackupFotoTests/ImportSourceGuardTests.swift`). Le caselle erano rimaste non spuntate.
+>
+> **Il piano riprende da qui.** Era fermo in attesa di #31, che e' chiuso dal 2026-09-01: l'import ora ha l'indice di contenuto sotto, quindi il wizard nasce gia' con il dedup attivo.
 
 ### Task 3: `ImportView` — wizard a 3 passi
 
