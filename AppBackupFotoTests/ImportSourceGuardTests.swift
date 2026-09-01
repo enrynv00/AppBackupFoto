@@ -231,6 +231,20 @@ final class ImportSourceGuardTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: dir.path))
     }
 
+    // MARK: - Guardia job in corso (Task 3, wizard di import)
+
+    func testImportStartDisabledReason_noJobRunning_isNil() {
+        XCTAssertNil(importStartDisabledReason(jobIsRunning: false))
+    }
+
+    func testImportStartDisabledReason_jobRunning_hasWrittenReason() {
+        // Deve essere un motivo scritto, non solo un booleano: la stessa lezione di
+        // `LibraryIndexCommandGate` applicata al wizard di import (2026-09-01).
+        let reason = importStartDisabledReason(jobIsRunning: true)
+        XCTAssertNotNil(reason)
+        XCTAssertFalse(reason!.isEmpty)
+    }
+
     // MARK: - Temp dir (solo directory temporanee: mai SSD/HDD o dati reali)
 
     private var tempRoot: URL {

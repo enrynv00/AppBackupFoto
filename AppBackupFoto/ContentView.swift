@@ -1502,6 +1502,25 @@ func importFolderSlug(_ label: String) -> String {
     return cleaned
 }
 
+/// Motivo scritto (non un bottone semplicemente grigio) quando il wizard di import non può
+/// partire perché un'altra copia è già in corso (un backup automatico scattato al collegamento
+/// dell'SSD, o un job precedente non ancora finito). `nil` quando si può procedere.
+///
+/// Stessa lezione pagata due volte il 2026-09-01 su `LibraryIndexCommandGate` (i bottoni della
+/// card «Foto già salvate sull'SSD») e sul pannello Doppioni: fra la scelta dell'etichetta e il
+/// click su "Avvia importazione" possono passare minuti, e in quel tempo un job può partire senza
+/// che l'utente lo sappia. Una guardia valutata solo quando il bottone viene disegnato non basta:
+/// va rivalutata anche dentro `BackupRunner.runImport`, al momento dell'avvio vero — altrimenti
+/// l'unica reazione a una corsa persa sarebbe il `guard !isRunning` silenzioso di
+/// `BackupRunner.run(label:...)`, che chiude lo sheet senza copiare nulla e senza dirlo.
+/// Un'unica sorgente per il testo: usata sia per il messaggio sotto il bottone sia per
+/// l'alert se la corsa scatta comunque fra il click e l'avvio.
+func importStartDisabledReason(jobIsRunning: Bool) -> String? {
+    guard jobIsRunning else { return nil }
+    return "C'è già un'altra copia in corso (un backup automatico o un import precedente). "
+        + "Aspetta che finisca, poi riprova."
+}
+
 /// File e cartelle di sistema da non trattare come contenuto dell'utente.
 ///
 /// **Chi la usa davvero, oggi**: `FileSyncer` (Mac→SSD e SSD→HDD) e
@@ -6872,6 +6891,15 @@ final class BackupRunner: ObservableObject {
     }
 
     func runImport(source: URL, label: String) {
+        // Rivalutata qui, non solo sul bottone del wizard: fra la scelta dell'etichetta e
+        // questo avvio vero possono passare minuti in cui un altro job e' partito (vedi
+        // `importStartDisabledReason`). Senza questo controllo il `guard !isRunning` di
+        // `run(label:...)` più sotto farebbe fallire l'import in silenzio, con lo sheet
+        // già chiuso e nessun messaggio per l'utente.
+        if let reason = importStartDisabledReason(jobIsRunning: isRunning) {
+            alert("Import non avviato", reason)
+            return
+        }
         speedUnit = "file/s"
         guard let ssdURL = bm.startAccessing(.ssd) else {
             alert("Accesso all'SSD non disponibile", "Vai in Impostazioni e riseleziona l'SSD.")
@@ -8283,6 +8311,162 @@ struct RestoreView: View {
         step = .running
         engine.run(source: selectedSource, selectedFolders: selectedFolders,
                    sourceRootURL: sourceRootURL, destination: destinationURL, s3Config: s3Config)
+    }
+}
+
+// MARK: - ImportView
+struct ImportView: View {
+    @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var runner: BackupRunner
+    @ObservedObject private var bm = BookmarkManager.shared
+    private let previewSyncer = FileSyncer()
+
+    enum Step { case chooseSource, preview, label }
+
+    @State private var step: Step = .chooseSource
+    @State private var sourceURL: URL?
+    @State private var guardErrorMessage: String?
+    @State private var isLoadingPreview = false
+    @State private var previewResult: (toAdd: Int, toSkip: Int, toAddBytes: Int64, estimatedSec: Int)?
+    @State private var label: String = ""
+
+    private static let dateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd"
+        return f
+    }()
+
+    var body: some View {
+        VStack(spacing: AppSpacing.xl) {
+            switch step {
+            case .chooseSource: chooseSourceStep
+            case .preview: previewStep
+            case .label: labelStep
+            }
+        }
+        .padding(32)
+        .frame(minWidth: 460, minHeight: 360)
+    }
+
+    private var chooseSourceStep: some View {
+        VStack(spacing: AppSpacing.lg) {
+            VStack(spacing: AppSpacing.sm) {
+                Image(systemName: "square.and.arrow.down.on.square")
+                    .font(.system(size: AppIconSize.heroSmall)).foregroundStyle(.blue)
+                Text("Importa foto da un dispositivo o una cartella").font(AppFont.title)
+                Text("Scegli una fotocamera, un drone, un vecchio disco o qualsiasi cartella con foto da importare.")
+                    .font(AppFont.body).foregroundStyle(.secondary).multilineTextAlignment(.center)
+            }
+            if let guardErrorMessage {
+                Text(guardErrorMessage).font(AppFont.caption).foregroundStyle(AppColor.error)
+                    .multilineTextAlignment(.center)
+            }
+            Button("Scegli cartella o dispositivo…") { pickSource() }
+                .buttonStyle(.borderedProminent)
+            Spacer()
+            HStack {
+                Spacer()
+                Button("Annulla") { dismiss() }.buttonStyle(.bordered)
+            }
+        }
+    }
+
+    private var previewStep: some View {
+        VStack(spacing: AppSpacing.lg) {
+            Text("Anteprima").font(AppFont.title)
+            if isLoadingPreview {
+                ProgressView("Conteggio file in corso…")
+            } else if let previewResult {
+                VStack(alignment: .leading, spacing: AppSpacing.sm) {
+                    Text("File da importare: \(previewResult.toAdd)")
+                    Text("Spazio necessario: \(ByteCountFormatter.string(fromByteCount: previewResult.toAddBytes, countStyle: .file))")
+                    if previewResult.estimatedSec > 0 {
+                        Text("Tempo stimato: \(FileSyncer.SyncResult.hms(previewResult.estimatedSec))")
+                    }
+                }
+                .font(AppFont.body)
+            }
+            if bm.urls[.ssd] == nil {
+                Text("SSD non configurato — vai in Impostazioni per configurarlo prima di importare.")
+                    .font(AppFont.caption).foregroundStyle(AppColor.error)
+            }
+            Spacer()
+            HStack {
+                Button("Indietro") { step = .chooseSource }.buttonStyle(.bordered)
+                Spacer()
+                Button("Continua") { step = .label }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(isLoadingPreview || bm.urls[.ssd] == nil)
+            }
+        }
+    }
+
+    private var labelStep: some View {
+        VStack(spacing: AppSpacing.lg) {
+            Text("Nome della cartella di destinazione").font(AppFont.title)
+            Text("Le foto verranno copiate in una cartella dedicata sull'SSD, dentro \"Import\".")
+                .font(AppFont.body).foregroundStyle(.secondary).multilineTextAlignment(.center)
+            TextField("Etichetta", text: $label)
+                .textFieldStyle(.roundedBorder)
+                .frame(maxWidth: 320)
+            // Motivo scritto se un'altra copia e' gia' in corso — vedi doc-comment di
+            // `importStartDisabledReason`: fra la scelta dell'etichetta e il click possono
+            // passare minuti in cui un backup automatico o un import precedente e' partito.
+            if let reason = importStartDisabledReason(jobIsRunning: runner.isRunning) {
+                Text(reason).font(AppFont.caption).foregroundStyle(AppColor.error)
+                    .multilineTextAlignment(.center)
+            }
+            Spacer()
+            HStack {
+                Button("Indietro") { step = .preview }.buttonStyle(.bordered)
+                Spacer()
+                Button("Avvia importazione") { startImport() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(label.trimmingCharacters(in: .whitespaces).isEmpty
+                        || importStartDisabledReason(jobIsRunning: runner.isRunning) != nil)
+            }
+        }
+    }
+
+    private func pickSource() {
+        guardErrorMessage = nil
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.treatsFilePackagesAsDirectories = true
+        panel.message = "Scegli la cartella o il volume da cui importare le foto"
+        panel.prompt = "Seleziona"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        if isSourceInsideConfiguredLocations(url, configuredURLs: Array(bm.urls.values)) {
+            guardErrorMessage = "'\(url.lastPathComponent)' fa parte di una cartella già configurata (Libreria Foto, SSD o HDD) — scegli una sorgente diversa."
+            return
+        }
+        sourceURL = url
+        label = "\(url.lastPathComponent) - \(Self.dateFormatter.string(from: Date()))"
+        previewResult = nil
+        step = .preview
+        guard let ssdURL = bm.urls[.ssd] else { return }
+        isLoadingPreview = true
+        // La cartella di destinazione è sempre nuova/vuota (Import/<slug> non esiste ancora),
+        // quindi toSkip sarà sempre 0 qui indipendentemente dallo slug esatto usato: il numero
+        // non cambia se l'utente modifica l'etichetta al passo successivo.
+        let dst = ssdURL.appendingPathComponent("Import").appendingPathComponent(importFolderSlug(label))
+        Task { @MainActor in
+            let result = await previewSyncer.previewSync(from: url, to: dst, deep: false)
+            isLoadingPreview = false
+            previewResult = result
+        }
+    }
+
+    private func startImport() {
+        guard let sourceURL else { return }
+        // Difesa sul click, oltre a quella dentro `BackupRunner.runImport` (vedi doc-comment
+        // di `importStartDisabledReason`): il bottone e' gia' disabilitato in questo caso, ma
+        // un secondo controllo qui evita di chiudere lo sheet inutilmente in caso di corsa.
+        guard importStartDisabledReason(jobIsRunning: runner.isRunning) == nil else { return }
+        runner.runImport(source: sourceURL, label: label)
+        dismiss()
     }
 }
 
