@@ -408,4 +408,56 @@ final class ImportPreviewDedupTests: XCTestCase {
         XCTAssertTrue(result.isEmpty)
         XCTAssertEqual(progressCallsAfterStart, 0, "nessuna lettura, quindi nessun avanzamento oltre 0")
     }
+
+    // MARK: - Il ramo di bookkeeping che passa dallo store (rilievo di review, 2026-09-01)
+
+    /// **Buco di copertura chiuso il 2026-09-01.** `importPreviewDuplicates` ha **due**
+    /// rami che seminano `previewSession`, e fino a questo test uno solo era coperto.
+    ///
+    /// Tutti i test sui doppioni interni qui sopra usano `store: nil`, quindi passano
+    /// sempre dal ramo "seed manuale" — quello che hasha da se' perche' `isAlreadyInLibrary`
+    /// e' uscita al proprio Stadio 1. L'altro ramo — quello che registra l'hash gia'
+    /// calcolato quando lo **store** aveva fatto passare lo Stadio 1 — non era esercitato da
+    /// nessuno: si poteva cancellare e la suite restava verde.
+    ///
+    /// Lo scenario che lo isola: la libreria conosce gia' la dimensione S con un contenuto
+    /// **diverso**; la sorgente porta due file byte-identici fra loro, anch'essi di
+    /// dimensione S. Per il primo, lo Stadio 1 passa **grazie allo store** (non grazie a
+    /// `sourceRepeatedSizes`), quindi il seed manuale non scatta mai: se il ramo di
+    /// bookkeeping non registrasse l'hash, il secondo file verrebbe hashato, non troverebbe
+    /// il gemello in sessione ne' corrispondenza in libreria, e risulterebbe **nuovo**.
+    /// L'anteprima tornerebbe a mentire, esattamente nel caso realistico di una scheda con
+    /// foto in parte nuove e in parte gia' note per dimensione.
+    func testInternalPairWhoseSizeIsKnownToTheStore_isStillRecognized() throws {
+        let library = libraryDir!
+
+        // In libreria: un file di un certo contenuto. Serve solo a far conoscere allo
+        // store la sua DIMENSIONE.
+        let inLibrary = try writeFile(library.appendingPathComponent("Foto/vecchia.jpg"),
+                                      "AAAAAAAAAAAAAAAAAAAAAAAA")
+        let store = try LibraryIndexStore(url: root.appendingPathComponent("index.sqlite"))
+        try seedStore(store, displayPath: "Foto/vecchia.jpg", contentsOf: inLibrary)
+
+        // Sulla sorgente: due file byte-identici FRA LORO, della stessa dimensione di
+        // quello in libreria ma con contenuto diverso. Stessa lunghezza, contenuto altro.
+        let gemelli = "BBBBBBBBBBBBBBBBBBBBBBBB"
+        XCTAssertEqual(gemelli.utf8.count, "AAAAAAAAAAAAAAAAAAAAAAAA".utf8.count,
+                       "il caso ha senso solo se le dimensioni coincidono davvero")
+        let a = try writeFile(srcDir.appendingPathComponent("uno.jpg"), gemelli)
+        let b = try writeFile(srcDir.appendingPathComponent("due.jpg"), gemelli)
+
+        // Precondizione del caso: nessuno dei due e' un doppione di cio' che c'e' in
+        // libreria — altrimenti il test proverebbe un'altra cosa.
+        XCTAssertNotEqual(try XCTUnwrap(sha256(of: a)), try XCTUnwrap(sha256(of: inLibrary)))
+
+        let dup = BackupRunner.importPreviewDuplicates(
+            candidates: [try candidate(a), try candidate(b)],
+            store: store, libraryRoot: library,
+            isCancelled: { false }, onProgress: { _, _ in })
+
+        XCTAssertEqual(dup, [1],
+                       "il secondo dei due gemelli va riconosciuto come doppione interno "
+                       + "anche quando e' lo store, non il lotto, ad aver aperto lo Stadio 1")
+    }
+
 }
