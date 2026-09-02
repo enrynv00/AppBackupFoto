@@ -11112,6 +11112,36 @@ struct DuplicatesView: View {
 /// copie che se ne andrebbero — con quelle a pari merito con la tenuta marcate visivamente
 /// (`DuplicateKeepChoice.tiedPaths`), cosi' la frase di `duplicateKeepExplanation` non deve
 /// indovinare a quale riga si riferisce.
+/// Dimensione esatta e hash di UN file del gruppo, letti direttamente da
+/// `LibraryIndexEntry` — nessun calcolo, sono gia' nel record dell'indice.
+///
+/// Nasce dal rilievo di Enrico del 2026-09-02: la view mostrava solo la spiegazione a
+/// parole di quale copia teneva e i percorsi delle altre, senza numeri con cui
+/// verificare a occhio "sono davvero lo stesso file?". L'hash mostrato qui e' quello
+/// dell'INDICE (livello 1, ADR-0003) — una cache che puo' essere stantia (ADR-0002) — non
+/// e' la riprova crittografica che decide se cestinare: quella resta la rilettura dal
+/// disco al momento del blocco (ADR-0005), invariata. Questa riga serve a **far vedere**
+/// il dato che gia' esiste, non a spostare la decisione qui.
+///
+/// Hash troncato a 12 caratteri esadecimali: basta a un confronto visivo fra righe
+/// (un SHA256 vero che collide sui primi 12 caratteri per caso non e' uno scenario
+/// realistico), e un hash intero da 64 caratteri renderebbe la riga illeggibile.
+private struct DuplicateFileDetail: View {
+    let entry: LibraryIndexEntry
+
+    var body: some View {
+        HStack(spacing: AppSpacing.xs) {
+            Text(ByteCountFormatter.string(fromByteCount: entry.size, countStyle: .file))
+            Text("·").foregroundStyle(.tertiary)
+            Text(String(entry.hash.prefix(12)))
+                .font(.system(.caption2, design: .monospaced))
+        }
+        .font(.caption2)
+        .foregroundStyle(.secondary)
+        .textSelection(.enabled)
+    }
+}
+
 private struct DuplicateGroupRow: View {
     let entry: DuplicateBatch.Entry
     let isSelected: Bool
@@ -11142,20 +11172,33 @@ private struct DuplicateGroupRow: View {
                 Text(entry.choice.keeper.displayPath).font(AppFont.body)
                     .lineLimit(1).truncationMode(.middle)
 
+                // Dimensione e hash del file TENUTO, per esteso — rilievo di Enrico del
+                // 2026-09-02: prima della sola frase di spiegazione non c'era modo di
+                // verificare a occhio cosa stesse per essere spostato. Valori letti
+                // direttamente da `LibraryIndexEntry`, nessun calcolo nuovo: sono gia' nel
+                // record dell'indice. L'hash e' il livello 1 di fiducia (ADR-0003) — quello
+                // che DECIDE se cestinare e' sempre la rilettura al momento del blocco
+                // (ADR-0005), questa riga e' solo per farla vedere a chi guarda, non
+                // sostituisce quella verifica.
+                DuplicateFileDetail(entry: entry.choice.keeper)
+
                 Text(duplicateKeepExplanation(entry.choice, in: entry.group))
                     .font(AppFont.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
 
                 ForEach(entry.leaving, id: \.path) { leaving in
-                    HStack(spacing: AppSpacing.xs) {
-                        Image(systemName: "arrow.turn.down.right")
-                            .font(.caption2).foregroundStyle(.secondary)
-                        Text(leaving.displayPath).font(.caption).foregroundStyle(.secondary)
-                            .lineLimit(1).truncationMode(.middle)
-                        if entry.choice.tiedPaths.contains(leaving.path) {
-                            Text("· pari merito con la tenuta")
-                                .font(.caption2).italic().foregroundStyle(AppColor.warning)
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: AppSpacing.xs) {
+                            Image(systemName: "arrow.turn.down.right")
+                                .font(.caption2).foregroundStyle(.secondary)
+                            Text(leaving.displayPath).font(.caption).foregroundStyle(.secondary)
+                                .lineLimit(1).truncationMode(.middle)
+                            if entry.choice.tiedPaths.contains(leaving.path) {
+                                Text("· pari merito con la tenuta")
+                                    .font(.caption2).italic().foregroundStyle(AppColor.warning)
+                            }
                         }
+                        DuplicateFileDetail(entry: leaving).padding(.leading, AppSpacing.md)
                     }
                 }
             }

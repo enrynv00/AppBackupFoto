@@ -4,6 +4,9 @@
     "" : {
 
     },
+    "· pari merito con la tenuta" : {
+
+    },
     "%@ · Copiati %lld · Skippati %lld · Errori %lld · Hash-mismatch %lld" : {
       "localizations" : {
         "it" : {
@@ -72,13 +75,25 @@
     "AccessKey" : {
 
     },
+    "Aggiorna" : {
+
+    },
     "Aggiorna da rclone.conf" : {
 
     },
     "Annulla" : {
 
     },
+    "Annulla l'ultimo spostamento" : {
+
+    },
+    "Anteprima" : {
+
+    },
     "Anteprima: mostra quanti file verranno copiati senza avviare il backup" : {
+
+    },
+    "AppBackupFoto è bloccata" : {
 
     },
     "Appena colleghi l'SSD, se l'app è aperta, parte da sola l'aggiornamento da Foto a SSD." : {
@@ -99,13 +114,19 @@
     "Aspetto Interfaccia" : {
 
     },
+    "Autenticazione…" : {
+
+    },
     "Avanzamento" : {
 
     },
-    "Avviato alle" : {
+    "Avvia Immich" : {
 
     },
-    "Backup Foto" : {
+    "Avvia importazione" : {
+
+    },
+    "Avviato alle" : {
 
     },
     "Backup automatico Mac → SSD quando colleghi l'SSD" : {
@@ -117,10 +138,19 @@
     "Backup fallito" : {
 
     },
+    "Backup Foto" : {
+
+    },
+    "Backup personale" : {
+
+    },
     "Cambia" : {
 
     },
     "Cambia cartella…" : {
+
+    },
+    "Cancella TUTTO il contenuto del disco. L'operazione è irreversibile." : {
 
     },
     "Cartella" : {
@@ -135,13 +165,25 @@
     "Cerca per nome o cartella" : {
 
     },
+    "Chiudere l'app?" : {
+
+    },
     "Chiudi" : {
+
+    },
+    "Configura Immich" : {
 
     },
     "Configurazione Backup Foto" : {
 
     },
+    "Conteggio file in corso…" : {
+
+    },
     "Continua" : {
+
+    },
+    "Continua…" : {
 
     },
     "Controlla il log per i dettagli sugli errori." : {
@@ -151,6 +193,9 @@
 
     },
     "Copia" : {
+
+    },
+    "Copiati ma non verificati: %lld — il controllo di integrità non ha potuto concludersi (file in uso durante la copia?)" : {
 
     },
     "Cosa vuoi ripristinare?" : {
@@ -171,7 +216,13 @@
     "Dimensione" : {
 
     },
+    "Disco formattato" : {
+
+    },
     "Dopo potrai trascinarle nell'app Foto quando vuoi." : {
+
+    },
+    "Doppioni" : {
 
     },
     "Dove vuoi salvare le foto?" : {
@@ -180,19 +231,55 @@
     "Elimina" : {
 
     },
-    "Enrico Nanni Vicenzi" : {
+    "Esci" : {
 
     },
-    "Esci" : {
+    "Etichetta" : {
 
     },
     "Fatto! Le tue foto sono qui" : {
 
     },
+    "Filesystem" : {
+
+    },
+    "Formatta" : {
+
+    },
+    "Formatta \"%@\"" : {
+
+    },
+    "Formattare \"%@\"?" : {
+
+    },
+    "Formattazione in corso…" : {
+
+    },
+    "Formattazione non eseguita" : {
+
+    },
+    "Foto" : {
+
+    },
+    "Foto già salvate sull'SSD" : {
+
+    },
+    "Già presenti in libreria, non copiati: %lld" : {
+
+    },
     "Ho già un backup, voglio ripristinare" : {
 
     },
+    "I processi in corso verranno interrotti." : {
+
+    },
     "Il grafico velocità appare quando avvii un'operazione" : {
+
+    },
+    "Immich è il motore che permette di sfogliare le foto per data, luogo e persone, con ricerca intelligente e riconoscimento dei volti." : {
+
+    },
+    "Importa foto da un dispositivo o una cartella" : {
 
     },
     "Impostazioni" : {
@@ -201,7 +288,22 @@
     "Indietro" : {
 
     },
+    "iniziato il %@" : {
+
+    },
+    "Installa" : {
+
+    },
+    "Installazione…" : {
+
+    },
     "Interrompi" : {
+
+    },
+    "L'app tiene un elenco delle foto e dei video che sono già sull'SSD. Serve quando importi da una fotocamera o dal telefono: gli scatti che hai già non vengono ricopiati una seconda volta." : {
+
+    },
+    "Le foto verranno copiate in una cartella dedicata sull'SSD, dentro \"Import\"." : {
 
     },
     "Log" : {
@@ -216,6 +318,9 @@
     "Nascondi" : {
 
     },
+    "Nessun disco candidabile trovato. Collega un disco esterno nuovo e premi Aggiorna." : {
+
+    },
     "Nessun file trovato" : {
 
     },
@@ -228,10 +333,16 @@
     "Nome" : {
 
     },
+    "Nome della cartella di destinazione" : {
+
+    },
+    "Nome disco" : {
+
+    },
     "OK" : {
 
     },
-    "Operazioni" : {
+    "Ora vai in Impostazioni e seleziona questo disco come SSD o HDD." : {
 
     },
     "Origine: Keychain" : {
@@ -240,7 +351,22 @@
     "Origine: rclone.conf" : {
 
     },
+    "Per confermare, scrivi esattamente il nome del disco:" : {
+
+    },
+    "Prepara un disco nuovo" : {
+
+    },
+    "Prepara un disco nuovo…" : {
+
+    },
     "Prima di scaricare da Cubbit" : {
+
+    },
+    "Quando colleghi l'SSD, o appena finisce una copia, l'app dà un'occhiata veloce solo alle foto nuove. La prima creazione dell'elenco resta manuale, da Diagnostica: quella dura diversi minuti." : {
+
+    },
+    "rclone.conf non trovato o credenziali mancanti" : {
 
     },
     "Recuperate %lld di %lld foto" : {
@@ -256,6 +382,12 @@
     "Revisione" : {
 
     },
+    "Richiedi Touch ID all'avvio" : {
+
+    },
+    "Riepilogo dello spostamento" : {
+
+    },
     "Ripristina" : {
 
     },
@@ -265,7 +397,19 @@
     "Salva" : {
 
     },
+    "Sblocca con Touch ID" : {
+
+    },
+    "Scegli cartella o dispositivo…" : {
+
+    },
     "Scegli cartella…" : {
+
+    },
+    "Scegli una fotocamera, un drone, un vecchio disco o qualsiasi cartella con foto da importare." : {
+
+    },
+    "Se disattivato, l'app si apre senza chiedere l'autenticazione." : {
 
     },
     "SecretKey" : {
@@ -277,10 +421,35 @@
     "Seleziona le cartelle una volta sola — l'app le ricorderà automaticamente." : {
 
     },
+    "Solo dischi esterni mai configurati come SSD o HDD di backup possono essere formattati qui — i tuoi dischi di backup non compaiono mai in questo elenco." : {
+
+    },
     "Sono già tutte selezionate — deseleziona solo quello che non ti serve." : {
 
     },
+    "Sposta nel Cestino" : {
+
+    },
+    "Sposta nel Cestino…" : {
+
+    },
+    "Spostare queste copie nel Cestino?" : {
+
+    },
+    "Sposto le copie nel Cestino: %lld di %lld gruppi" : {
+      "localizations" : {
+        "it" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Sposto le copie nel Cestino: %1$lld di %2$lld gruppi"
+          }
+        }
+      }
+    },
     "Sto leggendo %@…" : {
+
+    },
+    "Sto leggendo l'elenco…" : {
 
     },
     "Sync Info" : {
@@ -292,10 +461,22 @@
     "Tempo stimato: %@" : {
 
     },
+    "Tieni aggiornato da solo l'elenco delle foto già salvate" : {
+
+    },
+    "Tutti i dati su questo disco verranno cancellati in modo permanente. Non è possibile recuperarli dopo." : {
+
+    },
     "Ultimo job: %@" : {
 
     },
     "Upload incompleti trovati" : {
+
+    },
+    "Vedi le copie doppie…" : {
+
+    },
+    "velocita %@" : {
 
     },
     "Verifica Cubbit in corso…" : {
@@ -308,18 +489,6 @@
 
     },
     "Versione %@" : {
-
-    },
-    "Volumi" : {
-
-    },
-    "iniziato il %@" : {
-
-    },
-    "rclone.conf non trovato o credenziali mancanti" : {
-
-    },
-    "velocita %@" : {
 
     }
   },
