@@ -268,7 +268,7 @@ struct CatalogView: View {
     @EnvironmentObject private var runner: BackupRunner
     @ObservedObject private var bm = BookmarkManager.shared
     @ObservedObject private var gate = AuthGateManager.shared
-    @StateObject private var volumes = VolumeMonitor()
+    @ObservedObject private var volumes = VolumeMonitor.shared
     @State private var destination: CatalogDestination = .ssd
     @State private var searchText = ""
     @State private var loadState: LoadState = .idle
@@ -6097,21 +6097,60 @@ final class S3Syncer {
 }
 
 // MARK: - VolumeMonitor
+/// Sorveglia la presenza dei due volumi esterni, con un sondaggio ogni 3 secondi.
+///
+/// **Riscritta il 2026-09-03 dopo un beachball riprodotto da Enrico.** La versione precedente
+/// aveva tre difetti che si sommavano, e insieme rendevano lenta l'INTERA app:
+///
+/// 1. **`fileExists` girava sul main thread.** `check()` faceva `DispatchQueue.main.async` e
+///    *poi* dentro chiamava `fm.fileExists` sui due volumi: esattamente al contrario. Una
+///    `stat()` su un volume esterno — SSD exFAT via FSKit, o un HDD che si e' addormentato —
+///    puo' bloccare per centinaia di millisecondi. Bloccarla sul main thread e' un beachball.
+/// 2. **Cinque istanze, cinque timer.** `ContentView`, `RestoreView`, `ImportView`,
+///    `DuplicatesView` e `SetupView` creavano ognuna il proprio `VolumeMonitor` con
+///    `@StateObject`: dieci `stat()` bloccanti ogni 3 secondi invece di due. Ora c'e' una
+///    **istanza sola** (`shared`), come gia' fanno `BookmarkManager`, `AppearanceManager` e
+///    `AuthGateManager`.
+/// 3. **Ripubblicava lo stesso valore ogni 3 secondi.** Assegnare a un `@Published` fa scattare
+///    `objectWillChange` anche quando il valore non e' cambiato: ogni view che osservava questo
+///    monitor si ridisegnava **ogni 3 secondi, per sempre**, senza motivo. Combinato col bug del
+///    pannello Doppioni corretto il giorno prima (che ricostruiva l'intero batch a ogni
+///    ridisegno), quello era un ricalcolo completo garantito ogni 3 secondi.
+///
+/// Perche' il profiler non lo trovava: una `stat()` in attesa del disco **non consuma CPU**.
+/// Quattro campionature con `sample` mostravano un processo "inattivo" mentre il thread
+/// principale era fermo in attesa di I/O. Cercavo calcoli, il problema era attesa.
 final class VolumeMonitor: ObservableObject {
+    /// Istanza unica. Le view la osservano con `@ObservedObject`, non la creano.
+    static let shared = VolumeMonitor()
+
     @Published var ssdMounted = false
     @Published var hddMounted = false
     private let ssdPath = "/Volumes/SSD - Enri"
     private let hddPath = "/Volumes/BackupHDD"
     private var timer: Timer?
-    init() {
+    /// I `stat()` sui volumi esterni vivono qui. Mai sul main thread.
+    private let probeQueue = DispatchQueue(label: "AppBackupFoto.VolumeMonitor", qos: .utility)
+
+    private init() {
         check()
         timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in self?.check() }
     }
+
+    deinit { timer?.invalidate() }
+
     private func check() {
-        let fm = FileManager.default
-        DispatchQueue.main.async {
-            self.ssdMounted = fm.fileExists(atPath: self.ssdPath)
-            self.hddMounted = fm.fileExists(atPath: self.hddPath)
+        probeQueue.async { [weak self] in
+            guard let self else { return }
+            let fm = FileManager.default
+            let ssd = fm.fileExists(atPath: self.ssdPath)
+            let hdd = fm.fileExists(atPath: self.hddPath)
+            DispatchQueue.main.async {
+                // Si pubblica SOLO se il valore e' cambiato davvero: un `@Published`
+                // riassegnato allo stesso valore fa comunque ridisegnare ogni osservatore.
+                if self.ssdMounted != ssd { self.ssdMounted = ssd }
+                if self.hddMounted != hdd { self.hddMounted = hdd }
+            }
         }
     }
 }
@@ -8403,7 +8442,7 @@ struct RestoreView: View {
     @Environment(\.dismiss) private var dismiss
     @EnvironmentObject private var runner: BackupRunner
     @ObservedObject private var bm = BookmarkManager.shared
-    @StateObject private var volumes = VolumeMonitor()
+    @ObservedObject private var volumes = VolumeMonitor.shared
     @StateObject private var engine = RestoreEngine()
     private let s3Syncer = S3Syncer()
 
@@ -8765,7 +8804,7 @@ struct ImportView: View {
     @Environment(\.dismiss) private var dismiss
     @EnvironmentObject private var runner: BackupRunner
     @ObservedObject private var bm = BookmarkManager.shared
-    @StateObject private var volumes = VolumeMonitor()
+    @ObservedObject private var volumes = VolumeMonitor.shared
     private let previewSyncer = FileSyncer()
 
     enum Step { case chooseSource, preview, label }
@@ -9143,7 +9182,7 @@ struct LocationRow: View {
 // MARK: - ContentView
 struct ContentView: View {
     @EnvironmentObject private var runner: BackupRunner
-    @StateObject private var volumes = VolumeMonitor()
+    @ObservedObject private var volumes = VolumeMonitor.shared
     @State private var showCompletion = false
     @State private var showSettings = false
     @State private var showHamburger = false
@@ -10743,7 +10782,7 @@ private final class CancelFlag {
 struct DuplicatesView: View {
     @ObservedObject private var gate = AuthGateManager.shared
     @EnvironmentObject private var runner: BackupRunner
-    @StateObject private var volumes = VolumeMonitor()
+    @ObservedObject private var volumes = VolumeMonitor.shared
 
     private enum LoadState {
         case idle, loading, loaded([DuplicateGroup]), failed(String)

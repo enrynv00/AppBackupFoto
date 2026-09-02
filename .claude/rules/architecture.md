@@ -311,6 +311,20 @@ Ognuno è stato **misurato**, non dedotto, e ognuno ha una contromisura in codic
 
 Due lezioni di metodo, già pagate più volte su questo progetto e riconfermate qui: **un test può codificare il bug invece di trovarlo** (`testCancelStopsScan` sarebbe passato con `cancelled` rotto; il test sulla root sparita provava il caso *all'inizio*, cioè quello già coperto), e **un test basato su una corsa è verde col bug ogni volta che la corsa va nell'altro verso** — per questo l'hash della verifica post-copia è iniettabile in `FileSyncer.init` (`hashFunction`, con default la vera `sha256(of:)`, nessun call site di produzione lo passa) invece di essere provato a cronometro.
 
+#### `VolumeMonitor` bloccava il main thread ogni 3 secondi (2026-09-03) — la vera causa della lentezza generale
+
+**Sintomo**: beachball ogni volta che si apriva il pannello hamburger, e sensazione di app lenta ovunque. **Il profiler non lo trovava**: quattro campionature con `sample` (55 secondi totali, con Enrico che cliccava su richiesta) mostravano il processo *inattivo*. Motivo: una `stat()` in attesa del disco **non consuma CPU**, quindi al profiler basato su CPU sembra idle. Si cercavano calcoli, il problema era **attesa di I/O**. Il fatto che il sintomo fosse il **beachball** — cioè per definizione il main thread che non risponde al run loop — è stato l'indizio che ha smontato l'ipotesi "è la memoria satura" e riportato l'indagine sul codice.
+
+Tre difetti sommati nella stessa classe da 17 righe:
+
+1. **`fileExists` girava sul main thread.** `check()` faceva `DispatchQueue.main.async` e *poi*, dentro quel blocco, chiamava `fm.fileExists` sui due volumi esterni — esattamente al contrario di come va fatto. Su un SSD exFAT via FSKit o un HDD addormentato una `stat()` blocca per centinaia di millisecondi.
+2. **Cinque istanze, cinque timer.** `ContentView`, `RestoreView`, `ImportView`, `DuplicatesView` e `SetupView` creavano ognuna il proprio monitor con `@StateObject`: **dieci `stat()` bloccanti sul main thread ogni 3 secondi**, per sempre. Ora `VolumeMonitor.shared`, come già fanno `BookmarkManager`, `AppearanceManager` e `AuthGateManager`.
+3. **Ripubblicava lo stesso valore ogni 3 secondi.** Assegnare a un `@Published` fa scattare `objectWillChange` anche se il valore non è cambiato: ogni view osservante si ridisegnava ogni 3 secondi senza motivo. **Combinato col bug del pannello Doppioni corretto il giorno prima** (che ricostruiva l'intero `DuplicateBatch` a ogni ridisegno), quello era un ricalcolo completo dei gruppi **garantito ogni 3 secondi** — i due bug si moltiplicavano.
+
+Fix: sondaggio su una coda `.utility` dedicata, pubblicazione sul main solo dei valori **cambiati**, istanza unica, `deinit` che invalida il timer.
+
+**Lezione di metodo**: `sample`/Time Profiler misurano CPU. Un main thread bloccato in I/O è invisibile lì e va cercato con altro (il tipo di sintomo — beachball — o `spindump`, che mostra anche i thread in attesa). Non concludere "il processo è inattivo, quindi non c'è un bug".
+
 #### Dimensione e hash visibili per ogni file (2026-09-02, rilievo di Enrico)
 
 La riga di un gruppo mostrava solo una spiegazione a parole di quale copia veniva tenuta e i percorsi delle altre — nessun numero con cui verificare a occhio "sono davvero lo stesso file?". `DuplicateFileDetail` (nuovo, subito prima di `DuplicateGroupRow`) mostra dimensione esatta (`ByteCountFormatter`) e i primi 12 caratteri esadecimali dell'hash, per il file tenuto **e** per ognuna delle copie in uscita — letti direttamente da `LibraryIndexEntry.size`/`.hash`, nessun calcolo nuovo. **Non cambia la decisione**: l'hash mostrato è quello dell'indice (livello 1, ADR-0003, una cache che può essere stantia per ADR-0002), non la riprova che autorizza il cestinamento — quella resta la rilettura dal disco al momento del blocco (ADR-0005), invariata. Testo selezionabile (`.textSelection(.enabled)`) per poter copiare l'hash e confrontarlo altrove.
