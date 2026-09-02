@@ -10750,6 +10750,20 @@ struct DuplicatesView: View {
     }
 
     @State private var loadState: LoadState = .idle
+    /// Il batch **gia' calcolato**, aggiornato in blocco con `loadState` dentro `loadGroups()`.
+    ///
+    /// Bug reale trovato il 2026-09-02 misurando il processo vivo (`sample`, non a deduzione):
+    /// `headerLine` e `listArea` ricostruivano `DuplicateBatch(groups:)` da zero **a ogni
+    /// ridisegno di SwiftUI**, cioe' ogni volta che una checkbox cambiava, una miniatura
+    /// finiva di caricare, o qualunque altro `@State` di questa view veniva toccato.
+    /// `DuplicateBatch.init` ordina l'intero elenco e per ogni gruppo richiama
+    /// `duplicateKeepChoice` e filtra i membri piu' volte: con le migliaia di gruppi reali
+    /// prodotti da un SSD vero (`Foto Google Drive` collide con `Takeout` all'80,6%,
+    /// misurato il 2026-09-01), un `sample` del processo ha mostrato il thread principale
+    /// bloccato al 100% dentro questo identico percorso per l'intera finestra di
+    /// campionamento — la causa del pannello che "non rispondeva piu'". Ora si calcola
+    /// **una volta sola**, fuori dal main thread, quando i gruppi arrivano.
+    @State private var loadedBatch: DuplicateBatch? = nil
     @State private var selectedHashes: Set<String> = []
 
     /// Avvisi **locali della view**, mai `runner.pendingAlert`: quello ha un solo
@@ -10861,11 +10875,9 @@ struct DuplicatesView: View {
 
     private var headerLine: some View {
         let indexBuilt = runner.indexedFileCount > 0
-        let (groupCount, reclaimableBytes): (Int, Int64) = {
-            guard case .loaded(let groups) = loadState else { return (0, 0) }
-            let batch = DuplicateBatch(groups: groups)
-            return (batch.groups.count, batch.reclaimableBytes)
-        }()
+        // Lettura O(1) dal batch gia' calcolato — vedi doc-comment su `loadedBatch`.
+        let groupCount = loadedBatch?.groups.count ?? 0
+        let reclaimableBytes = loadedBatch?.reclaimableBytes ?? 0
         return Text(DuplicatesStatus.headerLine(indexBuilt: indexBuilt,
                                                 groupCount: groupCount,
                                                 reclaimableBytes: reclaimableBytes).text)
@@ -10898,11 +10910,11 @@ struct DuplicatesView: View {
         case .failed(let message):
             Text(message).foregroundStyle(AppColor.error)
                 .frame(maxWidth: .infinity, alignment: .leading)
-        case .loaded(let groups):
-            let batch = DuplicateBatch(groups: groups)
-            if batch.groups.isEmpty {
-                Spacer()
-            } else {
+        case .loaded:
+            // `loadedBatch`, non una ricostruzione da `groups` — vedi doc-comment sul
+            // `@State`. `loadState`/`loadedBatch` sono pubblicati insieme in `loadGroups()`,
+            // quindi sono sempre coerenti quando si arriva qui.
+            if let batch = loadedBatch, !batch.groups.isEmpty {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: AppSpacing.sm) {
                         ForEach(batch.groups, id: \.group.hash) { entry in
@@ -10915,6 +10927,8 @@ struct DuplicatesView: View {
                         }
                     }
                 }
+            } else {
+                Spacer()
             }
         }
     }
@@ -10985,7 +10999,14 @@ struct DuplicatesView: View {
         Task.detached(priority: .utility) {
             do {
                 let groups = try store.duplicateGroups()
-                await MainActor.run { loadState = .loaded(groups) }
+                // Ordinamento + scelta di chi tenere per OGNI gruppo: e' il lavoro pesante,
+                // e va fatto qui, fuori dal main thread, una volta sola (vedi doc-comment
+                // su `loadedBatch`), non dentro la view a ogni ridisegno.
+                let batch = DuplicateBatch(groups: groups)
+                await MainActor.run {
+                    loadState = .loaded(groups)
+                    loadedBatch = batch
+                }
             } catch {
                 await MainActor.run {
                     loadState = .failed("Non è stato possibile leggere l'elenco delle copie doppie: "

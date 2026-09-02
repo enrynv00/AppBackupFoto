@@ -311,6 +311,23 @@ Ognuno è stato **misurato**, non dedotto, e ognuno ha una contromisura in codic
 
 Due lezioni di metodo, già pagate più volte su questo progetto e riconfermate qui: **un test può codificare il bug invece di trovarlo** (`testCancelStopsScan` sarebbe passato con `cancelled` rotto; il test sulla root sparita provava il caso *all'inizio*, cioè quello già coperto), e **un test basato su una corsa è verde col bug ogni volta che la corsa va nell'altro verso** — per questo l'hash della verifica post-copia è iniettabile in `FileSyncer.init` (`hashFunction`, con default la vera `sha256(of:)`, nessun call site di produzione lo passa) invece di essere provato a cronometro.
 
+#### Bug di prestazioni trovato e chiuso il 2026-09-02 — il pannello Doppioni bloccava il thread principale
+
+**Non trovato per deduzione: misurato sul processo vivo.** Enrico ha riportato l'app "in crash" e "lentissima" dopo aver aperto il pannello Doppioni con l'SSD vero collegato. Nessun crash reale (`~/Library/Logs/DiagnosticReports/` vuoto per l'app, nessun log di sistema), quindi il sospetto si e' spostato su un blocco della UI. Un `sample` del processo vivo (`sample <pid> 3`) ha mostrato il thread principale bloccato **al 100% della finestra di campionamento** dentro:
+
+```
+DuplicatesView.body → content → headerLine → DuplicateBatch.init(groups:) → sorted(by:) →
+  Entry.reclaimableBytes → Entry.leaving → Array.filter
+```
+
+**Causa**: `headerLine` e `listArea` erano `some View` computed properties che **ricostruivano `DuplicateBatch(groups:)` da zero a ogni ridisegno di SwiftUI** — non solo al caricamento. `DuplicateBatch.init` ordina l'intero elenco dei gruppi e, per ognuno, richiama `duplicateKeepChoice` e filtra i membri **tre volte** (`fileCount`, `reclaimableBytes` che rifà `leaving` internamente, `folderBreakdown`). Con le migliaia di gruppi reali che questo SSD produce — la collisione `Foto Google Drive` ↔ `Takeout` all'80,6% misurata il giorno prima significa migliaia di doppioni veri, non decine — ogni ridisegno (una checkbox, una miniatura che finisce di caricare, qualunque `@State` della view) rifaceva l'intero calcolo sul thread principale. Bloccava per secondi, ripetutamente: agli occhi di Enrico, un crash.
+
+**Non è un bug di oggi**: viene dal Task 6 (fine agosto), sfuggito a due giri di code review perché quelle si sono concentrate sulla sicurezza del percorso distruttivo (`trashItem`, l'unanimità della rilettura), non sul costo di `headerLine`/`listArea`. Nessun test l'avrebbe preso: `DuplicatesView` è dichiarata non testabile per lo stesso motivo di sempre (SwiftUI, non raggiungibile senza una corsa reale) — ed è esattamente per questo che serviva una corsa reale, con dati reali, per trovarlo.
+
+**Fix**: `DuplicateBatch(groups:)` si calcola **una volta sola**, dentro `loadGroups()`, fuori dal main thread (nello stesso `Task.detached` che già legge `store.duplicateGroups()`), e si pubblica insieme a `loadState` in un solo `MainActor.run`. Nuovo `@State private var loadedBatch: DuplicateBatch?`; `headerLine` e `listArea` lo leggono con un semplice `?? 0` / `if let`, O(1) invece di O(n log n + n·m) per ridisegno. `loadState` e `loadedBatch` sono sempre coerenti perché assegnati nello stesso blocco — nessuna finestra in cui uno dei due è aggiornato e l'altro no.
+
+**Lezione di metodo**: `duplicateGroups()`/`groups` (i dati grezzi) erano già trattati con la disciplina giusta — caricati fuori dal main thread, pubblicati una volta. Il buco era una *derivazione* di quei dati (`DuplicateBatch`) rifatta dentro la View invece che insieme al caricamento: la regola "carica fuori dal main thread" va applicata a **tutto ciò che deriva dai dati**, non solo alla lettura grezza.
+
 #### Rilievi minori di #31 chiusi il 2026-09-01
 
 Cinque dei sei rilievi non bloccanti lasciati aperti alla chiusura del nucleo. Suite da 480 a **501 test**.
