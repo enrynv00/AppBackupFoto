@@ -7,6 +7,7 @@ import SQLite3
 import CryptoKit
 import Charts
 import ImageIO
+import AVFoundation
 import Sparkle
 import LocalAuthentication
 import WebKit
@@ -1648,6 +1649,56 @@ nonisolated func makeThumbnail(url: URL, maxPixelSize: Int) -> NSImage? {
     ]
     guard let cgThumb = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
     return NSImage(cgImage: cgThumb, size: .zero)
+}
+
+/// Un fotogramma di un video, da usare come miniatura.
+///
+/// **Funzione separata da `makeThumbnail` di proposito.** Quella usa ImageIO e serve anche la
+/// miniatura del file corrente durante un job di copia (#17): allargarla ai video vi
+/// aggiungerebbe una decodifica video dentro il percorso caldo di un backup, che e' gia'
+/// vincolato dall'I/O. Qui il costo si paga solo nel pannello Doppioni, una volta per gruppo,
+/// fuori dal main thread e con il risultato in cache.
+///
+/// Riapre una decisione del 2026-08-28 («video: solo icona di sistema, nessun
+/// `AVAssetImageGenerator` in questa versione»). Il motivo di allora era che i membri di un
+/// gruppo sono byte-identici, quindi la miniatura non serve a **distinguerli fra loro** — vero,
+/// e resta vero. Ma Enrico il 2026-09-03 ha chiesto un'altra cosa: vedere **cosa sta per
+/// spostare**, e i suoi doppioni piu' grossi sono video da centinaia di MB che mostravano solo
+/// un'icona generica. Distinguere le copie fra loro e riconoscere il contenuto sono due
+/// bisogni diversi; il secondo non era coperto.
+///
+/// Due accorgimenti che contano su un SSD esterno via USB:
+/// - **tolleranze di ricerca ampie**: senza, `AVAssetImageGenerator` decodifica fino al
+///   fotogramma esatto; con 2 secondi di tolleranza prende il keyframe piu' vicino, che su un
+///   file da 600 MB e' un'altra cosa in termini di tempo.
+/// - **non il fotogramma 0**: l'inizio di un video e' spesso nero o sfocato. Si prende a 1s,
+///   o a meta' per i video piu' corti di 2 secondi.
+/// Misurato il 2026-09-03 su un video da 100+ MB dell'SSD reale: **0,14 s**, fotogramma
+/// 90x160 con l'orientamento verticale corretto. Le API usate sono quelle **asincrone**
+/// (`load(.duration)`, `image(at:)`): le equivalenti sincrone sono deprecate da macOS 13 e 15,
+/// e questo progetto ha come target macOS 26.
+nonisolated func makeVideoThumbnail(url: URL, maxPixelSize: Int) async -> NSImage? {
+    let asset = AVURLAsset(url: url)
+    let generator = AVAssetImageGenerator(asset: asset)
+    generator.appliesPreferredTrackTransform = true
+    generator.maximumSize = CGSize(width: maxPixelSize, height: maxPixelSize)
+    // Tolleranze ampie: senza, si decodifica fino al fotogramma esatto. Con 2 secondi si
+    // prende il keyframe piu' vicino — su un file da 600 MB via USB e' un'altra cosa.
+    generator.requestedTimeToleranceBefore = CMTime(seconds: 2, preferredTimescale: 600)
+    generator.requestedTimeToleranceAfter = CMTime(seconds: 2, preferredTimescale: 600)
+
+    // Mai il fotogramma 0: l'inizio di un video e' spesso nero o sfocato.
+    let seconds: Double
+    if let duration = try? await asset.load(.duration) {
+        let d = CMTimeGetSeconds(duration)
+        seconds = d.isFinite && d > 2 ? 1.0 : max(d / 2, 0)
+    } else {
+        seconds = 0
+    }
+
+    guard let result = try? await generator.image(at: CMTime(seconds: seconds, preferredTimescale: 600))
+    else { return nil }
+    return NSImage(cgImage: result.image, size: .zero)
 }
 
 /// Componenti del percorso canonico di `url`, per confronti fra percorsi.
@@ -4658,9 +4709,12 @@ final class FileSyncer {
                 // formula non cambia per loro.
                 let workUnits = toAdd + toSkipDuplicates
                 let estimatedSec = workUnits > 0 ? max(1, workUnits / 50) : 0
+                // L'ordine segue quello dichiarato nel tipo di ritorno: Swift accetta ancora
+                // un riordino implicito ma lo deprecato, e in una versione futura del
+                // linguaggio sara' un errore.
                 cont.resume(returning: (toAdd: toAdd, toSkip: toSkip, toSkipDuplicates: toSkipDuplicates,
-                                        countComplete: countComplete,
-                                         toAddBytes: toAddBytes, estimatedSec: estimatedSec))
+                                        toAddBytes: toAddBytes, estimatedSec: estimatedSec,
+                                        countComplete: countComplete))
             }
         }
     }
@@ -11045,9 +11099,21 @@ private struct RevealInFinderButton: View {
 private struct DuplicateFileDetail: View {
     let entry: LibraryIndexEntry
 
+    private static let dateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateStyle = .medium
+        f.timeStyle = .short
+        return f
+    }()
+
     var body: some View {
         HStack(spacing: AppSpacing.xs) {
             Text(ByteCountFormatter.string(fromByteCount: entry.size, countStyle: .file))
+            Text("·").foregroundStyle(.tertiary)
+            // La data c'e' perche' la spiegazione della scelta la CITA («ha la data piu'
+            // vecchia») mentre la riga non la mostrava: l'utente leggeva un'affermazione che
+            // non poteva verificare. Rilievo di Enrico del 2026-09-03.
+            Text(Self.dateFormatter.string(from: Date(timeIntervalSince1970: entry.mtime)))
             Text("·").foregroundStyle(.tertiary)
             Text(String(entry.hash.prefix(12)))
                 .font(.system(.caption2, design: .monospaced))
@@ -11144,11 +11210,22 @@ private struct DuplicateGroupRow: View {
         if let thumbnail {
             Image(nsImage: thumbnail)
                 .resizable().scaledToFill()
-                .frame(width: 48, height: 48)
+                .frame(width: 72, height: 72)
                 .clipShape(RoundedRectangle(cornerRadius: 6))
+                .overlay(alignment: .bottomTrailing) {
+                    // Sulla miniatura di un video resta un segno che lo dice: il fotogramma
+                    // da solo non distingue una foto da un filmato.
+                    if isVideo {
+                        Image(systemName: "play.circle.fill")
+                            .font(.system(size: 14))
+                            .foregroundStyle(.white)
+                            .shadow(radius: 2)
+                            .padding(3)
+                    }
+                }
         } else {
             Image(systemName: isVideo ? "video.fill" : "photo")
-                .frame(width: 48, height: 48)
+                .frame(width: 72, height: 72)
                 .foregroundStyle(.secondary)
         }
     }
@@ -11168,12 +11245,20 @@ private struct DuplicateGroupRow: View {
             thumbnail = cached
             return
         }
-        guard IndexableKind.of(url: url) == .image else { return }
+        let kind = IndexableKind.of(url: url)
+        guard kind == .image || kind == .video else { return }
         let token = UUID()
         loadToken = token
-        let image = await Task.detached(priority: .utility) {
-            makeThumbnail(url: url, maxPixelSize: 96)
-        }.value
+        let image: NSImage?
+        if kind == .video {
+            // `makeVideoThumbnail` e' gia' asincrona e AVFoundation lavora per conto suo
+            // fuori dal main thread: non serve incapsularla in un `Task.detached`.
+            image = await makeVideoThumbnail(url: url, maxPixelSize: 160)
+        } else {
+            image = await Task.detached(priority: .utility) {
+                makeThumbnail(url: url, maxPixelSize: 160)
+            }.value
+        }
         // Scartata se questa riga e' stata riusata per un altro gruppo nel frattempo
         // (scroll di una `LazyVStack`).
         guard loadToken == token else { return }
