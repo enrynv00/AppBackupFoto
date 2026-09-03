@@ -174,15 +174,7 @@ struct BackupFotoEnricoApp: App {
         .windowResizability(.contentSize)
         // Il ripristino automatico delle finestre di macOS riaprirebbe questa scena
         // al rilancio prima dello sblocco: disabilitato come barriera aggiuntiva
-        // (il gate vero è dentro ToolsSheet/CatalogView).
-        .restorationBehavior(.disabled)
-
-        Window("Catalogo", id: "catalog") {
-            CatalogView()
-                .environmentObject(runner)
-        }
-        .defaultSize(width: 720, height: 520)
-        .windowResizability(.contentSize)
+        // (il gate vero è dentro ToolsSheet).
         .restorationBehavior(.disabled)
 
         Window("Foto", id: "immich") {
@@ -256,158 +248,12 @@ private struct MenuBarContent: View {
     }
 }
 
-struct CatalogView: View {
-    enum CatalogDestination: String, CaseIterable, Identifiable {
-        case ssd = "SSD", hdd = "HDD", s3 = "Cubbit S3"
-        var id: String { rawValue }
-    }
-    enum LoadState {
-        case idle, loading, loaded([CatalogEntry]), failed(String)
-    }
-
-    @EnvironmentObject private var runner: BackupRunner
-    @ObservedObject private var bm = BookmarkManager.shared
-    @ObservedObject private var gate = AuthGateManager.shared
-    @ObservedObject private var volumes = VolumeMonitor.shared
-    @State private var destination: CatalogDestination = .ssd
-    @State private var searchText = ""
-    @State private var loadState: LoadState = .idle
-    private let reviewEngine = ReviewEngine()
-
-    private let byteFormatter: ByteCountFormatter = {
-        let f = ByteCountFormatter(); f.countStyle = .file
-        return f
-    }()
-    private let dateFormatter: DateFormatter = {
-        let f = DateFormatter(); f.dateStyle = .medium; f.timeStyle = .short
-        return f
-    }()
-
-    private func isAvailable(_ d: CatalogDestination) -> Bool {
-        switch d {
-        case .ssd: return volumes.ssdMounted
-        case .hdd: return volumes.hddMounted
-        case .s3: return runner.s3Config != nil
-        }
-    }
-
-    private var filteredEntries: [CatalogEntry] {
-        guard case .loaded(let entries) = loadState else { return [] }
-        return filterCatalogEntries(entries, matching: searchText)
-    }
-
-    /// Gate Touch ID anche qui: "Catalogo" è una scena di primo livello, apribile dal menu
-    /// Finestra mentre la finestra principale è ancora bloccata — senza questo controllo
-    /// elencherebbe nomi/cartelle/date delle foto senza autenticazione (roadmap #30).
-    var body: some View {
-        if gate.touchIDEnabled && !gate.unlocked {
-            LockScreenView()
-        } else {
-            content
-        }
-    }
-
-    private var content: some View {
-        VStack(alignment: .leading, spacing: AppSpacing.md) {
-            Text("Catalogo").font(AppFont.title)
-
-            Picker("Destinazione", selection: $destination) {
-                ForEach(CatalogDestination.allCases) { d in
-                    Text(isAvailable(d) ? d.rawValue : "\(d.rawValue) (non disponibile)").tag(d)
-                }
-            }
-            .pickerStyle(.segmented)
-            .onChange(of: destination) { _, _ in loadCurrentDestination() }
-
-            TextField("Cerca per nome o cartella", text: $searchText)
-                .textFieldStyle(.roundedBorder)
-
-            Group {
-                switch loadState {
-                case .idle:
-                    Color.clear.onAppear { loadCurrentDestination() }
-                case .loading:
-                    ProgressView("Sto leggendo \(destination.rawValue)…")
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                case .failed(let message):
-                    Text(message).foregroundStyle(AppColor.error)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                case .loaded:
-                    if filteredEntries.isEmpty {
-                        Text(searchText.isEmpty ? "Nessun file trovato" : "Nessun risultato per \"\(searchText)\"")
-                            .foregroundStyle(.secondary)
-                            .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    } else {
-                        Table(filteredEntries) {
-                            TableColumn("Nome") { Text($0.name) }
-                            TableColumn("Cartella") { Text($0.relativePath) }
-                            TableColumn("Dimensione") { entry in
-                                Text(byteFormatter.string(fromByteCount: entry.sizeBytes))
-                            }
-                            TableColumn("Data") { entry in
-                                Text(entry.modified.map { dateFormatter.string(from: $0) } ?? "—")
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        .padding(AppSpacing.lg)
-        .frame(minWidth: 640, minHeight: 480)
-    }
-
-    private func loadCurrentDestination() {
-        guard isAvailable(destination) else {
-            loadState = .failed("\(destination.rawValue) non disponibile al momento")
-            return
-        }
-        loadState = .loading
-        let dest = destination
-        Task {
-            do {
-                let entries: [CatalogEntry]
-                switch dest {
-                case .ssd:
-                    guard let url = bm.startAccessing(.ssd) else {
-                        throw NSError(domain: "Catalog", code: 1,
-                            userInfo: [NSLocalizedDescriptionKey: "Accesso all'SSD non disponibile"])
-                    }
-                    defer { bm.stopAccessing(.ssd) }
-                    entries = reviewEngine.scanLocalCatalog(rootURL: url)
-                case .hdd:
-                    guard let url = bm.startAccessing(.hdd) else {
-                        throw NSError(domain: "Catalog", code: 2,
-                            userInfo: [NSLocalizedDescriptionKey: "Accesso all'HDD non disponibile"])
-                    }
-                    defer { bm.stopAccessing(.hdd) }
-                    entries = reviewEngine.scanLocalCatalog(rootURL: url)
-                case .s3:
-                    guard let cfg = runner.s3Config else {
-                        throw NSError(domain: "Catalog", code: 3,
-                            userInfo: [NSLocalizedDescriptionKey: "Configurazione Cubbit non disponibile"])
-                    }
-                    entries = try await S3Syncer().listAllWithDates(config: cfg)
-                }
-                await MainActor.run {
-                    guard dest == destination else { return }
-                    loadState = .loaded(entries)
-                }
-            } catch {
-                await MainActor.run {
-                    guard dest == destination else { return }
-                    loadState = .failed(error.localizedDescription)
-                }
-            }
-        }
-    }
-}
-
 // MARK: - Immich (finestra "Foto")
 
 /// Finestra "Foto": la web UI di Immich incorporata, con il ciclo di vita dello stack
 /// gestito da `ImmichManager`.
 ///
-/// Gate Touch ID anche qui, come per `CatalogView`/`ToolsSheet`: è una scena di primo
+/// Gate Touch ID anche qui, come per `ToolsSheet`: è una scena di primo
 /// livello apribile dal menu Finestra mentre la finestra principale è ancora bloccata, e
 /// senza gate mostrerebbe l'intera libreria foto senza autenticazione (roadmap #30).
 struct ImmichView: View {
@@ -1680,8 +1526,8 @@ enum ImportPreviewStatus {
 
 /// File e cartelle di sistema da non trattare come contenuto dell'utente.
 ///
-/// **Chi la usa davvero, oggi**: `FileSyncer` (Mac→SSD e SSD→HDD) e
-/// `ReviewEngine.scanLocalCatalog`. **Non** la usano `S3Syncer.previewUpload`,
+/// **Chi la usa davvero, oggi**: `FileSyncer` (Mac→SSD e SSD→HDD) e l'indicizzatore
+/// della libreria. **Non** la usano `S3Syncer.previewUpload`,
 /// `S3Syncer.sync` e `ReviewEngine.sampleLocalPair`, che hanno una variante più
 /// debole (`hasPrefix("._") || name == ".DS_Store"`). Poiché tutti girano dentro un
 /// enumerator con `.skipsHiddenFiles`, la divergenza reale è di due soli nomi non
@@ -5586,69 +5432,6 @@ final class S3Syncer {
         return (objs, nextToken)
     }
 
-    // Come listPage, ma per il Catalogo (roadmap #12): estrae anche LastModified, non solo
-    // Key/Size. Funzione separata per non toccare listPage/listAll esistenti, usati da
-    // preview/restore/orphaned-uploads.
-    func parseCatalogEntries(fromListObjectsXML xml: String) -> [CatalogEntry] {
-        let keys = xmlAll(xml, tag: "Key")
-        let dates = xmlAll(xml, tag: "LastModified")
-        let sizes = xmlAll(xml, tag: "Size").compactMap { Int64($0) }
-        let fmt = ISO8601DateFormatter()
-        fmt.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let count = min(keys.count, dates.count, sizes.count)
-        var entries: [CatalogEntry] = []
-        for i in 0..<count {
-            let key = keys[i]
-            entries.append(CatalogEntry(
-                name: (key as NSString).lastPathComponent,
-                relativePath: key,
-                sizeBytes: sizes[i],
-                modified: fmt.date(from: dates[i])))
-        }
-        return entries
-    }
-
-    private func listPageWithDates(config: S3Config, token: String?) async throws -> ([CatalogEntry], String?) {
-        guard var comps = URLComponents(string: "\(config.endpoint)/\(config.bucket)") else {
-            throw NSError(domain: "S3", code: 8,
-                userInfo: [NSLocalizedDescriptionKey: "URL non valido per il bucket: \(config.bucket)"])
-        }
-        var qi = [URLQueryItem(name: "list-type", value: "2"),
-                  URLQueryItem(name: "max-keys", value: "1000")]
-        if let t = token { qi.append(URLQueryItem(name: "continuation-token", value: t)) }
-        comps.queryItems = qi
-        guard let url = comps.url else {
-            throw NSError(domain: "S3", code: 8,
-                userInfo: [NSLocalizedDescriptionKey: "URL non valido per list"])
-        }
-        var req = URLRequest(url: url)
-        req.httpMethod = "GET"
-        sign(&req, config: config, body: Data(), date: Date())
-        let (data, resp) = try await session.data(for: req)
-        guard (resp as? HTTPURLResponse)?.statusCode == 200 else {
-            let body = String(data: data, encoding: .utf8) ?? ""
-            throw NSError(domain: "S3", code: 3,
-                userInfo: [NSLocalizedDescriptionKey: "Errore lista S3: \(body.prefix(300))"])
-        }
-        let xml = String(data: data, encoding: .utf8) ?? ""
-        let entries = parseCatalogEntries(fromListObjectsXML: xml)
-        let isTruncated = xmlFirst(xml, tag: "IsTruncated") == "true"
-        let nextToken = isTruncated ? xmlFirst(xml, tag: "NextContinuationToken") : nil
-        return (entries, nextToken)
-    }
-
-    func listAllWithDates(config: S3Config) async throws -> [CatalogEntry] {
-        var entries: [CatalogEntry] = []
-        var token: String? = nil
-        repeat {
-            if cancelled || Task.isCancelled { break }
-            let (page, next) = try await listPageWithDates(config: config, token: token)
-            entries.append(contentsOf: page)
-            token = next
-        } while token != nil
-        return entries
-    }
-
     private func retrying<T>(key: String, maxAttempts: Int = 3,
                               onStatus: @escaping (String) -> Void,
                               operation: () async throws -> T) async throws -> T {
@@ -6659,11 +6442,20 @@ final class BackupRunner: ObservableObject {
     func loadS3ConfigIfNeeded() async {
         guard !s3ConfigLoaded else { return }
         s3ConfigLoaded = true
-        do {
-            let result = try S3Syncer.readConfigWithSource()
+        // `BackupRunner` e' `@MainActor`, quindi questo corpo girerebbe TUTTO sul main thread —
+        // inclusa `readConfigWithSource`, che legge il **Keychain** e, in fallback, un file di
+        // configurazione. Un accesso al Keychain puo' costare centinaia di millisecondi, e
+        // questa funzione e' chiamata dalla `.task` di `ContentView`, cioe' all'avvio: era il
+        // secondo blocco del thread principale al lancio (2026-09-03). La lettura va fuori, il
+        // risultato torna qui.
+        let outcome = await Task.detached(priority: .userInitiated) {
+            Result { try S3Syncer.readConfigWithSource() }
+        }.value
+        switch outcome {
+        case .success(let result):
             s3Config = result.config
             s3ConfigFromKeychain = result.fromKeychain
-        } catch {
+        case .failure(let error):
             s3ConfigError = error
         }
     }
@@ -6737,7 +6529,14 @@ final class BackupRunner: ObservableObject {
                 guard let self else { return }
                 Task { @MainActor in self.stopIndexingForVolumeChange() }
             }
-        refreshIndexedFileCount()
+        // NON qui in modo sincrono: `refreshIndexedFileCount` tocca `libraryIndexStore`, che
+        // e' `lazy` — valutarla APRE il database SQLite, e con un WAL da recuperare quella
+        // apertura e' I/O vero (misurato il 2026-09-03: 18 MB di database piu' 2 MB di WAL).
+        // Farlo dentro `init` significa farlo sul main thread PRIMA che la finestra compaia:
+        // l'app sembra "lavorare per partire". Rimandandolo di un giro di run loop la finestra
+        // appare subito e il conteggio si riempie un istante dopo. La semantica della `lazy`
+        // resta intatta: chi ha bisogno dello store lo ottiene comunque su richiesta.
+        Task { @MainActor [weak self] in self?.refreshIndexedFileCount() }
     }
 
     deinit {
@@ -7984,24 +7783,6 @@ struct IntegrityCheckResult: Identifiable {
     var error: String? = nil
 }
 
-// Voce del catalogo backup (roadmap #12) — alimentata sia da ReviewEngine.scanLocalCatalog
-// (SSD/HDD) sia da S3Syncer.listAllWithDates (Cubbit), sola lettura, nessuna azione associata.
-struct CatalogEntry: Identifiable {
-    let id = UUID()
-    let name: String
-    let relativePath: String
-    let sizeBytes: Int64
-    let modified: Date?
-}
-
-// Filtro di ricerca puro sul catalogo (nome o cartella, case-insensitive) — nessuna dipendenza
-// da rete o disco, applicato in memoria sui CatalogEntry già caricati.
-func filterCatalogEntries(_ entries: [CatalogEntry], matching query: String) -> [CatalogEntry] {
-    guard !query.isEmpty else { return entries }
-    let q = query.lowercased()
-    return entries.filter { $0.name.lowercased().contains(q) || $0.relativePath.lowercased().contains(q) }
-}
-
 final class ReviewEngine {
     private let bm = BookmarkManager.shared
     private let s3Syncer = S3Syncer()
@@ -8092,34 +7873,6 @@ final class ReviewEngine {
             }
         }
         return result
-    }
-
-    // Catalogo backup (roadmap #12): elenca tutti i file sotto rootURL con nome/cartella
-    // relativa/dimensione/data. Sola lettura — nessuna azione, nessuna modifica. Stessa
-    // esclusione di file di sistema già usata da FileSyncer.
-    func scanLocalCatalog(rootURL: URL) -> [CatalogEntry] {
-        let resolvedRoot = URL(fileURLWithPath: realResolvedPath(rootURL), isDirectory: true)
-        guard let enumerator = fm.enumerator(
-            at: resolvedRoot,
-            includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey],
-            options: [.skipsHiddenFiles]) else {
-            return []
-        }
-        var entries: [CatalogEntry] = []
-        let base = resolvedRoot.path
-        while let f = enumerator.nextObject() as? URL {
-            let vals = try? f.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey])
-            guard vals?.isRegularFile == true else { continue }
-            let name = f.lastPathComponent
-            if LibraryExclusions.shouldExclude(f) { continue }
-            let relativePath = String(f.path.dropFirst(base.count).drop(while: { $0 == "/" }))
-            entries.append(CatalogEntry(
-                name: name,
-                relativePath: relativePath,
-                sizeBytes: Int64(vals?.fileSize ?? 0),
-                modified: vals?.contentModificationDate))
-        }
-        return entries
     }
 
     private func sampleS3Pair(ssdRoot: URL, sampleSize: Int,
@@ -9844,12 +9597,6 @@ struct HamburgerPanel: View {
                             }
                         }
 
-                        HamburgerRow(icon: "magnifyingglass", label: "Catalogo", iconColor: .indigo) {
-                            Task {
-                                await runner.loadS3ConfigIfNeeded()
-                                await MainActor.run { openWindow(id: "catalog") }
-                            }
-                        }
                         HamburgerRow(icon: "photo.stack", label: "Foto", iconColor: .pink) {
                             openWindow(id: "immich")
                         }
@@ -10273,7 +10020,7 @@ struct ToolsSheet: View {
             onConfirm: action)
     }
 
-    /// Stesso gate di `CatalogView`: "Diagnostica" è una scena di primo livello, apribile
+    /// Stesso gate delle altre scene: "Diagnostica" è una scena di primo livello, apribile
     /// dal menu Finestra mentre la finestra principale è ancora bloccata (roadmap #30).
     var body: some View {
         if gate.touchIDEnabled && !gate.unlocked {
