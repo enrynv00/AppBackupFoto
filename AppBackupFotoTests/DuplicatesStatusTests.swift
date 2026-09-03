@@ -217,4 +217,29 @@ final class DuplicatesStatusTests: XCTestCase {
         }
         XCTAssertEqual(cache.count, 5)
     }
+
+    // MARK: - La garanzia sui mirror va detta nel pannello (direttiva di Enrico, 2026-09-02)
+
+    /// Enrico ha chiesto esplicitamente che l'HDD resti un archivio completo, doppioni
+    /// compresi. Il comportamento era gia' quello, ma il pannello lo diceva **solo** nel
+    /// riepilogo finale — cioe' dopo che aveva gia' scelto cosa spuntare. Questa riga lo dice
+    /// mentre decide.
+    func testMirrorsUntouchedNote_namesBothMirrorsAndSaysOnlyTheSSDIsTouched() {
+        let nota = DuplicatesStatus.mirrorsUntouchedNote().lowercased()
+        XCTAssertTrue(nota.contains("hdd"), "la nota non nomina l'HDD: «\(nota)»")
+        XCTAssertTrue(nota.contains("cubbit"), "la nota non nomina Cubbit: «\(nota)»")
+        XCTAssertTrue(nota.contains("ssd"), "la nota non dice che si tocca solo l'SSD")
+        XCTAssertTrue(nota.contains("doppioni"),
+                      "la nota deve dire esplicitamente che il backup tiene ANCHE i doppioni")
+    }
+
+    /// Registro anti-gergo anche qui.
+    func testMirrorsUntouchedNote_carriesNoJargon() {
+        let gergo = ["hash", "indice", "sha256", "dedup", "scansione", "entry", "mirror"]
+        let nota = DuplicatesStatus.mirrorsUntouchedNote().lowercased()
+        for parola in gergo {
+            XCTAssertFalse(nota.contains(parola), "gergo: '\(parola)' in «\(nota)»")
+        }
+    }
+
 }

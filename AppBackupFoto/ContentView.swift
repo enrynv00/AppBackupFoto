@@ -2664,6 +2664,19 @@ enum DuplicatesStatus {
     /// `indexBuilt == false` **deve** rimandare alla card, mai leggersi come "non hai
     /// doppioni": e' la stessa classe di errore gia' corretta con `sawNothing` in #31 — un
     /// elenco che non esiste e un elenco costruito e vuoto sono due situazioni opposte.
+    /// Che l'HDD e Cubbit non vengano toccati **va detto qui**, nel pannello, mentre l'utente
+    /// sta ancora decidendo — non solo nel riepilogo finale, dove arriva dopo aver gia' scelto.
+    ///
+    /// Direttiva esplicita di Enrico (2026-09-02): «l'HDD non lo tocchiamo, e' un backup,
+    /// voglio che mi tenga tutto, anche i doppioni». Il comportamento era gia' quello — i
+    /// mirror non cancellano mai — ma il pannello non lo diceva nel momento in cui serviva
+    /// saperlo, cioe' mentre si spuntano i gruppi. Una garanzia che non si vede non
+    /// tranquillizza nessuno.
+    static func mirrorsUntouchedNote() -> String {
+        "Questa operazione tocca soltanto l'SSD. Le copie sull'HDD e su Cubbit restano dove "
+            + "sono: il backup continua a conservare tutto, doppioni compresi."
+    }
+
     static func headerLine(indexBuilt: Bool, groupCount: Int, reclaimableBytes: Int64) -> Line {
         guard indexBuilt else {
             return Line(id: "no-index", tone: .info, text:
@@ -10195,15 +10208,15 @@ struct ToolsSheet: View {
 
                     ForEach(integrityResults) { result in
                         VStack(alignment: .leading, spacing: AppSpacing.xs) {
-                            if let error = result.error {
-                                Text("\(result.pairName): saltato — \(error)")
-                                    .font(AppFont.caption).foregroundStyle(AppColor.warning)
-                            } else if result.mismatches.isEmpty {
-                                Text("\(result.pairName): \(result.matched)/\(result.checked) verificati, 0 problemi")
-                                    .font(AppFont.caption).foregroundStyle(AppColor.success)
-                            } else {
-                                Text("\(result.pairName): \(result.mismatches.count) mismatch su \(result.checked) verificati — \(result.mismatches.prefix(3).joined(separator: ", "))")
-                                    .font(AppFont.caption).foregroundStyle(AppColor.error)
+                            // Nessuna stringa scritta qui: `IntegritySummary` e' la fonte unica,
+                            // e mostra anche i due contatori che questa view buttava via.
+                            ForEach(IntegritySummary.lines(for: result)) { line in
+                                Text(line.text)
+                                    .font(AppFont.caption)
+                                    .foregroundStyle(line.tone == .ok ? AppColor.success
+                                                     : line.tone == .warning ? AppColor.error
+                                                     : Color.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
                             }
                         }
                     }
@@ -10588,6 +10601,10 @@ struct DuplicatesView: View {
 
             headerLine
 
+            Label(DuplicatesStatus.mirrorsUntouchedNote(), systemImage: "externaldrive.badge.checkmark")
+                .font(AppFont.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
             if let reason = trashDisabledReasonNow {
                 Label(reason, systemImage: "info.circle")
                     .font(AppFont.caption).foregroundStyle(.secondary)
@@ -10898,6 +10915,99 @@ struct DuplicatesView: View {
 /// copie che se ne andrebbero — con quelle a pari merito con la tenuta marcate visivamente
 /// (`DuplicateKeepChoice.tiedPaths`), cosi' la frase di `duplicateKeepExplanation` non deve
 /// indovinare a quale riga si riferisce.
+/// Le righe del campione d'integrita', in logica pura — stesso ruolo di `LibraryIndexStatus`,
+/// `DuplicatesStatus` e `ImportPreviewStatus`.
+///
+/// Nasce da un difetto trovato il 2026-09-03: la view mostrava solo `matched/checked` e
+/// **buttava via due contatori**, `skippedNoSource` e `skippedUnreadable`.
+///
+/// - `skippedNoSource` diventa normale e frequente **dopo il pannello Doppioni**: il campione
+///   enumera l'HDD e cerca il gemello sull'SSD, e i doppioni tolti dall'SSD non ce l'hanno
+///   piu'. Non e' un guasto — e' esattamente quello che Enrico ha chiesto (l'HDD tiene tutto,
+///   l'SSD no) — ma tacerlo fa sembrare il campione piu' piccolo di quanto richiesto senza
+///   dire perche'.
+/// - `skippedUnreadable` e' invece un **sospetto vero**: il file c'e' ma non si e' riusciti a
+///   leggerlo. Nasconderlo era la cosa peggiore delle due.
+enum IntegritySummary {
+    /// `ok` = niente da segnalare, `info` = spiegazione neutra, `warning` = merita attenzione.
+    enum Tone { case ok, info, warning }
+    struct Line: Identifiable { let id: String; let tone: Tone; let text: String }
+
+    static func lines(for r: IntegrityCheckResult) -> [Line] {
+        if let error = r.error {
+            return [Line(id: "error", tone: .warning, text: "\(r.pairName): saltato — \(error)")]
+        }
+
+        var out: [Line] = []
+
+        if r.mismatches.isEmpty {
+            out.append(Line(id: "esito", tone: .ok, text:
+                "\(r.pairName): \(r.matched) su \(r.checked) verificati, nessuna differenza."))
+        } else {
+            out.append(Line(id: "esito", tone: .warning, text:
+                "\(r.pairName): \(r.mismatches.count) su \(r.checked) verificati NON corrispondono — "
+                + r.mismatches.prefix(3).joined(separator: ", ")))
+        }
+
+        if r.skippedNoSource > 0 {
+            out.append(Line(id: "senza-origine", tone: .info, text:
+                "\(r.skippedNoSource) file del backup non esistono più sull'SSD e non sono stati "
+                + "confrontati. È normale se hai tolto delle copie doppie: il backup le conserva "
+                + "comunque, ed è quello che deve fare."))
+        }
+
+        if r.skippedUnreadable > 0 {
+            out.append(Line(id: "illeggibili", tone: .warning, text:
+                "\(r.skippedUnreadable) file esistono ma non si sono lasciati leggere: non è stato "
+                + "possibile confrontarli. Vale la pena controllarli a mano."))
+        }
+
+        return out
+    }
+}
+
+/// Dice a parole se questo file **resta** o **va nel Cestino**, invece di lasciarlo dedurre
+/// dalla posizione nella lista. Rilievo di Enrico del 2026-09-03: davanti a un'operazione che
+/// sposta file veri, una freccia e un rientro non bastano a capire cosa si sta confermando.
+private struct DuplicateRoleBadge: View {
+    enum Kind { case kept, leaving }
+    let kind: Kind
+
+    var body: some View {
+        Text(kind == .kept ? "RESTA" : "NEL CESTINO")
+            .font(.system(size: 9, weight: .bold))
+            .foregroundStyle(kind == .kept ? AppColor.success : AppColor.warning)
+            .padding(.horizontal, 5).padding(.vertical, 1)
+            .background(
+                RoundedRectangle(cornerRadius: 3)
+                    .fill((kind == .kept ? AppColor.success : AppColor.warning).opacity(0.15)))
+            .accessibilityLabel(kind == .kept ? "Questa copia resta sull'SSD"
+                                              : "Questa copia viene spostata nel Cestino")
+    }
+}
+
+/// «Mostra nel Finder» per un singolo file. **È l'unico modo che ha l'utente di verificare con
+/// i propri occhi** cosa sta per spostare, invece di fidarsi di una riga di testo: apre il
+/// Finder con il file gia' selezionato, cosi' puo' aprirlo, guardarlo con Anteprima, e
+/// decidere. Nessuna scrittura, nessun effetto sul file — solo `activateFileViewerSelecting`.
+private struct RevealInFinderButton: View {
+    let url: URL?
+
+    var body: some View {
+        Button {
+            guard let url else { return }
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        } label: {
+            Image(systemName: "magnifyingglass.circle")
+                .font(.caption)
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.secondary)
+        .disabled(url == nil)
+        .help("Mostra nel Finder")
+    }
+}
+
 /// Dimensione esatta e hash di UN file del gruppo, letti direttamente da
 /// `LibraryIndexEntry` — nessun calcolo, sono gia' nel record dell'indice.
 ///
@@ -10941,9 +11051,14 @@ private struct DuplicateGroupRow: View {
     /// `Task.detached`, che non eredita la cancellazione automatica del `.task` della view.
     @State private var loadToken = UUID()
 
-    private var keeperURL: URL? {
+    private var keeperURL: URL? { url(for: entry.choice.keeper) }
+
+    /// Percorso su disco di un qualunque membro del gruppo. Serve a "Mostra nel Finder",
+    /// che e' l'unico modo che ha Enrico di verificare **con i propri occhi** cosa sta per
+    /// spostare, invece di fidarsi di una riga di testo (rilievo del 2026-09-03).
+    private func url(for member: LibraryIndexEntry) -> URL? {
         guard let libraryRootPath else { return nil }
-        return URL(fileURLWithPath: libraryRootPath).appendingPathComponent(entry.choice.keeper.displayPath)
+        return URL(fileURLWithPath: libraryRootPath).appendingPathComponent(member.displayPath)
     }
 
     var body: some View {
@@ -10955,8 +11070,17 @@ private struct DuplicateGroupRow: View {
             thumbnailView
 
             VStack(alignment: .leading, spacing: AppSpacing.xs) {
-                Text(entry.choice.keeper.displayPath).font(AppFont.body)
-                    .lineLimit(1).truncationMode(.middle)
+                HStack(spacing: AppSpacing.xs) {
+                    // Etichetta esplicita, non solo una posizione nella lista. Rilievo di
+                    // Enrico del 2026-09-03: "non si capisce cosa stia eliminando o meno".
+                    // La distinzione fra la copia tenuta e quelle in uscita era affidata a
+                    // una freccia e a un rientro — troppo poco davanti a un'operazione che
+                    // sposta file veri.
+                    DuplicateRoleBadge(kind: .kept)
+                    Text(entry.choice.keeper.displayPath).font(AppFont.body)
+                        .lineLimit(1).truncationMode(.middle)
+                    RevealInFinderButton(url: url(for: entry.choice.keeper))
+                }
 
                 // Dimensione e hash del file TENUTO, per esteso — rilievo di Enrico del
                 // 2026-09-02: prima della sola frase di spiegazione non c'era modo di
@@ -10975,10 +11099,10 @@ private struct DuplicateGroupRow: View {
                 ForEach(entry.leaving, id: \.path) { leaving in
                     VStack(alignment: .leading, spacing: 2) {
                         HStack(spacing: AppSpacing.xs) {
-                            Image(systemName: "arrow.turn.down.right")
-                                .font(.caption2).foregroundStyle(.secondary)
+                            DuplicateRoleBadge(kind: .leaving)
                             Text(leaving.displayPath).font(.caption).foregroundStyle(.secondary)
                                 .lineLimit(1).truncationMode(.middle)
+                            RevealInFinderButton(url: url(for: leaving))
                             if entry.choice.tiedPaths.contains(leaving.path) {
                                 Text("· pari merito con la tenuta")
                                     .font(.caption2).italic().foregroundStyle(AppColor.warning)
