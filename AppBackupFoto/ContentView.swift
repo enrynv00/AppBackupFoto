@@ -614,8 +614,45 @@ final class ImmichManager: ObservableObject {
     /// il `~/.docker` personale di Enrico.
     var dockerConfigDir: URL { appSupportDir.appendingPathComponent("docker-config", isDirectory: true) }
     /// `LIMA_HOME`/`COLIMA_HOME` privati: la VM e il suo stato non finiscono in `~/.lima`/`~/.colima`.
-    var limaHomeDir: URL { appSupportDir.appendingPathComponent("lima-home", isDirectory: true) }
-    var colimaHomeDir: URL { appSupportDir.appendingPathComponent("colima-home", isDirectory: true) }
+    ///
+    /// **Perche' NON stanno sotto Application Support come tutto il resto** (corretto il
+    /// 2026-09-03, dopo averlo visto fallire davvero): Lima crea un socket UNIX dentro
+    /// `LIMA_HOME`, e un socket UNIX non puo' superare **104 caratteri** di percorso
+    /// (`UNIX_PATH_MAX`). Con il percorso precedente
+    /// — `~/Library/Application Support/AppBackupFoto/immich/lima-home/colima/ssh.sock.<16 cifre>` —
+    /// si arrivava a **117 caratteri**, e `colima start` moriva subito con
+    /// «instance name too long ... must be less than UNIX_PATH_MAX=104». **Sempre.** La
+    /// feature non poteva funzionare, e non se n'era accorto nessuno perche' non era mai
+    /// stata eseguita davvero.
+    ///
+    /// Non e' un capriccio di Lima: e' il motivo per cui Lima e Colima usano di default
+    /// `~/.lima` e `~/.colima`, cioe' percorsi corti. Lo scopo del percorso privato era
+    /// **isolare** lo stato da quello personale di Enrico, non stare per forza dentro
+    /// Application Support: una cartella nascosta dedicata ottiene l'isolamento e sta nel
+    /// limite. Con questo percorso il socket misura 77 caratteri, 27 di margine.
+    ///
+    /// `binDir` resta invece sotto Application Support: i binari non creano socket.
+    var privateVMHome: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".appbackupfoto-vm", isDirectory: true)
+    }
+    var limaHomeDir: URL { privateVMHome.appendingPathComponent("lima", isDirectory: true) }
+    var colimaHomeDir: URL { privateVMHome.appendingPathComponent("colima", isDirectory: true) }
+
+    /// Il percorso del socket che Lima creera', e se ci sta nel limite del sistema.
+    ///
+    /// Pura e testabile apposta: e' l'unico modo di impedire che questo difetto torni in
+    /// silenzio. Un nome utente molto lungo puo' ancora far sforare il limite — e' un caso
+    /// che qui non si verifica ma che non e' impossibile su un altro Mac, ed e' meglio un
+    /// messaggio che lo dice di un errore di Lima che nessuno sa interpretare.
+    static func vmSocketPathFits(limaHome: String, instance: String = "colima") -> Bool {
+        socketPathLength(limaHome: limaHome, instance: instance) <= 104
+    }
+
+    static func socketPathLength(limaHome: String, instance: String = "colima") -> Int {
+        // Forma reale del socket creato da Lima: `<LIMA_HOME>/<istanza>/ssh.sock.<16 cifre>`.
+        "\(limaHome)/\(instance)/ssh.sock.1234567890123456".count
+    }
 
     var colimaBinary: URL { binDir.appendingPathComponent("colima") }
     var limactlBinary: URL { binDir.appendingPathComponent("limactl") }
@@ -759,9 +796,17 @@ extension ImmichManager {
         case startTimedOut
         case checksumMismatch(asset: String, expected: String, actual: String)
         case unsupportedLibraryPath(String)
+        case vmPathTooLong(length: Int)
 
         var errorDescription: String? {
             switch self {
+            case .vmPathTooLong(let length):
+                return """
+                Non è possibile avviare il motore delle foto su questo Mac: il percorso interno che
+                deve usare è troppo lungo (\(length) caratteri, il massimo di sistema è 104).
+                Di solito dipende da un nome utente molto lungo.
+                Non è un problema delle tue foto e non è stato modificato niente.
+                """
             case .unsupportedLibraryPath(let path):
                 return """
                 Il percorso della libreria contiene un carattere non supportato (:) e non può essere usato da Immich.
@@ -1001,6 +1046,12 @@ extension ImmichManager {
             // Prima di qualunque effetto collaterale: un path che Colima interpreterebbe male
             // non deve nemmeno arrivare alla riga di comando (vedi `validateLibraryPath`).
             try Self.validateLibraryPath(sourceLibraryPath)
+            // Prima di scaricare immagini e avviare VM: se il socket non ci sta nel limite,
+            // `colima start` fallirebbe comunque, ma con un errore di Lima incomprensibile.
+            guard Self.vmSocketPathFits(limaHome: limaHomeDir.path) else {
+                throw Failure.vmPathTooLong(
+                    length: Self.socketPathLength(limaHome: limaHomeDir.path))
+            }
             let fm = FileManager.default
             for dir in [dataDir, dockerConfigDir, limaHomeDir, colimaHomeDir] {
                 try fm.createDirectory(at: dir, withIntermediateDirectories: true)

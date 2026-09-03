@@ -311,6 +311,18 @@ Ognuno è stato **misurato**, non dedotto, e ognuno ha una contromisura in codic
 
 Due lezioni di metodo, già pagate più volte su questo progetto e riconfermate qui: **un test può codificare il bug invece di trovarlo** (`testCancelStopsScan` sarebbe passato con `cancelled` rotto; il test sulla root sparita provava il caso *all'inizio*, cioè quello già coperto), e **un test basato su una corsa è verde col bug ogni volta che la corsa va nell'altro verso** — per questo l'hash della verifica post-copia è iniettabile in `FileSyncer.init` (`hashFunction`, con default la vera `sha256(of:)`, nessun call site di produzione lo passa) invece di essere provato a cronometro.
 
+#### Immich (#29): la feature non poteva funzionare, e il test economico è passato (2026-09-03)
+
+Primo tentativo reale di avviare Colima, tre settimane dopo che il codice era «completo». Due risultati, uno per verso.
+
+**1. Bug bloccante: il socket della VM sforava il limite di sistema.** `LIMA_HOME` stava sotto Application Support, e Lima ci crea un socket UNIX il cui percorso — `<LIMA_HOME>/colima/ssh.sock.<16 cifre>` — misurava **117 caratteri** contro `UNIX_PATH_MAX = 104`. `colima start` moriva **sempre**, subito, con «instance name too long». La feature era irraggiungibile dal giorno in cui è stata scritta, e non se n'era accorto nessuno **perché non era mai stata eseguita**. È l'argomento più forte visto finora contro il marcare «fatto» del codice che nessuno ha visto girare.
+
+Correzione: `LIMA_HOME`/`COLIMA_HOME` spostati in `~/.appbackupfoto-vm/{lima,colima}` (socket a 77 caratteri, 27 di margine). Non è un ripiego: Lima e Colima usano di default `~/.lima` e `~/.colima` **proprio per questo limite**. Lo scopo del percorso privato era isolare lo stato da quello personale di Enrico, non stare dentro Application Support — l'isolamento resta. `binDir` non si sposta: i binari non creano socket. Aggiunta una guardia (`vmSocketPathFits`) che controlla **prima** di scaricare immagini e avviare VM, con un messaggio comprensibile invece dell'errore di Lima; 4 test la fissano, incluso il confine esatto 104/105 e il caso di un nome utente molto lungo, che può ancora sforare su un altro Mac.
+
+**2. Il test economico (Step 0 del piano) è PASSATO — l'approccio regge.** La domanda era se il «Vincolo tecnico macOS Sequoia» (i subprocess non ricevono i permessi TCC sui volumi esterni) si applicasse anche alla VM, invalidando l'idea della External Library sull'SSD. **No.** Con `--vm-type vz --mount-type virtiofs` e il mount dell'SSD, da dentro la VM: `ls "/Volumes/SSD - Enri/Foto iPhone"` elenca le sottocartelle, e `Foto iPhone/0` conta **1131 file**. Un volume **exFAT montato via FSKit si monta e si legge** dentro una VM Lima. **Riserva onesta**: la prova è stata fatta da terminale, non dall'app firmata — il contesto TCC è diverso, quindi il successo qui non è la prova definitiva per l'app, mentre un fallimento sarebbe stato decisivo. VM di prova creata in un profilo isolato e cancellata a fine test.
+
+**Trappola di ambiente, non del progetto**: `colima`/`limactl`/`docker` in `/usr/local/bin` su questo Mac sono build **x86_64** (Homebrew Intel sotto Rosetta) e `limactl` si rifiuta di partire — «running under rosetta, please reinstall with native arch». L'app **non li usa**: gestisce binari propri in `binDir`, che sono arm64 nativi. Chi prova comandi Colima da terminale su questa macchina deve usare quelli dell'app, non quelli nel PATH.
+
 #### Audit di sicurezza complessivo (2026-09-03) — nessuna violazione, e un limite accettato
 
 Richiesto da Enrico per «essere up to speed su tutto e non avere cose lasciate al caso». Coperti i sei commit del 2026-09-01/03 più lo stato generale delle regole assolute. **Nessuna violazione confermata.**
