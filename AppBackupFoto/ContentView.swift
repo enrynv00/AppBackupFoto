@@ -10393,16 +10393,36 @@ struct LibraryIndexCard: View {
                     }
                     .buttonStyle(.bordered).controlSize(.small).disabled(commandsDisabled)
 
-                    Button(LibraryIndexCommands.fullRecheck) { confirmFullRecheck() }
-                        .buttonStyle(.bordered).controlSize(.small)
-                        .disabled(commandsDisabled || runner.indexedFileCount == 0)
-
                     Spacer()
 
-                    Button(LibraryIndexCommands.reset) { confirmReset() }
-                        .buttonStyle(.bordered).controlSize(.small)
-                        .tint(AppColor.error)
-                        .disabled(commandsDisabled || runner.indexedFileCount == 0)
+                    // I due comandi rari stanno dietro un menu, non in fila con quello di
+                    // tutti i giorni (2026-09-03, richiesta di Enrico: «dev'essere sicuro e
+                    // semplice, se non e' facile da usare ci possono essere errori»).
+                    //
+                    // Prima erano tre bottoni affiancati, della stessa dimensione, con nomi
+                    // che si somigliano — «Aggiorna l'elenco», «Controlla tutte le foto da
+                    // capo», «Svuota l'elenco e ricomincia da zero» — e l'unico distruttivo
+                    // era distinguibile solo dal colore. Un clic di troppo a destra e si
+                    // buttava via un elenco che costa venti minuti a ricostruire.
+                    //
+                    // Lo svuotamento **resta raggiungibile**, ed e' un vincolo, non un
+                    // dettaglio: ADR-0002 lo indica come l'unica via d'uscita quando restano
+                    // in elenco foto che sull'SSD non ci sono piu'. Nasconderlo del tutto
+                    // lascerebbe l'utente in un vicolo cieco. Qui e' a due gesti invece che a
+                    // uno, che e' esattamente la differenza fra "raggiungibile" e "a portata
+                    // di clic distratto".
+                    Menu {
+                        Button(LibraryIndexCommands.fullRecheck) { confirmFullRecheck() }
+                            .disabled(commandsDisabled || runner.indexedFileCount == 0)
+                        Divider()
+                        Button(LibraryIndexCommands.reset, role: .destructive) { confirmReset() }
+                            .disabled(commandsDisabled || runner.indexedFileCount == 0)
+                    } label: {
+                        Label("Altro", systemImage: "ellipsis.circle")
+                    }
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
+                    .help("Controlli meno frequenti su questo elenco")
                 }
 
                 // Disattivare **e** dire perche', come `RestoreView` con le fonti non
