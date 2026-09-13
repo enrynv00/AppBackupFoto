@@ -100,9 +100,22 @@ paths:
 - Le foto ripristinate atterrano in una cartella normale sul Mac, **non** nella libreria interna di Foto.app (troppo rischioso toccare il suo database privato) — l'utente le importa lui con un paio di click.
 - Raggiungibile da hamburger → Ripristina, e da un bottone secondario in `SetupView` (visibile anche a configurazione incompleta, grazie a `canEnterApp`).
 
-### ImmichManager e finestra "Foto" (2026-08-17, roadmap #29 — codice completo, verifica manuale ancora da fare)
+### ImmichManager e finestra "Foto" (2026-08-17, roadmap #29 — primo avvio reale riuscito il 2026-09-13, verifica non ancora completa)
 
-**Stato: NON marcare #29 come "fatto" finché Enrico non ha eseguito con successo la verifica manuale end-to-end** descritta in `Docs/superpowers/plans/2026-08-17-immich-integration.md` (Task 5, Step 4). Tutto il codice qui sotto compila e i test passano, ma **nessuno di questi comandi è mai stato eseguito davvero**: la VM Colima non è mai stata avviata, le immagini Docker di Immich non sono mai state scaricate, l'account e la External Library non sono mai stati creati. Spec: `Docs/superpowers/specs/2026-08-17-immich-integration-design.md`.
+**Stato: NON marcare #29 come "fatto"** — la verifica end-to-end di `Docs/superpowers/plans/2026-08-17-immich-integration.md` (Task 5, Step 4) è **iniziata ma non conclusa**. Spec: `Docs/superpowers/specs/2026-08-17-immich-integration-design.md`.
+
+**Il 2026-09-13 lo stack è stato avviato per la prima volta davvero** (fino a quel giorno questa sezione diceva che nessun comando era mai stato eseguito, ed era vero). Verificati sul campo i punti 0-7 dello Step 4:
+
+- VM Colima creata e avviata (`vz` + `virtiofs`, 4 CPU / 8 GB), socket a **64 caratteri** contro `UNIX_PATH_MAX` 104 — il fix di `ff4e9a3` regge nella realtà, non solo nei test.
+- Immagini Docker scaricate (~4,1 GB), 4 container `healthy`, Immich **3.2.0** raggiungibile su `127.0.0.1:2283`.
+- **La sola lettura è confermata dall'interno del container**: l'SSD è montato su `/external-ssd`, `ls` funziona e `touch` risponde `Read-only file system`. È la prova che i due strati (`read_only: true` nel compose + mount Colima senza `:w`) fanno davvero quello che i test possono solo asserire sul testo generato.
+- Account admin e External Library creati; scansione avviata su **47.479 media** (39.873 foto + 7.606 video).
+
+**Restano da verificare i punti 8, 9 e 10**: griglia completa con ricerca smart e facce sensate su un campione; chiusura totale dell'app → i container devono risultare fermi da `docker ps`; finestra "Foto" con app bloccata da Touch ID → deve mostrare la lock screen. **Finché questi tre non passano, #29 resta 🔲** — e il punto 9 in particolare esercita `applicationShouldTerminate`/`detectRunning()`, cioè proprio la logica descritta più sotto che non è mai stata eseguita su uno stack realmente acceso.
+
+**Due `exclusionPatterns` sono obbligatori sulla libreria esterna, e uno non era nella spec**: `**/Zip/**` (deciso in review, esclude 40-50 GB di archivi — verificato che dentro `Zip/` ci sono solo `.zip`, nessun media sciolto) e **`**/._*`**, aggiunto il 2026-09-13: senza, Immich importerebbe i **34.969 sidecar AppleDouble** che l'SSD exFAT/FSKit genera con estensione da foto. È lo stesso inciampo che `LibraryExclusions` già evita nell'indice di contenuto (#31) — due sottosistemi diversi, la stessa trappola, da ricordare per qualunque terzo consumatore della libreria.
+
+**Lo Swagger è disabilitato in produzione** (`/api/docs-json` → 404): le rotte dell'API si leggono dal controller compilato dentro il container (`/usr/src/app/server/dist/controllers/library.controller.js`). Esiste `POST /api/libraries/:id/validate`, non previsto dal piano, da usare **prima** dello scan.
 
 - `ImmichManager` (singleton `ObservableObject`, stesso stile di `BackupRunner`/`AuthGateManager`) pubblica `installed`/`isRunning`/`vmPossiblyUp`/`isStarting`/`lastError` e gestisce il ciclo di vita di un'istanza Immich locale via Colima + Docker Compose, shellando con `Process` sui binari scaricati dall'app.
 - **Dove vivono i dati — regola non negoziabile**: tutto sotto `~/Library/Application Support/AppBackupFoto/immich/` sul **disco interno** del Mac (`appSupportDir`, con `binDir`/`dataDir`/`dockerConfigDir`/`limaHomeDir`/`colimaHomeDir`), **mai su SSD/HDD esterni**. Motivi: Postgres vuole storage locale veloce, e se l'SSD viene scollegato il server resta comunque in piedi (si ferma solo la scansione della libreria esterna). `DOCKER_CONFIG`/`LIMA_HOME`/`COLIMA_HOME` sono dirottati lì apposta, così l'app non tocca mai il `~/.docker`/`~/.lima`/`~/.colima` personali di Enrico.
