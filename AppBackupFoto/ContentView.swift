@@ -2818,7 +2818,7 @@ enum DuplicatesStatus {
         guard indexBuilt else {
             return Line(id: "no-index", tone: .info, text:
                 "Non hai ancora creato l'elenco delle foto già salvate sull'SSD. Vai in "
-                + "Diagnostica → «Foto già salvate sull'SSD» e crealo da lì, poi torna qui.")
+                + "Diagnostica → «\(LibraryIndexCommands.cardTitle)» e crealo da lì, poi torna qui.")
         }
         guard groupCount > 0 else {
             return Line(id: "zero-groups", tone: .ok, text:
@@ -4233,6 +4233,10 @@ nonisolated final class LibraryIndexer: @unchecked Sendable {
 /// dicono all'utente **quale bottone premere**, e se il nome vivesse in due posti la prima
 /// rinomina lascerebbe un messaggio che indica un bottone che non esiste piu'.
 enum LibraryIndexCommands {
+    /// Titolo della card di Diagnostica. In un punto solo perche' compare anche fuori dalla
+    /// card (il rimando di `DuplicatesStatus.headerLine` e, dal 2026-09-19, il riepilogo del
+    /// passo 2 del backup quando c'e' qualcosa da controllare in Diagnostica).
+    static let cardTitle = "Foto già salvate sull'SSD"
     static let build = "Crea l'elenco"
     static let refresh = "Aggiorna l'elenco"
     static let fullRecheck = "Controlla tutte le foto da capo"
@@ -4475,6 +4479,158 @@ enum LibraryIndexAutoRefresh {
     static func shouldRun(enabled: Bool, indexedFileCount: Int, isIndexing: Bool, jobIsRunning: Bool,
                           isTrashingDuplicates: Bool) -> Bool {
         enabled && indexedFileCount > 0 && !isIndexing && !jobIsRunning && !isTrashingDuplicates
+    }
+}
+
+// MARK: - Il passo 2 del backup: l'elenco si aggiorna come ultima parte del job (2026-09-19)
+
+/// Logica **pura** del passo 2 di MAC -> SSD e di un'importazione (spec
+/// `Docs/superpowers/specs/2026-09-19-index-refresh-as-backup-step-design.md`, ADR-0007):
+/// se e quando parte, la stima e la percentuale mostrate mentre gira, l'esito con cui
+/// finisce e ogni testo che arriva a schermo. Nessun accesso a filesystem/SQLite qui dentro
+/// — quello resta in `BackupRunner.startLibraryIndexScan`. Stesso stile isolamento di
+/// `LibraryIndexAutoRefresh`: chiamato solo dal MainActor e dai test.
+///
+/// Registro: nessun gergo ("indice", "hash", "scansione", "sqlite", ...) in nessun testo
+/// prodotto — stessa lista di `LibraryIndexStatusTests`.
+enum BackupListStep {
+    /// Stato del passo 2, pubblicato da `BackupRunner` per la durata dell'intero job.
+    /// `nil` = nessun passo 2 previsto per questo job (job che non scrive sull'SSD, o
+    /// condizioni che lo escludono). `.planned` = previsto, il passo 1 (la copia) e' ancora
+    /// in corso. `.running` = il passo 1 e' finito e la lettura sta girando.
+    enum State: Equatable {
+        case planned
+        case running(estimate: Int)
+    }
+
+    /// Come e' andato il passo 2, precedenza dall'alto in basso — non alternative
+    /// indipendenti: piu' condizioni possono essere vere insieme (es. l'utente ha premuto
+    /// Interrompi mentre l'SSD stava anche per scollegarsi), e conta solo la prima che si
+    /// applica.
+    enum Outcome: Equatable {
+        case couldNotUpdate       // non e' partito, o la lettura ha lanciato un errore
+        case stoppedByYou         // "Interrompi" dell'utente
+        case ssdDisconnected      // l'SSD (la root che si stava leggendo) e' sparito
+        case stoppedByAnotherDisk // smontato un disco diverso: l'osservatore non filtra per volume
+        case updatedWithRemarks   // completato, ma la card di Diagnostica avrebbe un avviso
+        case updated              // completato, niente da segnalare
+    }
+
+    /// Parte solo se il job scrive sull'SSD, l'interruttore e' acceso, l'elenco esiste gia'
+    /// (la prima creazione resta manuale, dura minuti), e non c'e' gia' un'altra lettura o
+    /// uno spostamento nel Cestino in corso. Non riceve `jobIsRunning`: e' chiamata da
+    /// dentro il job stesso, che a questo punto e' per definizione in corso.
+    static func shouldRun(refreshesLibraryIndex: Bool, enabled: Bool, indexedFileCount: Int,
+                          isIndexing: Bool, isTrashingDuplicates: Bool) -> Bool {
+        refreshesLibraryIndex && enabled && indexedFileCount > 0 && !isIndexing && !isTrashingDuplicates
+    }
+
+    /// Stima di quanti file la lettura controllera': le voci gia' in elenco piu' i file
+    /// copiati dal passo 1 (verificati o no). Il totale vero non si conosce prima che la
+    /// lettura finisca — costerebbe una seconda traversata dell'SSD per saperlo prima.
+    static func estimate(indexedBefore: Int, copied: Int, copiedUnverified: Int) -> Int {
+        indexedBefore + copied + copiedUnverified
+    }
+
+    /// Percentuale e totale mostrati mentre il passo 2 gira. Il totale mostrato non torna
+    /// mai indietro (segue `scanned` se supera la stima), e la percentuale non tocca mai il
+    /// 100: quello lo scrive solo la fine del job.
+    static func progress(scanned: Int, estimate: Int) -> (percent: Int, shownTotal: Int) {
+        let shownTotal = max(estimate, scanned)
+        guard shownTotal > 0 else { return (0, 0) }
+        let raw = Int((Double(scanned) / Double(shownTotal) * 100).rounded(.down))
+        return (min(99, raw), shownTotal)
+    }
+
+    /// Esito finale, con le precedenze della spec (tabella D6). `progress` e' quello
+    /// restituito da `LibraryIndexer.scan` quando e' arrivata a finire (anche se fermata a
+    /// meta'); `couldNotStart`/`scanFailed` coprono i casi in cui non c'e' un `Progress`
+    /// utilizzabile.
+    static func outcome(progress: LibraryIndexer.Progress?, interruptedByUser: Bool,
+                        couldNotStart: Bool, scanFailed: Bool) -> Outcome {
+        if couldNotStart || scanFailed { return .couldNotUpdate }
+        guard let p = progress else { return .couldNotUpdate }
+        if interruptedByUser { return .stoppedByYou }
+        if p.volumeVanished { return .ssdDisconnected }
+        if p.cancelled { return .stoppedByAnotherDisk }
+        // Stessa definizione di "qualcosa non torna" della card di Diagnostica — una sola
+        // fonte: se domani la card cambia idea su un caso, il riepilogo cambia con lei.
+        if LibraryIndexStatus.lines(for: p, interruptedByUser: false).contains(where: { $0.tone == .warning }) {
+            return .updatedWithRemarks
+        }
+        return .updated
+    }
+
+    /// Intestazione della finestra durante il job. `nil` = nessun passo 2 previsto: etichetta
+    /// invariata, esattamente come prima di questa spec.
+    static func header(label: String, state: State?) -> String {
+        switch state {
+        case .none: return label
+        case .planned: return "\(label) — passo 1 di 2"
+        case .running: return "\(label) — passo 2 di 2"
+        }
+    }
+
+    /// Riga "Foto copiate" del passo 2, con `clean == false` (niente spunta verde) se ci sono
+    /// stati errori. "nuove" = copiate, verificate o no; "già presenti" = skippate perche'
+    /// gia' a destinazione o perche' riconosciute come doppioni gia' in libreria.
+    static func copyDoneLine(stats: JobStats) -> (text: String, clean: Bool) {
+        let new = stats.copied + stats.copiedUnverified
+        let alreadyThere = stats.skipped + stats.duplicatesSkipped
+        let problems = stats.errors + stats.hashErrors
+        var text = "Foto copiate (\(new.formatted()) \(new == 1 ? "nuova" : "nuove"), "
+            + "\(alreadyThere.formatted()) \(alreadyThere == 1 ? "già presente" : "già presenti")"
+        if problems > 0 {
+            text += ", \(problems.formatted()) \(problems == 1 ? "non copiata per errore" : "non copiate per errore")"
+        }
+        text += ")"
+        return (text, problems == 0)
+    }
+
+    static let runningLine = "Aggiorno l'elenco delle foto sull'SSD…"
+
+    static func countLine(scanned: Int, shownTotal: Int) -> String {
+        "\(scanned.formatted()) / \(shownTotal.formatted()) file controllati"
+    }
+
+    static let stoppingLabel = "Mi fermo…"
+
+    /// Riga aggiunta al riepilogo di fine job quando c'e' stato un passo 2. Il titolo e
+    /// l'icona del riepilogo restano quelli di oggi ("Backup completato", verde): il job e'
+    /// riuscito per costruzione, le foto sono copiate e verificate anche quando il passo 2
+    /// si e' fermato.
+    static func completionLine(_ o: Outcome) -> (text: String, tone: LibraryIndexStatus.Tone) {
+        switch o {
+        case .couldNotUpdate:
+            return ("Non è stato possibile aggiornare l'elenco delle foto sull'SSD. "
+                + "Le foto sono state copiate lo stesso: l'app riproverà al prossimo backup.", .warning)
+        case .stoppedByYou:
+            return ("Hai fermato l'aggiornamento dell'elenco delle foto sull'SSD. "
+                + "Le foto sono state copiate lo stesso: l'elenco si rimetterà in pari al prossimo backup.", .info)
+        case .ssdDisconnected:
+            return ("L'SSD è stato scollegato prima che l'elenco delle foto fosse aggiornato. "
+                + "Le foto erano già state copiate: l'elenco si rimetterà in pari al prossimo backup.", .warning)
+        case .stoppedByAnotherDisk:
+            return ("L'aggiornamento dell'elenco delle foto si è fermato perché è stato scollegato un disco. "
+                + "Le foto erano già state copiate: l'elenco si rimetterà in pari al prossimo backup.", .warning)
+        case .updatedWithRemarks:
+            return ("Elenco delle foto sull'SSD aggiornato, ma qualcosa non torna: trovi i dettagli "
+                + "in Diagnostica, alla voce «\(LibraryIndexCommands.cardTitle)».", .warning)
+        case .updated:
+            return ("Elenco delle foto sull'SSD aggiornato.", .ok)
+        }
+    }
+
+    /// Corpo della notifica di sistema, inviata una sola volta alla fine del job (successo).
+    /// `outcome == nil` = nessun passo 2: corpo identico a quello di sempre. Un esito diverso
+    /// da "aggiornato" (con o senza avvisi) aggiunge una riga; `updatedWithRemarks` non
+    /// aggiunge niente, perche' i dettagli stanno nella card, non nella notifica.
+    static func notificationBody(stats: JobStats, outcome: Outcome?) -> String {
+        var body = "Copiati \(stats.copied) · Skippati \(stats.skipped) · Errori \(stats.errors)"
+        if let outcome, outcome != .updated, outcome != .updatedWithRemarks {
+            body += " · Elenco delle foto non aggiornato"
+        }
+        return body
     }
 }
 
@@ -10652,7 +10808,7 @@ struct LibraryIndexCard: View {
     private let durata = "di solito servono dai 15 ai 25 minuti"
 
     var body: some View {
-        GroupBox("Foto già salvate sull'SSD") {
+        GroupBox(LibraryIndexCommands.cardTitle) {
             VStack(alignment: .leading, spacing: AppSpacing.sm) {
                 Text("L'app tiene un elenco delle foto e dei video che sono già sull'SSD. Serve quando importi da una fotocamera o dal telefono: gli scatti che hai già non vengono ricopiati una seconda volta.")
                     .font(AppFont.caption).foregroundStyle(.secondary)
