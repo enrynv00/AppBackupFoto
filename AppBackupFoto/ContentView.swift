@@ -214,12 +214,15 @@ private struct MenuBarIcon: View {
     var body: some View {
         Image(systemName: "photo.stack")
             .symbolEffect(.pulse, isActive: runner.isRunning)
-            .onChange(of: runner.stats.percent) { _, _ in updateDockBadge() }
+            .onChange(of: runner.displayPercent) { _, _ in updateDockBadge() }
             .onChange(of: runner.isRunning) { _, _ in updateDockBadge() }
     }
 
     private func updateDockBadge() {
-        NSApp.dockTile.badgeLabel = runner.isRunning ? "\(runner.stats.percent)%" : nil
+        // Durante il passo 2 del backup scende da 100% a pochi punti: accettato (D5 della
+        // spec), e' lo stesso numero della barra della finestra, che intanto dice "passo 2
+        // di 2".
+        NSApp.dockTile.badgeLabel = runner.isRunning ? "\(runner.displayPercent)%" : nil
     }
 }
 
@@ -4521,6 +4524,15 @@ enum BackupListStep {
         case updated              // completato, niente da segnalare
     }
 
+    /// Cosa mostrare in `StatsPanel` durante il passo 2. Valore puro calcolato dal runner
+    /// (`BackupRunner.listStepPresentation`) da `stats`/`indexProgress`/`listStepState`:
+    /// nessuna stringa nasce nella View.
+    struct Presentation {
+        let copyDone: (text: String, clean: Bool)
+        let runningLine: String
+        let countLine: String
+    }
+
     /// Parte solo se il job scrive sull'SSD, l'interruttore e' acceso, l'elenco esiste gia'
     /// (la prima creazione resta manuale, dura minuti), e non c'e' gia' un'altra lettura o
     /// uno spostamento nel Cestino in corso. Non riceve `jobIsRunning`: e' chiamata da
@@ -6921,6 +6933,18 @@ final class BackupRunner: ObservableObject {
             return BackupListStep.progress(scanned: indexProgress?.scanned ?? 0, estimate: estimate).percent
         }
         return stats.percent
+    }
+
+    /// `nil` finche' il passo 2 non e' davvero in corso (`.planned` non basta: durante la
+    /// copia `StatsPanel` mostra ancora miniatura + stato). Valori gia' calcolati, nessuna
+    /// stringa costruita nella View.
+    var listStepPresentation: BackupListStep.Presentation? {
+        guard case .running(let estimate) = listStepState else { return nil }
+        let scanned = indexProgress?.scanned ?? 0
+        let shownTotal = BackupListStep.progress(scanned: scanned, estimate: estimate).shownTotal
+        return BackupListStep.Presentation(copyDone: BackupListStep.copyDoneLine(stats: stats),
+                                           runningLine: BackupListStep.runningLine,
+                                           countLine: BackupListStep.countLine(scanned: scanned, shownTotal: shownTotal))
     }
 
     /// Vero mentre `DuplicateTrasher.run` sta spostando un blocco nel Cestino. Vive QUI,
@@ -9570,7 +9594,8 @@ struct ContentView: View {
             } detail: {
                 VStack(spacing: 0) {
                     HStack(spacing: AppSpacing.sm) {
-                        PhaseIndicator(phase: runner.phase, percent: runner.stats.percent)
+                        PhaseIndicator(phase: runner.phase, percent: runner.displayPercent,
+                                      title: BackupListStep.header(label: runner.phase.label, state: runner.listStepState))
                         Spacer()
                         Button {
                             activeSpeedTab = .log
@@ -9578,8 +9603,10 @@ struct ContentView: View {
                         .buttonStyle(.bordered).controlSize(.small)
                         if runner.isRunning {
                             Button(role: .destructive) { runner.stop() } label: {
-                                Label("Interrompi", systemImage: "stop.fill")
+                                Label(runner.listStopRequested ? BackupListStep.stoppingLabel : "Interrompi",
+                                     systemImage: "stop.fill")
                             }.buttonStyle(.bordered).controlSize(.small).tint(AppColor.error)
+                            .disabled(runner.listStopRequested)
                         }
                     }
                     .padding(.horizontal, AppSpacing.lg).padding(.vertical, AppSpacing.sm).background(.regularMaterial)
@@ -9588,7 +9615,9 @@ struct ContentView: View {
                         .padding(.horizontal, AppSpacing.lg).padding(.top, AppSpacing.md).padding(.bottom, AppSpacing.sm)
                     if runner.phase != .idle {
                         Divider()
-                        StatsPanel(stats: runner.stats, phase: runner.phase, currentStatus: runner.currentStatus, currentThumbnail: runner.currentThumbnail)
+                        StatsPanel(stats: runner.stats, phase: runner.phase, currentStatus: runner.currentStatus,
+                                  currentThumbnail: runner.currentThumbnail, displayPercent: runner.displayPercent,
+                                  listStep: runner.listStepPresentation)
                             .padding(AppSpacing.lg)
                     }
                     Divider()
@@ -9961,6 +9990,17 @@ struct CompletionSheet: View {
                 Label("Controlla il log per i dettagli sugli errori.", systemImage: "exclamationmark.triangle.fill")
                     .font(.caption).foregroundStyle(AppColor.warning).multilineTextAlignment(.center)
             }
+            // Passo 2 del backup (2026-09-19): solo se c'e' stato. Titolo e icona del
+            // riepilogo restano quelli di sopra ("Backup completato", verde) — il job e'
+            // riuscito per costruzione, anche quando il passo 2 si e' fermato (D3 della spec).
+            if let listStepOutcome = stats.listStepOutcome {
+                let (text, tone) = BackupListStep.completionLine(listStepOutcome)
+                Label(text, systemImage: tone == .ok ? "checkmark.circle.fill"
+                    : tone == .warning ? "exclamationmark.triangle.fill" : "info.circle.fill")
+                    .font(.caption)
+                    .foregroundStyle(tone == .ok ? AppColor.success : tone == .warning ? AppColor.warning : .secondary)
+                    .multilineTextAlignment(.center)
+            }
             Button(action: onDismiss) { Text("OK").frame(minWidth: 120) }
                 .buttonStyle(.borderedProminent).tint(ok ? AppColor.success : AppColor.error).keyboardShortcut(.defaultAction)
         }.padding(AppSpacing.xxl).frame(minWidth: 380)
@@ -10318,11 +10358,17 @@ struct HamburgerRow: View {
 // MARK: - Phase & Status
 struct PhaseIndicator: View {
     let phase: JobPhase; let percent: Int
+    /// Etichetta durante `.running`: normalmente identica a `phase.label`, ma durante il
+    /// passo 2 del backup diventa "<label> — passo 2 di 2" (`BackupListStep.header`, mai
+    /// calcolata qui). `percent` durante il passo 2 e' `BackupRunner.displayPercent`, che
+    /// non tocca mai 100 finche' la lettura non e' finita — per questo "Finalizzando..." non
+    /// puo' comparire nel passo 2.
+    var title: String? = nil
     var body: some View {
         HStack(spacing: AppSpacing.sm) {
             if case .running = phase {
                 ProgressView().controlSize(.small)
-                Text(percent >= 100 ? "Finalizzando..." : phase.label)
+                Text(percent >= 100 ? "Finalizzando..." : (title ?? phase.label))
                     .font(AppFont.body).foregroundStyle(phase.color)
             } else {
                 Image(systemName: phase.icon).foregroundStyle(phase.color)
@@ -10370,27 +10416,57 @@ struct StatusBar: View {
 // MARK: - Stats Panel
 struct StatsPanel: View {
     let stats: JobStats; let phase: JobPhase; let currentStatus: String; let currentThumbnail: NSImage?
+    /// Percentuale da mostrare: `BackupRunner.displayPercent` (quella del passo 2 mentre
+    /// gira, altrimenti `stats.percent` — lo decide il chiamante, non questa view).
+    var displayPercent: Int
+    /// Presente solo durante il passo 2 (`BackupRunner.listStepPresentation`): sostituisce
+    /// miniatura/stato e "done / total file", azzera velocita' ed ETA. Nessuna stringa nasce
+    /// qui dentro: arriva gia' pronta da `BackupListStep`.
+    var listStep: BackupListStep.Presentation? = nil
+
     var body: some View {
         VStack(spacing: AppSpacing.lg) {
-            HStack(spacing: AppSpacing.sm) {
-                CurrentFileThumbnail(image: currentThumbnail)
-                StatusBar(status: currentStatus, phase: phase)
+            if let listStep {
+                VStack(alignment: .leading, spacing: AppSpacing.xs) {
+                    Label {
+                        Text(listStep.copyDone.text)
+                    } icon: {
+                        Image(systemName: listStep.copyDone.clean ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                            .foregroundStyle(listStep.copyDone.clean ? AppColor.success : AppColor.error)
+                    }
+                    Label {
+                        Text(listStep.runningLine)
+                    } icon: {
+                        ProgressView().controlSize(.small)
+                    }
+                }
+                .font(AppFont.body)
+            } else {
+                HStack(spacing: AppSpacing.sm) {
+                    CurrentFileThumbnail(image: currentThumbnail)
+                    StatusBar(status: currentStatus, phase: phase)
+                }
             }
             VStack(spacing: AppSpacing.sm) {
                 HStack {
                     Text("Avanzamento").font(.caption).foregroundStyle(.secondary)
                     Spacer()
-                    Text("\(stats.percent)%").font(.caption).monospacedDigit().foregroundStyle(.secondary)
+                    Text("\(displayPercent)%").font(.caption).monospacedDigit().foregroundStyle(.secondary)
                         .contentTransition(.numericText())
-                        .animation(.default, value: stats.percent)
+                        .animation(.default, value: displayPercent)
                 }
-                ProgressView(value: Double(stats.percent), total: 100).progressViewStyle(.linear)
+                ProgressView(value: Double(displayPercent), total: 100).progressViewStyle(.linear)
                     .tint(phase == .idle ? .secondary : (stats.errors > 0 ? AppColor.error : AppColor.inProgress))
                 HStack {
-                    Text("\(stats.done) / \(stats.total) file")
-                        .font(AppFont.caption).monospacedDigit().foregroundStyle(.secondary)
+                    if let listStep {
+                        Text(listStep.countLine)
+                            .font(AppFont.caption).monospacedDigit().foregroundStyle(.secondary)
+                    } else {
+                        Text("\(stats.done) / \(stats.total) file")
+                            .font(AppFont.caption).monospacedDigit().foregroundStyle(.secondary)
+                    }
                     Spacer()
-                    Text("velocita \(stats.speed)").font(AppFont.caption).monospacedDigit().foregroundStyle(.secondary)
+                    Text("velocita \(listStep != nil ? "—" : stats.speed)").font(AppFont.caption).monospacedDigit().foregroundStyle(.secondary)
                         .contentTransition(.numericText())
                         .animation(.default, value: stats.speed)
                 }
@@ -10400,7 +10476,7 @@ struct StatsPanel: View {
                 StatTile(label: "Skippati",  value: "\(stats.skipped)", accent: .secondary)
                 StatTile(label: "Errori",    value: "\(stats.errors)",  accent: stats.errors > 0 ? AppColor.error : .secondary)
                 StatTile(label: "Trascorso", value: stats.elapsed,      accent: .secondary)
-                StatTile(label: "ETA",       value: stats.eta,           accent: .secondary)
+                StatTile(label: "ETA",       value: listStep != nil ? "—" : stats.eta, accent: .secondary)
             }
         }
     }
