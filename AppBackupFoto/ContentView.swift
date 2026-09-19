@@ -7007,10 +7007,95 @@ final class BackupRunner: ObservableObject {
         }
     }
 
-    /// Costruisce o aggiorna l'elenco delle foto gia' presenti sull'SSD.
-    /// `full: true` = si rilegge da capo ogni file, senza fidarsi di niente di memorizzato.
-    /// `onAlert` = dove mostrare gli avvisi (vedi `AlertSink`): la card della finestra
-    /// Diagnostica passa il proprio canale, l'aggiornamento automatico non passa niente.
+    /// Perche' `startLibraryIndexScan` non e' potuta partire. Le stesse tre cause che
+    /// `rebuildLibraryIndex` mostrava direttamente prima del 2026-09-19 (passo 2 del
+    /// backup): ora il motivo torna al chiamante invece di aprire un avviso, cosi' il
+    /// passo 2 silenzioso puo' trasformarlo nell'esito del job invece che in una finestra.
+    enum ListScanStartFailure {
+        case storeUnavailable
+        case ssdUnavailable
+        case notVolumeRoot(path: String)
+    }
+
+    /// Fa **tutto** quello che serve per eseguire una lettura dell'elenco — apertura dello
+    /// store, accesso all'SSD, controllo della radice del volume, avvio dello stesso
+    /// `Task.detached` su `LibraryIndexer` di sempre — senza passare dal gate dei comandi
+    /// manuali (`LibraryIndexCommandGate`) e senza mostrare avvisi. Due ingressi sopra
+    /// questa unica funzione: `rebuildLibraryIndex` (manuale, con gate e avvisi) e il passo
+    /// 2 del backup (`BackupRunner.startListStep`, senza gate perche' i pulsanti sono gia'
+    /// disattivati, senza avvisi perche' un'operazione automatica non fa comparire finestre
+    /// — l'esito finisce nel riepilogo del job).
+    ///
+    /// Restituisce **il motivo** se non e' partita (invece di mostrare un avviso); se e'
+    /// partita, `onFinish` viene chiamato **sempre** alla fine (successo o errore) con il
+    /// `Progress` finale e l'eventuale errore di `scan` — mai scartato con `_ =` come prima
+    /// del 2026-09-19.
+    private func startLibraryIndexScan(full: Bool,
+                                       onFinish: @escaping @MainActor (LibraryIndexer.Progress?, Error?) -> Void) -> ListScanStartFailure? {
+        // L'elenco e' una cache, mai un prerequisito (ADR-0002): se non si apre, si dice e
+        // basta. Niente nell'app smette di funzionare.
+        guard let store = libraryIndexStore else { return .storeUnavailable }
+        guard let ssdURL = bm.startAccessing(.ssd) else { return .ssdUnavailable }
+        // La root da leggere e' ESATTAMENTE quella che `runImport` passa come `libraryRoot`:
+        // la radice del volume, non la sottocartella "Foto iPhone". I percorsi dell'elenco
+        // sono relativi a questa; se le due divergessero ogni voce punterebbe a un file
+        // inesistente e il riconoscimento dei doppioni smetterebbe di funzionare **senza
+        // dire niente** (Task 6, Step 2-ter).
+        guard isLikelyVolumeRoot(ssdURL) else {
+            bm.stopAccessing(.ssd)
+            return .notVolumeRoot(path: ssdURL.path)
+        }
+        isIndexing = true
+        indexInterruptedByUser = false
+        indexProgress = LibraryIndexer.Progress()
+        // UNA SOLA istanza di store per file dell'indice: si riusa `libraryIndexStore`, mai
+        // una seconda connessione sullo stesso database. La coda seriale che protegge SQLite
+        // serializza **per istanza**: due istanze sono lo scenario SIGSEGV misurato tre run
+        // su tre (Task 6, Step 2-ter).
+        let idx = LibraryIndexer(store: store)
+        indexer = idx
+        Task.detached(priority: .utility) { [weak self] in
+            guard let self else { return }
+            // `let`, non `var`: due assegnazioni possibili (successo/errore), ciascuna una
+            // sola volta lungo il percorso — evita la cattura di una `var` mutabile
+            // attraverso il confine di attore del successivo `MainActor.run`.
+            let finalProgress: LibraryIndexer.Progress?
+            let finalError: Error?
+            do {
+                finalProgress = try idx.scan(root: ssdURL, ignoringStoredHashes: full) { p in
+                    // `onProgress` arriva dal thread che sta leggendo, mai dal MainActor:
+                    // l'aggiornamento della finestra va pubblicato esplicitamente.
+                    Task { @MainActor in
+                        self.indexProgress = p
+                        self.indexedFileCount = p.total
+                    }
+                }
+                finalError = nil
+            } catch {
+                // `scan` e' `throws`, ma un suo errore non deve poter far fallire niente
+                // altro: torna al chiamante tramite `onFinish`, non mostrato qui (ADR-0002).
+                finalProgress = nil
+                finalError = error
+            }
+            // Sempre, anche dopo un errore: senza, "Interrompi" e i bottoni resterebbero
+            // disabilitati fino alla chiusura dell'app.
+            await MainActor.run {
+                self.bm.stopAccessing(.ssd)
+                self.isIndexing = false
+                self.indexer = nil
+                onFinish(finalProgress, finalError)
+            }
+        }
+        return nil
+    }
+
+    /// Costruisce o aggiorna l'elenco delle foto gia' presenti sull'SSD, da comando manuale
+    /// (card di Diagnostica). `full: true` = si rilegge da capo ogni file, senza fidarsi di
+    /// niente di memorizzato. `onAlert` = dove mostrare gli avvisi (vedi `AlertSink`): la
+    /// card della finestra Diagnostica passa il proprio canale, l'aggiornamento automatico
+    /// non passa niente. **Il comportamento non cambia di una virgola** dal 2026-09-19: gli
+    /// stessi tre avvisi, con lo stesso testo, ora costruiti da `ListScanStartFailure`
+    /// invece che inline.
     func rebuildLibraryIndex(full: Bool = false, onAlert: AlertSink? = nil) {
         // Precondizioni rivalutate **qui**, all'avvio vero, non solo sul bottone che ha
         // aperto il flusso. Rilievo di review del 2026-09-01: fra il click e la conferma sta
@@ -7029,68 +7114,30 @@ final class BackupRunner: ObservableObject {
             onAlert?(SimpleAlert(title: "Meglio non farlo adesso", message: reason))
             return
         }
-        // L'elenco e' una cache, mai un prerequisito (ADR-0002): se non si apre, si dice e
-        // basta. Niente nell'app smette di funzionare.
-        guard let store = libraryIndexStore else {
+        let failure = startLibraryIndexScan(full: full) { [weak self] _, error in
+            guard let self else { return }
+            if let error {
+                // `scan` e' `throws`, ma un suo errore non deve poter far fallire niente
+                // altro: si mostra e si prosegue (ADR-0002).
+                self.showIndexAlert(SimpleAlert(
+                    title: "Il controllo si è fermato",
+                    message: "\(error.localizedDescription)\n\nQuello che l'app aveva già letto resta salvato: puoi riprovare più tardi."), via: onAlert)
+            }
+        }
+        guard let failure else { return }
+        switch failure {
+        case .storeUnavailable:
             showIndexAlert(SimpleAlert(
                 title: "Elenco non disponibile",
                 message: "Non è stato possibile aprire l'elenco delle foto già salvate.\n\nL'importazione funziona lo stesso: senza elenco l'app copia tutto, senza riconoscere le foto che hai già."), via: onAlert)
-            return
-        }
-        guard let ssdURL = bm.startAccessing(.ssd) else {
+        case .ssdUnavailable:
             showIndexAlert(SimpleAlert(
                 title: "Accesso all'SSD non disponibile",
                 message: "Vai in Impostazioni e riseleziona l'SSD."), via: onAlert)
-            return
-        }
-        // La root da leggere e' ESATTAMENTE quella che `runImport` passa come `libraryRoot`:
-        // la radice del volume, non la sottocartella "Foto iPhone". I percorsi dell'elenco
-        // sono relativi a questa; se le due divergessero ogni voce punterebbe a un file
-        // inesistente e il riconoscimento dei doppioni smetterebbe di funzionare **senza
-        // dire niente** (Task 6, Step 2-ter).
-        guard isLikelyVolumeRoot(ssdURL) else {
-            bm.stopAccessing(.ssd)
+        case .notVolumeRoot(let path):
             showIndexAlert(SimpleAlert(
                 title: "Bookmark SSD non valido",
-                message: "Il percorso '\(ssdURL.path)' non è la radice del volume.\n\nVai in Impostazioni (⚙) → riseleziona SSD scegliendo '/Volumes/SSD - Enri' (root del volume, non una sottocartella)."), via: onAlert)
-            return
-        }
-        isIndexing = true
-        indexInterruptedByUser = false
-        indexProgress = LibraryIndexer.Progress()
-        // UNA SOLA istanza di store per file dell'indice: si riusa `libraryIndexStore`, mai
-        // una seconda connessione sullo stesso database. La coda seriale che protegge SQLite
-        // serializza **per istanza**: due istanze sono lo scenario SIGSEGV misurato tre run
-        // su tre (Task 6, Step 2-ter).
-        let idx = LibraryIndexer(store: store)
-        indexer = idx
-        Task.detached(priority: .utility) { [weak self] in
-            guard let self else { return }
-            do {
-                _ = try idx.scan(root: ssdURL, ignoringStoredHashes: full) { p in
-                    // `onProgress` arriva dal thread che sta leggendo, mai dal MainActor:
-                    // l'aggiornamento della finestra va pubblicato esplicitamente.
-                    Task { @MainActor in
-                        self.indexProgress = p
-                        self.indexedFileCount = p.total
-                    }
-                }
-            } catch {
-                // `scan` e' `throws`, ma un suo errore non deve poter far fallire niente
-                // altro: si mostra e si prosegue (ADR-0002).
-                await MainActor.run {
-                    self.showIndexAlert(SimpleAlert(
-                        title: "Il controllo si è fermato",
-                        message: "\(error.localizedDescription)\n\nQuello che l'app aveva già letto resta salvato: puoi riprovare più tardi."), via: onAlert)
-                }
-            }
-            // Sempre, anche dopo un errore: senza, "Interrompi" e i bottoni resterebbero
-            // disabilitati fino alla chiusura dell'app.
-            await MainActor.run {
-                self.bm.stopAccessing(.ssd)
-                self.isIndexing = false
-                self.indexer = nil
-            }
+                message: "Il percorso '\(path)' non è la radice del volume.\n\nVai in Impostazioni (⚙) → riseleziona SSD scegliendo '/Volumes/SSD - Enri' (root del volume, non una sottocartella)."), via: onAlert)
         }
     }
 
