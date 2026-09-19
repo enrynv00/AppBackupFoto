@@ -10252,7 +10252,9 @@ struct SidebarView: View {
             VStack(alignment: .leading, spacing: AppSpacing.xs) {
                 HamburgerSectionLabel("Volumi")
                 VolumeRow(name: "SSD - Enri",  icon: "internaldrive.fill",  mounted: volumes.ssdMounted)
+                VolumeSpaceLine(kind: .ssd)
                 VolumeRow(name: "BackupHDD",   icon: "externaldrive.fill",  mounted: volumes.hddMounted)
+                VolumeSpaceLine(kind: .hdd)
                 VolumeRow(name: "Cubbit S3",   icon: "cloud.fill",          mounted: true, alwaysOn: true)
             }.padding(.bottom, AppSpacing.sm)
             Divider()
@@ -10301,6 +10303,91 @@ struct VolumeRow: View {
             Circle().fill(mounted ? (alwaysOn ? AppColor.ssdToCubbit : AppColor.success) : Color.secondary.opacity(0.3))
                 .frame(width: 7, height: 7)
         }.padding(.horizontal, 16).padding(.vertical, AppSpacing.xs)
+    }
+}
+
+/// Quale disco con barra di spazio: SSD o HDD. Porta con sé il colore "normale" della propria
+/// barra — quello della DESTINAZIONE (`AppColor.macToSSD`/`ssdToHDD`), non un token unico
+/// legato all'accent di sistema: decisione di Enrico (ADR-0008, deviazione dalla spec
+/// originale). Blu e teal non sono confondibili con l'arancione/rosso delle soglie
+/// (`AppColor.warning`/`error`): tre hue diversi sulla ruota dei colori.
+enum VolumeKind {
+    case ssd, hdd
+
+    var normalColor: Color {
+        switch self {
+        case .ssd: return AppColor.macToSSD
+        case .hdd: return AppColor.ssdToHDD
+        }
+    }
+}
+
+/// Barra sottile disegnata a mano con due `Capsule` sovrapposte, non una `ProgressView`: su
+/// macOS il `.tint` di una barra lineare non è garantito.
+struct SpaceBar: View {
+    let fraction: Double
+    let color: Color
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.secondary.opacity(0.2))
+                Capsule().fill(color)
+                    .frame(width: max(0, min(1, fraction)) * geo.size.width)
+            }
+        }
+        .frame(height: 4)
+    }
+}
+
+/// Riga sotto un `VolumeRow` (SSD o HDD) con la barra di spazio e il testo "X liberi su Y · N%".
+/// Osserva `VolumeMonitor.shared.space` da sola: `SidebarView` non le passa nessun parametro
+/// nuovo, quindi non si abbona allo spazio e non si ridisegna quando cambia.
+struct VolumeSpaceLine: View {
+    let kind: VolumeKind
+    @ObservedObject private var space = VolumeMonitor.shared.space
+
+    private var state: VolumeSpaceState {
+        switch kind {
+        case .ssd: return space.ssd
+        case .hdd: return space.hdd
+        }
+    }
+
+    var body: some View {
+        Group {
+            switch state {
+            case .measured(let display):
+                VStack(alignment: .leading, spacing: 2) {
+                    SpaceBar(fraction: Double(display.percentUsed) / 100, color: color(for: display.level))
+                    HStack {
+                        Text(display.freeLine)
+                        Spacer()
+                        Text("\(display.percentUsed)%").monospacedDigit()
+                    }
+                }
+            case .disconnected, .unreadable:
+                Text(state.statusText)
+            }
+        }
+        .font(AppFont.caption)
+        .foregroundStyle(.secondary)
+        .padding(.leading, 44).padding(.trailing, 16).padding(.bottom, AppSpacing.xs)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(accessibilityText)
+    }
+
+    private func color(for level: SpaceLevel) -> Color {
+        switch level {
+        case .normal: return kind.normalColor
+        case .warning: return AppColor.warning
+        case .critical: return AppColor.error
+        }
+    }
+
+    private var accessibilityText: String {
+        if case .measured(let display) = state { return display.accessibilityLabel }
+        return state.statusText
     }
 }
 
