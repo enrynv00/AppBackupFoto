@@ -1255,6 +1255,11 @@ struct JobStats {
     var copiedUnverified: Int = 0   // file copiati la cui verifica SHA256 non ha potuto concludersi (vedi FileSyncer.SyncResult)
     var changedSkipped: Int = 0   // file esistente ma diverso dalla sorgente, skippato per zero-overwrite (roadmap #13)
     var duplicatesSkipped: Int = 0   // file gia' presenti altrove in libreria con contenuto identico (roadmap #31)
+    /// Esito del passo 2 del backup (2026-09-19), `nil` = nessun passo 2 per questo job.
+    /// NON persistito (`JobStats` non e' `Codable`) e nessun conteggio lo legge: i numeri
+    /// del passo 1 sopra restano quelli della copia, invariati. Serve solo a CompletionSheet
+    /// e alla notifica di fine job.
+    var listStepOutcome: BackupListStep.Outcome? = nil
 }
 
 struct SpeedSample: Identifiable {
@@ -6892,6 +6897,32 @@ final class BackupRunner: ObservableObject {
 
     var isRunning: Bool { if case .running = phase { return true }; return false }
 
+    // MARK: Passo 2 del backup: l'elenco si aggiorna come ultima parte del job (2026-09-19)
+
+    /// `nil` = nessun passo 2 previsto per il job in corso. `.planned` = previsto, il passo 1
+    /// (la copia) e' ancora in corso: l'intestazione dice "passo 1 di 2". `.running` = il
+    /// passo 1 e' finito, la lettura sta girando: "passo 2 di 2". Il job resta `.running`
+    /// (`isRunning == true`) per TUTTO il passo 2 (D1 della spec): e' la scelta che tiene
+    /// disattivati i pulsanti di backup, il wizard di importazione e lo spostamento nel
+    /// Cestino senza dover toccare ognuno di quei siti — leggono gia' tutti `isRunning`.
+    @Published private(set) var listStepState: BackupListStep.State? = nil
+    /// "Interrompi" e' stato premuto durante il passo 2: il pulsante resta visibile ma
+    /// disattivato con "Mi fermo…" finche' `scan` non torna. Non e' `wasStopped`: quel flag
+    /// farebbe leggere il job come fallito, mentre qui il job finisce comunque "completato"
+    /// (D3).
+    @Published private(set) var listStopRequested = false
+
+    /// Percentuale mostrata da barra della finestra, `PhaseIndicator` e badge del Dock:
+    /// quella del passo 2 mentre gira, altrimenti quella del passo 1 di sempre. Un solo
+    /// numero, in un posto solo — nessun chiamante deve piu' decidere da se' quale dei due
+    /// leggere.
+    var displayPercent: Int {
+        if case .running(let estimate) = listStepState {
+            return BackupListStep.progress(scanned: indexProgress?.scanned ?? 0, estimate: estimate).percent
+        }
+        return stats.percent
+    }
+
     /// Vero mentre `DuplicateTrasher.run` sta spostando un blocco nel Cestino. Vive QUI,
     /// non in uno `@State` di `DuplicatesView`: uno `@State` torna `false` quando la finestra
     /// si riapre, permettendo un secondo spostamento in parallelo al primo — esattamente il
@@ -7805,13 +7836,26 @@ final class BackupRunner: ObservableObject {
         }
     }
 
+    /// Durante il passo 2 (`listStepState == .running`) "Interrompi" NON fa quello che fa
+    /// durante la copia: il job non risulta "interrotto" (D3 della spec) — le foto sono gia'
+    /// copiate e verificate, il `JobSummary` e' gia' salvato come riuscito. Ferma solo la
+    /// lettura (`cancelIndexing()`) e aspetta che `scan` se ne accorga; il pulsante resta
+    /// visibile ma disattivato ("Mi fermo…") finche' non arriva `finishJob`. Un secondo click
+    /// mentre si sta gia' fermando non fa niente (`listStopRequested` gia' vero).
     func stop() {
+        if case .running = listStepState {
+            guard !listStopRequested else { return }
+            listStopRequested = true
+            cancelIndexing()
+            return
+        }
         wasStopped = true
         let jobLabel = phase.label   // etichetta del job in corso, catturata prima di sovrascrivere phase
         elapsedTimer?.cancel(); elapsedTimer = nil
         syncer.cancel()
         s3Syncer.cancel()
         syncTask?.cancel(); syncTask = nil
+        listStepState = nil   // un job interrotto durante la copia non deve lasciare "passo 1 di 2" sull'intestazione
         phase = .failed("Interrotto dall'utente")
         completionSnapshot = (phase, stats)
         JobHistoryStore.save(JobSummary(date: Date(), label: jobLabel, copied: stats.copied,
@@ -7820,10 +7864,90 @@ final class BackupRunner: ObservableObject {
             duplicatesSkipped: stats.duplicatesSkipped))
     }
 
+    /// La copia (passo 1) e' finita con successo. Aggiorna `stats` dal `SyncResult` e salva
+    /// subito il `JobSummary` — esattamente come faceva `run` prima del 2026-09-19, stesso
+    /// ordine: il registro dell'ultimo backup racconta le foto, che a questo punto sono
+    /// copiate e verificate, indipendentemente da come andra' il passo 2. Poi decide se c'e'
+    /// un passo 2 da fare (`BackupListStep.shouldRun`) e lo avvia, altrimenti il job finisce
+    /// qui.
+    private func finishCopyStep(result: FileSyncer.SyncResult?, label: String, refreshesLibraryIndex: Bool) {
+        guard !wasStopped else { return }
+        if let r = result {
+            stats.copied = r.copied; stats.skipped = r.skipped
+            stats.errors = r.errors; stats.done = r.done
+            stats.total = r.total; stats.percent = 100
+            stats.elapsed = FileSyncer.SyncResult.hms(r.elapsedSec)
+            stats.hashErrors = r.hashErrors          // mismatch SHA256
+            stats.verifiedOk = r.copied              // tutti i copied sono verified ok
+            stats.copiedUnverified = r.copiedUnverified  // copiati ma non verificabili: fuori da copied/verifiedOk
+            stats.changedSkipped = r.changedSkipped  // file cambiati, non copiati (roadmap #13)
+            stats.duplicatesSkipped = r.duplicatesSkipped  // gia' in libreria, non copiati (roadmap #31)
+        }
+        JobHistoryStore.save(JobSummary(date: Date(), label: label, copied: stats.copied,
+            skipped: stats.skipped, errors: stats.errors,
+            hashErrors: stats.hashErrors, succeeded: true,
+            changedSkipped: stats.changedSkipped,
+            duplicatesSkipped: stats.duplicatesSkipped))
+
+        if BackupListStep.shouldRun(refreshesLibraryIndex: refreshesLibraryIndex,
+                                    enabled: LibraryIndexAutoRefresh.isEnabled(),
+                                    indexedFileCount: indexedFileCount,
+                                    isIndexing: isIndexing,
+                                    isTrashingDuplicates: isTrashingDuplicates) {
+            startListStep(label: label)
+        } else {
+            finishJob(label: label, listOutcome: nil)
+        }
+    }
+
+    /// Avvia il passo 2: la stessa lettura di sempre, silenziosa (nessun avviso in nessun
+    /// ramo — D4/D6: qualunque cosa vada storta diventa l'esito del passo, scritto nel
+    /// riepilogo finale, non una finestra a comparsa). `stats.percent` resta 100 (la copia e'
+    /// finita): durante il passo 2 tutti leggono `displayPercent`, non `stats.percent`.
+    private func startListStep(label: String) {
+        stats.percent = 100
+        listStepState = .running(estimate: BackupListStep.estimate(indexedBefore: indexedFileCount,
+                                                                    copied: stats.copied,
+                                                                    copiedUnverified: stats.copiedUnverified))
+        append("STATUS: \(BackupListStep.runningLine)\n")
+        let failure = startLibraryIndexScan(full: false) { [weak self] progress, error in
+            guard let self else { return }
+            let outcome = BackupListStep.outcome(progress: progress,
+                                                 interruptedByUser: self.indexInterruptedByUser,
+                                                 couldNotStart: false, scanFailed: error != nil)
+            self.finishJob(label: label, listOutcome: outcome)
+        }
+        // Non dovrebbe quasi mai succedere (shouldRun ha gia' verificato indexedFileCount >
+        // 0 e nessuna lettura/trashing in corso), ma se lo store non si apre o l'SSD sparisce
+        // proprio in questo istante, il job finisce comunque: mai bloccato in "passo 2".
+        if failure != nil {
+            finishJob(label: label, listOutcome: .couldNotUpdate)
+        }
+    }
+
+    /// L'UNICO punto in cui il job finisce davvero, con o senza passo 2. `listOutcome == nil`
+    /// = nessun passo 2 per questo job: fine identica a prima del 2026-09-19. Non salva un
+    /// `JobSummary`: e' gia' stato salvato da `finishCopyStep` alla fine del passo 1.
+    private func finishJob(label: String, listOutcome: BackupListStep.Outcome?) {
+        elapsedTimer?.cancel(); elapsedTimer = nil
+        stats.elapsed = makeElapsed()
+        stats.listStepOutcome = listOutcome
+        listStepState = nil
+        listStopRequested = false
+        phase = .success("Completato: \(label)")
+        Notifier.send(phase.label, BackupListStep.notificationBody(stats: stats, outcome: listOutcome))
+        if let listOutcome {
+            append("STATUS: \(BackupListStep.completionLine(listOutcome).text)\n")
+        }
+        completionSnapshot = (phase, stats)
+    }
+
     /// - Parameter refreshesLibraryIndex: il job **scrive** sull'SSD (Mac -> SSD, Importa),
-    ///   quindi a fine corsa l'elenco delle foto gia' salvate non e' piu' in pari. Falso per
-    ///   SSD -> HDD e SSD -> Cubbit, che sull'SSD leggono soltanto: una lettura integrale
-    ///   dopo ognuno di quei job costerebbe minuti per non trovare niente di nuovo.
+    ///   quindi a fine passo 1 l'elenco delle foto gia' salvate non e' piu' in pari — se le
+    ///   condizioni lo permettono (`BackupListStep.shouldRun`), il passo 2 lo aggiorna prima
+    ///   che il job finisca (`finishCopyStep`). Falso per SSD -> HDD e SSD -> Cubbit, che
+    ///   sull'SSD leggono soltanto: un passo 2 dopo ognuno di quei job costerebbe minuti per
+    ///   non trovare niente di nuovo.
     private func run(label: String, refreshesLibraryIndex: Bool = false,
                      work: @escaping () async throws -> FileSyncer.SyncResult?) {
         guard !isRunning else { return }
@@ -7840,6 +7964,18 @@ final class BackupRunner: ObservableObject {
                         SpeedSample(time: now, value: 0)]
         lastSpeedSampleDate = now.addingTimeInterval(-2.1)
         smoothedEtaSec = 0
+        // Calcolato subito, con le condizioni di ORA: se previsto, l'intestazione dice
+        // "passo 1 di 2" gia' durante la copia, cosi' il passo 2 non compare a sorpresa
+        // quando la barra e' gia' al 100% (D2 della spec). Ricalcolato in `finishCopyStep`
+        // con le condizioni di quel momento: possono cambiare (interruttore spento a meta'),
+        // e in quel caso raro il job finisce dopo il passo 1 anche se l'intestazione diceva
+        // "di 2".
+        listStepState = BackupListStep.shouldRun(refreshesLibraryIndex: refreshesLibraryIndex,
+                                                 enabled: LibraryIndexAutoRefresh.isEnabled(),
+                                                 indexedFileCount: indexedFileCount,
+                                                 isIndexing: isIndexing,
+                                                 isTrashingDuplicates: isTrashingDuplicates) ? .planned : nil
+        listStopRequested = false
         phase = .running(label)
 
         elapsedTimer = Timer.publish(every: 1, on: .main, in: .common)
@@ -7853,39 +7989,14 @@ final class BackupRunner: ObservableObject {
             do {
                 let result = try await work()
                 await MainActor.run { [weak self] in
-                    guard let self else { return }
-                    self.elapsedTimer?.cancel(); self.elapsedTimer = nil
-                    guard !self.wasStopped else { return }
-                    if let r = result {
-                        self.stats.copied = r.copied; self.stats.skipped = r.skipped
-                        self.stats.errors = r.errors; self.stats.done = r.done
-                        self.stats.total = r.total; self.stats.percent = 100
-                        self.stats.elapsed = FileSyncer.SyncResult.hms(r.elapsedSec)
-                        self.stats.hashErrors = r.hashErrors          // mismatch SHA256
-                        self.stats.verifiedOk = r.copied              // tutti i copied sono verified ok
-                        self.stats.copiedUnverified = r.copiedUnverified  // copiati ma non verificabili: fuori da copied/verifiedOk
-                        self.stats.changedSkipped = r.changedSkipped  // file cambiati, non copiati (roadmap #13)
-                        self.stats.duplicatesSkipped = r.duplicatesSkipped  // gia' in libreria, non copiati (roadmap #31)
-                    }
-                    self.phase = .success("Completato: \(label)")
-                    Notifier.send(self.phase.label,
-                        "Copiati \(self.stats.copied) · Skippati \(self.stats.skipped) · Errori \(self.stats.errors)")
-                    self.completionSnapshot = (self.phase, self.stats)
-                    JobHistoryStore.save(JobSummary(date: Date(), label: label, copied: self.stats.copied,
-                        skipped: self.stats.skipped, errors: self.stats.errors,
-                        hashErrors: self.stats.hashErrors, succeeded: true,
-                        changedSkipped: self.stats.changedSkipped,
-                        duplicatesSkipped: self.stats.duplicatesSkipped))
-                    // Dopo un job riuscito che ha scritto sull'SSD: e' il momento in cui
-                    // l'elenco serve aggiornato, ed e' anche l'unico in cui si e' certi che
-                    // nessuno stia piu' scrivendo sul volume.
-                    if refreshesLibraryIndex { self.autoRefreshLibraryIndexIfEnabled() }
+                    self?.finishCopyStep(result: result, label: label, refreshesLibraryIndex: refreshesLibraryIndex)
                 }
             } catch {
                 await MainActor.run { [weak self] in
                     guard let self else { return }
                     self.elapsedTimer?.cancel(); self.elapsedTimer = nil
                     guard !self.wasStopped else { return }
+                    self.listStepState = nil   // un job fallito non deve lasciare "passo 1 di 2" sull'intestazione
                     self.stats.elapsed = self.makeElapsed()
                     self.phase = .failed("Errore: \(error.localizedDescription)")
                     Notifier.send(self.phase.label,
