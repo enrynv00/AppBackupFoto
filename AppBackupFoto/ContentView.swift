@@ -7639,7 +7639,7 @@ final class BackupRunner: ObservableObject {
         syncTask = Task.detached(priority: .userInitiated) { [weak self] in
             do {
                 let result = try await work()
-                await MainActor.run {
+                await MainActor.run { [weak self] in
                     guard let self else { return }
                     self.elapsedTimer?.cancel(); self.elapsedTimer = nil
                     guard !self.wasStopped else { return }
@@ -7669,7 +7669,7 @@ final class BackupRunner: ObservableObject {
                     if refreshesLibraryIndex { self.autoRefreshLibraryIndexIfEnabled() }
                 }
             } catch {
-                await MainActor.run {
+                await MainActor.run { [weak self] in
                     guard let self else { return }
                     self.elapsedTimer?.cancel(); self.elapsedTimer = nil
                     guard !self.wasStopped else { return }
@@ -7726,7 +7726,7 @@ final class BackupRunner: ObservableObject {
         if FileKind.isImage(url: url) {
             Task.detached(priority: .utility) { [weak self] in
                 let thumb = makeThumbnail(url: url, maxPixelSize: 88)
-                await MainActor.run {
+                await MainActor.run { [weak self] in
                     guard let self, self.thumbnailRequestID == requestID else { return }
                     self.currentThumbnail = thumb
                 }
@@ -10405,7 +10405,7 @@ struct ToolsSheet: View {
                                     do {
                                         let config = try S3Syncer.readConfigFromFile(remoteName: "Cubbit", bucket: "backupfoto")
                                         try S3Syncer.writeToKeychain(config: config, remoteName: "Cubbit")
-                                        // Stesso motivo di `LibraryIndexCard.alertSink`: qui
+                                        // Stesso motivo di `LibraryIndexCard.postAlert`: qui
                                         // si sta assegnando il binding mentre SwiftUI smonta
                                         // l'alert che ha eseguito questo `onConfirm`.
                                         DispatchQueue.main.async {
@@ -10615,7 +10615,7 @@ struct LibraryIndexCard: View {
     ///
     /// Rilievo minore di #31, chiuso il 2026-09-01: questi avvisi nascono dentro l'`onConfirm`
     /// di un altro alert (`confirmFirstBuild`, `confirmFullRecheck`, `confirmReset` passano
-    /// tutti `alertSink` a `rebuildLibraryIndex`/`resetLibraryIndex`, che possono richiamarlo
+    /// tutti una closure `{ postAlert($0) }` a `rebuildLibraryIndex`/`resetLibraryIndex`, che possono richiamarla
     /// **sincronicamente** — per esempio quando l'SSD non e' collegato). Assegnare il binding
     /// mentre SwiftUI sta smontando l'alert che lo ha prodotto e' la ricetta perche' la
     /// seconda presentazione venga inghiottita: l'utente preme «Crea l'elenco», l'elenco non
@@ -10626,8 +10626,8 @@ struct LibraryIndexCard: View {
     /// dimostrato, e' cio' che rende la domanda irrilevante — costa un frame e toglie di
     /// mezzo l'unico ordine di eventi in cui il problema puo' esistere. Resta fra le
     /// verifiche manuali: aprire Diagnostica senza SSD e premere «Crea l'elenco».
-    private var alertSink: AlertSink {
-        { alert in DispatchQueue.main.async { pendingAlert = alert } }
+    private func postAlert(_ alert: SimpleAlert) {
+        DispatchQueue.main.async { pendingAlert = alert }
     }
 
     /// Stima dichiarata prima di partire. Non e' mai stata misurata sul volume vero: e'
@@ -10668,7 +10668,7 @@ struct LibraryIndexCard: View {
                         if runner.indexedFileCount > 0 {
                             // Aggiornamento: legge per intero solo le foto nuove o cambiate,
                             // dura poco. Nessuna conferma da chiedere.
-                            runner.rebuildLibraryIndex(onAlert: alertSink)
+                            runner.rebuildLibraryIndex(onAlert: { postAlert($0) })
                         } else {
                             confirmFirstBuild()
                         }
@@ -10776,7 +10776,7 @@ struct LibraryIndexCard: View {
             message: "L'app legge una volta sola tutte le foto e tutti i video che sono sull'SSD, per riconoscerli alle importazioni successive: \(durata), a seconda di quanti ne hai.\n\nPuoi fermarti quando vuoi con «\(LibraryIndexCommands.stop)»: la parte già fatta resta salvata e la volta dopo si riprende da lì.\n\nL'SSD viene solo letto: niente viene spostato, modificato o cancellato.",
             confirmTitle: "Crea l'elenco",
             cancelTitle: "Annulla",
-            onConfirm: { runner.rebuildLibraryIndex(onAlert: alertSink) })
+            onConfirm: { runner.rebuildLibraryIndex(onAlert: { postAlert($0) }) })
     }
 
     private func confirmFullRecheck() {
@@ -10785,7 +10785,7 @@ struct LibraryIndexCard: View {
             message: "L'app rilegge dall'inizio ogni foto e ogni video sull'SSD, anche quelli che ha già visto: \(durata).\n\nServe dopo che hai spostato o riorganizzato le cartelle sull'SSD, per rimettere in pari l'elenco.\n\nPuoi fermarti quando vuoi. L'SSD viene solo letto: nessuna foto viene toccata.",
             confirmTitle: "Controlla da capo",
             cancelTitle: "Annulla",
-            onConfirm: { runner.rebuildLibraryIndex(full: true, onAlert: alertSink) })
+            onConfirm: { runner.rebuildLibraryIndex(full: true, onAlert: { postAlert($0) }) })
     }
 
     /// L'unica via d'uscita quando restano nell'elenco foto che sull'SSD non ci sono piu'
@@ -10798,7 +10798,7 @@ struct LibraryIndexCard: View {
             isDestructive: true,
             confirmTitle: "Svuota l'elenco",
             cancelTitle: "Annulla",
-            onConfirm: { runner.resetLibraryIndex(onAlert: alertSink) })
+            onConfirm: { runner.resetLibraryIndex(onAlert: { postAlert($0) }) })
     }
 }
 
