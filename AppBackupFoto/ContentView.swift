@@ -6303,6 +6303,120 @@ final class S3Syncer {
     }
 }
 
+// MARK: - Spazio dei volumi
+//
+// Indicatore di spazio per SSD, HDD (barra + "X liberi su Y") e Cubbit (solo "X usati").
+// Spec `Docs/superpowers/specs/2026-09-19-volume-space-indicator-design.md`, ADR-0008.
+//
+// Logica pura (questo blocco, Task 1) + lettura fuori dal main (Task 2, sotto) + cablaggio in
+// VolumeMonitor (Task 3, sezione VolumeMonitor) + UI (Task 4, sezione SidebarView/VolumeRow).
+
+/// Soglie di colore sulla percentuale intera mostrata — le stesse parole di Enrico
+/// ("sopra l'85%") prese alla lettera: 85 resta `.normal`, 86 è già `.warning`; 95 resta
+/// `.warning`, 96 è già `.critical`.
+enum SpaceLevel: Equatable {
+    case normal, warning, critical
+
+    static func forPercentUsed(_ percentUsed: Int) -> SpaceLevel {
+        if percentUsed > 95 { return .critical }
+        if percentUsed > 85 { return .warning }
+        return .normal
+    }
+}
+
+/// Fonte UNICA di formattazione byte per i dischi e per Cubbit (`CloudUsageText` la riusa,
+/// Task 6). `isAdaptive = false` dà tre cifre significative ("448 GB" invece di "448,06 GB"):
+/// si legge meglio, e con tre cifre il testo cambia ogni ~1GB su un disco da 1TB invece che
+/// ogni 10MB — è ciò che tiene bassa la frequenza dei ridisegni durante una copia (vedi
+/// VolumeSpaceState, più sotto). `allowsNonnumericFormatting = false` fa leggere "0 byte"
+/// invece di "Zero KB" sul caso limite del disco pieno.
+enum SpaceFormat {
+    static func bytes(_ n: Int64) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        formatter.isAdaptive = false
+        formatter.allowsNonnumericFormatting = false
+        return formatter.string(fromByteCount: n)
+    }
+}
+
+/// Esito della lettura di capacità di un volume (Task 2, `VolumeCapacityReader`). Dichiarato
+/// qui perché `VolumeSpaceState.from` lo consuma; l'implementazione `nonisolated` che lo
+/// produce sta subito dopo questo blocco di tipi puri.
+enum VolumeCapacityReading: Equatable {
+    /// Il percorso esiste ma non è la radice di un volume (es. una cartella normale lasciata
+    /// al posto dell'SSD scollegato): mostrare la capacità letta lì sarebbe quella del disco
+    /// che la contiene, non quella del volume che il nome sulla riga promette.
+    case notAMountPoint
+    /// La lettura è fallita, o il totale riportato è ≤ 0.
+    case unreadable
+    case measured(total: Int64, available: Int64)
+}
+
+/// Cosa si vede per un disco (SSD/HDD): percentuale intera, livello di colore e i due testi
+/// già pronti per la UI e per VoiceOver. Contiene TESTO GIÀ FORMATTATO e non i byte grezzi di
+/// proposito: l'uguaglianza (`Equatable`, sintetizzata sui quattro campi) è quello che decide
+/// se `VolumeSpaceModel` ripubblica o no (Task 3) — due letture che differiscono di 30MB
+/// producono lo stesso `freeLine` (tre cifre significative) e la stessa `percentUsed`, quindi
+/// lo stesso `VolumeSpaceDisplay`, quindi NESSUN ridisegno. Se questo tipo conservasse i byte
+/// grezzi, ogni giro di sondaggio (ogni 3s) produrrebbe un valore diverso e si tornerebbe al
+/// difetto del 2026-09-03 (VolumeMonitor che ridisegna tutte le view che lo osservano, questa
+/// volta anche durante una copia). Non "ottimizzare" spostando qui i byte grezzi.
+struct VolumeSpaceDisplay: Equatable {
+    let percentUsed: Int
+    let level: SpaceLevel
+    let freeLine: String
+    let accessibilityLabel: String
+
+    /// `available` è limitato a `0...total` prima del calcolo: una lettura anomala (che sulla
+    /// carta non dovrebbe capitare, ma non è garantita dal sistema operativo) non deve produrre
+    /// una percentuale negativa o sopra 100, né un crash.
+    init(total: Int64, available: Int64, volumeName: String) {
+        let clampedAvailable = min(max(available, 0), total)
+        // Arrotondamento per DIFETTO (mai al più vicino): "100%" deve comparire solo quando il
+        // disco è pieno davvero, mai quando restano ancora alcuni GB liberi.
+        let usedFraction = total > 0 ? Double(total - clampedAvailable) / Double(total) : 0
+        let percent = Int((usedFraction * 100).rounded(.down))
+        self.percentUsed = percent
+        self.level = SpaceLevel.forPercentUsed(percent)
+        self.freeLine = "\(SpaceFormat.bytes(clampedAvailable)) liberi su \(SpaceFormat.bytes(total))"
+        self.accessibilityLabel = "\(volumeName), \(freeLine), occupato al \(percent)%"
+    }
+}
+
+/// Cosa mostra la riga sotto un volume nella sidebar. Nessun gergo: niente "capacità",
+/// "volume", "byte" (a parte "0 byte" sul disco pieno), "montato" — i test di parole vietate
+/// lo garantiscono.
+enum VolumeSpaceState: Equatable {
+    /// `mounted == false`: SEMPRE questo caso, qualunque sia l'esito della lettura — un volume
+    /// scollegato non ha uno stato di spazio "vecchio" da mostrare, ha "Non collegato".
+    case disconnected
+    case unreadable
+    case measured(VolumeSpaceDisplay)
+
+    static func from(mounted: Bool, reading: VolumeCapacityReading?, volumeName: String) -> VolumeSpaceState {
+        guard mounted else { return .disconnected }
+        guard let reading else { return .unreadable }
+        switch reading {
+        case .notAMountPoint, .unreadable:
+            // Per l'utente la conseguenza è la stessa in entrambi i casi: non si sa quanto
+            // spazio resta, e non si mostra un numero su cui non ci si può fidare.
+            return .unreadable
+        case .measured(let total, let available):
+            guard total > 0 else { return .unreadable }
+            return .measured(VolumeSpaceDisplay(total: total, available: available, volumeName: volumeName))
+        }
+    }
+
+    var statusText: String {
+        switch self {
+        case .disconnected: return "Non collegato"
+        case .unreadable: return "Spazio libero non disponibile"
+        case .measured(let display): return display.freeLine
+        }
+    }
+}
+
 // MARK: - VolumeMonitor
 /// Sorveglia la presenza dei due volumi esterni, con un sondaggio ogni 3 secondi.
 ///
