@@ -6456,6 +6456,27 @@ enum VolumeCapacityReader {
     }
 }
 
+/// Spazio libero/usato di SSD e HDD, pubblicato SEPARATO da `VolumeMonitor` (Task 3, indicatore
+/// di spazio, ADR-0008).
+///
+/// **Perché separato, e perché non toccarlo.** SwiftUI propaga `objectWillChange` a chi osserva
+/// un `ObservableObject` quando cambia una SUA `@Published` — ma NON quando cambia una
+/// `@Published` di un `ObservableObject` annidato al suo interno. Le cinque view che osservano
+/// `VolumeMonitor` (`ContentView`, `RestoreView`, `ImportView`, `DuplicatesView`, `SetupView`)
+/// leggono solo `ssdMounted`/`hddMounted`: se lo spazio diventasse una `@Published` DI
+/// `VolumeMonitor` stesso, ogni cambio di spazio (fino a una volta ogni ~5-6s durante una copia,
+/// vedi `VolumeSpaceState`) ridisegnerebbe tutte e cinque, anche quelle che lo spazio non lo
+/// mostrano nemmeno — lo stesso difetto n. 3 del 2026-09-03 su `VolumeMonitor`, che questa
+/// feature aggraverebbe invece di risolvere. Con l'oggetto separato, solo `VolumeSpaceLine`
+/// (Task 4), che osserva `VolumeMonitor.shared.space` e non `VolumeMonitor.shared`, si
+/// ridisegna. Se un giorno qualcuno "semplificasse" spostando `ssd`/`hdd` dentro `VolumeMonitor`
+/// per avere "un solo oggetto da osservare", reintrodurrebbe il bug del 2026-09-03 durante ogni
+/// copia — non toccare senza aver riletto questo commento.
+final class VolumeSpaceModel: ObservableObject {
+    @Published var ssd: VolumeSpaceState = .disconnected
+    @Published var hdd: VolumeSpaceState = .disconnected
+}
+
 // MARK: - VolumeMonitor
 /// Sorveglia la presenza dei due volumi esterni, con un sondaggio ogni 3 secondi.
 ///
@@ -6480,17 +6501,34 @@ enum VolumeCapacityReader {
 /// Perche' il profiler non lo trovava: una `stat()` in attesa del disco **non consuma CPU**.
 /// Quattro campionature con `sample` mostravano un processo "inattivo" mentre il thread
 /// principale era fermo in attesa di I/O. Cercavo calcoli, il problema era attesa.
+///
+/// **Spazio (2026-09-19, indicatore di spazio, ADR-0008).** `check()` legge anche la capacita'
+/// dei volumi presenti (`VolumeCapacityReader.read`, fuori dal main come il resto) e pubblica
+/// il risultato in `space` (`VolumeSpaceModel`, oggetto SEPARATO apposta — vedi il suo
+/// doc-comment), ognuno SOLO se cambiato, nello stesso salto sul main che pubblica
+/// `ssdMounted`/`hddMounted`: non c'e' un istante in cui un volume risulta scollegato con la
+/// barra ancora piena. `probeInFlight` (letto/scritto SOLO sul main, dove il timer scatta e
+/// dove torna il salto di ritorno) evita l'accumulo di sondaggi se una lettura dura piu' di 3s
+/// (un HDD che si sveglia, o ora anche la lettura di capacita'): senza, il timer accoderebbe
+/// un altro `check()` sulla `probeQueue` a ogni giro, sempre di piu'.
 final class VolumeMonitor: ObservableObject {
     /// Istanza unica. Le view la osservano con `@ObservedObject`, non la creano.
     static let shared = VolumeMonitor()
 
     @Published var ssdMounted = false
     @Published var hddMounted = false
+    /// Spazio di SSD/HDD, oggetto separato apposta — vedi `VolumeSpaceModel`.
+    let space = VolumeSpaceModel()
     private let ssdPath = "/Volumes/SSD - Enri"
     private let hddPath = "/Volumes/BackupHDD"
     private var timer: Timer?
     /// I `stat()` sui volumi esterni vivono qui. Mai sul main thread.
     private let probeQueue = DispatchQueue(label: "AppBackupFoto.VolumeMonitor", qos: .utility)
+    /// Un sondaggio e' gia' in corso: il prossimo scatto del timer va saltato invece di
+    /// accodare un altro `check()` sulla `probeQueue`. Letto e scritto SOLO sul main thread —
+    /// il timer scatta li' e il salto di ritorno di `check()` arriva li' — quindi non serve
+    /// un lock.
+    private var probeInFlight = false
 
     private init() {
         check()
@@ -6500,16 +6538,28 @@ final class VolumeMonitor: ObservableObject {
     deinit { timer?.invalidate() }
 
     private func check() {
+        guard !probeInFlight else { return }
+        probeInFlight = true
         probeQueue.async { [weak self] in
             guard let self else { return }
             let fm = FileManager.default
             let ssd = fm.fileExists(atPath: self.ssdPath)
             let hdd = fm.fileExists(atPath: self.hddPath)
+            // La lettura di capacita' ha senso solo per i volumi presenti: su un volume
+            // scollegato produrrebbe solo `.unreadable`/`.notAMountPoint` a costo zero
+            // aggiunto, ma non c'e' motivo di pagare nemmeno quello.
+            let ssdReading = ssd ? VolumeCapacityReader.read(path: self.ssdPath) : nil
+            let hddReading = hdd ? VolumeCapacityReader.read(path: self.hddPath) : nil
             DispatchQueue.main.async {
                 // Si pubblica SOLO se il valore e' cambiato davvero: un `@Published`
                 // riassegnato allo stesso valore fa comunque ridisegnare ogni osservatore.
                 if self.ssdMounted != ssd { self.ssdMounted = ssd }
                 if self.hddMounted != hdd { self.hddMounted = hdd }
+                let ssdSpace = VolumeSpaceState.from(mounted: ssd, reading: ssdReading, volumeName: "SSD - Enri")
+                let hddSpace = VolumeSpaceState.from(mounted: hdd, reading: hddReading, volumeName: "BackupHDD")
+                if self.space.ssd != ssdSpace { self.space.ssd = ssdSpace }
+                if self.space.hdd != hddSpace { self.space.hdd = hddSpace }
+                self.probeInFlight = false
             }
         }
     }
