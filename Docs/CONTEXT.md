@@ -60,6 +60,8 @@ Attenzione a una frase che questa pagina ha portato fino al 2026-08-27: «il pan
 
 **Ricostruzione completa** (`ignoringStoredHashes`) — rihasha tutto senza fidarsi di nulla di memorizzato. Azione esplicita dell'utente, che significa "fidati del disco". Tutti i tool esaminati (rsync, restic, borg, rmlint) ne offrono una.
 
+**Passo 2 del backup** (2026-09-19, ADR-0007) — l'aggiornamento dell'indice dopo un MAC → SSD o un'importazione, che dal 2026-09-19 non è più una lettura separata avviata *dopo* la fine del job, ma l'ultima parte del job stesso: stessa barra, stesso «Interrompi», riepilogo e notifica solo alla fine. Il job resta «in corso» per tutta la sua durata. Se l'utente interrompe durante il passo 2 il backup risulta comunque **completato** (le foto sono copiate e verificate), con una riga che dice che l'indice non è stato aggiornato — mai «interrotto». Al collegamento dell'SSD non parte più nessuna lettura da sola: l'indice si aggiorna solo come passo 2 di un job, o a mano da Diagnostica.
+
 ---
 
 ## Pannello Doppioni (roadmap #31)
