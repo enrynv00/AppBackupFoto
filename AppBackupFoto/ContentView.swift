@@ -1999,17 +1999,19 @@ nonisolated func normalizedIndexKey(_ relativePath: String) -> String {
 /// lo si confronta. La stessa stringa compare come letterale nel job di copia
 /// (`grep -n 'appendingPathComponent("Foto iPhone")'`): se un giorno quel nome cambia,
 /// vanno cambiati entrambi i punti — qui e li'.
-let mainLibraryFolderKey = normalizedIndexKey("Foto iPhone")
+// `nonisolated`: valutata una volta dal runtime Swift, usata da `duplicateKeepChoice` fuori
+// dal main thread (pannello Doppioni, Task 5).
+nonisolated let mainLibraryFolderKey = normalizedIndexKey("Foto iPhone")
 
 /// La cartella di primo livello dove atterrano gli import da schede e dischi
 /// (`<SSD>/Import/<etichetta>`, roadmap #27-A). Stessa nota di sopra sul letterale.
-let importFolderKey = normalizedIndexKey("Import")
+nonisolated let importFolderKey = normalizedIndexKey("Import")
 
 /// Perche' la copia proposta e' quella proposta. Fa parte del risultato e non e' un
 /// commento: la decisione 3 di Enrico chiede che la proposta sia **spiegata a parole**, e
 /// una spiegazione ricostruita a posteriori dalla UI divergerebbe dalla regola alla prima
 /// modifica di una delle due.
-enum DuplicateKeepReason {
+nonisolated enum DuplicateKeepReason {
     /// Sta nella libreria principale, e le altre copie no.
     case mainLibrary
     /// Sta in una cartella organizzata a mano, e le altre copie stanno in un import.
@@ -2022,7 +2024,8 @@ enum DuplicateKeepReason {
 }
 
 /// La copia che si propone di tenere, con il motivo.
-struct DuplicateKeepChoice {
+// `nonisolated`: costruita da `duplicateKeepChoice` fuori dal main thread.
+nonisolated struct DuplicateKeepChoice {
     let keeper: LibraryIndexEntry
     let reason: DuplicateKeepReason
     /// Quante copie restavano **indistinguibili** dopo tutte le regole di prodotto, la
@@ -2060,7 +2063,7 @@ struct DuplicateKeepChoice {
 ///
 /// Un file nella root non ha cartella: la sua unica componente e' il proprio nome, e un
 /// file chiamato "Foto iPhone" non e' la libreria principale.
-private func topLevelFolderKey(of key: String) -> String? {
+private nonisolated func topLevelFolderKey(of key: String) -> String? {
     // `normalizedIndexKey` e' idempotente sulle chiavi dell'indice, che sono gia' NFC +
     // minuscole. Riapplicarlo costa nulla e rende la regola vera anche se un chiamante
     // futuro costruisse un gruppo da percorsi grezzi. Non si guarda MAI `displayPath`:
@@ -2071,11 +2074,11 @@ private func topLevelFolderKey(of key: String) -> String? {
     return String(components[0])
 }
 
-private func isInMainLibrary(_ entry: LibraryIndexEntry) -> Bool {
+private nonisolated func isInMainLibrary(_ entry: LibraryIndexEntry) -> Bool {
     topLevelFolderKey(of: entry.path) == mainLibraryFolderKey
 }
 
-private func isInImportFolder(_ entry: LibraryIndexEntry) -> Bool {
+private nonisolated func isInImportFolder(_ entry: LibraryIndexEntry) -> Bool {
     topLevelFolderKey(of: entry.path) == importFolderKey
 }
 
@@ -2129,7 +2132,8 @@ private func isInImportFolder(_ entry: LibraryIndexEntry) -> Bool {
 ///   un chiamante futuro va **saltato**, non passato qui in cerca di una risposta: proporre
 ///   di "tenere" l'unica copia esistente e' una riga che nel pannello Doppioni dichiara
 ///   doppione un file che copie non ne ha.
-func duplicateKeepChoice(_ group: DuplicateGroup) -> DuplicateKeepChoice {
+// `nonisolated`: pura, chiamata dal pannello Doppioni fuori dal main thread (Task 5).
+nonisolated func duplicateKeepChoice(_ group: DuplicateGroup) -> DuplicateKeepChoice {
     precondition(group.members.count > 1, "un gruppo di doppioni ha sempre almeno due membri")
 
     var candidates = group.members
@@ -2302,14 +2306,14 @@ func duplicateKeepExplanation(_ choice: DuplicateKeepChoice, in group: Duplicate
 ///
 /// Prudente e **ritarabile alla prima passata reale con l'SSD collegato**: nessuno ha ancora
 /// visto quanti doppioni ci siano davvero, e 500 potrebbe rivelarsi scomodo in eccesso.
-let duplicateBatchFileCap = 500
+nonisolated let duplicateBatchFileCap = 500
 
 /// Stesso ragionamento del tetto sui file, sull'altra grandezza che conta.
 ///
 /// **Decimale** (50 × 1000⁴) e non binario, per coerenza con `ByteCountFormatter(.file)`,
 /// che e' il modo in cui questa app scrive i byte all'utente ovunque: un tetto binario
 /// scatterebbe a un numero diverso da quello mostrato nel riepilogo.
-let duplicateBatchByteCap: Int64 = 50_000_000_000
+nonisolated let duplicateBatchByteCap: Int64 = 50_000_000_000
 
 /// Il blocco di doppioni che l'utente sta per confermare: quali gruppi, quale copia si
 /// tiene di ognuno, quanti file si spostano, quanto spazio si libera e da quali cartelle.
@@ -2327,7 +2331,10 @@ let duplicateBatchByteCap: Int64 = 50_000_000_000
 /// non deve mai ricalcolare la scelta: deve usare quella che trova qui dentro.
 ///
 /// Logica **pura**: nessun filesystem, nessun database.
-struct DuplicateBatch {
+// `nonisolated`: costruita dal pannello Doppioni fuori dal main thread (Task 5) — e' il tipo
+// del bug di prestazioni del 2026-09-02, che allora era stato "corretto" solo spostando il
+// PUNTO in cui si ricalcolava, non il thread su cui girava.
+nonisolated struct DuplicateBatch {
 
     /// Un gruppo insieme alla copia che si e' deciso di tenere. I due viaggiano appaiati
     /// proprio perche' non si possano disallineare.
@@ -2458,7 +2465,9 @@ struct DuplicateBatch {
 /// `hash` e `size` non sono decorativi: sono il patto fra il momento del cestinamento e
 /// quello dell'annullamento. Ripristinare senza riverificarli significherebbe rimettere al
 /// posto della foto dell'utente un file che nel frattempo e' diventato un altro file.
-struct TrashedItem: Codable, Equatable {
+// `nonisolated`: value type senza stato condiviso, scritto da `DuplicateTrasher.run` fuori
+// dal main thread e letto da `TrashManifestStore` (dietro `lock`).
+nonisolated struct TrashedItem: Codable, Equatable {
     /// Tutti gli item cestinati nello stesso blocco condividono questo identificatore: e'
     /// cio' che rende «Annulla l'ultimo spostamento» un'operazione su un blocco e non su un
     /// file solo.
@@ -2476,7 +2485,7 @@ struct TrashedItem: Codable, Equatable {
 /// Perche' una voce non e' stata rimessa al suo posto. Ogni caso ha una frase propria:
 /// l'utente che preme «Annulla» e non vede tornare tutto deve poter capire quale dei motivi
 /// lo riguarda, e cosa puo' farci.
-enum RestoreSkipReason: Equatable {
+nonisolated enum RestoreSkipReason: Equatable {
     /// Il file non e' piu' nel Cestino: quasi sempre il Cestino e' stato svuotato.
     case missingInTrash
     /// Il file nel Cestino non e' piu' quello che ci era stato messo.
@@ -2506,13 +2515,15 @@ enum RestoreSkipReason: Equatable {
     }
 }
 
-struct RestoreOutcome {
+nonisolated struct RestoreOutcome {
     var restored: [TrashedItem] = []
     var skipped: [(item: TrashedItem, reason: RestoreSkipReason)] = []
 }
 
 /// Il contenuto del registro su disco.
-struct TrashManifest: Codable {
+// `nonisolated`: value type senza stato condiviso, letto/scritto da `TrashManifestStore`
+// sempre dietro `lock`.
+nonisolated struct TrashManifest: Codable {
     /// Quante voci sono state registrate in tutto. Resta veritiero anche quando `items` e'
     /// stata potata dal tetto: e' questo il numero da mostrare, `items.count` non lo e'.
     /// Stessa forma di `UnverifiedCopies.totalCount`, per lo stesso motivo.
@@ -2520,7 +2531,7 @@ struct TrashManifest: Codable {
     var items: [TrashedItem] = []
 }
 
-extension TrashManifest {
+nonisolated extension TrashManifest {
     private enum CodingKeys: String, CodingKey { case totalRecorded, items }
 
     /// `init(from:)` esplicita con `decodeIfPresent`, **obbligatoria** su ogni tipo
@@ -2536,7 +2547,7 @@ extension TrashManifest {
     }
 }
 
-extension TrashedItem {
+nonisolated extension TrashedItem {
     private enum CodingKeys: String, CodingKey {
         case batchId, originalDisplayPath, originalKey, trashedPath, size, hash, trashedAt
     }
@@ -2570,7 +2581,10 @@ extension TrashedItem {
 /// Da cui la regola di questa classe: **`record` scrive subito**, una voce alla volta. Un
 /// registro bufferizzato e salvato a fine blocco avrebbe esattamente lo stesso difetto di
 /// quello che sta sostituendo.
-final class TrashManifestStore {
+// `nonisolated`: `record` viene chiamato dal trasher fuori dal main thread, `lastBatch`/
+// `restore` dal main. Ogni accesso a `manifest` avviene dentro `lock.withLock`, scrittura su
+// disco compresa; `url` e' `let`. Vedi ADR-0006.
+nonisolated final class TrashManifestStore: @unchecked Sendable {
 
     enum StoreError: Error, LocalizedError {
         case invalidLocation(String)
@@ -2700,7 +2714,7 @@ final class TrashManifestStore {
 /// vede un gruppo restare nell'elenco dopo aver confermato deve capire se il problema e'
 /// suo, del disco o dell'indice — e cosa puo' farci. Stessa disciplina di
 /// `RestoreSkipReason`.
-enum DuplicateTrashSkipReason: Equatable {
+nonisolated enum DuplicateTrashSkipReason: Equatable {
     /// Un membro — la copia tenuta compresa — non ha piu' lo stesso contenuto degli altri.
     case contentDisagrees(displayPath: String)
     /// Un membro non e' stato rileggibile: sparito, illeggibile, o cambiato durante la lettura.
@@ -2752,7 +2766,8 @@ enum DuplicateTrashSkipReason: Equatable {
 /// L'esito di un blocco. `trashedFiles` e' il numero **onesto** di file spostati, anche
 /// quando il blocco si e' interrotto a meta': e' quello che va mostrato, non il numero di
 /// file che si era chiesto di smaltire.
-struct DuplicateTrashOutcome {
+// `nonisolated`: value type senza stato, restituito da `DuplicateTrasher.run` fuori dal main.
+nonisolated struct DuplicateTrashOutcome {
     var trashedFiles: [TrashedItem] = []
     var skippedGroups: [(group: DuplicateGroup, reason: DuplicateTrashSkipReason)] = []
     /// Il volume e' sparito a meta' blocco: si e' fermato tutto, non solo il gruppo.
@@ -2942,7 +2957,11 @@ final class DuplicateThumbnailCache {
 /// cancellazione, uno scollegamento a meta' blocco) non sono producibili su file veri senza
 /// una corsa fra thread, e un test basato su una corsa e' verde col bug ogni volta che la
 /// corsa va nell'altro verso. Stesso pattern gia' in `FileSyncer.init(hashFunction:)`.
-final class DuplicateTrasher {
+// `nonisolated`: `run` deve poter girare fuori dal main thread — la rilettura/rihash di ogni
+// membro puo' richiedere minuti su un SSD USB. Solo proprieta' `let`; lo stato di `run` e'
+// tutto locale. `run` puo' girare su qualunque thread, uno alla volta per blocco (lo
+// garantisce `BackupRunner.isTrashingDuplicates`, Task 4). Vedi ADR-0006.
+nonisolated final class DuplicateTrasher: @unchecked Sendable {
 
     /// Cio' che l'utente ha confermato: il gruppo **e** la copia che resta, congelati
     /// insieme al momento della conferma.
@@ -10777,10 +10796,18 @@ struct DiagRow: View {
 /// `DuplicateTrasher.run`. Stesso schema gia' in uso in `LibraryIndexer.cancelled`, qui come
 /// tipo a parte perche' `DuplicatesView` e' una `struct` e non puo' tenere un lock su una sua
 /// proprieta' di valore.
-private final class CancelFlag {
+///
+/// Dal 2026-09-19 (Task 5/6 del fix di isolamento, BUG-7) e' il flag di interruzione
+/// **condiviso** del progetto: non piu' `private`, usato anche da `FileSyncer`/`S3Syncer` al
+/// posto dei loro `private var cancelled = false` nudi (data race non protetta in
+/// `FileSyncer`, due warning di isolamento in `S3Syncer`). `reset()` serve a quei due
+/// chiamanti: un nuovo `sync()` deve poter ripartire dopo un `cancel()` precedente.
+// `nonisolated`: `flag` si tocca solo dentro `lock.withLock`.
+nonisolated final class CancelFlag: @unchecked Sendable {
     private let lock = NSLock()
     private var flag = false
     func cancel() { lock.withLock { flag = true } }
+    func reset() { lock.withLock { flag = false } }
     var isCancelled: Bool { lock.withLock { flag } }
 }
 

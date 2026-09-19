@@ -67,4 +67,70 @@ final class MainThreadIsolationTests: XCTestCase {
         XCTAssertEqual(done.wait(timeout: .now() + 10), .success,
                        "LibraryIndexer.scan ha avuto bisogno del main thread: e' il bug dei sei minuti dopo MAC -> SSD.")
     }
+
+    // MARK: - Pannello Doppioni (Task 5)
+
+    func testDuplicateGroups_runsWithoutTheMainThread() throws {
+        let store = try makeStore()
+        let done = DispatchSemaphore(value: 0)
+        Task.detached {
+            _ = try? store.duplicateGroups()
+            done.signal()
+        }
+        XCTAssertEqual(done.wait(timeout: .now() + 10), .success,
+                       "LibraryIndexStore.duplicateGroups() ha avuto bisogno del main thread.")
+    }
+
+    func testDuplicateBatch_runsWithoutTheMainThread() {
+        let done = DispatchSemaphore(value: 0)
+        Task.detached {
+            _ = DuplicateBatch(groups: [])
+            done.signal()
+        }
+        XCTAssertEqual(done.wait(timeout: .now() + 10), .success,
+                       "DuplicateBatch(groups:) ha avuto bisogno del main thread: e' il bug del 2026-09-02, mai davvero corretto fino a oggi.")
+    }
+
+    func testTrasherRun_runsWithoutTheMainThread() throws {
+        let root = tmp.appendingPathComponent("SSD")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let store = try makeStore()
+        let manifest = try TrashManifestStore(url: tmp.appendingPathComponent("manifest.json"))
+        // Funzioni iniettate che non toccano niente: nessun Cestino vero, mai, in questo test.
+        let trasher = DuplicateTrasher(libraryRoot: root, store: store, manifest: manifest,
+                                       trashFunction: { _ in nil }, hashFunction: { _ in nil })
+        let done = DispatchSemaphore(value: 0)
+        Task.detached {
+            _ = trasher.run([])
+            done.signal()
+        }
+        XCTAssertEqual(done.wait(timeout: .now() + 10), .success,
+                       "DuplicateTrasher.run ha avuto bisogno del main thread: e' il percorso a danno piu' alto del progetto (ADR-0005).")
+    }
+
+    // MARK: - CancelFlag (Task 5/6): il flag di interruzione condiviso del progetto
+
+    /// `cancel()` chiamato da un thread in background deve essere visibile dal main dopo
+    /// l'attesa: e' esattamente l'uso reale (bottone "Interrompi" sul main, lettura dal
+    /// thread che sta scansionando/trasherando).
+    func testCancelFlag_cancelFromBackgroundThread_visibleFromMain() {
+        let flag = CancelFlag()
+        let done = DispatchSemaphore(value: 0)
+        Task.detached {
+            flag.cancel()
+            done.signal()
+        }
+        XCTAssertEqual(done.wait(timeout: .now() + 5), .success)
+        XCTAssertTrue(flag.isCancelled)
+    }
+
+    /// `reset()` (Task 6): un nuovo `sync()` deve poter ripartire dopo un `cancel()`
+    /// precedente, per `FileSyncer` e `S3Syncer` che adotteranno questo tipo condiviso.
+    func testCancelFlag_reset_clearsThePreviousCancellation() {
+        let flag = CancelFlag()
+        flag.cancel()
+        XCTAssertTrue(flag.isCancelled)
+        flag.reset()
+        XCTAssertFalse(flag.isCancelled)
+    }
 }
