@@ -294,31 +294,39 @@ final class LibraryIndexStatusTests: XCTestCase {
     // sola, nemmeno con l'interruttore acceso.
     func testAutoRefresh_neverBuildsTheListForTheFirstTime() {
         XCTAssertFalse(LibraryIndexAutoRefresh.shouldRun(enabled: true, indexedFileCount: 0,
-                                                         isIndexing: false, jobIsRunning: false))
+                                                         isIndexing: false, jobIsRunning: false, isTrashingDuplicates: false))
     }
 
     func testAutoRefresh_runsWhenTheListExistsAndNothingElseIsGoingOn() {
         XCTAssertTrue(LibraryIndexAutoRefresh.shouldRun(enabled: true, indexedFileCount: 1,
-                                                        isIndexing: false, jobIsRunning: false))
+                                                        isIndexing: false, jobIsRunning: false, isTrashingDuplicates: false))
     }
 
     func testAutoRefresh_respectsTheSwitch() {
         XCTAssertFalse(LibraryIndexAutoRefresh.shouldRun(enabled: false, indexedFileCount: 1,
-                                                         isIndexing: false, jobIsRunning: false))
+                                                         isIndexing: false, jobIsRunning: false, isTrashingDuplicates: false))
     }
 
     // Una lettura per volta: due letture insieme sarebbero due scritture sullo stesso
     // elenco.
     func testAutoRefresh_doesNotStartASecondReadOverTheFirst() {
         XCTAssertFalse(LibraryIndexAutoRefresh.shouldRun(enabled: true, indexedFileCount: 1,
-                                                         isIndexing: true, jobIsRunning: false))
+                                                         isIndexing: true, jobIsRunning: false, isTrashingDuplicates: false))
     }
 
     // Leggere l'SSD per intero mentre una copia ci sta scrivendo rallenta entrambe e fa
     // risultare illeggibili i file che la copia sta scrivendo proprio in quel momento.
     func testAutoRefresh_waitsForACopyJobToFinish() {
         XCTAssertFalse(LibraryIndexAutoRefresh.shouldRun(enabled: true, indexedFileCount: 1,
-                                                         isIndexing: false, jobIsRunning: true))
+                                                         isIndexing: false, jobIsRunning: true, isTrashingDuplicates: false))
+    }
+
+    // Task 4 (2026-09-19, BUG-7): lo spostamento nel Cestino gira davvero fuori dal main,
+    // quindi puo' essere in corso mentre l'aggancio automatico scatterebbe da solo. I file
+    // che il trasher sta spostando risulterebbero illeggibili, stessa ragione di jobIsRunning.
+    func testAutoRefresh_waitsForATrashingOperationToFinish() {
+        XCTAssertFalse(LibraryIndexAutoRefresh.shouldRun(enabled: true, indexedFileCount: 1,
+                                                         isIndexing: false, jobIsRunning: false, isTrashingDuplicates: true))
     }
 
     // `UserDefaults.bool` risponde `false` per una chiave mai scritta, e `@AppStorage` la
@@ -466,32 +474,42 @@ final class LibraryIndexStatusTests: XCTestCase {
     /// l'aggiornamento automatico si'. Chi premeva "Aggiorna" durante un backup faceva
     /// leggere per intero l'SSD mentre una copia ci scriveva sopra.
     func testCommandGate_blocksWhileACopyJobIsRunning() {
-        XCTAssertNotNil(LibraryIndexCommandGate.disabledReason(isIndexing: false, jobIsRunning: true))
+        XCTAssertNotNil(LibraryIndexCommandGate.disabledReason(isIndexing: false, jobIsRunning: true, isTrashingDuplicates: false))
     }
 
     func testCommandGate_blocksWhileTheListIsBeingRead() {
-        XCTAssertNotNil(LibraryIndexCommandGate.disabledReason(isIndexing: true, jobIsRunning: false))
+        XCTAssertNotNil(LibraryIndexCommandGate.disabledReason(isIndexing: true, jobIsRunning: false, isTrashingDuplicates: false))
     }
 
     func testCommandGate_allowsWhenNothingElseIsGoingOn() {
-        XCTAssertNil(LibraryIndexCommandGate.disabledReason(isIndexing: false, jobIsRunning: false))
+        XCTAssertNil(LibraryIndexCommandGate.disabledReason(isIndexing: false, jobIsRunning: false, isTrashingDuplicates: false))
     }
 
     /// Le due cause hanno due frasi diverse: un bottone grigio senza motivo, o con il motivo
     /// sbagliato, e' la stessa disciplina gia' applicata a `RestoreView` e al pannello
     /// Doppioni — disattivare **e** dire perche'.
     func testCommandGate_tellsTheTwoCausesApart() {
-        let job = LibraryIndexCommandGate.disabledReason(isIndexing: false, jobIsRunning: true)
-        let lettura = LibraryIndexCommandGate.disabledReason(isIndexing: true, jobIsRunning: false)
+        let job = LibraryIndexCommandGate.disabledReason(isIndexing: false, jobIsRunning: true, isTrashingDuplicates: false)
+        let lettura = LibraryIndexCommandGate.disabledReason(isIndexing: true, jobIsRunning: false, isTrashingDuplicates: false)
         XCTAssertNotEqual(job, lettura)
+    }
+
+    /// Task 4 (2026-09-19, BUG-7): lo spostamento nel Cestino ha la PRECEDENZA sulle altre
+    /// due — da quando gira fuori dal main puo' essere in corso insieme a una lettura, ed e'
+    /// la causa piu' vicina al danno.
+    func testCommandGate_blocksWhileTrashingIsInProgress() {
+        let reason = LibraryIndexCommandGate.disabledReason(isIndexing: true, jobIsRunning: false,
+                                                             isTrashingDuplicates: true)
+        XCTAssertNotNil(reason)
+        XCTAssertTrue(reason!.lowercased().contains("cestino"))
     }
 
     /// Il motivo finisce a schermo come tutte le altre righe della card.
     func testCommandGate_reasonsCarryNoJargon() {
         let gergo = ["indice", "hash", "sha", "scansione", "sqlite", "mtime", "cache", "entry"]
-        for reason in [LibraryIndexCommandGate.disabledReason(isIndexing: true, jobIsRunning: false),
-                       LibraryIndexCommandGate.disabledReason(isIndexing: false, jobIsRunning: true),
-                       LibraryIndexCommandGate.disabledReason(isIndexing: true, jobIsRunning: true)] {
+        for reason in [LibraryIndexCommandGate.disabledReason(isIndexing: true, jobIsRunning: false, isTrashingDuplicates: false),
+                       LibraryIndexCommandGate.disabledReason(isIndexing: false, jobIsRunning: true, isTrashingDuplicates: false),
+                       LibraryIndexCommandGate.disabledReason(isIndexing: true, jobIsRunning: true, isTrashingDuplicates: false)] {
             let detto = (reason ?? "").lowercased()
             for parola in gergo {
                 XCTAssertFalse(detto.contains(parola), "gergo nel motivo: '\(parola)' in «\(detto)»")
@@ -506,8 +524,8 @@ final class LibraryIndexStatusTests: XCTestCase {
     /// Il danno e' un altro — un'importazione in corso usa l'elenco per non ricopiare foto
     /// gia' presenti, e togliergielo sotto significa fargliele ricopiare.
     func testResetGate_hasItsOwnReason_notTheReadingOne() {
-        let lettura = LibraryIndexCommandGate.disabledReason(isIndexing: false, jobIsRunning: true)
-        let svuota = LibraryIndexCommandGate.resetDisabledReason(isIndexing: false, jobIsRunning: true)
+        let lettura = LibraryIndexCommandGate.disabledReason(isIndexing: false, jobIsRunning: true, isTrashingDuplicates: false)
+        let svuota = LibraryIndexCommandGate.resetDisabledReason(isIndexing: false, jobIsRunning: true, isTrashingDuplicates: false)
         XCTAssertNotNil(svuota)
         XCTAssertNotEqual(svuota, lettura, "svuotare e rileggere non hanno lo stesso motivo")
         XCTAssertFalse(svuota!.lowercased().contains("illeggibili"),
@@ -515,15 +533,23 @@ final class LibraryIndexStatusTests: XCTestCase {
     }
 
     func testResetGate_blocksDuringAReadAndDuringAJob() {
-        XCTAssertNotNil(LibraryIndexCommandGate.resetDisabledReason(isIndexing: true, jobIsRunning: false))
-        XCTAssertNotNil(LibraryIndexCommandGate.resetDisabledReason(isIndexing: false, jobIsRunning: true))
-        XCTAssertNil(LibraryIndexCommandGate.resetDisabledReason(isIndexing: false, jobIsRunning: false))
+        XCTAssertNotNil(LibraryIndexCommandGate.resetDisabledReason(isIndexing: true, jobIsRunning: false, isTrashingDuplicates: false))
+        XCTAssertNotNil(LibraryIndexCommandGate.resetDisabledReason(isIndexing: false, jobIsRunning: true, isTrashingDuplicates: false))
+        XCTAssertNil(LibraryIndexCommandGate.resetDisabledReason(isIndexing: false, jobIsRunning: false, isTrashingDuplicates: false))
+    }
+
+    /// Stessa precedenza dell'altro gate: lo spostamento vince su isIndexing/jobIsRunning.
+    func testResetGate_blocksWhileTrashingIsInProgress() {
+        let reason = LibraryIndexCommandGate.resetDisabledReason(isIndexing: false, jobIsRunning: false,
+                                                                  isTrashingDuplicates: true)
+        XCTAssertNotNil(reason)
+        XCTAssertTrue(reason!.lowercased().contains("cestino"))
     }
 
     func testResetGate_reasonsCarryNoJargon() {
         let gergo = ["indice", "hash", "sha", "scansione", "sqlite", "mtime", "cache", "entry"]
-        for reason in [LibraryIndexCommandGate.resetDisabledReason(isIndexing: true, jobIsRunning: false),
-                       LibraryIndexCommandGate.resetDisabledReason(isIndexing: false, jobIsRunning: true)] {
+        for reason in [LibraryIndexCommandGate.resetDisabledReason(isIndexing: true, jobIsRunning: false, isTrashingDuplicates: false),
+                       LibraryIndexCommandGate.resetDisabledReason(isIndexing: false, jobIsRunning: true, isTrashingDuplicates: false)] {
             let detto = (reason ?? "").lowercased()
             for parola in gergo {
                 XCTAssertFalse(detto.contains(parola), "gergo nel motivo: '\(parola)' in «\(detto)»")

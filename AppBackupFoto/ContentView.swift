@@ -2817,7 +2817,8 @@ enum DuplicatesStatus {
     /// Perche' il bottone di cancellazione e' disattivato adesso. `nil` = niente lo impedisce
     /// da qui (restano comunque le due conferme). Stessa disciplina di `RestoreView`: un
     /// bottone disattivato dice sempre perche', non un semplice grigiore.
-    static func trashDisabledReason(isRunning: Bool, isIndexing: Bool, ssdMounted: Bool) -> String? {
+    static func trashDisabledReason(isRunning: Bool, isIndexing: Bool, ssdMounted: Bool,
+                                    isTrashingDuplicates: Bool) -> String? {
         guard ssdMounted else {
             return "L'SSD non è collegato in questo momento: senza, l'app non può né "
                 + "riverificare né spostare niente."
@@ -2829,6 +2830,12 @@ enum DuplicatesStatus {
         guard !isIndexing else {
             return "L'elenco delle foto già salvate si sta aggiornando in questo momento: "
                 + "aspetta che finisca."
+        }
+        // Dopo isIndexing, non prima: e' la causa piu' vicina se l'utente sta guardando
+        // proprio questa finestra (un secondo spostamento non puo' partire finche' il primo
+        // non e' finito — vedi `BackupRunner.isTrashingDuplicates`).
+        guard !isTrashingDuplicates else {
+            return "Uno spostamento nel Cestino è già in corso: aspetta che finisca."
         }
         return nil
     }
@@ -4332,11 +4339,49 @@ enum LibraryIndexStatus {
 /// Restituisce **il motivo scritto**, non un booleano: disattivare un bottone senza dire
 /// perche' e' la disciplina che questo progetto ha gia' scelto contro, in `RestoreView`
 /// (fonti non disponibili) e nel pannello Doppioni.
+/// Perche' un job che scrive (MAC -> SSD, SSD -> HDD, SSD -> Cubbit, importazione) non puo'
+/// partire adesso, oppure `nil`. Consultato da `BackupRunner.run(label:...)`, il punto da cui
+/// passano tutti.
+///
+/// Esiste dal 2026-09-19. Fino a quel giorno lo spostamento nel Cestino e la lettura
+/// dell'elenco giravano per errore sul main thread, e nessun backup poteva partire mentre
+/// erano in corso perche' l'app era bloccata: la mutua esclusione la garantiva il bug. Tolto
+/// il bug (BUG-7), la garantisce questo gate. Il verso opposto (niente spostamento durante un
+/// job o una lettura) e' in `DuplicatesStatus.trashDisabledReason` e `LibraryIndexCommandGate`.
+///
+/// Risposta di Enrico alla domanda aperta 1 della spec (2026-09-19): il backup NON parte e
+/// l'app spiega perche' con un messaggio chiaro, senza gergo tecnico.
+///
+/// NON `nonisolated`: chiamato solo da `BackupRunner.run(label:...)`, gia' sul MainActor, e
+/// la sua frase su `isIndexing` cita `LibraryIndexCommands.stop`, che e' anch'esso
+/// MainActor per il default del target — nessun motivo di annotarlo diversamente.
+enum JobStartGate {
+    static func blockedReason(isIndexing: Bool, isTrashingDuplicates: Bool) -> String? {
+        if isTrashingDuplicates {
+            return "L'app sta spostando nel Cestino le copie doppie che hai confermato. "
+                + "Aspetta che finisca, oppure fermala con «Interrompi» nella finestra Doppioni."
+        }
+        if isIndexing {
+            return "L'app sta leggendo le foto sull'SSD per aggiornare l'elenco. Aspetta che "
+                + "finisca, oppure fermala con «\(LibraryIndexCommands.stop)» in Diagnostica."
+        }
+        return nil
+    }
+}
+
 enum LibraryIndexCommandGate {
     /// `nil` quando i comandi si possono usare. La lettura in corso ha la precedenza sul job
     /// perche' e' la causa piu' vicina a quello che l'utente sta guardando: se sta scorrendo
     /// la barra di avanzamento, la frase sul backup lo confonderebbe.
-    static func disabledReason(isIndexing: Bool, jobIsRunning: Bool) -> String? {
+    static func disabledReason(isIndexing: Bool, jobIsRunning: Bool,
+                               isTrashingDuplicates: Bool) -> String? {
+        // Lo spostamento nel Cestino ha la precedenza sulle altre due: da quando gira
+        // davvero fuori dal main (2026-09-19, BUG-7) puo' essere in corso insieme a
+        // un'altra causa, ed e' quella piu' vicina al danno se qualcuno lo ignorasse.
+        if isTrashingDuplicates {
+            return "L'app sta spostando nel Cestino le copie doppie che hai confermato: "
+                + "leggere le foto adesso darebbe un elenco sbagliato. Riprova quando ha finito."
+        }
         if isIndexing {
             return "L'app sta già leggendo le foto sull'SSD. Aspetta che finisca, "
                 + "oppure fermala con «\(LibraryIndexCommands.stop)»."
@@ -4353,7 +4398,12 @@ enum LibraryIndexCommandGate {
     /// concorrente sarebbe falsa. Il danno e' un altro — un'importazione in corso si appoggia
     /// all'elenco per non ricopiare foto che ci sono gia', e togliergielo sotto significa
     /// ricopiarle.
-    static func resetDisabledReason(isIndexing: Bool, jobIsRunning: Bool) -> String? {
+    static func resetDisabledReason(isIndexing: Bool, jobIsRunning: Bool,
+                                    isTrashingDuplicates: Bool) -> String? {
+        if isTrashingDuplicates {
+            return "L'app sta spostando nel Cestino le copie doppie e intanto aggiorna "
+                + "l'elenco: svuotarlo adesso lo lascerebbe a metà. Riprova quando ha finito."
+        }
         if isIndexing {
             return "L'app sta leggendo le foto sull'SSD proprio ora. Fermala con "
                 + "«\(LibraryIndexCommands.stop)» prima di svuotare l'elenco."
@@ -4386,8 +4436,13 @@ enum LibraryIndexAutoRefresh {
     /// - `isIndexing`: una lettura per volta, sempre sulla stessa istanza dello store.
     /// - `jobIsRunning`: una lettura integrale dell'SSD in parallelo a una copia rallenta
     ///   entrambe e conta come illeggibili i file che la copia sta scrivendo proprio ora.
-    static func shouldRun(enabled: Bool, indexedFileCount: Int, isIndexing: Bool, jobIsRunning: Bool) -> Bool {
-        enabled && indexedFileCount > 0 && !isIndexing && !jobIsRunning
+    /// - `isTrashingDuplicates` (2026-09-19, BUG-7): lo spostamento nel Cestino ora gira
+    ///   davvero fuori dal main, quindi puo' essere in corso mentre l'elenco si aggiornerebbe
+    ///   da solo — stessa ragione di `jobIsRunning`, i file che il trasher sta spostando
+    ///   risulterebbero illeggibili.
+    static func shouldRun(enabled: Bool, indexedFileCount: Int, isIndexing: Bool, jobIsRunning: Bool,
+                          isTrashingDuplicates: Bool) -> Bool {
+        enabled && indexedFileCount > 0 && !isIndexing && !jobIsRunning && !isTrashingDuplicates
     }
 }
 
@@ -6628,6 +6683,34 @@ final class BackupRunner: ObservableObject {
 
     var isRunning: Bool { if case .running = phase { return true }; return false }
 
+    /// Vero mentre `DuplicateTrasher.run` sta spostando un blocco nel Cestino. Vive QUI,
+    /// non in uno `@State` di `DuplicatesView`: uno `@State` torna `false` quando la finestra
+    /// si riapre, permettendo un secondo spostamento in parallelo al primo — esattamente il
+    /// caso che il pannello Doppioni vieta (ADR-0005, "cestinare mentre un mirror legge gli
+    /// stessi file trasforma due operazioni corrette in un guasto"). Vive nel runner come
+    /// `isRunning`/`isIndexing`, cosi' tutti e tre si controllano nello stesso posto.
+    @Published private(set) var isTrashingDuplicates = false
+
+    /// Prova ad avviare uno spostamento nel Cestino. Rifiuta (restituendo l'avviso da
+    /// mostrare) se e' gia' in corso uno spostamento, un job o una lettura dell'elenco;
+    /// altrimenti imposta il flag e restituisce `nil`. Controllo e impostazione sono
+    /// atomici rispetto a ogni altro gate perche' girano entrambi sul MainActor.
+    func beginDuplicateTrashing() -> SimpleAlert? {
+        guard !isTrashingDuplicates, !isRunning, !isIndexing else {
+            return SimpleAlert(title: "Meglio non farlo adesso",
+                message: "C'è già un'altra operazione in corso (un backup, una lettura "
+                    + "dell'elenco o un altro spostamento nel Cestino). Aspetta che finisca.")
+        }
+        isTrashingDuplicates = true
+        return nil
+    }
+
+    /// Chiamato SEMPRE dallo stesso `MainActor.run` che pubblica l'esito dello spostamento —
+    /// `DuplicateTrasher.run` non lancia mai, quindi nessun percorso lo salta.
+    func endDuplicateTrashing() {
+        isTrashingDuplicates = false
+    }
+
     private let syncer = FileSyncer()
     private let s3Syncer = S3Syncer()
     private let bm = BookmarkManager.shared
@@ -6732,7 +6815,8 @@ final class BackupRunner: ObservableObject {
         // Silenzioso quando non c'e' un canale: l'aggiornamento automatico ha gia' deciso di
         // suo con `LibraryIndexAutoRefresh.shouldRun` e non deve far comparire niente.
         if let reason = LibraryIndexCommandGate.disabledReason(isIndexing: isIndexing,
-                                                              jobIsRunning: isRunning) {
+                                                              jobIsRunning: isRunning,
+                                                              isTrashingDuplicates: isTrashingDuplicates) {
             onAlert?(SimpleAlert(title: "Meglio non farlo adesso", message: reason))
             return
         }
@@ -6823,7 +6907,8 @@ final class BackupRunner: ObservableObject {
         // svuotamento: qui non si legge l'SSD, si toglie l'elenco a un'importazione che ci si
         // sta appoggiando per non ricopiare foto gia' presenti.
         if let reason = LibraryIndexCommandGate.resetDisabledReason(isIndexing: isIndexing,
-                                                                   jobIsRunning: isRunning) {
+                                                                   jobIsRunning: isRunning,
+                                                                   isTrashingDuplicates: isTrashingDuplicates) {
             onAlert?(SimpleAlert(title: "Meglio non farlo adesso", message: reason))
             return
         }
@@ -6856,7 +6941,8 @@ final class BackupRunner: ObservableObject {
         guard LibraryIndexAutoRefresh.shouldRun(enabled: LibraryIndexAutoRefresh.isEnabled(),
                                                 indexedFileCount: indexedFileCount,
                                                 isIndexing: isIndexing,
-                                                jobIsRunning: isRunning) else { return }
+                                                jobIsRunning: isRunning,
+                                                isTrashingDuplicates: isTrashingDuplicates) else { return }
         rebuildLibraryIndex()
     }
 
@@ -7485,6 +7571,11 @@ final class BackupRunner: ObservableObject {
     private func run(label: String, refreshesLibraryIndex: Bool = false,
                      work: @escaping () async throws -> FileSyncer.SyncResult?) {
         guard !isRunning else { return }
+        if let reason = JobStartGate.blockedReason(isIndexing: isIndexing,
+                                                    isTrashingDuplicates: isTrashingDuplicates) {
+            pendingAlert = SimpleAlert(title: "Meglio non farlo adesso", message: reason)
+            return
+        }
         output = ""; stats = JobStats(); currentStatus = ""; currentThumbnail = nil
         wasStopped = false
         let now = Date()
@@ -10471,7 +10562,8 @@ struct LibraryIndexCard: View {
     /// prima modifica di una sola delle due, ed e' gia' successo altrove in questo progetto.
     private var commandsDisabledReason: String? {
         LibraryIndexCommandGate.disabledReason(isIndexing: runner.isIndexing,
-                                               jobIsRunning: runner.isRunning)
+                                               jobIsRunning: runner.isRunning,
+                                               isTrashingDuplicates: runner.isTrashingDuplicates)
     }
 
     private var commandsDisabled: Bool { commandsDisabledReason != nil }
@@ -10747,7 +10839,6 @@ struct DuplicatesView: View {
     @State private var pendingBatch: DuplicateBatch? = nil
     @State private var showDestructiveConfirm = false
 
-    @State private var isTrashing = false
     @State private var trashProgress: (done: Int, total: Int)? = nil
     @State private var activeCancelFlag: CancelFlag? = nil
     @State private var lastOutcome: DuplicateTrashOutcome? = nil
@@ -10779,7 +10870,7 @@ struct DuplicatesView: View {
 
             listArea
 
-            if isTrashing, let progress = trashProgress {
+            if runner.isTrashingDuplicates, let progress = trashProgress {
                 trashProgressBar(progress)
             }
 
@@ -10793,7 +10884,7 @@ struct DuplicatesView: View {
             }
 
             HStack {
-                // `isTrashing` nella condizione non e' ridondante, ed e' il rilievo di
+                // `runner.isTrashingDuplicates` nella condizione non e' ridondante, ed e' il rilievo di
                 // review del 2026-09-01: `lastBatch()` e' l'ultimo blocco **registrato**,
                 // e durante una corsa quello e' il blocco ancora in esecuzione. Senza
                 // questa guardia l'utente che preme qui a meta' corsa non annulla il blocco
@@ -10803,7 +10894,7 @@ struct DuplicatesView: View {
                 // modello "blocco atomico" su cui e' costruita tutta la doppia conferma.
                 Button("Annulla l'ultimo spostamento") { undoLastBatch() }
                     .buttonStyle(.bordered).controlSize(.small)
-                    .disabled(!hasRestorableBatch || isTrashing)
+                    .disabled(!hasRestorableBatch || runner.isTrashingDuplicates)
 
                 Spacer()
 
@@ -10858,11 +10949,12 @@ struct DuplicatesView: View {
     private var trashDisabledReasonNow: String? {
         DuplicatesStatus.trashDisabledReason(isRunning: runner.isRunning,
                                              isIndexing: runner.isIndexing,
-                                             ssdMounted: volumes.ssdMounted)
+                                             ssdMounted: volumes.ssdMounted,
+                                             isTrashingDuplicates: runner.isTrashingDuplicates)
     }
 
     private var canRequestTrash: Bool {
-        trashDisabledReasonNow == nil && !selectedHashes.isEmpty && !isTrashing
+        trashDisabledReasonNow == nil && !selectedHashes.isEmpty && !runner.isTrashingDuplicates
     }
 
     private var hasRestorableBatch: Bool {
@@ -11027,12 +11119,21 @@ struct DuplicatesView: View {
             return
         }
 
+        // Lo stato "sto spostando" vive nel runner, non in uno `@State` di questa view:
+        // riaprire la finestra Doppioni farebbe tornare `false` uno `@State`, permettendo un
+        // secondo spostamento in parallelo al primo (Task 4, ADR-0006). Chiamato subito
+        // prima del `Task.detached` (nessun `return` fra qui e li'), cosi' un `begin` che
+        // riesce e' sempre seguito da un `end` — vedi il commento sul blocco finale sotto.
+        if let alert = runner.beginDuplicateTrashing() {
+            pendingAlert = alert
+            return
+        }
+
         let decisions = batch.groups.map { DuplicateTrasher.Decision(group: $0.group, keeper: $0.choice.keeper) }
         let trasher = DuplicateTrasher(libraryRoot: root, store: store, manifest: manifest)
         let cancelFlag = CancelFlag()
         activeCancelFlag = cancelFlag
 
-        isTrashing = true
         lastOutcome = nil
         trashProgress = (0, decisions.count)
 
@@ -11042,7 +11143,10 @@ struct DuplicatesView: View {
             }, isCancelled: { cancelFlag.isCancelled })
 
             await MainActor.run {
-                isTrashing = false
+                // `endDuplicateTrashing()` nello STESSO blocco che pubblica l'esito: `run`
+                // non lancia mai, quindi nessun percorso di questo `Task.detached` salta
+                // questa chiamata e lascia il flag bloccato a `true` per sempre.
+                runner.endDuplicateTrashing()
                 trashProgress = nil
                 activeCancelFlag = nil
                 lastOutcome = outcome

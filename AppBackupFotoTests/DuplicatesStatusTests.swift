@@ -38,15 +38,15 @@ final class DuplicatesStatusTests: XCTestCase {
 
     /// Job in corso: motivo scritto, non un bottone grigio senza spiegazione.
     func testJobRunning_explainsWhyTrashDisabled() {
-        let reason = DuplicatesStatus.trashDisabledReason(isRunning: true, isIndexing: false, ssdMounted: true)
+        let reason = DuplicatesStatus.trashDisabledReason(isRunning: true, isIndexing: false, ssdMounted: true, isTrashingDuplicates: false)
         XCTAssertNotNil(reason)
         XCTAssertTrue(reason!.lowercased().contains("backup"))
     }
 
     /// Scansione dell'indice in corso: stessa disciplina, motivo diverso da quello del job.
     func testIndexingRunning_explainsWhyTrashDisabled() {
-        let indexing = DuplicatesStatus.trashDisabledReason(isRunning: false, isIndexing: true, ssdMounted: true)
-        let running = DuplicatesStatus.trashDisabledReason(isRunning: true, isIndexing: false, ssdMounted: true)
+        let indexing = DuplicatesStatus.trashDisabledReason(isRunning: false, isIndexing: true, ssdMounted: true, isTrashingDuplicates: false)
+        let running = DuplicatesStatus.trashDisabledReason(isRunning: true, isIndexing: false, ssdMounted: true, isTrashingDuplicates: false)
         XCTAssertNotNil(indexing)
         XCTAssertNotEqual(indexing, running, "i due motivi non devono essere la stessa frase")
     }
@@ -54,7 +54,7 @@ final class DuplicatesStatusTests: XCTestCase {
     /// SSD scollegato: riga PROPRIA, diversa da "nessun doppione" — non sono la stessa cosa:
     /// uno è "non ho niente da segnalare", l'altro è "non posso controllare adesso".
     func testSSDDisconnected_ownReason_differsFromNoGroups() {
-        let reason = DuplicatesStatus.trashDisabledReason(isRunning: false, isIndexing: false, ssdMounted: false)
+        let reason = DuplicatesStatus.trashDisabledReason(isRunning: false, isIndexing: false, ssdMounted: false, isTrashingDuplicates: false)
         let noGroupsLine = DuplicatesStatus.headerLine(indexBuilt: true, groupCount: 0, reclaimableBytes: 0)
         XCTAssertNotNil(reason)
         XCTAssertNotEqual(reason!, noGroupsLine.text)
@@ -65,7 +65,17 @@ final class DuplicatesStatusTests: XCTestCase {
     /// comunque le due conferme). Una funzione che restituisse sempre un motivo non
     /// distinguerebbe "disattivato" da "attivo".
     func testNothingBlocksTrash_whenAllConditionsAreFine() {
-        XCTAssertNil(DuplicatesStatus.trashDisabledReason(isRunning: false, isIndexing: false, ssdMounted: true))
+        XCTAssertNil(DuplicatesStatus.trashDisabledReason(isRunning: false, isIndexing: false, ssdMounted: true, isTrashingDuplicates: false))
+    }
+
+    /// Uno spostamento nel Cestino gia' in corso (Task 4, 2026-09-19): un secondo non puo'
+    /// partire mentre il primo gira. Valutato DOPO isIndexing, come tutte le altre condizioni:
+    /// e' la garanzia che sostituisce il vecchio `@State isTrashing` che si azzerava riaprendo
+    /// la finestra.
+    func testTrashingAlreadyInProgress_explainsWhyTrashDisabled() {
+        let reason = DuplicatesStatus.trashDisabledReason(isRunning: false, isIndexing: false, ssdMounted: true, isTrashingDuplicates: true)
+        XCTAssertNotNil(reason)
+        XCTAssertTrue(reason!.lowercased().contains("cestino"))
     }
 
     // MARK: - Tetto del blocco
@@ -159,9 +169,10 @@ final class DuplicatesStatusTests: XCTestCase {
         allTexts.append(DuplicatesStatus.headerLine(indexBuilt: false, groupCount: 0, reclaimableBytes: 0).text)
         allTexts.append(DuplicatesStatus.headerLine(indexBuilt: true, groupCount: 0, reclaimableBytes: 0).text)
         allTexts.append(DuplicatesStatus.headerLine(indexBuilt: true, groupCount: 3, reclaimableBytes: 1_000).text)
-        allTexts.append(DuplicatesStatus.trashDisabledReason(isRunning: true, isIndexing: false, ssdMounted: true) ?? "")
-        allTexts.append(DuplicatesStatus.trashDisabledReason(isRunning: false, isIndexing: true, ssdMounted: true) ?? "")
-        allTexts.append(DuplicatesStatus.trashDisabledReason(isRunning: false, isIndexing: false, ssdMounted: false) ?? "")
+        allTexts.append(DuplicatesStatus.trashDisabledReason(isRunning: true, isIndexing: false, ssdMounted: true, isTrashingDuplicates: false) ?? "")
+        allTexts.append(DuplicatesStatus.trashDisabledReason(isRunning: false, isIndexing: true, ssdMounted: true, isTrashingDuplicates: false) ?? "")
+        allTexts.append(DuplicatesStatus.trashDisabledReason(isRunning: false, isIndexing: false, ssdMounted: false, isTrashingDuplicates: false) ?? "")
+        allTexts.append(DuplicatesStatus.trashDisabledReason(isRunning: false, isIndexing: false, ssdMounted: true, isTrashingDuplicates: true) ?? "")
         allTexts.append(DuplicatesStatus.confirmationBlockedReason(exceedsCap: true) ?? "")
 
         var skipped = DuplicateTrashOutcome()
