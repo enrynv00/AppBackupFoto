@@ -65,6 +65,26 @@ final class FileSyncerZeroOverwriteTests: XCTestCase {
                                      onStatus: { _ in }, onProgress: { _ in })
     }
 
+    // MARK: - Interruzione e ripartenza (Task 6, 2026-09-19)
+
+    /// Al 2026-09-19 nessun test di questo file chiamava `.cancel()` su `FileSyncer`: il
+    /// flag di interruzione e' passato da un `private var cancelled = false` nudo a
+    /// `CancelFlag` condiviso (con `reset()`), e senza questo test il `reset()` sarebbe
+    /// rimasto scoperto. Un `cancel()` di un job precedente non deve impedire a un nuovo
+    /// `sync()` di copiare: `sync()` chiama `cancelFlag.reset()` all'inizio.
+    func testAfterCancel_aNewSyncCopiesAgain() async throws {
+        let syncer = FileSyncer()
+        syncer.cancel()   // simula un job precedente interrotto sulla stessa istanza
+        _ = try writeFile(srcDir.appendingPathComponent("photo.jpg"), "CONTENT")
+
+        let result = try await syncer.sync(from: srcDir, to: dstDir, deep: false,
+                                           onStatus: { _ in }, onProgress: { _ in })
+
+        XCTAssertEqual(result.copied, 1, "un cancel() precedente non deve impedire una nuova copia")
+        XCTAssertEqual(result.errors, 0)
+        XCTAssertTrue(fm.fileExists(atPath: dstDir.appendingPathComponent("photo.jpg").path))
+    }
+
     // MARK: - Zero-overwrite: destination differs (different content & size)
 
     func testExistingDestDifferentContent_shallow_isNotOverwritten() async throws {

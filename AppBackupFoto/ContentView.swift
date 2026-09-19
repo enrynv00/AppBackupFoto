@@ -773,7 +773,9 @@ extension ImmichManager {
 /// Buffer thread-safe per l'output di un `Process`: senza leggere la pipe *mentre* il processo
 /// gira, un comando verboso (`docker compose up` che scarica GB di immagini) riempie i 64KB di
 /// buffer del kernel e si blocca per sempre.
-private final class ProcessOutputBuffer: @unchecked Sendable {
+// `nonisolated`: handler di `Pipe` su thread arbitrari (non il main). Aveva gia' `NSLock` e
+// `@unchecked Sendable`, mancava solo l'annotazione.
+private nonisolated final class ProcessOutputBuffer: @unchecked Sendable {
     private let lock = NSLock()
     private var data = Data()
     func append(_ chunk: Data) { lock.lock(); data.append(chunk); lock.unlock() }
@@ -782,7 +784,8 @@ private final class ProcessOutputBuffer: @unchecked Sendable {
 
 /// Garantisce che una `CheckedContinuation` venga ripresa una volta sola: qui ci arrivano
 /// sia la terminazione del processo sia il timeout, e riprenderla due volte è un crash.
-private final class ContinuationGuard: @unchecked Sendable {
+// `nonisolated`: handler di `Process` su thread arbitrari, stessa ragione di sopra.
+private nonisolated final class ContinuationGuard: @unchecked Sendable {
     private let lock = NSLock()
     private var used = false
     func claim() -> Bool { lock.lock(); defer { lock.unlock() }; if used { return false }; used = true; return true }
@@ -4746,7 +4749,12 @@ nonisolated final class ImportSessionIndex: @unchecked Sendable {
 }
 
 // MARK: - FileSyncer
-final class FileSyncer {
+// `nonisolated`: non segnalato da nessun warning (caso B della spec — girava gia' su
+// `DispatchQueue.global` senza saltare sul main), ma era una data race vera: `cancelled` era
+// un `private var` nudo, scritto dal main (`cancel()`) e letto dalla coda di lavoro senza
+// nessuna protezione. Unico stato mutabile: `cancelFlag`, dietro lock (Task 5/6, `CancelFlag`
+// condiviso). `fm` e `hashFunction` sono `let`. Vedi ADR-0006.
+nonisolated final class FileSyncer: @unchecked Sendable {
     struct SyncResult {
         var total = 0; var done = 0; var copied = 0; var skipped = 0; var errors = 0
         var hashErrors = 0   // file con SHA256 mismatch dopo la copia
@@ -4779,7 +4787,10 @@ final class FileSyncer {
         }
     }
 
-    private var cancelled = false
+    /// Flag di interruzione condiviso del progetto (Task 5/6, `CancelFlag`). Unico stato
+    /// mutabile della classe: tutto dietro `NSLock`.
+    private let cancelFlag = CancelFlag()
+    private var cancelled: Bool { cancelFlag.isCancelled }
     private let fm = FileManager.default
 
     /// Funzione di hash usata dalla verifica post-copia. In produzione e' sempre la
@@ -4794,7 +4805,7 @@ final class FileSyncer {
         self.hashFunction = hashFunction
     }
 
-    func cancel() { cancelled = true }
+    func cancel() { cancelFlag.cancel() }
 
     // MARK: - Dry-run preview (solo stat, nessuna copia)
     /// Un file che `previewSync` conterebbe fra i `toAdd`. Coppia neutra: nessun
@@ -4834,7 +4845,7 @@ final class FileSyncer {
             countComplete: Bool) {
         return await withCheckedContinuation { [self] cont in
             DispatchQueue.global(qos: .userInitiated).async {
-                self.cancelled = false
+                self.cancelFlag.reset()
                 var toAdd = 0
                 var toSkip = 0
                 var toAddBytes: Int64 = 0
@@ -4950,7 +4961,7 @@ final class FileSyncer {
               onUnverified: @escaping (URL) -> Void = { _ in }) async throws -> SyncResult {
         try await withCheckedThrowingContinuation { [self] cont in
             DispatchQueue.global(qos: .userInitiated).async {
-                self.cancelled = false
+                self.cancelFlag.reset()
                 var result = SyncResult()
 
                 DispatchQueue.main.async { onStatus("Conteggio file in corso...") }
@@ -5170,7 +5181,10 @@ final class S3Syncer {
         return existingSize != size
     }
 
-    struct S3Config {
+    // `nonisolated`: la lettura delle credenziali gira fuori dal main dal 2026-09-03
+    // (`loadS3ConfigIfNeeded`, caso F della spec: una closure sincrona dentro `Result { }`).
+    // L'annotazione lo dichiara al compilatore, non cambia il comportamento.
+    nonisolated struct S3Config {
         let accessKeyId: String
         let secretAccessKey: String
         let endpoint: String
@@ -5190,20 +5204,20 @@ final class S3Syncer {
         let initiated: Date
     }
 
-    private struct KeychainCredentials: Codable {
+    private nonisolated struct KeychainCredentials: Codable {
         let accessKeyId: String
         let secretAccessKey: String
         let endpoint: String
         let region: String
     }
 
-    private static func keychainQuery(remoteName: String) -> [String: Any] {
+    private nonisolated static func keychainQuery(remoteName: String) -> [String: Any] {
         [kSecClass as String: kSecClassGenericPassword,
          kSecAttrService as String: "AppBackupFoto",
          kSecAttrAccount as String: remoteName]
     }
 
-    private static func readFromKeychain(remoteName: String) -> KeychainCredentials? {
+    private nonisolated static func readFromKeychain(remoteName: String) -> KeychainCredentials? {
         var query = keychainQuery(remoteName: remoteName)
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
@@ -5214,7 +5228,7 @@ final class S3Syncer {
     }
 
     // internal (non private): richiamata anche dal bottone "Aggiorna da rclone.conf" in ToolsSheet.
-    static func writeToKeychain(config: S3Config, remoteName: String) throws {
+    nonisolated static func writeToKeychain(config: S3Config, remoteName: String) throws {
         let creds = KeychainCredentials(accessKeyId: config.accessKeyId, secretAccessKey: config.secretAccessKey,
                                          endpoint: config.endpoint, region: config.region)
         let data = try JSONEncoder().encode(creds)
@@ -5281,12 +5295,13 @@ final class S3Syncer {
 
     // Non private: deve restare visibile a @testable import per i test unitari
     // (stesso criterio già usato per validateEndpoint/isRetryable).
-    struct AdaptiveLimiterState: Equatable {
+    // `nonisolated`: value type senza stato, chiamato dall'actor AdaptiveUploadGate.
+    nonisolated struct AdaptiveLimiterState: Equatable {
         var limit: Int
         var consecutiveSuccesses: Int
     }
 
-    enum AdaptiveLimiterOutcome {
+    nonisolated enum AdaptiveLimiterOutcome {
         case success
         case retryableFailure
         case permanentFailure
@@ -5295,7 +5310,8 @@ final class S3Syncer {
     // Logica pura AIMD (Additive Increase / Multiplicative Decrease), separata
     // dall'actor sottostante per essere testabile senza rete/timer. Vedi
     // Docs/superpowers/specs/2026-08-18-adaptive-s3-concurrency-design.md.
-    enum AdaptiveLimiter {
+    // `nonisolated`: pura, chiamata dall'actor AdaptiveUploadGate.
+    nonisolated enum AdaptiveLimiter {
         static let floor = 1
         static let growthStep = 2
         static let successesToGrow = 5
@@ -5365,7 +5381,14 @@ final class S3Syncer {
     private static let adaptiveMemoryCeilingBytes = 2 * 1024 * 1024 * 1024
     static let adaptiveConcurrencyCeiling = adaptiveMemoryCeilingBytes / multipartChunkSize
 
-    private var cancelled = false
+    /// Flag di interruzione condiviso del progetto (Task 5/6, `CancelFlag`), invece del
+    /// `private var cancelled = false` nudo di prima (produceva due dei 29 warning di
+    /// isolamento, perche' l'accesso da un `Task.detached`/gruppo di task era una lettura
+    /// da un contesto non isolato su una proprieta' `@MainActor`).
+    private let cancelFlag = CancelFlag()
+    // `nonisolated`: solo la lettura del flag, dietro lock in `CancelFlag`. S3Syncer resta
+    // `@MainActor` per il resto (default del target).
+    nonisolated private var cancelled: Bool { cancelFlag.isCancelled }
     private lazy var session: URLSession = {
         let cfg = URLSessionConfiguration.default
         cfg.timeoutIntervalForRequest = 300
@@ -5373,9 +5396,9 @@ final class S3Syncer {
         return URLSession(configuration: cfg)
     }()
 
-    func cancel() { cancelled = true }
+    func cancel() { cancelFlag.cancel() }
 
-    static func readConfig(remoteName: String = "Cubbit", bucket: String = "backupfoto") throws -> S3Config {
+    nonisolated static func readConfig(remoteName: String = "Cubbit", bucket: String = "backupfoto") throws -> S3Config {
         try readConfigWithSource(remoteName: remoteName, bucket: bucket).config
     }
 
@@ -5383,7 +5406,8 @@ final class S3Syncer {
     // in un'unica lettura Keychain: usata dove serve entrambe le informazioni (findings di
     // Revisione + card credenziali in ToolsSheet) per evitare letture Keychain ridondanti —
     // ognuna può richiedere una propria autorizzazione interattiva dell'utente.
-    static func readConfigWithSource(remoteName: String = "Cubbit",
+    // `nonisolated`: gira fuori dal main dal 2026-09-03 (`loadS3ConfigIfNeeded`, caso F).
+    nonisolated static func readConfigWithSource(remoteName: String = "Cubbit",
                                       bucket: String = "backupfoto") throws -> (config: S3Config, fromKeychain: Bool) {
         if let creds = readFromKeychain(remoteName: remoteName) {
             let cleanEp = try validateEndpoint(creds.endpoint)
@@ -5396,7 +5420,7 @@ final class S3Syncer {
     }
 
     // Non private: deve restare richiamabile dal bottone "Aggiorna da rclone.conf" in ToolsSheet.
-    static func readConfigFromFile(remoteName: String, bucket: String) throws -> S3Config {
+    nonisolated static func readConfigFromFile(remoteName: String, bucket: String) throws -> S3Config {
         let path = NSHomeDirectory() + "/.config/rclone/rclone.conf"
         if let attrs = try? FileManager.default.attributesOfItem(atPath: path),
            let perms = attrs[.posixPermissions] as? Int, perms & 0o077 != 0 {
@@ -5426,7 +5450,7 @@ final class S3Syncer {
     }
 
     // Non private: deve restare visibile a @testable import per i test unitari.
-    static func validateEndpoint(_ raw: String) throws -> String {
+    nonisolated static func validateEndpoint(_ raw: String) throws -> String {
         let cleanEp = raw.hasSuffix("/") ? String(raw.dropLast()) : raw
         guard cleanEp.hasPrefix("https://") else {
             throw NSError(domain: "S3", code: 10, userInfo: [NSLocalizedDescriptionKey:
@@ -5478,7 +5502,7 @@ final class S3Syncer {
               onStatus: @escaping (String) -> Void,
               onProgress: @escaping (SyncResult) -> Void,
               onCurrentFile: @escaping (URL) -> Void = { _ in }) async throws -> SyncResult {
-        cancelled = false
+        cancelFlag.reset()
         var result = SyncResult()
 
         DispatchQueue.main.async { onStatus("Connessione a Cubbit S3 — recupero lista file remoti...") }
@@ -5954,7 +5978,7 @@ final class S3Syncer {
     func downloadMany(selectedFolders: Set<String>, config: S3Config, destination: URL,
                        onStatus: @escaping (String) -> Void,
                        onProgress: @escaping (DownloadManyResult) -> Void) async throws -> DownloadManyResult {
-        cancelled = false
+        cancelFlag.reset()
         var result = DownloadManyResult()
         DispatchQueue.main.async { onStatus("Connessione a Cubbit — recupero elenco file...") }
         let all = try await listAll(config: config)
