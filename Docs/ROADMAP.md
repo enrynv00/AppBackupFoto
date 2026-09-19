@@ -161,6 +161,16 @@ Sei punti aperti, trovati durante spec/piano/implementazione del fix di isolamen
 
 ---
 
+## Nuovo capitolo — trovati implementando l'indicatore di spazio SSD/HDD/Cubbit (2026-09-19)
+
+Tre punti, dalle «Scoperte collaterali» della spec `Docs/superpowers/specs/2026-09-19-volume-space-indicator-design.md` (ADR-0008): trovati leggendo il codice durante il brainstorming, non verificati empiricamente, e deliberatamente non corretti in quell'intervento perché fuori scope. Registrati qui invece che come ticket — decisione presa senza consultare Enrico, da riaprire se preferisce il tracker.
+
+38. 🔲 **Probabile bug esistente: l'anteprima SSD→Cubbit dopo uno stop mostra numeri sbagliati.** `BackupRunner.stop()` chiama `s3Syncer.cancel()` (`cancelFlag.cancel()`); il flag resta `true` finché un `sync()` o un `downloadMany()` non lo azzera (`cancelFlag.reset()` in testa). `previewUpload()` non lo azzera, e `listAllDetailed`/`listAll` escono prima della prima pagina (`S3Listing.isComplete == false`, elenco vuoto): l'anteprima dice che **tutti** i file locali sono «da caricare» e che nessuno è già presente. Non fa danni ai dati (il `sync()` successivo azzera il flag ed elenca davvero), ma mostra un numero falso. Si corregge con una riga (`cancelFlag.reset()` in testa a `previewUpload`), fuori scope dell'indicatore di spazio perché tocca un percorso diverso (l'anteprima, non lo spazio). Con l'indicatore di spazio il sintomo si allarga: un ↻ o un'anteprima subito dopo uno stop non aggiornerebbe (correttamente, per la guardia su `isComplete`) il numero di Cubbit — comportamento sicuro, ma da tenere a mente se un giorno si decide di correggere anche `previewUpload`.
+39. 🔲 **`hasSufficientSpace` legge la capacità dal main thread.** Gira dentro un `Task { @MainActor }` in `BackupRunner`, una volta per job (non ogni 3s come `VolumeMonitor`): di solito 10-18 ms, qualche secondo se l'HDD dorme. Potrebbe riusare `VolumeCapacityReader.read` (Task 2 dell'indicatore di spazio, `nonisolated`, già pensato per girare fuori dal main) in un intervento separato.
+40. 🔲 **`ssdMounted` è vero anche per una cartella normale al posto del volume.** `VolumeMonitor.check()` usa ancora `fm.fileExists(atPath:)` per `ssdMounted`/`hddMounted` — la guardia sul punto di montaggio (`VolumeCapacityReader`, per componenti canoniche) vale **solo** per lo spazio, non per il booleano che abilita i bottoni dei job. Oggi abiliterebbe MAC→SSD/SSD→HDD/SSD→Cubbit su una cartella del disco interno lasciata al posto dell'SSD scollegato. `isLikelyVolumeRoot` e i bookmark mitigano in parte (side-finding già noto della spec 2026-09-19, non nuovo di questo intervento). Estendere la stessa guardia a `ssdMounted`/`hddMounted` cambierebbe l'abilitazione dei bottoni: decisione di prodotto da riprendere con Enrico, non un bug da correggere a codice.
+
+---
+
 ## Fonti consultate
 
 - [7 Best Backup Software for macOS: Top Picks for 2026 — MacObserver](https://www.macobserver.com/tips/round-ups/7-best-backup-software-for-macos/)
