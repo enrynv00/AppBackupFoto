@@ -5614,14 +5614,17 @@ final class S3Syncer {
         }
     }
 
-    /// Dove va a finire il numero calcolato da un elenco completo. Il default (Task 6) scrive
-    /// nello store persistito passando dal main; i test passano un sink che registra le
-    /// chiamate.
+    /// Dove va a finire il numero calcolato da un elenco completo. Tipo di chiusura SENZA
+    /// `@MainActor`: come default argument di un `init` la sua conversione perderebbe
+    /// l'isolamento (errore in Swift 6 mode), quindi il salto sul main è esplicito nel corpo
+    /// del default, non nella firma — stesso pattern già in produzione altrove nel progetto
+    /// (`Task { @MainActor in ... }`). I test passano un sink sincrono che registra le
+    /// chiamate, senza bisogno del main.
     typealias CloudUsageSink = (CloudUsageTotals, _ bucket: String) -> Void
 
-    // TODO Task 6: sostituire con `{ totals, bucket in Task { @MainActor in
-    // CloudUsageStore.shared.record(totals, bucket: bucket) } } quando CloudUsageStore esiste.
-    static let defaultUsageSink: CloudUsageSink = { _, _ in }
+    static let defaultUsageSink: CloudUsageSink = { totals, bucket in
+        Task { @MainActor in CloudUsageStore.shared.record(totals, bucket: bucket) }
+    }
 
     private let usageSink: CloudUsageSink
 
@@ -6400,6 +6403,146 @@ final class S3Syncer {
             search = String(search[e.upperBound...])
         }
         return results
+    }
+}
+
+// MARK: - Spazio usato su Cubbit
+//
+// Persistenza e testo di "X usati · aggiornato...". Spec `Docs/superpowers/specs/2026-09-19-
+// volume-space-indicator-design.md`, ADR-0008.
+
+/// Ultimo numero conosciuto di spazio usato su Cubbit, con la data in cui è stato calcolato.
+/// Persistito in `UserDefaults` — il numero resta visibile anche ad app appena aperta, con la
+/// sua data.
+struct CloudUsageSnapshot: Codable, Equatable {
+    let usedBytes: Int64
+    let objectCount: Int
+    let measuredAt: Date
+    let bucket: String
+}
+
+extension CloudUsageSnapshot {
+    private enum CodingKeys: String, CodingKey { case usedBytes, objectCount, measuredAt, bucket }
+
+    /// `init(from:)` esplicita con `decodeIfPresent` FIN DAL PRIMO GIORNO — regola nata dal
+    /// fatto misurato n. 5 di #31 (`JobSummary`): i default sulle proprietà NON rendono
+    /// retrocompatibile un `Codable`, la `init(from:)` sintetizzata lancia `keyNotFound` su una
+    /// chiave assente e ignora il default. Qui non c'è ancora un campo "vecchio": è scritta
+    /// così da subito per non dover riscoprire la stessa lezione una quarta volta. Un record
+    /// che non decodifica per un campo davvero mancante è un record rotto, non recuperabile:
+    /// `CloudUsageStore.load` lo tratta come "mai misurato" (nessun crash).
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        usedBytes = try c.decode(Int64.self, forKey: .usedBytes)
+        objectCount = try c.decodeIfPresent(Int.self, forKey: .objectCount) ?? 0
+        measuredAt = try c.decode(Date.self, forKey: .measuredAt)
+        bucket = try c.decode(String.self, forKey: .bucket)
+    }
+}
+
+/// Motivo per cui il bottone ↻ di Cubbit è disattivato, o `nil` se è cliccabile. Logica pura,
+/// niente gergo ("indice"/"hash"/"scansione" non compaiono, come da regola del progetto).
+enum CloudUsageRefreshGate {
+    static func disabledReason(jobIsRunning: Bool, isRefreshing: Bool) -> String? {
+        if jobIsRunning {
+            return "Disponibile a backup finito: un backup su Cubbit lo aggiorna già da solo"
+        }
+        if isRefreshing {
+            return "Sto già calcolando lo spazio usato…"
+        }
+        return nil
+    }
+}
+
+/// Le frasi mostrate sotto Cubbit nella sidebar. Logica pura: `now`/`calendar`/`locale`
+/// iniettati per essere testabile a cavallo della mezzanotte e indipendentemente dalla lingua
+/// di sistema — stesso criterio di `checkDeepMirrorFreshness`.
+enum CloudUsageText {
+    static func usedLine(_ snapshot: CloudUsageSnapshot?) -> String {
+        guard let snapshot else { return "Spazio usato non ancora calcolato" }
+        return "\(SpaceFormat.bytes(snapshot.usedBytes)) usati"
+    }
+
+    static func updatedLine(_ snapshot: CloudUsageSnapshot?, now: Date,
+                             calendar: Calendar, locale: Locale) -> String {
+        guard let snapshot else { return "Si aggiorna al prossimo backup su Cubbit" }
+        let day = calendar.startOfDay(for: snapshot.measuredAt)
+        let today = calendar.startOfDay(for: now)
+        let timeFormatter = DateFormatter()
+        timeFormatter.calendar = calendar
+        timeFormatter.locale = locale
+        timeFormatter.timeStyle = .short
+        timeFormatter.dateStyle = .none
+        let time = timeFormatter.string(from: snapshot.measuredAt)
+
+        if day == today {
+            return "aggiornato oggi alle \(time)"
+        }
+        if let yesterday = calendar.date(byAdding: .day, value: -1, to: today), day == yesterday {
+            return "aggiornato ieri alle \(time)"
+        }
+        let dateFormatter = DateFormatter()
+        dateFormatter.calendar = calendar
+        dateFormatter.locale = locale
+        let sameYear = calendar.component(.year, from: snapshot.measuredAt) == calendar.component(.year, from: now)
+        dateFormatter.setLocalizedDateFormatFromTemplate(sameYear ? "d MMMM" : "d MMMM yyyy")
+        return "aggiornato il \(dateFormatter.string(from: snapshot.measuredAt))"
+    }
+}
+
+/// Persistenza del numero di Cubbit — `ObservableObject` singleton `@MainActor`, osservato
+/// SOLO dalla riga di Cubbit (stesso motivo di `VolumeSpaceModel`: non deve far ridisegnare
+/// niente che non mostra questo numero). La lettura di `UserDefaults` all'avvio è in memoria e
+/// non tocca né la rete né il Keychain.
+@MainActor final class CloudUsageStore: ObservableObject {
+    static let shared = CloudUsageStore()
+
+    @Published private(set) var snapshot: CloudUsageSnapshot?
+    @Published private(set) var isRefreshing = false
+    @Published private(set) var lastRefreshFailed = false
+
+    private let defaults: UserDefaults
+    private static let key = "cloudUsageSnapshot"
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        self.snapshot = Self.load(defaults: defaults)
+    }
+
+    private static func load(defaults: UserDefaults) -> CloudUsageSnapshot? {
+        guard let data = defaults.data(forKey: key) else { return nil }
+        return try? JSONDecoder().decode(CloudUsageSnapshot.self, from: data)
+    }
+
+    /// Registra un nuovo totale — chiamato dal sink di default di `S3Syncer` (da tutti e sei i
+    /// chiamanti di `listAll` che completano un elenco) e da `refresh()` sotto.
+    func record(_ totals: S3Syncer.CloudUsageTotals, bucket: String, at date: Date = Date()) {
+        let newSnapshot = CloudUsageSnapshot(usedBytes: totals.bytes, objectCount: totals.count,
+                                              measuredAt: date, bucket: bucket)
+        snapshot = newSnapshot
+        guard let data = try? JSONEncoder().encode(newSnapshot) else { return }
+        defaults.set(data, forKey: Self.key)
+    }
+
+    /// Ricalcolo manuale (bottone ↻, Task 7). Usa un'istanza NUOVA e dedicata di `S3Syncer`,
+    /// non quella dei job (`runner.s3Syncer`): quella condivide il proprio `cancelFlag` con i
+    /// job in corso, e dopo uno stop darebbe un elenco vuoto (side-finding della spec).
+    func refresh(config: S3Syncer.S3Config) async {
+        guard !isRefreshing else { return }
+        isRefreshing = true
+        defer { isRefreshing = false }
+        do {
+            let syncer = S3Syncer()
+            let listing = try await syncer.listAllDetailed(config: config)
+            if listing.isComplete {
+                record(.of(listing.objects), bucket: config.bucket)
+                lastRefreshFailed = false
+            } else {
+                lastRefreshFailed = true
+            }
+        } catch {
+            lastRefreshFailed = true
+        }
     }
 }
 
