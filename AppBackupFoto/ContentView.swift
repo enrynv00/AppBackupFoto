@@ -6417,6 +6417,45 @@ enum VolumeSpaceState: Equatable {
     }
 }
 
+/// Legge la capacità totale/disponibile di un volume — chiamata SOLO dalla `probeQueue` di
+/// `VolumeMonitor` (Task 3), mai dal main thread.
+///
+/// Tre regole, ciascuna con un motivo misurato o documentato (spec, ADR-0008):
+///
+/// 1. **Un `URL` NUOVO a ogni chiamata**, mai tenuto in una proprietà. `resourceValues`
+///    risponde dalla cache dell'istanza di `URL`, e l'invalidazione di quella cache è legata
+///    ai giri del run loop **del main thread** (Apple DTS:
+///    https://developer.apple.com/forums/thread/813641). Su una coda in background senza run
+///    loop non è garantito che la cache scada mai: con un URL riusato la barra resterebbe
+///    ferma al primo valore letto per sempre.
+/// 2. **Guardia sul punto di montaggio.** Si legge anche `volumeURLKey` e si confronta, PER
+///    COMPONENTI CANONICHE (stessa regola di `canonicalPathComponents`, mai `hasPrefix` né
+///    confronto di stringa), col percorso richiesto. Se una cartella normale prende il posto
+///    dell'SSD scollegato (una copia fatta a SSD staccato, uno smontaggio sporco),
+///    `fileExists` risponde `true` e la capacità letta sarebbe quella del volume che CONTIENE
+///    quella cartella — il disco interno, non l'SSD il cui nome sta sulla riga.
+/// 3. **Mai `volumeAvailableCapacityForImportantUsageKey`.** Misurato il 2026-09-19 sull'SSD
+///    ExFAT/FSKit reale: restituisce **0**, non `nil`. Un indicatore costruito su quella
+///    chiave mostrerebbe l'SSD pieno al 100%, in rosso, sempre — un falso allarme permanente
+///    sul disco più importante del progetto. Si usa `volumeAvailableCapacityKey`, che risponde
+///    correttamente (confermato con `df`) ed è la stessa chiave già usata da
+///    `BackupRunner.hasSufficientSpace`.
+enum VolumeCapacityReader {
+    nonisolated static func read(path: String) -> VolumeCapacityReading {
+        let url = URL(fileURLWithPath: path)
+        guard let values = try? url.resourceValues(forKeys: [
+            .volumeTotalCapacityKey, .volumeAvailableCapacityKey, .volumeURLKey
+        ]) else { return .unreadable }
+        guard let volumeURL = values.volume,
+              canonicalPathComponents(of: volumeURL) == canonicalPathComponents(of: url) else {
+            return .notAMountPoint
+        }
+        guard let total = values.volumeTotalCapacity, total > 0 else { return .unreadable }
+        let available = values.volumeAvailableCapacity ?? 0
+        return .measured(total: Int64(total), available: Int64(available))
+    }
+}
+
 // MARK: - VolumeMonitor
 /// Sorveglia la presenza dei due volumi esterni, con un sondaggio ogni 3 secondi.
 ///
