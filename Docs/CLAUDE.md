@@ -75,6 +75,12 @@ IF il codice aggiorna la UI da contesto async:
 
     THEN verifica che sia wrappato in Task { @MainActor in }
 
+IF il codice lancia lavoro in `Task.detached` o su una `DispatchQueue`:
+
+    THEN verifica che i tipi chiamati siano `nonisolated`, con la riga sul perché sono thread-safe
+
+    THEN se una funzione di fondo diventa `async`, verifica che sia `@concurrent`
+
 IF trovi bug in questa revisione:
 
     THEN documentalo nel log di output e correggilo prima di presentare il risultato finale
@@ -89,9 +95,9 @@ Qualsiasi subprocess (rsync, bash, rclone, Process()) lanciato da un'app GUI **n
 
 ---
 
-## Stato attuale (aggiornato 2026-08-27)
+## Stato attuale (aggiornato 2026-09-19)
 
-La data sopra vale per l'intera tabella. Se ci lavori, aggiornala: fino a oggi diceva 2026-07-29 mentre alcune righe erano già state riscritte al 2026-08-18, e il conteggio dei test era fermo a 139 su 346 reali.
+La data sopra vale per l'intera tabella. Se ci lavori, aggiornala: fino a oggi diceva 2026-07-29 mentre alcune righe erano già state riscritte al 2026-08-18, e il conteggio dei test era fermo a 139 su 346 reali. **Il tocco del 2026-09-19 è mirato**: solo la riga «Test automatici» sotto è stata aggiornata (fix di isolamento MainActor, BUG-7, 568 → 587 test) — le altre righe restano alle date che portano già scritte, non sono state riverificate in questa sessione.
 
 | Funzione | Stato |
 | :---- | :---- |
@@ -112,7 +118,7 @@ La data sopra vale per l'intera tabella. Se ci lavori, aggiornala: fino a oggi d
 | Indice di contenuto della libreria + dedup in import (#31) | ✅ **Nucleo implementato (2026-08-25/27)** — indice SHA256 SQLite delle foto/video dell'SSD in `~/Library/Application Support/AppBackupFoto/`, mai sull'SSD; card «Foto già salvate sull'SSD» in Diagnostica; durante un import non si ricopia un file il cui contenuto è già in libreria, né un doppione interno allo stesso import. **Pannello Doppioni implementato (2026-08-27 → 2026-09-01)**: finestra «Doppioni» dedicata, proposta spiegata a parole su quale copia tenere, lavoro a blocchi con riepilogo + conferma distruttiva, spostamento nel **Cestino del volume** con rilettura e rihash unanimi di tutto il gruppo, registro di ripristino proprio e «Annulla l'ultimo spostamento». È l'unica feature del progetto che rimuove file dalla loro posizione: leggere **ADR-0005** prima di toccarla. Restano due verifiche manuali dall'app (vedi sotto). Dettagli in `.claude/rules/architecture.md`, decisioni in `Docs/adr/` |
 | Formattazione disco guidata (#28) | ⏳ Codice completo e buildabile, **mai eseguito davvero** — nessun `diskutil eraseDisk`. Non marcarlo "fatto" |
 | Immich (#29) | ⏳ **Avviato davvero il 2026-09-13**: VM, 4 container, libreria esterna, 47.479 media indicizzati, sola lettura confermata dall'interno del container. Restano i punti 8-10 della verifica (griglia/ricerca/facce, chiusura app → container fermi, lock screen). Non marcarlo "fatto" |
-| Test automatici | ✅ **568 test XCTest passano** (346 al 2026-08-27, prima del pannello Doppioni; era 139 fino al 2026-07-29, numero rimasto fermo qui per un mese). 37 file in `AppBackupFotoTests`: zero-overwrite, volume-root, persistenza job, campionamento locale, parsing cartelle S3 per il restore, correttezza sha256 (incluso il file che cambia dimensione mentre lo si legge), classificazione retry S3, lettura file a blocchi, logica AIMD del gate adattivo, ordinamento parti multipart, validazione endpoint S3, generazione docker-compose Immich verificata con parser YAML reale, esclusione dischi formattabili `DiskFormatter`, guardia self-import e slug etichetta, gli otto file nati dal nucleo di #31 (`IndexableKindTests`, `IndexEntryVerdictTests`, `LibraryIndexStoreTests`, `LibraryIndexerTests`, `LibraryIndexStatusTests`, `ImportDedupTests`, `UnverifiedCopiesStoreTests`, `FileSyncerHashVerificationTests`) e i sei del pannello Doppioni (`DuplicateGroupsStoreTests`, `DuplicateKeepChoiceTests`, `DuplicateBatchTests`, `TrashManifestTests`, `DuplicateTrasherTests`, `DuplicatesStatusTests`) |
+| Test automatici | ✅ **587 test XCTest passano** (misurato 2026-09-19, build pulita con `SWIFT_TREAT_WARNINGS_AS_ERRORS=YES` in Debug, 0 fallimenti, 0 warning di isolamento; 568 prima del fix di isolamento MainActor, 346 al 2026-08-27 prima del pannello Doppioni; era 139 fino al 2026-07-29, numero rimasto fermo qui per un mese). File nuovi dal fix del 2026-09-19: `MainThreadIsolationTests`, `JobStartGateTests` — vedi BUG-7 in `.claude/rules/bug-history.md`. 37+ file in `AppBackupFotoTests`: zero-overwrite, volume-root, persistenza job, campionamento locale, parsing cartelle S3 per il restore, correttezza sha256 (incluso il file che cambia dimensione mentre lo si legge), classificazione retry S3, lettura file a blocchi, logica AIMD del gate adattivo, ordinamento parti multipart, validazione endpoint S3, generazione docker-compose Immich verificata con parser YAML reale, esclusione dischi formattabili `DiskFormatter`, guardia self-import e slug etichetta, gli otto file nati dal nucleo di #31 (`IndexableKindTests`, `IndexEntryVerdictTests`, `LibraryIndexStoreTests`, `LibraryIndexerTests`, `LibraryIndexStatusTests`, `ImportDedupTests`, `UnverifiedCopiesStoreTests`, `FileSyncerHashVerificationTests`) e i sei del pannello Doppioni (`DuplicateGroupsStoreTests`, `DuplicateKeepChoiceTests`, `DuplicateBatchTests`, `TrashManifestTests`, `DuplicateTrasherTests`, `DuplicatesStatusTests`) |
 | Build | ✅ `xcodebuild ... build` e `... test` verdi su questo stato (commit `23be5d0`) |
 
 Storico bug (risolti e aperti): vedi `.claude/rules/bug-history.md`.
@@ -172,6 +178,7 @@ Quello che **deve** cambiare nel codice è il commento di `duplicateKeepChoice`,
 - Compilare: `Cmd+B` (o `xcodebuild -project AppBackupFoto.xcodeproj -scheme AppBackupFoto -configuration Debug build`)
 - Testare: `Cmd+U` (o target `AppBackupFotoTests` via `xcodebuild ... test`)
 - Distribuire: Product → Archive → Distribute → Custom → Copy App → sostituisci in /Applications → ri-aggiungi in System Settings → Privacy → Full Disk Access
+- **Una build con anche un solo warning che contiene `actor-isolated` non è verde** (2026-09-19, BUG-7): è un salto reale sul main thread a runtime, non un avviso di stile. In Debug il target app ha `SWIFT_TREAT_WARNINGS_AS_ERRORS = YES` proprio per questo — vedi `.claude/rules/architecture.md`, sezione «Isolamento MainActor di default».
 
 ---
 

@@ -148,6 +148,19 @@ Riepilogo del capitolo (aggiornato 2026-08-27, punti 27-31): #30 è fatto (spec 
 
 ---
 
+## Nuovo capitolo — trovati lavorando al fix di isolamento MainActor (2026-09-19)
+
+Sei punti aperti, trovati durante spec/piano/implementazione del fix di isolamento MainActor di default (BUG-7, `.claude/rules/bug-history.md`; spec `Docs/superpowers/specs/2026-09-19-mainactor-default-isolation-fix-design.md`; piano `Docs/superpowers/plans/2026-09-19-mainactor-default-isolation-fix.md`; ADR-0006). I primi cinque sono i punti «Fuori scope» della spec (nessuno produce un warning, quindi la regola «zero warning» del fix non li chiudeva): **Enrico ha risposto di non implementarli ora** (domanda 3 della spec) e di registrarli qui come punti aperti/da verificare, non come ticket in `Docs/superpowers/tickets/`. Il sesto è un'osservazione nuova della verifica empirica del Task 9, non prevista dalla spec.
+
+32. 🔲 **Upload verso Cubbit, probabilmente in parte sul main thread (non misurato).** `S3Syncer.upload()`/`multipart()` sono metodi `async` di un tipo che resta `@MainActor`: la loro parte sincrona — `Data(contentsOf:)` fino a 64 MB per file e lo SHA256 del corpo per la firma — gira sul main (caso D della tabella dei sei casi, vedi `.claude/rules/architecture.md`). Scatti, non un beachball di minuti come BUG-7. Da misurare con `sample` durante un SSD→Cubbit reale prima di decidere se serve un fix.
+33. 🔲 **Campione d'integrità sul main thread (non misurato).** `ReviewEngine.runIntegritySample` è `async` e `@MainActor`: enumerazione dei volumi e 60 SHA256 girano sul main. Su un file grande (gli zip da 50 GB presenti sull'SSD) potrebbero essere minuti.
+34. 🔲 **«Annulla l'ultimo spostamento» sul main thread.** `TrashManifestStore.restore` è chiamata in modo sincrono dalla view, fino a 2.000 `moveItem` per un batch grande. Percorso distruttivo-adiacente (tocca il registro di ripristino dell'unica operazione che rimuove file, ADR-0005): va spostato fuori dal main con la stessa cura del gate D4 del fix di isolamento (`JobStartGate`/`isTrashingDuplicates`), non di passaggio dentro un intervento più grande.
+35. 🔲 **Apertura di SQLite sul main thread**, nel getter `lazy` di `BackupRunner.libraryIndexStore`. Oggi è solo rimandata di un giro di run loop (non spostata fuori dal main) — vedi `.claude/rules/architecture.md`, sezione sul limite di `refreshIndexedFileCount()`. Costo per ora accettato: la finestra è di millisecondi.
+36. 🔲 **Lavoro sincrono di minuti nel pool cooperativo di Swift Concurrency.** `Task.detached` esegue `LibraryIndexer.scan` e `DuplicateTrasher.run` su un thread del pool cooperativo (tanti thread quanti core), occupandolo per minuti — `FileSyncer` invece usa `DispatchQueue.global`, la forma raccomandata per I/O bloccante lungo. Con uno o due lavori così non si vede niente; accettato nel fix di isolamento per non cambiare i call site (regola 4 del piano). Da riconsiderare se un giorno più lavori di fondo di questo tipo girano insieme.
+37. 🔲 **Throttling degli aggiornamenti di progresso UI, priorità bassa — osservazione nuova del 2026-09-19 (Task 9 del fix di isolamento, non prevista dalla spec).** Durante la verifica empirica dal vivo, nella fase di copia/scan del backup (11:09:29 → 11:09:53, ~575 file/s) il main thread è risultato occupato **~100% in ridisegno SwiftUI/CoreAnimation** (flush transazioni, `NSHostingView`) — **non bloccato** (gli eventi venivano comunque processati, a differenza di BUG-7), probabilmente per un eccesso di aggiornamenti di progresso pubblicati **per singolo file**. Non misurato oltre l'osservazione dal vivo; da approfondire con `sample` mirato su quella fase prima di decidere se un throttling (es. aggiornare la UI ogni N file o ogni tot millisecondi invece che a ogni file) vale il costo.
+
+---
+
 ## Fonti consultate
 
 - [7 Best Backup Software for macOS: Top Picks for 2026 — MacObserver](https://www.macobserver.com/tips/round-ups/7-best-backup-software-for-macos/)

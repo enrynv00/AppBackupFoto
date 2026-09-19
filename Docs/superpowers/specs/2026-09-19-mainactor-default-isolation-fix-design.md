@@ -173,6 +173,37 @@ Baseline: **da misurare** sul `main` di partenza, non da copiare. Oggi `Docs/CLA
 
 Criterio: **durante il lavoro di fondo il main thread del processo sta fermo nel run loop** — le prime righe del suo albero di chiamate finiscono in `mach_msg2_trap` sotto `__CFRunLoopServiceMachPort` — **e** un altro thread mostra `LibraryIndexer.scan`. La seconda metà è il controllo positivo: senza, «main libero» potrebbe voler dire «la lettura non è mai partita». Procedura esatta nel piano, Task 9. Si ripete il MAC→SSD con l'aggiornamento automatico dell'elenco acceso, si campiona con `sample <pid> 4` ripetuto per tutta la durata della lettura, si prova «Interrompi» e si apre il pannello Doppioni campionando anche lì. Lo spostamento vero nel Cestino **solo se Enrico decide di farlo**, su un blocco piccolo.
 
+## Verifiche
+
+Risultati misurati a fine piano (Task 8 e Task 9), registrati qui come richiesto dal Task 8 Step 4 e dal Task 10.
+
+### Task 8 — gate di compilazione e mutation testing complessivo
+
+- **Build pulita + suite con `SWIFT_TREAT_WARNINGS_AS_ERRORS=YES` in Debug**: **587 test, 0 fallimenti, 0 warning di isolamento.** Baseline misurata a inizio piano (Task 1): **568**.
+- **Mutanti** (rimozione di `nonisolated`, su copia scratchpad):
+
+| Mutante | Build con gate | Test senza gate |
+| :--- | :--- | :--- |
+| `LibraryIndexStore` senza `nonisolated` | **rossa** (exit 65) | `testStoreCount_…`, `testDuplicateGroups_…` rossi per timeout |
+| `LibraryIndexer` senza `nonisolated` | **rossa** | `testScan_…` rosso per timeout |
+| `DuplicateBatch` senza `nonisolated` | **rossa** | `testDuplicateBatch_…` rosso per timeout |
+| `DuplicateTrasher` senza `nonisolated` | **rossa** | `testTrasherRun_…` rosso per timeout |
+| `sha256(of:)` senza `nonisolated` | **verde con warning** (classe F, atteso) | nessuno — equivalente dichiarato: lo prende solo la regola sui warning |
+| copia non mutata (controllo) | verde | nessun fallimento |
+
+  Il mutante di controllo del harness (`await MainActor.run { }` tolto dal test di controllo) **non è stato eseguito separatamente**: i quattro fallimenti per timeout sopra dimostrano comunque che il harness rileva davvero il lavoro rimasto sul main.
+- **Correzione al piano**: l'ID di build config indicato nel Task 8 Step 1 (`695F43402EB019B400509478`) è quello di livello **progetto**; il flag `SWIFT_TREAT_WARNINGS_AS_ERRORS = YES` è stato messo correttamente nella configurazione Debug del **target app** (`695F43432EB019B400509478`).
+
+### Task 9 — verifica empirica sull'app reale, con Enrico (2026-09-19)
+
+App Debug compilata dal branch, `sample <pid> 4` ripetuto ogni ~5 s, Mac → SSD reale con Enrico, 18.399 file, 0 copiati.
+
+- **Aggiornamento dell'elenco, 11:09:59 → 11:11:44 (~1'45")**: `LibraryIndexer.scan` presente in 17-32 campioni per istantanea su un thread di fondo, **0 volte sul main thread**; main thread idle (`__CFRunLoopServiceMachPort`) al 96-100% in tutte le istantanee. **Prima del fix**: beachball 01:15:59 → 01:22:10 (~6 minuti), main al 100% dentro `scan`.
+- **`JobStartGate` verificato dal vivo**: premendo di nuovo Mac → SSD durante l'aggiornamento compare l'alert «Meglio non farlo adesso — L'app sta leggendo le foto sull'SSD per aggiornare l'elenco…» e il job non parte, coerente con la risposta (a) alla domanda 1.
+  - **Cambio di UX richiesto da Enrico, non implementato qui**: l'aggiornamento dell'elenco diventerà "passo 2 di 2" del backup invece di un job separato con questo gate — lavoro pianificato a parte, citato come seguito in `Docs/ROADMAP.md`, non in questa spec/piano.
+- **Non provati dal vivo, verifiche ancora aperte**: «Interrompi» durante lo scan (Task 9 Step 5) e lo smontaggio a metà scan (Task 9 Step 10). Dichiarato esplicitamente, non dedotto.
+- **Osservazione nuova, fuori da quanto previsto dalla spec**: durante la fase di copia/scan del backup (11:09:29 → 11:09:53, ~575 file/s) il main thread risultava occupato ~100% in ridisegno SwiftUI/CoreAnimation (flush transazioni, `NSHostingView`) — **non bloccato** (eventi processati regolarmente), probabilmente per un eccesso di aggiornamenti di progresso pubblicati per-file. Non è un sintomo di BUG-7 (nessun salto di isolamento coinvolto): registrata in `Docs/ROADMAP.md` come punto aperto a priorità bassa (throttling degli aggiornamenti UI), insieme ai cinque punti «Fuori scope» sotto.
+
 ## Fuori scope — trovati lavorando a questa spec, da decidere a parte
 
 Nessuno di questi produce un warning, ed è per questo che la regola «zero warning» non li chiude:
