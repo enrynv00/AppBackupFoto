@@ -5342,8 +5342,23 @@ final class S3Syncer {
     // BUG-3: una key già presente su S3 non va mai ricaricata, indipendentemente
     // dalla dimensione locale — ricaricare sovrascriverebbe l'oggetto esistente via
     // PUT, violando zero-overwrite. Solo le key davvero assenti vengono caricate.
-    static func shouldUpload(key: String, existingKeys: Set<String>) -> Bool {
+    nonisolated static func shouldUpload(key: String, existingKeys: Set<String>) -> Bool {
         !existingKeys.contains(key)
+    }
+
+    /// Conteggio dell'anteprima SSD → Cubbit, con la STESSA regola di `sync()`: una key gia'
+    /// presente sul bucket non viene mai ricaricata, qualunque sia la dimensione locale
+    /// (zero-overwrite, BUG-3). Fino al 2026-09-19 l'anteprima confrontava anche la
+    /// dimensione e contava "da caricare" file che il backup vero avrebbe saltato.
+    nonisolated static func previewCount(files: [(key: String, size: Int64)], existingKeys: Set<String>)
+        -> (toUpload: Int, toSkip: Int, bytes: Int64) {
+        var toUpload = 0, toSkip = 0
+        var bytes: Int64 = 0
+        for f in files {
+            if shouldUpload(key: f.key, existingKeys: existingKeys) { toUpload += 1; bytes += f.size }
+            else { toSkip += 1 }
+        }
+        return (toUpload, toSkip, bytes)
     }
 
     // Conteggio informativo per roadmap #13 (segnalazione, non azione): una key già
@@ -5653,6 +5668,13 @@ final class S3Syncer {
 
     func cancel() { cancelFlag.cancel() }
 
+    /// Azzera l'interruzione lasciata da un'operazione precedente. Va chiamata in testa a
+    /// ogni operazione nuova su un'istanza riusata (ROADMAP #38, 2026-09-19): `sync` e
+    /// `downloadMany` lo facevano gia', l'anteprima e le letture del Ripristina no — dopo
+    /// uno stop leggevano un elenco del bucket VUOTO senza errore (`collectPages` esce
+    /// subito se il flag e' alzato), e l'anteprima dichiarava tutto "da caricare".
+    func beginNewOperation() { cancelFlag.reset() }
+
     nonisolated static func readConfig(remoteName: String = "Cubbit", bucket: String = "backupfoto") throws -> S3Config {
         try readConfigWithSource(remoteName: remoteName, bucket: bucket).config
     }
@@ -5726,9 +5748,10 @@ final class S3Syncer {
     // Sul modello di FileSyncer.previewSync, usato dai bottoni 👁 anteprima già esistenti
     // per Mac→SSD e SSD→HDD — SSD→S3 ne era rimasto privo.
     func previewUpload(from localURL: URL, config: S3Config) async throws -> (toUpload: Int, toSkip: Int, bytes: Int64) {
-        let existing = try await listAll(config: config)
+        beginNewOperation()
+        let existingKeys = Set(try await listAll(config: config).keys)
         let fm = FileManager.default
-        var toUpload = 0; var toSkip = 0; var bytes: Int64 = 0
+        var files: [(key: String, size: Int64)] = []
         let base = localURL.path
         guard let enumerator = fm.enumerator(
             at: localURL,
@@ -5743,14 +5766,9 @@ final class S3Syncer {
             let name = f.lastPathComponent
             if name.hasPrefix("._") || name == ".DS_Store" { continue }
             let rel = String(f.path.dropFirst(base.count).drop(while: { $0 == "/" }))
-            let size = Int64(v?.fileSize ?? 0)
-            if existing[rel] == size {
-                toSkip += 1
-            } else {
-                toUpload += 1; bytes += size
-            }
+            files.append((rel, Int64(v?.fileSize ?? 0)))
         }
-        return (toUpload, toSkip, bytes)
+        return Self.previewCount(files: files, existingKeys: existingKeys)
     }
 
     func sync(from localURL: URL, config: S3Config,
@@ -6726,6 +6744,16 @@ enum VolumeCapacityReader {
         let available = values.volumeAvailableCapacity ?? 0
         return .measured(total: Int64(total), available: Int64(available))
     }
+
+    /// Il disco conta come collegato se il percorso esiste **ed e' davvero un punto di
+    /// montaggio** (ROADMAP #40, decisione di Enrico del 2026-09-19): una cartella normale
+    /// rimasta al posto di `/Volumes/SSD - Enri` dopo uno scollegamento brusco abilitava i
+    /// pulsanti dei backup, che avrebbero scritto sul disco del Mac. Una capacita' illeggibile
+    /// (`.unreadable`, per esempio un HDD che dorme) NON basta a dichiararlo scollegato: solo
+    /// `.notAMountPoint` e' la prova che li' non c'e' il disco.
+    nonisolated static func isMounted(exists: Bool, reading: VolumeCapacityReading?) -> Bool {
+        exists && reading != .notAMountPoint
+    }
 }
 
 /// Spazio libero/usato di SSD e HDD, pubblicato SEPARATO da `VolumeMonitor` (Task 3, indicatore
@@ -6822,13 +6850,15 @@ final class VolumeMonitor: ObservableObject {
             // aggiunto, ma non c'e' motivo di pagare nemmeno quello.
             let ssdReading = ssd ? VolumeCapacityReader.read(path: self.ssdPath) : nil
             let hddReading = hdd ? VolumeCapacityReader.read(path: self.hddPath) : nil
+            let ssdIsDisk = VolumeCapacityReader.isMounted(exists: ssd, reading: ssdReading)
+            let hddIsDisk = VolumeCapacityReader.isMounted(exists: hdd, reading: hddReading)
             DispatchQueue.main.async {
                 // Si pubblica SOLO se il valore e' cambiato davvero: un `@Published`
                 // riassegnato allo stesso valore fa comunque ridisegnare ogni osservatore.
-                if self.ssdMounted != ssd { self.ssdMounted = ssd }
-                if self.hddMounted != hdd { self.hddMounted = hdd }
-                let ssdSpace = VolumeSpaceState.from(mounted: ssd, reading: ssdReading, volumeName: "SSD - Enri")
-                let hddSpace = VolumeSpaceState.from(mounted: hdd, reading: hddReading, volumeName: "BackupHDD")
+                if self.ssdMounted != ssdIsDisk { self.ssdMounted = ssdIsDisk }
+                if self.hddMounted != hddIsDisk { self.hddMounted = hddIsDisk }
+                let ssdSpace = VolumeSpaceState.from(mounted: ssdIsDisk, reading: ssdReading, volumeName: "SSD - Enri")
+                let hddSpace = VolumeSpaceState.from(mounted: hddIsDisk, reading: hddReading, volumeName: "BackupHDD")
                 if self.space.ssd != ssdSpace { self.space.ssd = ssdSpace }
                 if self.space.hdd != hddSpace { self.space.hdd = hddSpace }
                 self.probeInFlight = false
@@ -9190,12 +9220,14 @@ final class RestoreEngine: ObservableObject {
     }
 
     func listAvailableFolders(fromS3Config config: S3Syncer.S3Config) async throws -> [String] {
+        s3Syncer.beginNewOperation()
         let keys = try await s3Syncer.listAll(config: config).keys
         return S3Syncer.topLevelFolders(fromKeys: Array(keys))
     }
 
     func estimateS3Download(selectedFolders: Set<String>, destination: URL,
                              config: S3Syncer.S3Config) async throws -> (count: Int, bytes: Int64) {
+        s3Syncer.beginNewOperation()
         let all = try await s3Syncer.listAll(config: config)
         let fm = FileManager.default
         var count = 0; var bytes: Int64 = 0

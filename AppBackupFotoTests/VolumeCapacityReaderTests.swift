@@ -55,4 +55,24 @@ final class VolumeCapacityReaderTests: XCTestCase {
         XCTAssertEqual(withoutSlash, withSlash)
         XCTAssertEqual(withoutSlash, .notAMountPoint)
     }
+
+    // MARK: - ROADMAP #40: una cartella al posto del disco non e' il disco
+
+    func testIsMounted_folderInPlaceOfTheDisk_isNotMounted() {
+        XCTAssertFalse(VolumeCapacityReader.isMounted(exists: true, reading: .notAMountPoint))
+    }
+
+    func testIsMounted_realVolume_isMounted() {
+        XCTAssertTrue(VolumeCapacityReader.isMounted(exists: true, reading: .measured(total: 10, available: 5)))
+    }
+
+    func testIsMounted_unreadableCapacity_staysMounted() {
+        // Un HDD che dorme puo' non rispondere alla lettura di capacita': non e' un motivo
+        // per disattivare i pulsanti. Solo "non e' un punto di montaggio" lo e'.
+        XCTAssertTrue(VolumeCapacityReader.isMounted(exists: true, reading: .unreadable))
+    }
+
+    func testIsMounted_missingPath_isNotMounted() {
+        XCTAssertFalse(VolumeCapacityReader.isMounted(exists: false, reading: nil))
+    }
 }
