@@ -1602,7 +1602,12 @@ enum ImportPreviewStatus {
 /// sola, e il sintomo è silenzioso: un file escluso dalla copia ma incluso
 /// nell'indice (o viceversa) non produce nessun errore, solo un conteggio che non
 /// torna. Aggiungere qui, mai nei singoli chiamanti.
-enum LibraryExclusions {
+// `nonisolated`: classificazione pura per nome file, nessuno stato. Chiamata sia dal
+// MainActor sia dalla coda di lavoro di `FileSyncer` e da `LibraryIndexer.scan` (coda di
+// background) — senza l'annotazione, il default `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`
+// la isolerebbe e ogni chiamata da un contesto non isolato sarebbe un warning (un salto sul
+// main thread a runtime).
+nonisolated enum LibraryExclusions {
     static let names: Set<String> = [
         ".DS_Store", ".Spotlight-V100", ".TemporaryItems", ".Trashes",
         ".fseventsd", ".DocumentRevisions-V100", "lost+found", "Backups.backupdb"
@@ -1641,9 +1646,10 @@ enum LibraryExclusions {
 /// l'enumeratore restituisce gia' URL in forma `realpath` (misurato: con root
 /// `/var/folders/.../SSD` produce `/private/var/...`).
 // `nonisolated`: e' pura (una `realpath`) e viene chiamata anche dalla coda di lavoro di
-// `FileSyncer`, non solo dal MainActor. Senza, il default `SWIFT_DEFAULT_ACTOR_ISOLATION =
-// MainActor` la isola e ogni chiamata da un contesto nonisolated e' un warning (un errore in
-// Swift 6).
+// `FileSyncer` e da `LibraryIndexer.scan` (coda di background, dal 2026-09-19), non solo dal
+// MainActor. Senza, il default `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor` la isola e ogni
+// chiamata da un contesto nonisolated e' un warning (un errore in Swift 6) — e a runtime un
+// salto implicito sul main thread (BUG-7, `.claude/rules/bug-history.md`).
 nonisolated func realResolvedPath(_ url: URL) -> String {
     var buf = [Int8](repeating: 0, count: Int(PATH_MAX))
     guard let r = realpath(url.path, &buf) else { return url.path }
@@ -1757,7 +1763,9 @@ nonisolated func makeVideoThumbnail(url: URL, maxPixelSize: Int) async -> NSImag
 /// `hasPrefix`: `/Volumes/SSD` non e' un prefisso di `/Volumes/SSD 2`, ma lo e'
 /// testualmente. Costo misurato: 12,6 us/file (20.000 file in 0,25s), cioe' nulla
 /// rispetto alla lettura del file che segue.
-func canonicalPathComponents(of url: URL) -> [String] {
+// `nonisolated`: pura, chiamata da `LibraryIndexer.scan` (coda di background) oltre che dal
+// MainActor — stessa ragione di `realResolvedPath` qui sopra.
+nonisolated func canonicalPathComponents(of url: URL) -> [String] {
     realResolvedPath(url).split(separator: "/", omittingEmptySubsequences: true).map(String.init)
 }
 
@@ -1813,7 +1821,9 @@ nonisolated enum IndexableKind {
 }
 
 /// Esito della valutazione di attendibilita' di una entry dell'indice.
-enum IndexEntryVerdict {
+// `nonisolated`: valore puro senza stato, prodotto e consumato da `LibraryIndexer.scan`
+// (coda di background).
+nonisolated enum IndexEntryVerdict {
     /// La entry e' attendibile: l'hash memorizzato vale.
     case fresh
     /// Il file e' certamente cambiato: rihashare.
@@ -1866,7 +1876,9 @@ enum IndexEntryVerdict {
 ///    esatto di 3600s o 1800s e' quasi certamente un cambio di fuso, non una modifica:
 ///    trattarlo come `stale` farebbe rihashare l'intera libreria due volte l'anno.
 ///    NOTA: questa seconda regola non ha prior art — e' una scelta di questo progetto.
-func indexEntryVerdict(storedSize: Int64,
+// `nonisolated`: pura (nessun filesystem, nessun database), chiamata da `LibraryIndexer.scan`
+// sulla coda di background.
+nonisolated func indexEntryVerdict(storedSize: Int64,
                        storedMTime: Double,
                        storedHashedAt: Double,
                        currentSize: Int64,
@@ -1903,7 +1915,9 @@ func indexEntryVerdict(storedSize: Int64,
 // MARK: - LibraryIndexStore
 
 /// Una riga dell'indice di contenuto.
-struct LibraryIndexEntry {
+// `nonisolated`: value type senza stato mutabile condiviso, costruito e letto dalla coda
+// seriale di `LibraryIndexStore` e da `LibraryIndexer.scan`.
+nonisolated struct LibraryIndexEntry {
     /// Chiave normalizzata (NFC + minuscole), relativa alla root dell'SSD.
     let path: String
     /// Percorso come appare davvero su disco, per mostrarlo all'utente.
@@ -1923,7 +1937,9 @@ struct LibraryIndexEntry {
 /// Ha sempre **almeno due membri** e dimensione **maggiore di zero** — chi lo costruisce e'
 /// `LibraryIndexStore.duplicateGroups()`, che esclude entrambi i casi (vedi li' il perche'
 /// dei file da 0 byte).
-struct DuplicateGroup {
+// `nonisolated`: costruito da `LibraryIndexStore.duplicateGroups()` sulla coda seriale dello
+// store, letto dal pannello Doppioni fuori dal main thread. Nessuno stato mutabile.
+nonisolated struct DuplicateGroup {
     let hash: String
     /// La dimensione **minima** fra quelle dei membri, non la prima incontrata.
     ///
@@ -1966,7 +1982,8 @@ struct DuplicateGroup {
 /// un file (che verra' rihashato, o al peggio copiato una seconda volta), mai il contrario
 /// — non produce mai uno skip sbagliato, perche' lo skip in import rilegge e rihasha
 /// comunque il candidato (ADR-0003).
-func normalizedIndexKey(_ relativePath: String) -> String {
+// `nonisolated`: pura, chiamata da `LibraryIndexer.scan` sulla coda di background.
+nonisolated func normalizedIndexKey(_ relativePath: String) -> String {
     let folded = relativePath.precomposedStringWithCanonicalMapping.lowercased()
     return folded.split(separator: "/", omittingEmptySubsequences: true)
         .filter { $0 != "." }
@@ -3158,7 +3175,9 @@ final class DuplicateTrasher {
 /// `LibraryIndexStore` e da `TrashManifestStore`: il progetto ha gia' pagato due volte la
 /// duplicazione della stessa regola (`LibraryExclusions`, `realResolvedPath`), e due guardie
 /// diverse per lo stesso problema divergono alla prima modifica di una sola delle due.
-func isAllowedStoreLocation(_ url: URL,
+// `nonisolated`: pura, valutata dall'`init` di `LibraryIndexStore`/`TrashManifestStore`, non
+// solo dal MainActor.
+nonisolated func isAllowedStoreLocation(_ url: URL,
                             includingTemporary: Bool = isRunningUnderTests()) -> Bool {
     let dir = url.deletingLastPathComponent()
     let candidates = [dir.standardizedFileURL.path,
@@ -3179,11 +3198,11 @@ func isAllowedStoreLocation(_ url: URL,
 /// un'allow-list esiste per essere stretta. L'invariante che conta — mai sul volume delle
 /// foto — reggeva comunque, perche' `$TMPDIR` e' sul disco interno: questo e' igiene, non
 /// la chiusura di un buco.
-func isRunningUnderTests() -> Bool {
+nonisolated func isRunningUnderTests() -> Bool {
     ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
 }
 
-private func storeAllowedRoots(includingTemporary: Bool) -> [String] {
+private nonisolated func storeAllowedRoots(includingTemporary: Bool) -> [String] {
     var roots = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
     if includingTemporary {
         // I test aprono uno store usa-e-getta per ogni caso. Fuori dai test questa riga non
@@ -3197,7 +3216,7 @@ private func storeAllowedRoots(includingTemporary: Bool) -> [String] {
 
 /// Contenimento per **componenti**, non per prefisso di stringa: `/Volumes/SSD` non
 /// contiene `/Volumes/SSD 2`.
-private func isPathInside(_ path: String, root: String) -> Bool {
+private nonisolated func isPathInside(_ path: String, root: String) -> Bool {
     let p = path.hasSuffix("/") ? path : path + "/"
     let r = root.hasSuffix("/") ? root : root + "/"
     return p.hasPrefix(r)
@@ -3210,8 +3229,9 @@ private func isPathInside(_ path: String, root: String) -> Bool {
 /// CONCORRENZA: la SQLite di sistema di macOS e' compilata in modalita' *multi-thread*,
 /// non *serialized* (`sqlite3_threadsafe()` ritorna 2, misurato): una connessione aperta
 /// non e' condivisibile fra thread. Con i chiamanti reali — lo scanner scrive da una coda
-/// di background mentre l'import legge dalla sua e il pannello Revisione conta dal main
-/// thread — l'uso non sincronizzato **crasha** dentro `sqlite3_step` (riprodotto, SIGSEGV
+/// di background mentre l'import legge dalla sua e il pannello Revisione conta fuori dal
+/// main thread (dal 2026-09-19: prima ci tornava per il bug di isolamento, BUG-7) —
+/// l'uso non sincronizzato **crasha** dentro `sqlite3_step` (riprodotto, SIGSEGV
 /// con 4 thread). Il solo mutex di SQLite non basta: senza serializzazione i `BEGIN` di due
 /// batch si accavallano ("cannot start a transaction within a transaction") e il `ROLLBACK`
 /// di uno annulla la transazione in volo dell'altro (misurato: 1610 righe su 2000 perse).
@@ -3228,7 +3248,12 @@ private func isPathInside(_ path: String, root: String) -> Bool {
 /// batch su ~100.000 file non si ripaga. Regge perche' il replay del WAL e' atomico per
 /// transazione: quello che resta e' un indice **piu' vecchio**, mai un indice sbagliato —
 /// e un indice parziale e' esattamente ciò che ADR-0002 mette in conto.
-final class LibraryIndexStore {
+// `nonisolated`: usata da scansione, import, pannello Doppioni, trasher e conteggio, tutti
+// fuori dal MainActor. Sicura per costruzione: TUTTO lo stato mutabile (`db`) si tocca solo
+// dentro `queue.sync`; `url` e' `let`; `deinit` ha accesso esclusivo per definizione.
+// L'annotazione rende verificabile dal compilatore un invariante gia' scritto sopra
+// (CONCORRENZA), non lo cambia. Vedi ADR-0006.
+nonisolated final class LibraryIndexStore: @unchecked Sendable {
     static let schemaVersion = 1
 
     enum StoreError: Error, LocalizedError {
@@ -3729,7 +3754,12 @@ final class LibraryIndexStore {
 /// il chiamante che aggiorna la UI deve pubblicare su `@MainActor` (Task 6).
 /// Una singola istanza esegue una scansione per volta (`volumeVanished` e i contatori
 /// sono locali alla scansione in corso): non chiamare `scan` da due thread insieme.
-final class LibraryIndexer {
+// `nonisolated`: `store`/`fm` sono `let` (`FileManager.default` e' thread-safe per queste
+// operazioni); `cancelled` passa gia' da `cancelLock`; tutto il resto dello stato di una
+// scansione e' LOCALE a `scan`. Il contratto "una scansione per volta" resta, ed e'
+// semantico (consumo del cancel), non di memoria: lo garantisce `BackupRunner.isIndexing`
+// sul MainActor. Vedi ADR-0006.
+nonisolated final class LibraryIndexer: @unchecked Sendable {
     struct Progress {
         var scanned = 0     // file esaminati
         var hashed = 0      // file effettivamente (ri)hashati
@@ -4362,7 +4392,8 @@ enum LibraryIndexAutoRefresh {
 }
 
 /// Hash di un file **piu' la dimensione misurata sullo stesso descrittore**.
-struct MeasuredHash {
+// `nonisolated`: value type senza stato, restituito da `sha256Measured`.
+nonisolated struct MeasuredHash {
     let hash: String
     /// Byte effettivamente letti e hashati. Coincide con la dimensione del file
     /// misurata via `fstat` prima E dopo la lettura, altrimenti l'hash non viene
@@ -4403,7 +4434,9 @@ struct MeasuredHash {
 /// durante la lettura: `read()` -> errno 5 dopo 31.784.960 byte su 83.886.080. Sono due
 /// guardie distinte per due guasti distinti, e nel caso dello scollegamento e' sempre
 /// stata la seconda a scattare, mai il confronto sulle dimensioni.
-func sha256Measured(of url: URL) -> MeasuredHash? {
+// `nonisolated`: I/O POSIX a basso livello su un descrittore locale, nessuno stato condiviso.
+// Chiamata dalla verifica post-copia di `FileSyncer` (coda di lavoro) e da `LibraryIndexer.scan`.
+nonisolated func sha256Measured(of url: URL) -> MeasuredHash? {
     // I/O POSIX a basso livello (open/read/close) invece di FileHandle.readData(ofLength:):
     // su file molto grandi (decine di GB), FileHandle/NSData tende a mantenere le pagine
     // lette residenti in memoria invece di rilasciarle tra una lettura e l'altra, facendo
@@ -4462,7 +4495,8 @@ func sha256Measured(of url: URL) -> MeasuredHash? {
 /// quelle verificate. Corretto (contatore `copiedUnverified`). Prima di allargare
 /// ancora i casi di `nil`, ricontrollare i chiamanti uno per uno invece di fidarsi di
 /// questa frase.
-func sha256(of url: URL) -> String? {
+// `nonisolated`: delega a `sha256Measured`, stessa ragione.
+nonisolated func sha256(of url: URL) -> String? {
     sha256Measured(of: url)?.hash
 }
 
@@ -4620,7 +4654,8 @@ final class BookmarkManager: ObservableObject {
 /// Thread-safety: `FileSyncer` gira su una coda di lavoro globale, non sul
 /// MainActor. Il lock e' economico (un solo accesso per file) e toglie di mezzo la
 /// domanda "e se un giorno la copia diventasse concorrente?".
-final class ImportSessionIndex {
+// `nonisolated`: `bySize` si tocca solo sotto `lock`. Vedi ADR-0006.
+nonisolated final class ImportSessionIndex: @unchecked Sendable {
     private var bySize: [Int64: [(hash: String, url: URL)]] = [:]
     private let lock = NSLock()
 
@@ -6666,6 +6701,13 @@ final class BackupRunner: ObservableObject {
         // `guard let self` e non `self?.`: una `var` weak riferita da una closure
         // concorrente e' un errore in Swift 6, e qui una referenza forte per la durata di
         // una query non cambia niente (il runner vive quanto l'app).
+        //
+        // `store.count()` gira DAVVERO fuori dal main thread dal 2026-09-19 (Task 3 del
+        // fix di isolamento, BUG-7): prima di allora `LibraryIndexStore` non era annotato
+        // `nonisolated`, quindi il default `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor` lo
+        // isolava e questa chiamata, pur dentro un `Task.detached`, saltava comunque sul
+        // main actor a runtime (con un warning silenzioso). Il `Task.detached` sembrava
+        // gia' corretto: non lo era.
         Task.detached(priority: .utility) { [weak self] in
             guard let self else { return }
             let n = (try? store.count()) ?? 0
