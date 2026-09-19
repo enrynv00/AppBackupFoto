@@ -290,44 +290,13 @@ final class LibraryIndexStatusTests: XCTestCase {
 
     // MARK: Aggiornamento automatico
 
-    // La prima creazione dura minuti e legge per intero ogni foto: non deve MAI partire da
-    // sola, nemmeno con l'interruttore acceso.
-    func testAutoRefresh_neverBuildsTheListForTheFirstTime() {
-        XCTAssertFalse(LibraryIndexAutoRefresh.shouldRun(enabled: true, indexedFileCount: 0,
-                                                         isIndexing: false, jobIsRunning: false, isTrashingDuplicates: false))
-    }
-
-    func testAutoRefresh_runsWhenTheListExistsAndNothingElseIsGoingOn() {
-        XCTAssertTrue(LibraryIndexAutoRefresh.shouldRun(enabled: true, indexedFileCount: 1,
-                                                        isIndexing: false, jobIsRunning: false, isTrashingDuplicates: false))
-    }
-
-    func testAutoRefresh_respectsTheSwitch() {
-        XCTAssertFalse(LibraryIndexAutoRefresh.shouldRun(enabled: false, indexedFileCount: 1,
-                                                         isIndexing: false, jobIsRunning: false, isTrashingDuplicates: false))
-    }
-
-    // Una lettura per volta: due letture insieme sarebbero due scritture sullo stesso
-    // elenco.
-    func testAutoRefresh_doesNotStartASecondReadOverTheFirst() {
-        XCTAssertFalse(LibraryIndexAutoRefresh.shouldRun(enabled: true, indexedFileCount: 1,
-                                                         isIndexing: true, jobIsRunning: false, isTrashingDuplicates: false))
-    }
-
-    // Leggere l'SSD per intero mentre una copia ci sta scrivendo rallenta entrambe e fa
-    // risultare illeggibili i file che la copia sta scrivendo proprio in quel momento.
-    func testAutoRefresh_waitsForACopyJobToFinish() {
-        XCTAssertFalse(LibraryIndexAutoRefresh.shouldRun(enabled: true, indexedFileCount: 1,
-                                                         isIndexing: false, jobIsRunning: true, isTrashingDuplicates: false))
-    }
-
-    // Task 4 (2026-09-19, BUG-7): lo spostamento nel Cestino gira davvero fuori dal main,
-    // quindi puo' essere in corso mentre l'aggancio automatico scatterebbe da solo. I file
-    // che il trasher sta spostando risulterebbero illeggibili, stessa ragione di jobIsRunning.
-    func testAutoRefresh_waitsForATrashingOperationToFinish() {
-        XCTAssertFalse(LibraryIndexAutoRefresh.shouldRun(enabled: true, indexedFileCount: 1,
-                                                         isIndexing: false, jobIsRunning: false, isTrashingDuplicates: true))
-    }
+    // I sei test che stavano qui (`testAutoRefresh_*`) verificavano
+    // `LibraryIndexAutoRefresh.shouldRun`, rimossa il 2026-09-19 insieme alla lettura
+    // automatica al collegamento dell'SSD (decisione di Enrico, domanda aperta 1 della spec
+    // del passo 2 del backup): le stesse condizioni vivono ora in
+    // `BackupListStep.shouldRun` (vedi `BackupListStepTests`), tranne "aspetta la fine di un
+    // job", che non ha piu' senso — il passo 2 **e'** il job. Il test sull'interruttore
+    // resta: la chiave `UserDefaults` non e' cambiata.
 
     // `UserDefaults.bool` risponde `false` per una chiave mai scritta, e `@AppStorage` la
     // scrive solo al primo cambiamento: con `bool` l'aggiornamento automatico sarebbe

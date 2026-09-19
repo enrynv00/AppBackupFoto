@@ -4372,9 +4372,10 @@ enum LibraryIndexStatus {
 /// possono.
 ///
 /// Nasce da un rilievo minore di #31 chiuso il 2026-09-01: l'aggiornamento automatico
-/// sapeva di un job di copia in corso (`LibraryIndexAutoRefresh.shouldRun`, parametro
-/// `jobIsRunning`) mentre i bottoni della card no — erano disattivati solo durante una
-/// lettura. Chi premeva «\(LibraryIndexCommands.refresh)» durante un backup faceva leggere
+/// sapeva di un job di copia in corso (allora `LibraryIndexAutoRefresh.shouldRun`, parametro
+/// `jobIsRunning` — quella funzione e' stata rimossa il 2026-09-19, vedi la nota su
+/// `LibraryIndexAutoRefresh`) mentre i bottoni della card no — erano disattivati solo durante
+/// una lettura. Chi premeva «\(LibraryIndexCommands.refresh)» durante un backup faceva leggere
 /// e rihashare per intero l'SSD mentre una copia ci stava scrivendo sopra: le due operazioni
 /// si rallentano a vicenda e i file che la copia sta scrivendo proprio ora finiscono contati
 /// come illeggibili. E' la stessa classe di problema chiusa il 2026-09-01 nel pannello
@@ -4461,9 +4462,12 @@ enum LibraryIndexCommandGate {
     }
 }
 
-/// Quando l'elenco puo' aggiornarsi da solo. Pura e in un punto solo perche' i richiami sono
-/// due (SSD collegato, fine di un job che ha scritto sull'SSD) e devono decidere allo stesso
-/// modo.
+/// Chiave e stato dell'interruttore "Aggiorna l'elenco delle foto alla fine di ogni backup"
+/// in Impostazioni. Fino al 2026-09-19 questo tipo decideva anche **quando** una lettura
+/// automatica poteva partire da sola (`shouldRun`, rimossa: vedi la nota accanto a
+/// `BackupRunner.rebuildLibraryIndex`) — quella decisione ora vive in
+/// `BackupListStep.shouldRun`, perche' il passo 2 del backup **e'** il job: non c'e' piu' un
+/// "in parallela a un job" da escludere, c'e' solo "dentro il job".
 enum LibraryIndexAutoRefresh {
     static let defaultsKey = "autoRefreshLibraryIndex"
 
@@ -4473,20 +4477,6 @@ enum LibraryIndexAutoRefresh {
     /// contrario di quello che dice l'interruttore in Impostazioni.
     static func isEnabled(defaults: UserDefaults = .standard) -> Bool {
         defaults.object(forKey: defaultsKey) as? Bool ?? true
-    }
-
-    /// - `indexedFileCount == 0`: la **prima** creazione non parte mai da sola, dura minuti e
-    ///   legge per intero ogni foto e ogni video (Task 6, Step 4).
-    /// - `isIndexing`: una lettura per volta, sempre sulla stessa istanza dello store.
-    /// - `jobIsRunning`: una lettura integrale dell'SSD in parallelo a una copia rallenta
-    ///   entrambe e conta come illeggibili i file che la copia sta scrivendo proprio ora.
-    /// - `isTrashingDuplicates` (2026-09-19, BUG-7): lo spostamento nel Cestino ora gira
-    ///   davvero fuori dal main, quindi puo' essere in corso mentre l'elenco si aggiornerebbe
-    ///   da solo — stessa ragione di `jobIsRunning`, i file che il trasher sta spostando
-    ///   risulterebbero illeggibili.
-    static func shouldRun(enabled: Bool, indexedFileCount: Int, isIndexing: Bool, jobIsRunning: Bool,
-                          isTrashingDuplicates: Bool) -> Bool {
-        enabled && indexedFileCount > 0 && !isIndexing && !jobIsRunning && !isTrashingDuplicates
     }
 }
 
@@ -7161,8 +7151,10 @@ final class BackupRunner: ObservableObject {
         // lezione gia' pagata nel pannello Doppioni, dove le precondizioni del blocco erano
         // valutate una volta sola: qui non era stata applicata a se stessa.
         //
-        // Silenzioso quando non c'e' un canale: l'aggiornamento automatico ha gia' deciso di
-        // suo con `LibraryIndexAutoRefresh.shouldRun` e non deve far comparire niente.
+        // Silenzioso quando non c'e' un canale (`onAlert == nil`): oggi tutti i chiamanti da
+        // Diagnostica ne passano uno, ma la firma resta difensiva — un futuro chiamante
+        // automatico (come lo era, fino al 2026-09-19, il collegamento dell'SSD) non deve
+        // far comparire niente.
         if let reason = LibraryIndexCommandGate.disabledReason(isIndexing: isIndexing,
                                                               jobIsRunning: isRunning,
                                                               isTrashingDuplicates: isTrashingDuplicates) {
@@ -7246,16 +7238,11 @@ final class BackupRunner: ObservableObject {
         if let sink { sink(alert) } else { pendingAlert = alert }
     }
 
-    /// Aggiornamento automatico: SSD collegato, oppure fine di un job che ha scritto
-    /// sull'SSD. Le condizioni stanno in `LibraryIndexAutoRefresh`, non qui.
-    func autoRefreshLibraryIndexIfEnabled() {
-        guard LibraryIndexAutoRefresh.shouldRun(enabled: LibraryIndexAutoRefresh.isEnabled(),
-                                                indexedFileCount: indexedFileCount,
-                                                isIndexing: isIndexing,
-                                                jobIsRunning: isRunning,
-                                                isTrashingDuplicates: isTrashingDuplicates) else { return }
-        rebuildLibraryIndex()
-    }
+    // `autoRefreshLibraryIndexIfEnabled()` e `LibraryIndexAutoRefresh.shouldRun` sono stati
+    // rimossi il 2026-09-19 (decisione di Enrico, domanda aperta 1 della spec del passo 2 del
+    // backup): al collegamento dell'SSD non parte piu' nessuna lettura da sola. L'elenco si
+    // aggiorna solo come ultimo passo di un backup/importazione (`BackupListStep.shouldRun`,
+    // chiamato da `finishCopyStep`) o a mano da Diagnostica (`rebuildLibraryIndex`).
 
     private let maxOut = 60_000
     private let maxSpeedSamples = 120
@@ -9659,16 +9646,12 @@ struct ContentView: View {
             if let p, p.isTerminal { showCompletion = true }
         }
         .onChange(of: volumes.ssdMounted) { _, mounted in
-            guard mounted else { return }
-            if autoBackupEnabled && !runner.isRunning {
-                // Il backup automatico scrive sull'SSD: leggerlo per intero nello stesso
-                // momento rallenta entrambi e fa risultare illeggibili i file che il backup
-                // sta scrivendo proprio ora. L'elenco si aggiorna a fine job, che e' anche
-                // il momento in cui serve davvero aggiornato.
-                runner.runMacToSSD()
-            } else {
-                runner.autoRefreshLibraryIndexIfEnabled()
-            }
+            // Decisione di Enrico (2026-09-19, domanda aperta 1 della spec del passo 2 del
+            // backup): al collegamento dell'SSD non parte piu' nessuna lettura da sola.
+            // L'elenco si aggiorna solo come ultimo passo di un backup/importazione, o a
+            // mano da Diagnostica — mai piu' come attivita' separata al collegamento.
+            guard mounted, autoBackupEnabled, !runner.isRunning else { return }
+            runner.runMacToSSD()
         }
         .sheet(isPresented: $showCompletion) {
             if let snap = runner.completionSnapshot {
@@ -9721,8 +9704,8 @@ struct SettingsSheet: View {
                     .font(.caption).foregroundStyle(.secondary)
             }.padding(.horizontal, AppSpacing.xl)
             VStack(alignment: .leading, spacing: AppSpacing.xs) {
-                Toggle("Tieni aggiornato da solo l'elenco delle foto già salvate", isOn: $autoRefreshLibraryIndex)
-                Text("Quando colleghi l'SSD, o appena finisce una copia, l'app dà un'occhiata veloce solo alle foto nuove. La prima creazione dell'elenco resta manuale, da Diagnostica: quella dura diversi minuti.")
+                Toggle("Aggiorna l'elenco delle foto alla fine di ogni backup", isOn: $autoRefreshLibraryIndex)
+                Text("Dopo ogni copia verso l'SSD l'app controlla le foto che ci sono e aggiunge all'elenco quelle nuove: è l'ultimo passo del backup, e puoi fermarlo con «Interrompi». La prima creazione dell'elenco resta manuale, da Diagnostica: quella dura diversi minuti.")
                     .font(.caption).foregroundStyle(.secondary)
             }.padding(.horizontal, AppSpacing.xl)
             VStack(alignment: .leading, spacing: AppSpacing.xs) {
