@@ -6517,11 +6517,31 @@ enum CloudUsageText {
     /// Registra un nuovo totale — chiamato dal sink di default di `S3Syncer` (da tutti e sei i
     /// chiamanti di `listAll` che completano un elenco) e da `refresh()` sotto.
     func record(_ totals: S3Syncer.CloudUsageTotals, bucket: String, at date: Date = Date()) {
+        recordCount += 1
         let newSnapshot = CloudUsageSnapshot(usedBytes: totals.bytes, objectCount: totals.count,
                                               measuredAt: date, bucket: bucket)
         snapshot = newSnapshot
         guard let data = try? JSONEncoder().encode(newSnapshot) else { return }
         defaults.set(data, forKey: Self.key)
+    }
+
+    /// Quante volte `record` e' stato chiamato da quando l'app e' aperta. Serve a
+    /// `recordUnlessSuperseded`: un ricalcolo che dura minuti non deve sovrascrivere un numero
+    /// registrato *mentre* contava (rilievo di review del 2026-09-19).
+    private(set) var recordCount = 0
+
+    /// Registra solo se nessun altro `record` e' arrivato dopo `token` (il `recordCount` letto
+    /// all'inizio della lettura). Scenario: ↻ parte, intanto un SSD → Cubbit finisce e registra
+    /// il totale esatto con i file appena caricati; il ↻, partito prima, arriva per ultimo con
+    /// un elenco che quei file non li vedeva. Senza questo controllo vincerebbe l'ultimo ad
+    /// arrivare — il numero piu' vecchio, per di piu' con la data "adesso". Confrontare le date
+    /// non basterebbe: entrambe sono prese alla fine, e il ↻ finisce dopo.
+    @discardableResult
+    func recordUnlessSuperseded(_ totals: S3Syncer.CloudUsageTotals, bucket: String,
+                                since token: Int, at date: Date = Date()) -> Bool {
+        guard recordCount == token else { return false }
+        record(totals, bucket: bucket, at: date)
+        return true
     }
 
     /// Ricalcolo manuale (bottone ↻, Task 7). Usa un'istanza NUOVA e dedicata di `S3Syncer`,
@@ -6531,11 +6551,12 @@ enum CloudUsageText {
         guard !isRefreshing else { return }
         isRefreshing = true
         defer { isRefreshing = false }
+        let token = recordCount
         do {
             let syncer = S3Syncer()
             let listing = try await syncer.listAllDetailed(config: config)
             if listing.isComplete {
-                record(.of(listing.objects), bucket: config.bucket)
+                recordUnlessSuperseded(.of(listing.objects), bucket: config.bucket, since: token)
                 lastRefreshFailed = false
             } else {
                 lastRefreshFailed = true
@@ -10665,9 +10686,13 @@ struct CloudUsageLine: View {
                 } else {
                     Text(CloudUsageText.usedLine(store.snapshot))
                 }
-                Text(CloudUsageText.updatedLine(store.snapshot, now: Date(), calendar: .current, locale: .current))
-                    .foregroundStyle(.secondary)
-                if store.lastRefreshFailed {
+                // Durante il primo calcolo "Si aggiorna al prossimo backup" contraddirebbe la riga
+                // sopra (visto dal vivo il 2026-09-19): la si nasconde finche' non c'e' un numero.
+                if !(store.isRefreshing && store.snapshot == nil) {
+                    Text(CloudUsageText.updatedLine(store.snapshot, now: Date(), calendar: .current, locale: .current))
+                        .foregroundStyle(.secondary)
+                }
+                if store.lastRefreshFailed && !store.isRefreshing {
                     Text("Cubbit non raggiungibile, riprova più tardi").foregroundStyle(.secondary)
                 }
             }

@@ -80,4 +80,27 @@ final class CloudUsageStoreTests: XCTestCase {
         XCTAssertEqual(store.snapshot?.usedBytes, 200)
         XCTAssertEqual(store.snapshot?.bucket, "altro-bucket")
     }
+
+    // Rilievo di review del 2026-09-19: un ↻ partito prima di un SSD -> Cubbit non deve
+    // sovrascrivere, arrivando per ultimo, il totale esatto registrato dal backup.
+    func testRecordUnlessSuperseded_newerRecordArrivedMeanwhile_isDiscarded() {
+        let store = CloudUsageStore(defaults: defaults)
+        let token = store.recordCount                       // il ↻ parte
+        store.record(S3Syncer.CloudUsageTotals(bytes: 900, count: 12), bucket: "backupfoto")  // il backup finisce
+        let recorded = store.recordUnlessSuperseded(S3Syncer.CloudUsageTotals(bytes: 800, count: 10),
+                                                    bucket: "backupfoto", since: token)       // il ↻ arriva
+        XCTAssertFalse(recorded)
+        XCTAssertEqual(store.snapshot?.usedBytes, 900)
+        XCTAssertEqual(CloudUsageStore(defaults: defaults).snapshot?.usedBytes, 900)
+    }
+
+    func testRecordUnlessSuperseded_nothingNewer_records() {
+        let store = CloudUsageStore(defaults: defaults)
+        store.record(S3Syncer.CloudUsageTotals(bytes: 500, count: 5), bucket: "backupfoto")
+        let token = store.recordCount
+        let recorded = store.recordUnlessSuperseded(S3Syncer.CloudUsageTotals(bytes: 800, count: 10),
+                                                    bucket: "backupfoto", since: token)
+        XCTAssertTrue(recorded)
+        XCTAssertEqual(store.snapshot?.usedBytes, 800)
+    }
 }
