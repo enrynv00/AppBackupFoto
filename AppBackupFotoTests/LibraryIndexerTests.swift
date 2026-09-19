@@ -620,6 +620,39 @@ final class LibraryIndexerTests: XCTestCase {
         XCTAssertEqual(second.hashed, 5, "la scansione successiva riparte pulita")
     }
 
+    // Passo 2 del backup (2026-09-19): un aggiornamento dopo un backup normale trova
+    // quasi solo file invariati, che oggi riempiono un blocco solo se ce ne sono
+    // abbastanza da rileggere. Senza un avanzamento anche su di loro, la barra del
+    // passo 2 resterebbe ferma per minuti su una libreria vera (47.000 file).
+    func testUnchangedFiles_stillReportProgress() throws {
+        for i in 0..<600 { try makeFile("Foto/f\(i).jpg", contents: "c\(i)") }
+        _ = try indexer.scan(root: root)                       // prima lettura: tutto in elenco
+        var scannedSeen: [Int] = []
+        let p = try indexer.scan(root: root, progressEvery: 100) { scannedSeen.append($0.scanned) }
+        XCTAssertEqual(p.hashed, 0, "seconda lettura: nessun file da rileggere")
+        XCTAssertGreaterThanOrEqual(scannedSeen.filter { $0 < 600 }.count, 5,
+                                    "servono avanzamenti intermedi anche senza file da rileggere")
+        XCTAssertEqual(scannedSeen, scannedSeen.sorted(), "scanned non torna mai indietro")
+    }
+
+    // `total` e' "quante voci ci sono nell'elenco": vale gia' all'inizio, non 0 — senza
+    // questo la card di Diagnostica leggerebbe per un istante "0 foto nell'elenco".
+    func testFirstProgress_reportsTheEntriesAlreadyInTheList() throws {
+        for i in 0..<300 { try makeFile("Foto/f\(i).jpg", contents: "c\(i)") }
+        _ = try indexer.scan(root: root)
+        var first: LibraryIndexer.Progress?
+        _ = try indexer.scan(root: root, progressEvery: 100) { if first == nil { first = $0 } }
+        XCTAssertEqual(first?.total, 300)
+    }
+
+    func testProgressEveryZero_emitsNoIntermediateProgress() throws {
+        for i in 0..<300 { try makeFile("Foto/f\(i).jpg", contents: "c\(i)") }
+        _ = try indexer.scan(root: root)
+        var calls = 0
+        _ = try indexer.scan(root: root, progressEvery: 0) { _ in calls += 1 }
+        XCTAssertEqual(calls, 1, "solo l'avanzamento finale: nessun blocco da scrivere, nessuna emissione periodica")
+    }
+
     /// Hash di riferimento calcolato su un file di appoggio: serve a distinguere
     /// "hash del contenuto intero" da "hash del contenuto troncato".
     private func hashOfString(_ s: String) throws -> String {

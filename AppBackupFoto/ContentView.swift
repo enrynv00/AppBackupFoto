@@ -3893,6 +3893,7 @@ nonisolated final class LibraryIndexer: @unchecked Sendable {
     @discardableResult
     func scan(root: URL, batchSize: Int = 200,
               ignoringStoredHashes: Bool = false,
+              progressEvery: Int = 250,
               onProgress: @escaping (Progress) -> Void = { _ in }) throws -> Progress {
         // La cancellazione si consuma alla FINE della scansione, non all'inizio.
         //
@@ -3912,6 +3913,10 @@ nonisolated final class LibraryIndexer: @unchecked Sendable {
         var volumeVanished = false
         let failures = TraversalFailures()
         let knownKeys = try store.allKeys()
+        // `total` = voci nell'elenco in questo momento (passo 2 del backup, 2026-09-19):
+        // senza questa riga il primo avanzamento farebbe leggere "0 foto" alla card,
+        // perche' `total` restava a 0 finche' non si svuotava il primo blocco.
+        progress.total = knownKeys.count
 
         // Identita' del volume all'inizio, per confrontarla alla fine.
         let deviceAtStart = deviceIdentifier(of: root)
@@ -4029,6 +4034,11 @@ nonisolated final class LibraryIndexer: @unchecked Sendable {
             let relative = fileComponents.dropFirst(rootComponents.count).joined(separator: "/")
 
             progress.scanned += 1
+
+            // Avanzamento anche sui file invariati (2026-09-19, passo 2 del backup): i blocchi si
+            // riempiono solo con file da rileggere, e dopo un backup normale quasi nessuno lo e' —
+            // senza questa riga la barra resterebbe ferma per minuti. Non scrive e non decide niente.
+            if progressEvery > 0 && progress.scanned % progressEvery == 0 { onProgress(progress) }
 
             let key = normalizedIndexKey(relative)
             // La chiave entra in `seenKeys` PRIMA di qualunque possibile errore, ed e'
