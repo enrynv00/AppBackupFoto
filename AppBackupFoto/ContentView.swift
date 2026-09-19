@@ -6544,6 +6544,14 @@ enum CloudUsageText {
             lastRefreshFailed = true
         }
     }
+
+    /// Chiamato dal bottone ↻ (Task 7) quando la configurazione S3 non è disponibile
+    /// (`runner.s3Config == nil` dopo `loadS3ConfigIfNeeded()`): senza una config non c'è
+    /// nessun elenco da chiedere, ma l'utente ha comunque premuto un bottone e merita di
+    /// vedere che qualcosa non ha funzionato, non un silenzio.
+    func markConfigUnavailable() {
+        lastRefreshFailed = true
+    }
 }
 
 // MARK: - Spazio dei volumi
@@ -10499,6 +10507,7 @@ struct SidebarView: View {
                 VolumeRow(name: "BackupHDD",   icon: "externaldrive.fill",  mounted: volumes.hddMounted)
                 VolumeSpaceLine(kind: .hdd)
                 VolumeRow(name: "Cubbit S3",   icon: "cloud.fill",          mounted: true, alwaysOn: true)
+                CloudUsageLine(runner: runner)
             }.padding(.bottom, AppSpacing.sm)
             Divider()
             VStack(alignment: .leading, spacing: AppSpacing.xs) {
@@ -10631,6 +10640,56 @@ struct VolumeSpaceLine: View {
     private var accessibilityText: String {
         if case .measured(let display) = state { return display.accessibilityLabel }
         return state.statusText
+    }
+}
+
+/// Riga sotto la `VolumeRow` di Cubbit: «X usati» + «aggiornato…», più il bottone ↻ per il
+/// ricalcolo manuale (decisione di Enrico, ADR-0008: sì). Riceve `runner` come parametro —
+/// niente `@ObservedObject runner` aggiuntivo altrove, `SidebarView` lo passa già.
+struct CloudUsageLine: View {
+    @ObservedObject var runner: BackupRunner
+    @ObservedObject private var store = CloudUsageStore.shared
+
+    private var refreshDisabledReason: String? {
+        CloudUsageRefreshGate.disabledReason(jobIsRunning: runner.isRunning, isRefreshing: store.isRefreshing)
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: AppSpacing.xs) {
+            VStack(alignment: .leading, spacing: 2) {
+                if store.isRefreshing {
+                    HStack(spacing: AppSpacing.xs) {
+                        ProgressView().controlSize(.mini)
+                        Text("Sto calcolando lo spazio usato…")
+                    }
+                } else {
+                    Text(CloudUsageText.usedLine(store.snapshot))
+                }
+                Text(CloudUsageText.updatedLine(store.snapshot, now: Date(), calendar: .current, locale: .current))
+                    .foregroundStyle(.secondary)
+                if store.lastRefreshFailed {
+                    Text("Cubbit non raggiungibile, riprova più tardi").foregroundStyle(.secondary)
+                }
+            }
+            Spacer()
+            Button {
+                Task {
+                    await runner.loadS3ConfigIfNeeded()
+                    if let config = runner.s3Config {
+                        await store.refresh(config: config)
+                    } else {
+                        store.markConfigUnavailable()
+                    }
+                }
+            } label: {
+                Image(systemName: "arrow.clockwise").font(.system(size: 11, weight: .medium))
+            }
+            .buttonStyle(.borderless)
+            .disabled(refreshDisabledReason != nil)
+            .help(refreshDisabledReason ?? "Ricalcola lo spazio usato su Cubbit. Può richiedere un paio di minuti.")
+        }
+        .font(AppFont.caption)
+        .padding(.leading, 44).padding(.trailing, 16).padding(.bottom, AppSpacing.xs)
     }
 }
 
