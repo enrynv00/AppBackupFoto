@@ -225,6 +225,14 @@ Se Enrico sceglie (b) in D10: `LibraryIndexAutoRefresh.shouldRun` e i suoi 6 tes
 4. Interruttore spento: nessun «passo», riepilogo come prima di questa spec.
 5. Solo se Enrico sceglie (b): collegare l'SSD con il backup automatico spento non fa partire niente.
 
+### Esito della verifica dal vivo (2026-09-19, build Debug del branch a 4cfa325, `sample <pid> 4` ripetuto ogni ~5 s)
+
+- **Punto 1 — MAC → SSD completo:** copia 13:47:25 → 13:47:50, passo 2 13:47:55 → 13:49:12 (**~1'20"**). `LibraryIndexer.scan` in 15-32 campioni per istantanea su thread di fondo, **0 volte sul main thread**; main idle 70-95% durante il passo 2 (il resto e' il ridisegno della barra che ora avanza, `progressEvery = 250`). Enrico: flusso passo 1 → passo 2, riepilogo e testi a posto.
+- **Punto 2 — Interrompi nel passo 2:** secondo MAC → SSD, copia 13:49:20 → 13:49:45, passo 2 dalle 13:49:50, scan sparito dai campioni alle 13:50:01. Prima prova dal vivo di «Interrompi» durante la lettura dell'elenco (con BUG-7 era impossibile). Enrico: esito a schermo corretto.
+- **Punto 3 — durata:** ~1'20" per ~18.400 file nella libreria Foto e l'intero SSD; il costo accettato in D1 (SSD → HDD/Cubbit aspettano il passo 2) e' confermato accettabile da Enrico.
+- **Durante la copia** (25 s) il main thread resta ~100% occupato in ridisegno SwiftUI/CoreAnimation, non bloccato: e' il punto 37 della ROADMAP, invariato da questo lavoro.
+- Punti 4 (interruttore spento) e 5 (SSD ricollegato senza backup automatico) non registrati nei campioni: coperti dai test di `BackupListStep` e dalla rimozione del ramo in `onChange(of: ssdMounted)`.
+
 ## Rischi
 
 1. **Il backup dura di più, per come lo vede Enrico.** È voluto, ma cambia un'abitudine: SSD → HDD subito dopo MAC → SSD aspetta il passo 2 (o «Interrompi»). La durata fuori dal main non è ancora misurata.
