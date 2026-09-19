@@ -5426,6 +5426,11 @@ final class S3Syncer {
         var uploadedBytes: Int64 = 0
         var toUploadCount: Int = 0
         var changedSkipped = 0   // key esistente con dimensione diversa (roadmap #13)
+        /// Spazio usato su Cubbit corretto a fine `sync()` (indicatore di spazio, ADR-0008):
+        /// `nil` se non si può correggere (elenco iniziale incompleto, o job interrotto — vedi
+        /// `CloudUsageTotals.afterSync`). Non persistito: `JobStats` non è `Codable` e nessun
+        /// conteggio del riepilogo lo legge, lo consuma solo `sync()` per notificare il sink.
+        var cloudUsageAfter: CloudUsageTotals? = nil
         var percent: Int { total > 0 ? min(100, done * 100 / total) : 0 }
         var elapsedSec: Int { Int(Date().timeIntervalSince(startDate)) }
         // ETA basato sugli upload effettivi (non sui file già presenti su S3)
@@ -5569,6 +5574,80 @@ final class S3Syncer {
         return URLSession(configuration: cfg)
     }()
 
+    // MARK: Spazio usato su Cubbit (indicatore di spazio, Task 5, ADR-0008)
+
+    /// Elenco di uno o più pagine di `ListObjectsV2`. `isComplete` vale `true` SOLO se il
+    /// ciclo è uscito perché il token di continuazione è `nil` — mai perché `shouldStop()` ha
+    /// interrotto il giro, nemmeno con zero pagine lette. La distinzione esiste perché
+    /// `listAll` oggi esce in silenzio su stop e restituisce un dizionario troncato senza
+    /// errore: un gancio ingenuo sommerebbe quel dizionario troncato e mostrerebbe, per
+    /// esempio, «0 byte usati» dopo un'anteprima lanciata subito dopo uno stop (vedi
+    /// «Scoperte collaterali» della spec — non corretto qui, side-finding pre-esistente).
+    struct S3Listing: Equatable {
+        let objects: [String: Int64]
+        let isComplete: Bool
+    }
+
+    /// Somma di byte/oggetti di un elenco — quello che si mostra come «spazio usato su
+    /// Cubbit». Logica pura, nessuna rete.
+    struct CloudUsageTotals: Equatable, Codable {
+        let bytes: Int64
+        let count: Int
+
+        static func of(_ objects: [String: Int64]) -> CloudUsageTotals {
+            CloudUsageTotals(bytes: objects.values.reduce(0, +), count: objects.count)
+        }
+
+        /// Corregge il numero registrato **all'inizio** di `sync()` con gli upload riusciti
+        /// **alla fine**, invece di rifare un secondo elenco completo: per la regola
+        /// zero-overwrite `sync` carica solo chiavi assenti (`shouldUpload`), quindi lo
+        /// spazio usato dopo il job è esattamente `listed + uploadedBytes` — MA solo se
+        /// l'elenco iniziale era completo (altrimenti non si sa da cosa si parte) e il job
+        /// non è stato interrotto (dopo uno stop il ciclo degli esiti scarta con `continue`
+        /// anche i caricamenti finiti, quindi `uploadedBytes` sarebbe per difetto). In tutti
+        /// gli altri casi si restituisce `nil`: il valore registrato in precedenza resta
+        /// quello, con la sua data — più vecchio, mai sbagliato.
+        static func afterSync(listed: CloudUsageTotals?, uploadedBytes: Int64,
+                               uploadedCount: Int, wasCancelled: Bool) -> CloudUsageTotals? {
+            guard !wasCancelled, let listed else { return nil }
+            return CloudUsageTotals(bytes: listed.bytes + uploadedBytes, count: listed.count + uploadedCount)
+        }
+    }
+
+    /// Dove va a finire il numero calcolato da un elenco completo. Il default (Task 6) scrive
+    /// nello store persistito passando dal main; i test passano un sink che registra le
+    /// chiamate.
+    typealias CloudUsageSink = (CloudUsageTotals, _ bucket: String) -> Void
+
+    // TODO Task 6: sostituire con `{ totals, bucket in Task { @MainActor in
+    // CloudUsageStore.shared.record(totals, bucket: bucket) } } quando CloudUsageStore esiste.
+    static let defaultUsageSink: CloudUsageSink = { _, _ in }
+
+    private let usageSink: CloudUsageSink
+
+    /// `usageSink` è iniettabile SOLO per i test: nessun chiamante di produzione ne passa uno
+    /// diverso dal default (verificato: `grep -n "S3Syncer()"` mostra solo istanze col default,
+    /// vedi Task 7). La firma resta compatibile con `S3Syncer()` esistente in tutti i call site.
+    init(usageSink: @escaping CloudUsageSink = S3Syncer.defaultUsageSink) {
+        self.usageSink = usageSink
+    }
+
+    /// Ciclo di paginazione, estratto per essere testabile senza rete (Task 5). `listAll` e
+    /// `sync` lo usano entrambi: `listAll` tramite `listAllDetailed`, `sync` direttamente,
+    /// così la rete non viene interrogata due volte per lo stesso job.
+    nonisolated static func collectPages(fetch: (String?) async throws -> ([String: Int64], String?),
+                                          shouldStop: () -> Bool) async throws -> S3Listing {
+        var objects: [String: Int64] = [:]
+        var token: String? = nil
+        repeat {
+            if shouldStop() { return S3Listing(objects: objects, isComplete: false) }
+            let (objs, next) = try await fetch(token)
+            objects.merge(objs) { _, new in new }
+            token = next
+        } while token != nil
+        return S3Listing(objects: objects, isComplete: true)
+    }
+
     func cancel() { cancelFlag.cancel() }
 
     nonisolated static func readConfig(remoteName: String = "Cubbit", bucket: String = "backupfoto") throws -> S3Config {
@@ -5679,7 +5758,11 @@ final class S3Syncer {
         var result = SyncResult()
 
         DispatchQueue.main.async { onStatus("Connessione a Cubbit S3 — recupero lista file remoti...") }
-        let existing = try await listAll(config: config)
+        // `listAllDetailed`, non `listAll`: questa funzione deve sapere se l'elenco che ha
+        // appena letto era COMPLETO, per poter correggere lo spazio usato su Cubbit a fine job
+        // (vedi CloudUsageTotals.afterSync, più sotto) senza rifare un secondo elenco.
+        let listing = try await listAllDetailed(config: config)
+        let existing = listing.objects
         let existingCount = existing.count
         DispatchQueue.main.async { onStatus("Trovati \(existingCount) oggetti su S3 — scansione file locali...") }
 
@@ -5780,19 +5863,36 @@ final class S3Syncer {
                 addNext()
             }
         }
+
+        // Correzione esatta dello spazio usato su Cubbit (indicatore di spazio, ADR-0008):
+        // solo se l'elenco iniziale era completo E il job non è stato interrotto (dopo uno
+        // stop il ciclo degli esiti sopra scarta con `continue` anche i caricamenti finiti,
+        // quindi `result.uploadedBytes` sarebbe per difetto — vedi CloudUsageTotals.afterSync).
+        let listedTotals: CloudUsageTotals? = listing.isComplete ? .of(listing.objects) : nil
+        result.cloudUsageAfter = CloudUsageTotals.afterSync(listed: listedTotals, uploadedBytes: result.uploadedBytes,
+                                                              uploadedCount: result.uploaded,
+                                                              wasCancelled: cancelled || Task.isCancelled)
+        if let totals = result.cloudUsageAfter { usageSink(totals, config.bucket) }
         return result
     }
 
+    /// Come `listAll`, ma restituisce anche se l'elenco era COMPLETO, e non chiama il sink —
+    /// lo notifica il solo chiamante che ha davvero bisogno di sapere quando registrare
+    /// (`listAll` stessa, se completo; `sync`, con la correzione di fine job). Senza questa
+    /// separazione i due dovrebbero interrogare la rete due volte per lo stesso elenco.
+    func listAllDetailed(config: S3Config) async throws -> S3Listing {
+        try await Self.collectPages(
+            fetch: { token in try await self.listPage(config: config, token: token) },
+            shouldStop: { self.cancelled || Task.isCancelled })
+    }
+
     func listAll(config: S3Config) async throws -> [String: Int64] {
-        var objects: [String: Int64] = [:]
-        var token: String? = nil
-        repeat {
-            if cancelled || Task.isCancelled { break }
-            let (objs, next) = try await listPage(config: config, token: token)
-            objects.merge(objs) { _, n in n }
-            token = next
-        } while token != nil
-        return objects
+        let listing = try await listAllDetailed(config: config)
+        // Si notifica il sink SOLO se l'elenco è completo: un'uscita anticipata per stop
+        // (isComplete == false) non deve mai far credere che lo spazio usato sia 0 o
+        // parziale — vedi il doc-comment di `S3Listing.isComplete`.
+        if listing.isComplete { usageSink(.of(listing.objects), config.bucket) }
+        return listing.objects
     }
 
     func listMultipartUploads(config: S3Config) async throws -> [OrphanedMultipartUpload] {
