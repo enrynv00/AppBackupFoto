@@ -2751,7 +2751,10 @@ nonisolated final class TrashManifestStore: @unchecked Sendable {
             guard let ultimo = manifest.items.last?.batchId else { return nil }
             let batch = manifest.items.filter { $0.batchId == ultimo }
             let pending = batch.filter { $0.restoredAt == nil }
-            guard !pending.isEmpty, let oldest = batch.map(\.trashedAt).min() else { return nil }
+            // La data e' quella delle voci ANCORA da rimettere a posto, non dell'intero blocco
+            // (rilievo di review del 2026-09-20): in un annullamento ripreso, la conferma deve
+            // parlare di cio' che sta per succedere adesso.
+            guard !pending.isEmpty, let oldest = pending.map(\.trashedAt).min() else { return nil }
             return RestorableBatchSummary(pendingCount: pending.count, batchCount: batch.count,
                                           trashedAt: oldest)
         }
