@@ -44,6 +44,13 @@ final class TrashManifestTests: XCTestCase {
                            trashedAt: Date())
     }
 
+    /// `restore` non e' piu' un metodo dello store (ADR-0009): il motore e' `TrashRestorer`,
+    /// con `root` come `libraryRoot` — sia gli originali sia il Cestino di prova vivono
+    /// sotto la stessa directory temporanea, quindi `st_dev` coincide per costruzione.
+    private func restore(_ items: [TrashedItem], via store: TrashManifestStore) -> RestoreOutcome {
+        TrashRestorer(libraryRoot: root, manifest: store).run(items)
+    }
+
     // MARK: - Scrittura immediata
 
     /// **La lezione diretta della misura sul Finder.** Un registro bufferizzato e scritto a
@@ -89,7 +96,7 @@ final class TrashManifestTests: XCTestCase {
         let it = try item(trashed: trashed, originalAt: original)
         try store.record(it)
 
-        let esito = store.restore([it])
+        let esito = restore([it], via: store)
         XCTAssertEqual(esito.restored.count, 1)
         XCTAssertTrue(esito.skipped.isEmpty)
         XCTAssertEqual(try String(contentsOf: original, encoding: .utf8), "contenuto originale")
@@ -105,7 +112,7 @@ final class TrashManifestTests: XCTestCase {
         let it = try item(trashed: trashed, originalAt: original)
         try store.record(it)
 
-        XCTAssertEqual(store.restore([it]).restored.count, 1)
+        XCTAssertEqual(restore([it], via: store).restored.count, 1)
         XCTAssertTrue(FileManager.default.fileExists(atPath: original.path))
     }
 
@@ -121,7 +128,7 @@ final class TrashManifestTests: XCTestCase {
 
         try "alterato dopo il cestinamento".write(to: trashed, atomically: true, encoding: .utf8)
 
-        let esito = store.restore([it])
+        let esito = restore([it], via: store)
         XCTAssertTrue(esito.restored.isEmpty)
         XCTAssertEqual(esito.skipped.count, 1)
         XCTAssertEqual(esito.skipped.first?.reason, .alteredInTrash)
@@ -140,7 +147,7 @@ final class TrashManifestTests: XCTestCase {
         try "BBBB".write(to: trashed, atomically: true, encoding: .utf8)
         XCTAssertEqual(it.size, 4)
 
-        XCTAssertEqual(store.restore([it]).skipped.first?.reason, .alteredInTrash)
+        XCTAssertEqual(restore([it], via: store).skipped.first?.reason, .alteredInTrash)
     }
 
     /// **Il percorso originale e' di nuovo occupato**: non si sovrascrive. Non basta
@@ -154,7 +161,7 @@ final class TrashManifestTests: XCTestCase {
         let it = try item(trashed: trashed, originalAt: original)
         try store.record(it)
 
-        let esito = store.restore([it])
+        let esito = restore([it], via: store)
         XCTAssertEqual(esito.skipped.first?.reason, .originalPathOccupied)
         XCTAssertEqual(try String(contentsOf: original, encoding: .utf8), "una foto nuova, arrivata dopo",
                        "ha sovrascritto il file che si trovava al posto originale")
@@ -171,7 +178,7 @@ final class TrashManifestTests: XCTestCase {
         try store.record(it)
         try FileManager.default.removeItem(at: trashed)
 
-        let esito = store.restore([it])
+        let esito = restore([it], via: store)
         XCTAssertEqual(esito.skipped.first?.reason, .missingInTrash)
         XCTAssertTrue(esito.restored.isEmpty)
     }
@@ -190,7 +197,7 @@ final class TrashManifestTests: XCTestCase {
         for it in items { try store.record(it) }
         try FileManager.default.removeItem(at: rotta)
 
-        let esito = store.restore(items)
+        let esito = restore(items, via: store)
         XCTAssertEqual(esito.restored.count, 2)
         XCTAssertEqual(esito.skipped.count, 1)
         XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("a.jpg").path))
@@ -201,7 +208,8 @@ final class TrashManifestTests: XCTestCase {
     /// condividessero la stessa frase, il test sarebbe cieco proprio sul testo che l'utente
     /// legge per capire cosa non e' tornato al suo posto.
     func testEverySkipReason_hasItsOwnPlainExplanation() {
-        let reasons: [RestoreSkipReason] = [.missingInTrash, .alteredInTrash, .originalPathOccupied]
+        let reasons: [RestoreSkipReason] = [.missingInTrash, .alteredInTrash, .originalPathOccupied,
+                                            .unreadableInTrash, .outsideLibrary]
         let frasi = reasons.map(\.explanation)
         XCTAssertEqual(Set(frasi).count, reasons.count, "due motivi condividono la stessa frase: \(frasi)")
         for frase in frasi {
@@ -210,6 +218,117 @@ final class TrashManifestTests: XCTestCase {
                 XCTAssertFalse(frase.lowercased().contains(parola.lowercased()), "gergo in «\(frase)»")
             }
         }
+    }
+
+    // MARK: - Il registro ricorda cosa e' tornato a posto (Task 3, ADR-0009)
+
+    /// Un registro scritto dalla forma di OGGI (sette chiavi, nessun `restoredAt`) si
+    /// decodifica con `restoredAt == nil`: e' il JSON letterale, non generato dal tipo
+    /// nuovo, altrimenti il test proverebbe il tipo nuovo contro se stesso.
+    func testRecordWrittenByTheCurrentVersion_decodesWithoutRestoredAt() throws {
+        let vecchio = """
+        {"totalRecorded":1,"items":[{"batchId":"b1","originalDisplayPath":"/x/a.jpg",\
+        "originalKey":"a.jpg","trashedPath":"/x/.Trashes/a.jpg","size":4,"hash":"abc",\
+        "trashedAt":770000000}]}
+        """
+        try vecchio.write(to: manifestURL, atomically: true, encoding: .utf8)
+
+        let store = try TrashManifestStore(url: manifestURL)
+        XCTAssertEqual(store.lastBatch().first?.restoredAt, nil)
+    }
+
+    func testMarkRestored_isOnDiskImmediately() throws {
+        let store = try TrashManifestStore(url: manifestURL)
+        let trashed = try makeTrashedFile("a.jpg", contents: "foto")
+        let it = try item(trashed: trashed, originalAt: root.appendingPathComponent("a.jpg"))
+        try store.record(it)
+
+        try store.markRestored(it, at: Date())
+
+        let riletto = try TrashManifestStore(url: manifestURL)
+        XCTAssertNotNil(riletto.lastBatch().first?.restoredAt)
+    }
+
+    func testPendingInLastBatch_excludesRestoredItems() throws {
+        let store = try TrashManifestStore(url: manifestURL)
+        let uno = try makeTrashedFile("uno.jpg", contents: "1")
+        let due = try makeTrashedFile("due.jpg", contents: "2")
+        let itUno = try item(trashed: uno, originalAt: root.appendingPathComponent("uno.jpg"))
+        let itDue = try item(trashed: due, originalAt: root.appendingPathComponent("due.jpg"))
+        try store.record(itUno)
+        try store.record(itDue)
+
+        try store.markRestored(itUno, at: Date())
+
+        let pending = store.pendingInLastBatch()
+        XCTAssertEqual(pending.count, 1)
+        XCTAssertEqual(pending.first?.trashedPath, due.path)
+    }
+
+    /// Due blocchi possono condividere lo stesso `originalDisplayPath` (lo stesso file
+    /// cestinato, rimesso a posto, e ricestinato): marcare la voce del blocco NUOVO non deve
+    /// toccare quella del VECCHIO. L'identita' e' `batchId` + `trashedPath` +
+    /// `originalDisplayPath`, mai il solo percorso originale. Verificato leggendo il JSON
+    /// grezzo: l'API pubblica espone solo l'ultimo blocco, e qui serve controllare anche
+    /// quello vecchio.
+    func testMarkRestored_matchesByIdentity_notByOriginalPathAlone() throws {
+        let store = try TrashManifestStore(url: manifestURL)
+        let vecchio = try makeTrashedFile("vecchio.jpg", contents: "v")
+        let original = root.appendingPathComponent("a.jpg")
+        let itVecchio = try item(trashed: vecchio, originalAt: original, batch: "b1")
+        try store.record(itVecchio)
+
+        let nuovo = try makeTrashedFile("nuovo.jpg", contents: "n")
+        let itNuovo = try item(trashed: nuovo, originalAt: original, batch: "b2")
+        try store.record(itNuovo)
+
+        try store.markRestored(itNuovo, at: Date())
+
+        let raw = try String(contentsOf: manifestURL, encoding: .utf8)
+        let decoded = try JSONDecoder().decode(TrashManifest.self, from: Data(raw.utf8))
+        let vecchiaVoce = try XCTUnwrap(decoded.items.first(where: { $0.batchId == "b1" }))
+        let nuovaVoce = try XCTUnwrap(decoded.items.first(where: { $0.batchId == "b2" }))
+        XCTAssertNil(vecchiaVoce.restoredAt, "marcare la voce nuova ha toccato anche quella vecchia")
+        XCTAssertNotNil(nuovaVoce.restoredAt)
+    }
+
+    func testRestorableSummary_isNilWhenTheLastBatchIsFullyRestored() throws {
+        let store = try TrashManifestStore(url: manifestURL)
+        let trashed = try makeTrashedFile("a.jpg", contents: "foto")
+        let it = try item(trashed: trashed, originalAt: root.appendingPathComponent("a.jpg"))
+        try store.record(it)
+
+        XCTAssertNotNil(store.restorableSummary())
+        try store.markRestored(it, at: Date())
+        XCTAssertNil(store.restorableSummary())
+    }
+
+    func testRestorableSummary_countsOnlyPendingItems() throws {
+        let store = try TrashManifestStore(url: manifestURL)
+        let uno = try makeTrashedFile("uno.jpg", contents: "1")
+        let due = try makeTrashedFile("due.jpg", contents: "2")
+        let itUno = try item(trashed: uno, originalAt: root.appendingPathComponent("uno.jpg"))
+        let itDue = try item(trashed: due, originalAt: root.appendingPathComponent("due.jpg"))
+        try store.record(itUno)
+        try store.record(itDue)
+        try store.markRestored(itUno, at: Date())
+
+        let summary = try XCTUnwrap(store.restorableSummary())
+        XCTAssertEqual(summary.pendingCount, 1)
+        XCTAssertEqual(summary.batchCount, 2)
+    }
+
+    /// Una voce con `trashedPath` vuoto non era ripristinabile (non e' mai stata spostata
+    /// davvero dal Cestino): non si marca mai, anche se qualcuno la passasse per errore.
+    func testMarkRestored_ignoresItemsWithEmptyTrashedPath() throws {
+        let store = try TrashManifestStore(url: manifestURL)
+        var it = try item(trashed: try makeTrashedFile("a.jpg", contents: "foto"),
+                          originalAt: root.appendingPathComponent("a.jpg"))
+        it.trashedPath = ""
+        try store.record(it)
+
+        try store.markRestored(it, at: Date())
+        XCTAssertNil(store.lastBatch().first?.restoredAt)
     }
 
     // MARK: - Persistenza
@@ -307,16 +426,19 @@ final class TrashManifestTests: XCTestCase {
         XCTAssertEqual(perms & 0o077, 0, "permessi \(String(perms, radix: 8))")
     }
 
-    /// Ripristinare due volte la stessa voce non ripristina due volte: la seconda trova il
-    /// file gia' fuori dal Cestino e lo dice.
+    /// Ripristinare due volte la stessa voce non ripristina due volte, e la seconda dice il
+    /// VERO: la foto e' gia' al suo posto (riconciliazione D3, ADR-0009) — non piu' «il
+    /// Cestino e' stato svuotato», che sarebbe falso qui.
     func testRestoringTwice_isNotAnError() throws {
         let store = try TrashManifestStore(url: manifestURL)
         let trashed = try makeTrashedFile("a.jpg", contents: "foto")
         let it = try item(trashed: trashed, originalAt: root.appendingPathComponent("a.jpg"))
         try store.record(it)
 
-        XCTAssertEqual(store.restore([it]).restored.count, 1)
-        XCTAssertEqual(store.restore([it]).skipped.first?.reason, .missingInTrash)
+        XCTAssertEqual(restore([it], via: store).restored.count, 1)
+        let seconda = restore([it], via: store)
+        XCTAssertEqual(seconda.alreadyInPlace.count, 1)
+        XCTAssertTrue(seconda.skipped.isEmpty)
     }
 
     /// Un ripristino non tocca il registro delle **altre** voci: annullare un blocco non
@@ -330,7 +452,7 @@ final class TrashManifestTests: XCTestCase {
         try store.record(itVecchia)
         try store.record(itNuova)
 
-        _ = store.restore([itNuova])
+        _ = restore([itNuova], via: store)
         XCTAssertEqual(try TrashManifestStore(url: manifestURL).itemCount, 2)
     }
 }

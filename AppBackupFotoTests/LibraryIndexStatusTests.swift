@@ -443,23 +443,23 @@ final class LibraryIndexStatusTests: XCTestCase {
     /// l'aggiornamento automatico si'. Chi premeva "Aggiorna" durante un backup faceva
     /// leggere per intero l'SSD mentre una copia ci scriveva sopra.
     func testCommandGate_blocksWhileACopyJobIsRunning() {
-        XCTAssertNotNil(LibraryIndexCommandGate.disabledReason(isIndexing: false, jobIsRunning: true, isTrashingDuplicates: false))
+        XCTAssertNotNil(LibraryIndexCommandGate.disabledReason(isIndexing: false, jobIsRunning: true, isTrashingDuplicates: false, isRestoringFromTrash: false))
     }
 
     func testCommandGate_blocksWhileTheListIsBeingRead() {
-        XCTAssertNotNil(LibraryIndexCommandGate.disabledReason(isIndexing: true, jobIsRunning: false, isTrashingDuplicates: false))
+        XCTAssertNotNil(LibraryIndexCommandGate.disabledReason(isIndexing: true, jobIsRunning: false, isTrashingDuplicates: false, isRestoringFromTrash: false))
     }
 
     func testCommandGate_allowsWhenNothingElseIsGoingOn() {
-        XCTAssertNil(LibraryIndexCommandGate.disabledReason(isIndexing: false, jobIsRunning: false, isTrashingDuplicates: false))
+        XCTAssertNil(LibraryIndexCommandGate.disabledReason(isIndexing: false, jobIsRunning: false, isTrashingDuplicates: false, isRestoringFromTrash: false))
     }
 
     /// Le due cause hanno due frasi diverse: un bottone grigio senza motivo, o con il motivo
     /// sbagliato, e' la stessa disciplina gia' applicata a `RestoreView` e al pannello
     /// Doppioni — disattivare **e** dire perche'.
     func testCommandGate_tellsTheTwoCausesApart() {
-        let job = LibraryIndexCommandGate.disabledReason(isIndexing: false, jobIsRunning: true, isTrashingDuplicates: false)
-        let lettura = LibraryIndexCommandGate.disabledReason(isIndexing: true, jobIsRunning: false, isTrashingDuplicates: false)
+        let job = LibraryIndexCommandGate.disabledReason(isIndexing: false, jobIsRunning: true, isTrashingDuplicates: false, isRestoringFromTrash: false)
+        let lettura = LibraryIndexCommandGate.disabledReason(isIndexing: true, jobIsRunning: false, isTrashingDuplicates: false, isRestoringFromTrash: false)
         XCTAssertNotEqual(job, lettura)
     }
 
@@ -468,7 +468,7 @@ final class LibraryIndexStatusTests: XCTestCase {
     /// la causa piu' vicina al danno.
     func testCommandGate_blocksWhileTrashingIsInProgress() {
         let reason = LibraryIndexCommandGate.disabledReason(isIndexing: true, jobIsRunning: false,
-                                                             isTrashingDuplicates: true)
+                                                             isTrashingDuplicates: true, isRestoringFromTrash: false)
         XCTAssertNotNil(reason)
         XCTAssertTrue(reason!.lowercased().contains("cestino"))
     }
@@ -476,14 +476,29 @@ final class LibraryIndexStatusTests: XCTestCase {
     /// Il motivo finisce a schermo come tutte le altre righe della card.
     func testCommandGate_reasonsCarryNoJargon() {
         let gergo = ["indice", "hash", "sha", "scansione", "sqlite", "mtime", "cache", "entry"]
-        for reason in [LibraryIndexCommandGate.disabledReason(isIndexing: true, jobIsRunning: false, isTrashingDuplicates: false),
-                       LibraryIndexCommandGate.disabledReason(isIndexing: false, jobIsRunning: true, isTrashingDuplicates: false),
-                       LibraryIndexCommandGate.disabledReason(isIndexing: true, jobIsRunning: true, isTrashingDuplicates: false)] {
+        for reason in [LibraryIndexCommandGate.disabledReason(isIndexing: true, jobIsRunning: false, isTrashingDuplicates: false, isRestoringFromTrash: false),
+                       LibraryIndexCommandGate.disabledReason(isIndexing: false, jobIsRunning: true, isTrashingDuplicates: false, isRestoringFromTrash: false),
+                       LibraryIndexCommandGate.disabledReason(isIndexing: true, jobIsRunning: true, isTrashingDuplicates: false, isRestoringFromTrash: false),
+                       LibraryIndexCommandGate.disabledReason(isIndexing: false, jobIsRunning: false, isTrashingDuplicates: false, isRestoringFromTrash: true)] {
             let detto = (reason ?? "").lowercased()
             for parola in gergo {
                 XCTAssertFalse(detto.contains(parola), "gergo nel motivo: '\(parola)' in «\(detto)»")
             }
         }
+    }
+
+    /// Task 5 (2026-09-20, ADR-0009): un annullamento in corso blocca anche la lettura
+    /// manuale, con un motivo distinto dagli altri due.
+    func testCommandGate_restoringInProgress_disablesWithAReason() {
+        let reason = LibraryIndexCommandGate.disabledReason(isIndexing: false, jobIsRunning: false,
+                                                             isTrashingDuplicates: false, isRestoringFromTrash: true)
+        XCTAssertNotNil(reason)
+        let job = LibraryIndexCommandGate.disabledReason(isIndexing: false, jobIsRunning: true,
+                                                          isTrashingDuplicates: false, isRestoringFromTrash: false)
+        let trashing = LibraryIndexCommandGate.disabledReason(isIndexing: false, jobIsRunning: false,
+                                                               isTrashingDuplicates: true, isRestoringFromTrash: false)
+        XCTAssertNotEqual(reason, job)
+        XCTAssertNotEqual(reason, trashing)
     }
 
 
@@ -493,7 +508,7 @@ final class LibraryIndexStatusTests: XCTestCase {
     /// Il danno e' un altro — un'importazione in corso usa l'elenco per non ricopiare foto
     /// gia' presenti, e togliergielo sotto significa fargliele ricopiare.
     func testResetGate_hasItsOwnReason_notTheReadingOne() {
-        let lettura = LibraryIndexCommandGate.disabledReason(isIndexing: false, jobIsRunning: true, isTrashingDuplicates: false)
+        let lettura = LibraryIndexCommandGate.disabledReason(isIndexing: false, jobIsRunning: true, isTrashingDuplicates: false, isRestoringFromTrash: false)
         let svuota = LibraryIndexCommandGate.resetDisabledReason(isIndexing: false, jobIsRunning: true, isTrashingDuplicates: false)
         XCTAssertNotNil(svuota)
         XCTAssertNotEqual(svuota, lettura, "svuotare e rileggere non hanno lo stesso motivo")

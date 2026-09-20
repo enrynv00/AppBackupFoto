@@ -133,4 +133,81 @@ final class MainThreadIsolationTests: XCTestCase {
         flag.reset()
         XCTAssertFalse(flag.isCancelled)
     }
+
+    // MARK: - ProgressThrottle, TrashRestorer, RestorableBatchSummary, VolumeCapacityReader (2026-09-20)
+
+    func testProgressThrottle_runsWithoutTheMainThread() {
+        let done = DispatchSemaphore(value: 0)
+        Task.detached {
+            var throttle = ProgressThrottle()
+            _ = throttle.shouldEmit(nowNanos: 0, isFinal: false)
+            done.signal()
+        }
+        XCTAssertEqual(done.wait(timeout: .now() + 5), .success)
+    }
+
+    func testRestorableSummary_runsWithoutTheMainThread() throws {
+        let manifest = try TrashManifestStore(url: tmp.appendingPathComponent("manifest.json"))
+        let done = DispatchSemaphore(value: 0)
+        Task.detached {
+            _ = manifest.restorableSummary()
+            _ = manifest.pendingInLastBatch()
+            done.signal()
+        }
+        XCTAssertEqual(done.wait(timeout: .now() + 10), .success,
+                       "TrashManifestStore.restorableSummary()/pendingInLastBatch() hanno avuto bisogno del main thread.")
+    }
+
+    func testTrashRestorerRun_runsWithoutTheMainThread() throws {
+        let root = tmp.appendingPathComponent("SSD")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let manifest = try TrashManifestStore(url: tmp.appendingPathComponent("manifest.json"))
+        // Funzioni iniettate che non toccano niente: nessuna mossa vera, nessun Cestino vero.
+        let restorer = TrashRestorer(libraryRoot: root, manifest: manifest,
+                                     moveFunction: { _, _ in }, hashFunction: { _ in nil },
+                                     volumeIdentity: { _ in 1 })
+        let done = DispatchSemaphore(value: 0)
+        Task.detached {
+            _ = restorer.run([])
+            done.signal()
+        }
+        XCTAssertEqual(done.wait(timeout: .now() + 10), .success,
+                       "TrashRestorer.run ha avuto bisogno del main thread.")
+    }
+
+    func testVolumeCapacityRead_runsWithoutTheMainThread() {
+        let done = DispatchSemaphore(value: 0)
+        Task.detached {
+            // Una directory temporanea: il risultato e' `.notAMountPoint`, conta solo che finisca.
+            _ = VolumeCapacityReader.read(path: NSTemporaryDirectory())
+            done.signal()
+        }
+        XCTAssertEqual(done.wait(timeout: .now() + 5), .success,
+                       "VolumeCapacityReader.read ha avuto bisogno del main thread.")
+    }
+
+    // MARK: - Campione d'integrita' fuori dal main (2026-09-20, ROADMAP #33, aggiunta al piano)
+
+    /// `ReviewEngine.runIntegritySample` era `@MainActor` senza produrre alcun warning
+    /// (nessun `Task.detached` di mezzo, quindi nessuno dei sei casi della tabella): girava
+    /// sul main perche' era codice MainActor corretto, non per un bug di isolamento — ma su
+    /// un file grande (gli zip da 40-50 GB dell'SSD) avrebbe bloccato l'app per minuti.
+    func testIntegritySampleLocalPair_runsWithoutTheMainThread() throws {
+        let src = tmp.appendingPathComponent("src")
+        let dst = tmp.appendingPathComponent("dst")
+        try FileManager.default.createDirectory(at: src, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: dst, withIntermediateDirectories: true)
+        try Data("foto".utf8).write(to: src.appendingPathComponent("a.jpg"))
+        try Data("foto".utf8).write(to: dst.appendingPathComponent("a.jpg"))
+        let defaults = UserDefaults(suiteName: "MainThreadIsolationTests-integrity")!
+
+        let done = DispatchSemaphore(value: 0)
+        Task.detached {
+            _ = integritySampleLocalPair(srcRoot: src, dstRoot: dst, pairName: "Test",
+                                         sampleSize: 20, defaults: defaults)
+            done.signal()
+        }
+        XCTAssertEqual(done.wait(timeout: .now() + 10), .success,
+                       "integritySampleLocalPair ha avuto bisogno del main thread.")
+    }
 }

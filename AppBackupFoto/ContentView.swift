@@ -2491,12 +2491,18 @@ nonisolated struct TrashedItem: Codable, Equatable {
     var size: Int64
     var hash: String
     var trashedAt: Date
+    /// `nil` = ancora nel Cestino. Impostata da `TrashManifestStore.markRestored` non appena
+    /// `TrashRestorer` rimette la foto al suo posto (ADR-0009): senza, «Annulla» non sa cosa
+    /// e' gia' tornato e una seconda pressione racconterebbe «Cestino svuotato» su foto che
+    /// invece sono al loro posto. Campo accessorio: un registro scritto da una versione senza
+    /// questo campo si decodifica con `restoredAt == nil`, comportamento di oggi.
+    var restoredAt: Date? = nil
 }
 
 /// Perche' una voce non e' stata rimessa al suo posto. Ogni caso ha una frase propria:
 /// l'utente che preme «Annulla» e non vede tornare tutto deve poter capire quale dei motivi
 /// lo riguarda, e cosa puo' farci.
-nonisolated enum RestoreSkipReason: Equatable {
+nonisolated enum RestoreSkipReason: Hashable {
     /// Il file non e' piu' nel Cestino: quasi sempre il Cestino e' stato svuotato.
     case missingInTrash
     /// Il file nel Cestino non e' piu' quello che ci era stato messo.
@@ -2505,6 +2511,14 @@ nonisolated enum RestoreSkipReason: Equatable {
     case originalPathOccupied
     /// Lo spostamento e' fallito per un motivo del filesystem.
     case moveFailed(String)
+    /// Il file nel Cestino c'e', ma non e' stato possibile rileggerlo per riverificarlo — e
+    /// il disco e' rimasto lo stesso (altrimenti sarebbe uno scollegamento). Non e'
+    /// `alteredInTrash`: quello dice "e' cambiata", questo dice "non ho potuto controllare".
+    case unreadableInTrash
+    /// Il percorso originale o quello nel Cestino risolvono fuori dalla root della libreria
+    /// (registro alterato a mano, o un `..` nel percorso): l'app non tocca niente fuori dalla
+    /// libreria, per lo stesso motivo per cui `DuplicateTrasher` non lo fa.
+    case outsideLibrary
 
     var explanation: String {
         switch self {
@@ -2522,6 +2536,12 @@ nonisolated enum RestoreSkipReason: Equatable {
         case .moveFailed(let dettaglio):
             return "Non è stato possibile rimettere a posto questa foto (\(dettaglio)). "
                 + "La copia nel Cestino non è stata toccata."
+        case .unreadableInTrash:
+            return "Non è stato possibile rileggere questa foto nel Cestino, quindi è rimasta lì. "
+                + "Riprova più tardi; se il problema resta, puoi spostarla a mano."
+        case .outsideLibrary:
+            return "Questa foto doveva tornare in un posto fuori dall'SSD delle foto, quindi "
+                + "l'app non l'ha toccata: è ancora nel Cestino."
         }
     }
 }
@@ -2529,6 +2549,28 @@ nonisolated enum RestoreSkipReason: Equatable {
 nonisolated struct RestoreOutcome {
     var restored: [TrashedItem] = []
     var skipped: [(item: TrashedItem, reason: RestoreSkipReason)] = []
+    /// Voci trovate gia' al loro posto (ADR-0009, D3): il file non e' piu' nel Cestino, il
+    /// disco e' quello di prima, e al percorso originale c'e' un file con la stessa
+    /// dimensione e lo stesso hash registrati. Si marcano come tornate, senza muovere niente.
+    var alreadyInPlace: [TrashedItem] = []
+    /// L'utente ha premuto "Interrompi".
+    var interrupted: Bool = false
+    /// Il volume della libreria e' sparito a meta' ripristino: si e' fermato tutto.
+    var stoppedBecauseVolumeVanished: Bool = false
+    /// Voci mai tentate (scollegamento, interruzione, o volume assente all'avvio).
+    var notAttempted: Int = 0
+}
+
+/// Riepilogo piccolo e puro di cosa resta da rimettere a posto — quello che la UI legge in
+/// O(1), invece di rifare il filtro di `pendingInLastBatch()` a ogni ridisegno (ADR-0009, D8).
+/// `nil` (fuori da questo tipo, nel punto in cui viene prodotto) = niente da rimettere a posto.
+// Nessuna riga di sicurezza: value type senza stato condiviso.
+nonisolated struct RestorableBatchSummary: Equatable {
+    var pendingCount: Int
+    var batchCount: Int
+    /// Il piu' vecchio istante di cestinamento fra le voci ancora da rimettere a posto: e'
+    /// la data che la conferma mostra all'utente ("le foto spostate il 2 settembre").
+    var trashedAt: Date
 }
 
 /// Il contenuto del registro su disco.
@@ -2560,14 +2602,16 @@ nonisolated extension TrashManifest {
 
 nonisolated extension TrashedItem {
     private enum CodingKeys: String, CodingKey {
-        case batchId, originalDisplayPath, originalKey, trashedPath, size, hash, trashedAt
+        case batchId, originalDisplayPath, originalKey, trashedPath, size, hash, trashedAt, restoredAt
     }
 
     /// Stessa ragione del tipo contenitore. Qui la decodifica e' **tollerante sui campi
     /// accessori e severa su quelli portanti**: senza `trashedPath`, `size` o `hash` la voce
     /// non e' ripristinabile in sicurezza e non deve entrare nel registro fingendo di
     /// esserlo. `originalKey` invece degrada: serve a rimettere la riga nell'indice, e un
-    /// indice incompleto si ricostruisce da solo.
+    /// indice incompleto si ricostruisce da solo. `restoredAt` degrada a `nil`: un registro
+    /// scritto prima di ADR-0009 non aveva questo campo, e "non ancora tornato" e' la lettura
+    /// corretta della sua assenza.
     init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         batchId = try c.decodeIfPresent(String.self, forKey: .batchId) ?? ""
@@ -2577,6 +2621,7 @@ nonisolated extension TrashedItem {
         size = try c.decode(Int64.self, forKey: .size)
         hash = try c.decode(String.self, forKey: .hash)
         trashedAt = try c.decodeIfPresent(Date.self, forKey: .trashedAt) ?? Date(timeIntervalSince1970: 0)
+        restoredAt = try c.decodeIfPresent(Date.self, forKey: .restoredAt)
     }
 }
 
@@ -2592,9 +2637,10 @@ nonisolated extension TrashedItem {
 /// Da cui la regola di questa classe: **`record` scrive subito**, una voce alla volta. Un
 /// registro bufferizzato e salvato a fine blocco avrebbe esattamente lo stesso difetto di
 /// quello che sta sostituendo.
-// `nonisolated`: `record` viene chiamato dal trasher fuori dal main thread, `lastBatch`/
-// `restore` dal main. Ogni accesso a `manifest` avviene dentro `lock.withLock`, scrittura su
-// disco compresa; `url` e' `let`. Vedi ADR-0006.
+// `nonisolated`: `record` viene chiamato dal trasher fuori dal main thread, `markRestored` da
+// `TrashRestorer` (anche lei fuori dal main, ADR-0009), `lastBatch`/`pendingInLastBatch`/
+// `restorableSummary` da entrambi i thread e dal main. Ogni accesso a `manifest` avviene dentro
+// `lock.withLock`, scrittura su disco compresa; `url` e' `let`. Vedi ADR-0006, ADR-0009.
 nonisolated final class TrashManifestStore: @unchecked Sendable {
 
     enum StoreError: Error, LocalizedError {
@@ -2653,9 +2699,11 @@ nonisolated final class TrashManifestStore: @unchecked Sendable {
         }
     }
 
-    /// Le voci dell'ultimo blocco registrato — quello che «Annulla l'ultimo spostamento»
-    /// rimette a posto. L'ultimo e' quello **registrato per ultimo**, non quello con la data
-    /// piu' alta: due blocchi possono condividere l'istante, l'ordine di scrittura no.
+    /// Le voci dell'ultimo blocco registrato. L'ultimo e' quello **registrato per ultimo**,
+    /// non quello con la data piu' alta: due blocchi possono condividere l'istante, l'ordine
+    /// di scrittura no. Da ADR-0009 «Annulla l'ultimo spostamento» non usa piu' questo metodo
+    /// direttamente: usa `pendingInLastBatch()`, che esclude le voci gia' marcate tornate.
+    /// Resta usata dai test e per raccontare la storia del blocco.
     func lastBatch() -> [TrashedItem] {
         lock.withLock {
             guard let ultimo = manifest.items.last?.batchId else { return [] }
@@ -2663,51 +2711,50 @@ nonisolated final class TrashManifestStore: @unchecked Sendable {
         }
     }
 
-    /// Rimette al loro posto le voci indicate. Non lancia mai: ogni voce che non si riesce a
-    /// ripristinare finisce fra gli `skipped` **con il motivo**, e le altre proseguono. Una
-    /// voce rotta che interrompesse il ciclo lascerebbe l'annullamento a meta' senza dirlo.
-    func restore(_ items: [TrashedItem]) -> RestoreOutcome {
-        var outcome = RestoreOutcome()
-        let fm = FileManager.default
-
-        for item in items {
-            let trashed = URL(fileURLWithPath: item.trashedPath)
-            let original = URL(fileURLWithPath: item.originalDisplayPath)
-
-            guard fm.fileExists(atPath: trashed.path) else {
-                outcome.skipped.append((item, .missingInTrash)); continue
-            }
-
-            // Zero-overwrite, che vale anche in questa direzione. La guardia e' **nostra** e
-            // non si delega al rifiuto di `moveItem` (misurato `NSCocoaErrorDomain/516`):
-            // due implementazioni della stessa regola divergono, e questa e' la regola piu'
-            // importante del progetto.
-            guard !fm.fileExists(atPath: original.path) else {
-                outcome.skipped.append((item, .originalPathOccupied)); continue
-            }
-
-            // Si rilegge e si riverifica **prima** di spostare: il file nel Cestino puo'
-            // essere stato modificato da quando ce l'abbiamo messo, e rimettere al posto
-            // della foto dell'utente un file diverso sarebbe una sostituzione silenziosa.
-            // Dimensione e hash vengono dallo **stesso descrittore aperto** (`sha256Measured`).
-            guard let measured = sha256Measured(of: trashed),
-                  measured.hash == item.hash, measured.size == item.size else {
-                outcome.skipped.append((item, .alteredInTrash)); continue
-            }
-
-            do {
-                // Le cartelle intermedie possono essere state cancellate fra il cestinamento
-                // e l'annullamento: senza ricrearle il ripristino fallirebbe proprio nel
-                // caso in cui l'utente ha fatto pulizia e vuole tornare indietro.
-                try fm.createDirectory(at: original.deletingLastPathComponent(),
-                                       withIntermediateDirectories: true)
-                try fm.moveItem(at: trashed, to: original)
-                outcome.restored.append(item)
-            } catch {
-                outcome.skipped.append((item, .moveFailed(error.localizedDescription)))
-            }
+    /// Le voci dell'ultimo blocco **non ancora rimesse a posto**. E' questo, non `lastBatch()`,
+    /// che «Annulla l'ultimo spostamento» rimette a posto (ADR-0009, D1): un annullamento
+    /// interrotto a meta' lascia alcune voci marcate e altre no, e una seconda pressione deve
+    /// riprendere solo da quelle rimaste, non ritentare quelle gia' tornate.
+    func pendingInLastBatch() -> [TrashedItem] {
+        lock.withLock {
+            guard let ultimo = manifest.items.last?.batchId else { return [] }
+            return manifest.items.filter { $0.batchId == ultimo && $0.restoredAt == nil }
         }
-        return outcome
+    }
+
+    /// Marca una voce come tornata al suo posto e **scrive su disco prima di tornare** —
+    /// stessa disciplina di `record`: un annullamento interrotto o un crash non deve poter
+    /// disallineare il registro da quello che e' davvero successo sul disco.
+    ///
+    /// L'identita' e' `batchId` + `trashedPath` + `originalDisplayPath`, mai `==` sull'intero
+    /// valore: due voci con lo stesso `originalDisplayPath` in blocchi diversi (lo stesso file
+    /// cestinato, rimesso, e ricestinato) non si devono confondere. Una voce con
+    /// `trashedPath` vuoto non si marca mai: non era ripristinabile, e non e' mai stata
+    /// davvero spostata dal Cestino.
+    func markRestored(_ item: TrashedItem, at date: Date) throws {
+        guard !item.trashedPath.isEmpty else { return }
+        try lock.withLock {
+            guard let i = manifest.items.firstIndex(where: {
+                $0.batchId == item.batchId && $0.trashedPath == item.trashedPath
+                    && $0.originalDisplayPath == item.originalDisplayPath
+            }) else { return }
+            manifest.items[i].restoredAt = date
+            try writeUnsynchronized()
+        }
+    }
+
+    /// Cosa resta da rimettere a posto nell'ultimo blocco, o `nil` se non c'e' niente
+    /// (nessun blocco mai registrato, o l'ultimo e' completamente tornato). Valore piccolo e
+    /// puro: la UI lo legge in O(1) invece di rifare il filtro a ogni ridisegno (ADR-0009, D8).
+    func restorableSummary() -> RestorableBatchSummary? {
+        lock.withLock {
+            guard let ultimo = manifest.items.last?.batchId else { return nil }
+            let batch = manifest.items.filter { $0.batchId == ultimo }
+            let pending = batch.filter { $0.restoredAt == nil }
+            guard !pending.isEmpty, let oldest = batch.map(\.trashedAt).min() else { return nil }
+            return RestorableBatchSummary(pendingCount: pending.count, batchCount: batch.count,
+                                          trashedAt: oldest)
+        }
     }
 
     private func writeUnsynchronized() throws {
@@ -2716,6 +2763,288 @@ nonisolated final class TrashManifestStore: @unchecked Sendable {
         // contiene i **percorsi** di tutte le foto toccate, in chiaro. Best-effort — un
         // registro scritto e' piu' importante di un registro con i permessi giusti.
         try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    }
+}
+
+/// Rimette al loro posto le foto di un blocco — il motore dietro «Annulla l'ultimo
+/// spostamento» (ADR-0009). Stessa cura del cestinamento (`DuplicateTrasher`), letta al
+/// contrario: una voce alla volta, registro aggiornato subito dopo ogni successo, `st_dev`
+/// riletto a ogni fallimento, mai `NSFileNoSuchFileError` interpretato come "gia' fatto",
+/// interruzione solo fra una foto e l'altra. Sostituisce `TrashManifestStore.restore`
+/// (rimossa): tenerla come involucro avrebbe lasciato due strade per la stessa operazione,
+/// una senza `st_dev` — la classe di errore gia' pagata tre volte (`LibraryExclusions`,
+/// `realResolvedPath`, `makeThumbnail`).
+///
+/// `moveFunction`/`hashFunction`/`volumeIdentity` hanno per default le funzioni reali e sono
+/// iniettate **solo dai test**: gli esiti da coprire (uno scollegamento a meta' ripristino,
+/// un hash che cambia, un occupante che compare proprio prima della mossa) non sono
+/// producibili su file veri senza una corsa fra thread. Stesso pattern di `DuplicateTrasher`.
+// `nonisolated`: `run` deve girare fuori dal main thread — la rilettura di ogni foto puo'
+// richiedere minuti (blocco fino a 50 GB). Solo proprieta' `let`; lo stato di `run` e' tutto
+// locale. Uno alla volta: lo garantisce `BackupRunner.isRestoringFromTrash`. Il registro e'
+// protetto dal proprio lock (`TrashManifestStore`). Vedi ADR-0006, ADR-0009.
+nonisolated final class TrashRestorer: @unchecked Sendable {
+    private let libraryRoot: URL
+    private let manifest: TrashManifestStore
+    private let moveFunction: (URL, URL) throws -> Void
+    private let hashFunction: (URL) -> MeasuredHash?
+    private let volumeIdentity: (URL) -> dev_t?
+    private let now: () -> Date
+    /// Le due forme canoniche della root, calcolate una volta — stessa coppia usata da
+    /// `DuplicateTrasher`/`isAlreadyInLibrary`: la root puo' essere raggiunta per symlink.
+    private let rootForms: [[String]]
+
+    init(libraryRoot: URL,
+         manifest: TrashManifestStore,
+         moveFunction: @escaping (URL, URL) throws -> Void = { try FileManager.default.moveItem(at: $0, to: $1) },
+         hashFunction: @escaping (URL) -> MeasuredHash? = { sha256Measured(of: $0) },
+         volumeIdentity: @escaping (URL) -> dev_t? = { deviceIdentifier(of: $0) },
+         now: @escaping () -> Date = Date.init) {
+        self.libraryRoot = libraryRoot
+        self.manifest = manifest
+        self.moveFunction = moveFunction
+        self.hashFunction = hashFunction
+        self.volumeIdentity = volumeIdentity
+        self.now = now
+        self.rootForms = [libraryRoot.standardizedFileURL.path, realResolvedPath(libraryRoot)].map {
+            $0.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+        }
+    }
+
+    /// Rimette al loro posto le voci indicate. Non lancia mai: ogni voce che non si riesce a
+    /// ripristinare finisce fra gli `skipped` **con il motivo**, e le altre proseguono — a
+    /// meno che il volume della libreria non sia sparito, nel qual caso l'intero ripristino
+    /// si ferma (mai un tentativo di scrivere su un disco che non e' piu' quello di prima).
+    func run(_ items: [TrashedItem],
+             onProgress: (_ done: Int, _ total: Int) -> Void = { _, _ in },
+             isCancelled: () -> Bool = { false }) -> RestoreOutcome {
+        var outcome = RestoreOutcome()
+        let fm = FileManager.default
+
+        // `st_dev` della root letto una volta prima di iniziare. Senza questo valore «il file
+        // non c'era» e «il volume e' sparito» restano indistinguibili: presentano lo stesso
+        // `NSCocoaErrorDomain/4`. Se il volume non c'e' gia' all'inizio, nessuna voce viene
+        // tentata: scrivere sul disco interno al posto dell'SSD sarebbe il guasto peggiore.
+        guard let deviceAtStart = volumeIdentity(libraryRoot) else {
+            outcome.stoppedBecauseVolumeVanished = true
+            outcome.notAttempted = items.count
+            return outcome
+        }
+
+        for (index, item) in items.enumerated() {
+            // Un'interruzione lascia un blocco parziale: e' uno stato legittimo, e le foto
+            // gia' rimesse a posto restano marcate. Solo FRA una voce e l'altra: una foto a
+            // meta' non esiste, perche' `moveItem` e' una rename.
+            if isCancelled() {
+                outcome.interrupted = true
+                outcome.notAttempted += items.count - index
+                break
+            }
+            // Il conteggio "fatto" misura il lavoro tentato su questa voce, qualunque sia
+            // l'esito (tornata, saltata, o l'ultima prima di uno stop per scollegamento).
+            defer { onProgress(index + 1, items.count) }
+
+            let original = URL(fileURLWithPath: item.originalDisplayPath)
+            let trashed = URL(fileURLWithPath: item.trashedPath)
+
+            // Confinamento dell'origine, per COMPONENTI canoniche, mai `hasPrefix`: il
+            // registro e' un file JSON scrivibile dall'utente, e un percorso con `..` o su un
+            // altro disco non deve poter diventare la destinazione di una mossa.
+            guard rootForms.contains(where: { relativePath(of: original.path, under: $0) != nil }) else {
+                outcome.skipped.append((item, .outsideLibrary))
+                continue
+            }
+
+            guard fm.fileExists(atPath: trashed.path) else {
+                // Stesso `NSCocoaErrorDomain/4` per due guasti diversi: solo `st_dev` li
+                // distingue. Il volume c'e' ancora ⇒ il Cestino e' stato davvero svuotato (o
+                // il file spostato a mano), MAI "gia' fatto" senza controllare.
+                guard volumeIdentity(libraryRoot) == deviceAtStart else {
+                    outcome.stoppedBecauseVolumeVanished = true
+                    outcome.notAttempted += items.count - index - 1
+                    break
+                }
+                // Riconciliazione (ADR-0009, D3): il file non e' piu' nel Cestino, ma se al
+                // percorso originale c'e' gia' un file con la stessa dimensione e lo stesso
+                // hash registrati, la foto e' semplicemente gia' al suo posto — seconda
+                // pressione dopo un annullamento riuscito, "Rimetti a posto" fatto dal
+                // Finder, o un crash fra la mossa e la marcatura del registro.
+                if let measured = hashFunction(original),
+                   measured.hash == item.hash, measured.size == item.size {
+                    outcome.alreadyInPlace.append(item)
+                    // La foto e' tornata: se la scrittura del registro fallisce non si
+                    // ritenta qui, la prossima esecuzione la riconoscera' comunque via D3.
+                    try? manifest.markRestored(item, at: now())
+                } else {
+                    outcome.skipped.append((item, .missingInTrash))
+                }
+                continue
+            }
+
+            // Il file nel Cestino deve stare sullo stesso disco della libreria: garantisce
+            // anche che la mossa sotto sia sempre una rename, mai una copia fra volumi.
+            guard volumeIdentity(trashed) == deviceAtStart else {
+                outcome.skipped.append((item, .outsideLibrary))
+                continue
+            }
+
+            // Zero-overwrite, che vale anche in questa direzione. La guardia e' **nostra** e
+            // non si delega al solo rifiuto di `moveItem` (misurato `NSCocoaErrorDomain/516`
+            // sul pannello Doppioni): due implementazioni della stessa regola divergono, ed
+            // e' la regola piu' importante del progetto. Resta comunque un secondo strato
+            // sotto (`moveFunction` rifiuta anch'essa una destinazione occupata).
+            guard !fm.fileExists(atPath: original.path) else {
+                outcome.skipped.append((item, .originalPathOccupied))
+                continue
+            }
+
+            // Si rilegge e si riverifica PRIMA di spostare: il file nel Cestino puo' essere
+            // stato modificato da quando ce l'abbiamo messo. Dimensione e hash dallo stesso
+            // descrittore aperto (`sha256Measured`, iniettato come `hashFunction`).
+            guard let measured = hashFunction(trashed) else {
+                // Un hash illeggibile su un file che ESISTE non e' "e' cambiata" — puo'
+                // essere lo scollegamento che sta iniziando proprio ora.
+                guard volumeIdentity(libraryRoot) == deviceAtStart else {
+                    outcome.stoppedBecauseVolumeVanished = true
+                    outcome.notAttempted += items.count - index - 1
+                    break
+                }
+                outcome.skipped.append((item, .unreadableInTrash))
+                continue
+            }
+            guard measured.hash == item.hash, measured.size == item.size else {
+                outcome.skipped.append((item, .alteredInTrash))
+                continue
+            }
+
+            // Ricontrollo del disco SUBITO PRIMA di scrivere: e' la difesa nostra contro un
+            // `createDirectory` che ricreerebbe `/Volumes/SSD - Enri/…` sul disco del Mac se
+            // il volume sparisse proprio fra la rilettura e la scrittura.
+            guard volumeIdentity(libraryRoot) == deviceAtStart else {
+                outcome.stoppedBecauseVolumeVanished = true
+                outcome.notAttempted += items.count - index - 1
+                break
+            }
+
+            do {
+                // Le cartelle intermedie possono essere state cancellate fra il cestinamento
+                // e l'annullamento: senza ricrearle il ripristino fallirebbe proprio nel caso
+                // in cui l'utente ha fatto pulizia e vuole tornare indietro.
+                try fm.createDirectory(at: original.deletingLastPathComponent(),
+                                       withIntermediateDirectories: true)
+                try moveFunction(trashed, original)
+                outcome.restored.append(item)
+                // Foto tornata: se la scrittura del registro fallisce non si ritenta qui, la
+                // prossima esecuzione la riconosce comunque via D3.
+                try? manifest.markRestored(item, at: now())
+            } catch {
+                // Mai "gia' fatto": si ricontrolla `st_dev` anche su un fallimento della
+                // mossa, non solo su un file mancante.
+                guard volumeIdentity(libraryRoot) == deviceAtStart else {
+                    outcome.stoppedBecauseVolumeVanished = true
+                    outcome.notAttempted += items.count - index - 1
+                    break
+                }
+                outcome.skipped.append((item, .moveFailed((error as NSError).localizedDescription)))
+            }
+        }
+        return outcome
+    }
+}
+
+/// Cosa dice l'app durante e dopo «Annulla l'ultimo spostamento» (ADR-0009). Logica **pura**,
+/// stessa disciplina di `DuplicatesStatus`/`LibraryIndexStatus`: niente "hash", "indice",
+/// "registro", "manifest", "volume", "scansione", "entry", "cache", "sha" in nessun testo.
+enum TrashRestoreStatus {
+    /// Titolo e messaggio della conferma non distruttiva prima di partire (decisione 2 di
+    /// Enrico, 2026-09-20): numero di foto e data dello spostamento, in linguaggio comune.
+    struct Confirmation {
+        let title: String
+        let message: String
+    }
+
+    private static let dateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateStyle = .long
+        f.timeStyle = .none
+        f.locale = Locale(identifier: "it_IT")
+        return f
+    }()
+
+    static func confirmation(summary: RestorableBatchSummary) -> Confirmation {
+        let data = dateFormatter.string(from: summary.trashedAt)
+        return Confirmation(
+            title: "Rimettere a posto le foto?",
+            message: "Rimetto a posto \(count(summary.pendingCount, "foto spostata", "foto spostate")) "
+                + "nel Cestino il \(data). Ogni foto viene ricontrollata prima di essere spostata, "
+                + "quindi può volerci qualche minuto. Se al posto di una foto nel frattempo c'è un "
+                + "altro file, l'app non lo sovrascrive: la lascia nel Cestino e te lo dice.")
+    }
+
+    static func progressLine(done: Int, total: Int) -> String {
+        "Rimetto a posto le foto: \(done) di \(total)"
+    }
+
+    static let stoppingLine = "Mi fermo dopo la foto in corso…"
+
+    /// Le righe dell'esito, nell'ordine in cui l'utente deve leggerle: prima cosa e' successo
+    /// (tutto / interrotto / scollegamento), poi cosa non e' tornato e perche', poi
+    /// l'avvertenza sull'elenco. Restano nel pannello (non un alert): cosi' si vedono ancora
+    /// riaprendo la finestra.
+    static func outcomeLines(_ outcome: RestoreOutcome) -> [DuplicatesStatus.Line] {
+        var out: [DuplicatesStatus.Line] = []
+        // "Ancora nel Cestino" sono le voci NON tornate: quelle saltate (restano fisicamente
+        // li', tranne il caso limite di un Cestino svuotato a mano) piu' quelle mai tentate
+        // per uno stop o uno scollegamento. NON `total - restored`: quello conterebbe come
+        // "ancora nel Cestino" anche le voci `alreadyInPlace`, che invece sono gia' al posto
+        // giusto e non sono mai state nel Cestino durante questa corsa.
+        let stillInTrash = outcome.skipped.count + outcome.notAttempted
+
+        if outcome.stoppedBecauseVolumeVanished {
+            out.append(DuplicatesStatus.Line(id: "volume-vanished", tone: .warning, text:
+                "L'SSD si è scollegato mentre rimettevo a posto le foto: "
+                + "\(count(outcome.restored.count, "foto è tornata", "foto sono tornate")) al loro posto, "
+                + "\(count(stillInTrash, "altra è ancora", "altre sono ancora")) nel Cestino dell'SSD. "
+                + "Ricollegalo e premi di nuovo «Annulla l'ultimo spostamento» per finire."))
+        } else if outcome.interrupted {
+            out.append(DuplicatesStatus.Line(id: "interrupted", tone: .info, text:
+                "Ti sei fermato a metà: "
+                + "\(count(outcome.restored.count, "foto è tornata", "foto sono tornate")) al loro posto, "
+                + "\(count(stillInTrash, "altra è ancora", "altre sono ancora")) nel Cestino, al sicuro. "
+                + "Premi di nuovo «Annulla l'ultimo spostamento» per finire."))
+        } else if !outcome.restored.isEmpty {
+            out.append(DuplicatesStatus.Line(id: "done", tone: .ok, text:
+                "\(count(outcome.restored.count, "foto è tornata", "foto sono tornate")) al loro posto."))
+        }
+
+        if !outcome.alreadyInPlace.isEmpty {
+            out.append(DuplicatesStatus.Line(id: "already-in-place", tone: .info, text:
+                "\(count(outcome.alreadyInPlace.count, "era già al suo posto", "erano già al loro posto")) "
+                + "(forse le avevi rimesse tu dal Finder)."))
+        }
+
+        if !outcome.skipped.isEmpty {
+            let byReason = Dictionary(grouping: outcome.skipped, by: { $0.reason })
+            for (index, reason) in Array(byReason.keys).enumerated() {
+                let n = byReason[reason]?.count ?? 0
+                out.append(DuplicatesStatus.Line(id: "skipped-\(index)", tone: .warning, text:
+                    "\(n.formatted()) foto — \(reason.explanation)"))
+            }
+        }
+
+        // Vero oggi e non detto altrove: ADR-0005 vieta di reinserire a mano le voci
+        // nell'elenco, quindi le foto tornate ricompaiono solo al prossimo aggiornamento.
+        if !outcome.restored.isEmpty {
+            out.append(DuplicatesStatus.Line(id: "reappears", tone: .info, text:
+                "Le foto tornate a posto ricompariranno fra le copie doppie dopo il prossimo "
+                + "aggiornamento dell'elenco."))
+        }
+
+        return out
+    }
+
+    private static func count(_ n: Int, _ singular: String, _ plural: String) -> String {
+        "\(n.formatted()) \(n == 1 ? singular : plural)"
     }
 }
 
@@ -2844,7 +3173,7 @@ enum DuplicatesStatus {
     /// da qui (restano comunque le due conferme). Stessa disciplina di `RestoreView`: un
     /// bottone disattivato dice sempre perche', non un semplice grigiore.
     static func trashDisabledReason(isRunning: Bool, isIndexing: Bool, ssdMounted: Bool,
-                                    isTrashingDuplicates: Bool) -> String? {
+                                    isTrashingDuplicates: Bool, isRestoringFromTrash: Bool) -> String? {
         guard ssdMounted else {
             return "L'SSD non è collegato in questo momento: senza, l'app non può né "
                 + "riverificare né spostare niente."
@@ -2862,6 +3191,46 @@ enum DuplicatesStatus {
         // non e' finito — vedi `BackupRunner.isTrashingDuplicates`).
         guard !isTrashingDuplicates else {
             return "Uno spostamento nel Cestino è già in corso: aspetta che finisca."
+        }
+        // Stesso principio: un annullamento in corso e uno spostamento non possono coesistere
+        // (`BackupRunner.beginDuplicateTrashing`), ma la frase deve dirlo se mai capitasse.
+        guard !isRestoringFromTrash else {
+            return "L'app sta rimettendo a posto le foto dell'ultimo spostamento: aspetta che "
+                + "finisca."
+        }
+        return nil
+    }
+
+    /// Perche' «Annulla l'ultimo spostamento» e' disattivato adesso, `nil` se si puo' premere
+    /// (ADR-0009). Stessa disciplina di `trashDisabledReason`: un bottone disattivato dice
+    /// sempre perche'. `summary` e' `nil` quando non c'e' niente da rimettere a posto — due
+    /// frasi diverse a seconda che non si sia MAI spostato niente da qui (`hasEverTrashed ==
+    /// false`) o che l'ultimo blocco sia gia' stato rimesso a posto per intero.
+    static func undoDisabledReason(ssdMounted: Bool, isRunning: Bool, isIndexing: Bool,
+                                   isTrashingDuplicates: Bool, isRestoringFromTrash: Bool,
+                                   summary: RestorableBatchSummary?, hasEverTrashed: Bool) -> String? {
+        guard ssdMounted else {
+            return "L'SSD non è collegato: le foto da rimettere a posto sono nel suo Cestino. "
+                + "Ricollegalo e riprova."
+        }
+        guard !isTrashingDuplicates else {
+            return "Uno spostamento nel Cestino è in corso: aspetta che finisca prima di "
+                + "annullare quello precedente."
+        }
+        guard !isRestoringFromTrash else {
+            return "C'è già un annullamento in corso."
+        }
+        guard !isRunning else {
+            return "C'è un backup in corso: aspetta che finisca."
+        }
+        guard !isIndexing else {
+            return "L'elenco delle foto già salvate si sta aggiornando in questo momento: "
+                + "aspetta che finisca."
+        }
+        guard summary != nil else {
+            return hasEverTrashed
+                ? "L'ultimo spostamento è già stato annullato."
+                : "Da qui non hai ancora spostato niente nel Cestino."
         }
         return nil
     }
@@ -3131,7 +3500,7 @@ nonisolated final class DuplicateTrasher: @unchecked Sendable {
             // accadere, e proprio per questo gestito — si rimette a posto subito quanto si e'
             // appena spostato, invece di lasciare l'utente senza nessuna copia.
             if !FileManager.default.fileExists(atPath: keeperURL.path) {
-                _ = manifest.restore(trashedInGroup)
+                _ = TrashRestorer(libraryRoot: libraryRoot, manifest: manifest).run(trashedInGroup)
                 outcome.skippedGroups.append((group, .keeperVanished(displayPath: decision.keeper.displayPath)))
                 continue
             }
@@ -4401,9 +4770,19 @@ enum LibraryIndexStatus {
 /// la sua frase su `isIndexing` cita `LibraryIndexCommands.stop`, che e' anch'esso
 /// MainActor per il default del target — nessun motivo di annotarlo diversamente.
 enum JobStartGate {
-    static func blockedReason(isIndexing: Bool, isTrashingDuplicates: Bool) -> String? {
+    /// Precedenza (Task 5, ADR-0009): spostamento nel Cestino > annullamento dell'ultimo
+    /// spostamento > lettura dell'elenco. Le due operazioni sul Cestino sono le piu' vicine
+    /// al percorso a danno piu' alto del progetto (ADR-0005); non possono comunque coesistere
+    /// fra loro (si escludono a vicenda in `BackupRunner`), ma l'ordine qui fissa comunque
+    /// quale frase l'utente legge se mai lo stato risultasse incoerente.
+    static func blockedReason(isIndexing: Bool, isTrashingDuplicates: Bool,
+                              isRestoringFromTrash: Bool) -> String? {
         if isTrashingDuplicates {
             return "L'app sta spostando nel Cestino le copie doppie che hai confermato. "
+                + "Aspetta che finisca, oppure fermala con «Interrompi» nella finestra Doppioni."
+        }
+        if isRestoringFromTrash {
+            return "L'app sta rimettendo a posto le foto che avevi spostato nel Cestino. "
                 + "Aspetta che finisca, oppure fermala con «Interrompi» nella finestra Doppioni."
         }
         if isIndexing {
@@ -4419,13 +4798,17 @@ enum LibraryIndexCommandGate {
     /// perche' e' la causa piu' vicina a quello che l'utente sta guardando: se sta scorrendo
     /// la barra di avanzamento, la frase sul backup lo confonderebbe.
     static func disabledReason(isIndexing: Bool, jobIsRunning: Bool,
-                               isTrashingDuplicates: Bool) -> String? {
-        // Lo spostamento nel Cestino ha la precedenza sulle altre due: da quando gira
+                               isTrashingDuplicates: Bool, isRestoringFromTrash: Bool) -> String? {
+        // Lo spostamento nel Cestino ha la precedenza sulle altre: da quando gira
         // davvero fuori dal main (2026-09-19, BUG-7) puo' essere in corso insieme a
         // un'altra causa, ed e' quella piu' vicina al danno se qualcuno lo ignorasse.
         if isTrashingDuplicates {
             return "L'app sta spostando nel Cestino le copie doppie che hai confermato: "
                 + "leggere le foto adesso darebbe un elenco sbagliato. Riprova quando ha finito."
+        }
+        if isRestoringFromTrash {
+            return "L'app sta rimettendo a posto le foto spostate nel Cestino: leggere le foto "
+                + "adesso darebbe un elenco sbagliato. Riprova quando ha finito."
         }
         if isIndexing {
             return "L'app sta già leggendo le foto sull'SSD. Aspetta che finisca, "
@@ -4974,8 +5357,17 @@ nonisolated final class FileSyncer: @unchecked Sendable {
     /// Il ramo "non verificabile" era completamente scoperto fino al 2026-08-26.
     private let hashFunction: (URL) -> String?
 
-    init(hashFunction: @escaping (URL) -> String? = { sha256(of: $0) }) {
+    /// Intervallo minimo fra due `onProgress` pubblicati (ADR-0010, ROADMAP #37): in
+    /// produzione e' sempre `ProgressThrottle.defaultMinimumIntervalNanos` (~10/s). Iniettato
+    /// **solo dai test**, stesso schema di `hashFunction`: con un intervallo di un'ora un
+    /// test sa esattamente quali aggiornamenti arrivano, senza cronometro. `internal`, non
+    /// `private`, perche' `testDefaultInterval_isTheShared100ms` lo legge.
+    let progressIntervalNanos: UInt64
+
+    init(hashFunction: @escaping (URL) -> String? = { sha256(of: $0) },
+         progressIntervalNanos: UInt64 = ProgressThrottle.defaultMinimumIntervalNanos) {
         self.hashFunction = hashFunction
+        self.progressIntervalNanos = progressIntervalNanos
     }
 
     func cancel() { cancelFlag.cancel() }
@@ -5136,6 +5528,7 @@ nonisolated final class FileSyncer: @unchecked Sendable {
             DispatchQueue.global(qos: .userInitiated).async {
                 self.cancelFlag.reset()
                 var result = SyncResult()
+                var throttle = ProgressThrottle(minimumIntervalNanos: self.progressIntervalNanos)
 
                 DispatchQueue.main.async { onStatus("Conteggio file in corso...") }
                 result.total = self.countFiles(at: src)
@@ -5158,12 +5551,21 @@ nonisolated final class FileSyncer: @unchecked Sendable {
                         try self.fm.createDirectory(at: dst, withIntermediateDirectories: true)
                     }
                     try self.syncDir(src: src, dst: dst, base: src, deep: deep,
-                                     result: &result, onStatus: onStatus, onProgress: onProgress,
+                                     result: &result, progress: &throttle,
+                                     onStatus: onStatus, onProgress: onProgress,
                                      onCurrentFile: onCurrentFile,
                                      isDuplicate: isDuplicate, onCopied: onCopied,
                                      onUnverified: onUnverified)
+                    // Sempre l'ultimo valore, qualunque sia stato l'ultimo aggiornamento
+                    // diradato (ADR-0010): coincide con `result`, quindi arrivare dopo
+                    // `finishCopyStep` non cambia i numeri finali — non dipende da
+                    // `done == total`, che puo' non verificarsi mai su un'interruzione.
+                    let snap = result
+                    DispatchQueue.main.async { onProgress(snap) }
                     cont.resume(returning: result)
                 } catch {
+                    let snap = result
+                    DispatchQueue.main.async { onProgress(snap) }
                     cont.resume(throwing: error)
                 }
             }
@@ -5184,6 +5586,7 @@ nonisolated final class FileSyncer: @unchecked Sendable {
 
     private func syncDir(src: URL, dst: URL, base: URL, deep: Bool,
                          result: inout SyncResult,
+                         progress: inout ProgressThrottle,
                          onStatus: @escaping (String) -> Void,
                          onProgress: @escaping (SyncResult) -> Void,
                          onCurrentFile: @escaping (URL) -> Void,
@@ -5210,13 +5613,13 @@ nonisolated final class FileSyncer: @unchecked Sendable {
             let destItem = dst.appendingPathComponent(item.lastPathComponent)
             if vals?.isDirectory == true {
                 try syncDir(src: item, dst: destItem, base: base, deep: deep,
-                            result: &result, onStatus: onStatus, onProgress: onProgress,
+                            result: &result, progress: &progress, onStatus: onStatus, onProgress: onProgress,
                             onCurrentFile: onCurrentFile,
                             isDuplicate: isDuplicate, onCopied: onCopied,
                             onUnverified: onUnverified)
             } else if vals?.isRegularFile == true {
                 syncFile(src: item, dst: destItem, deep: deep,
-                         result: &result, onStatus: onStatus, onProgress: onProgress,
+                         result: &result, progress: &progress, onStatus: onStatus, onProgress: onProgress,
                          onCurrentFile: onCurrentFile,
                          isDuplicate: isDuplicate, onCopied: onCopied,
                          onUnverified: onUnverified)
@@ -5226,6 +5629,7 @@ nonisolated final class FileSyncer: @unchecked Sendable {
 
     private func syncFile(src: URL, dst: URL, deep: Bool,
                           result: inout SyncResult,
+                          progress: inout ProgressThrottle,
                           onStatus: @escaping (String) -> Void,
                           onProgress: @escaping (SyncResult) -> Void,
                           onCurrentFile: @escaping (URL) -> Void,
@@ -5327,7 +5731,13 @@ nonisolated final class FileSyncer: @unchecked Sendable {
         }
         result.done += 1
         let snap = result
-        DispatchQueue.main.async { onProgress(snap) }
+        // Diradato alla fonte (ADR-0010, ROADMAP #37): al massimo ~10 aggiornamenti al
+        // secondo, sempre quello finale (`isFinal` quando il conteggio combacia — non e' la
+        // sola garanzia: `sync` pubblica comunque un ultimo valore su ogni uscita).
+        if progress.shouldEmit(nowNanos: DispatchTime.now().uptimeNanoseconds,
+                               isFinal: snap.done == snap.total) {
+            DispatchQueue.main.async { onProgress(snap) }
+        }
     }
 
     private func shouldExclude(_ url: URL) -> Bool {
@@ -6707,8 +7117,9 @@ enum VolumeSpaceState: Equatable {
     }
 }
 
-/// Legge la capacità totale/disponibile di un volume — chiamata SOLO dalla `probeQueue` di
-/// `VolumeMonitor` (Task 3), mai dal main thread.
+/// Legge la capacità totale/disponibile di un volume — chiamata dalla `probeQueue` di
+/// `VolumeMonitor` (Task 3) e, una volta per job, da `BackupRunner` (`FreeSpaceCheck`,
+/// ROADMAP #39, via `Task.detached`): sempre fuori dal main thread, mai su di esso.
 ///
 /// Tre regole, ciascuna con un motivo misurato o documentato (spec, ADR-0008):
 ///
@@ -6728,8 +7139,9 @@ enum VolumeSpaceState: Equatable {
 ///    ExFAT/FSKit reale: restituisce **0**, non `nil`. Un indicatore costruito su quella
 ///    chiave mostrerebbe l'SSD pieno al 100%, in rosso, sempre — un falso allarme permanente
 ///    sul disco più importante del progetto. Si usa `volumeAvailableCapacityKey`, che risponde
-///    correttamente (confermato con `df`) ed è la stessa chiave già usata da
-///    `BackupRunner.hasSufficientSpace`.
+///    correttamente (confermato con `df`) — dal 2026-09-20 la stessa chiave che
+///    `FreeSpaceCheck` usa per il controllo di spazio prima di un job (ROADMAP #39, `Task 2`
+///    dell'indicatore di spazio riusato invece di una seconda lettura scritta a parte).
 enum VolumeCapacityReader {
     nonisolated static func read(path: String) -> VolumeCapacityReading {
         let url = URL(fileURLWithPath: path)
@@ -6753,6 +7165,45 @@ enum VolumeCapacityReader {
     /// `.notAMountPoint` e' la prova che li' non c'e' il disco.
     nonisolated static func isMounted(exists: Bool, reading: VolumeCapacityReading?) -> Bool {
         exists && reading != .notAMountPoint
+    }
+}
+
+/// Se c'e' abbastanza spazio per un job, con un motivo onesto quando non si puo' saperlo
+/// (ROADMAP #39). MainActor di default: e' logica pura, costa nulla girare sul main — solo la
+/// LETTURA che produce `VolumeCapacityReading` va fuori dal main (`VolumeCapacityReader.read`,
+/// gia' `nonisolated`, chiamata da `BackupRunner` via `Task.detached`).
+enum FreeSpaceCheck {
+    enum Verdict: Equatable {
+        case enough
+        case notEnough(available: Int64)
+        /// Al posto del volume c'e' una cartella normale (`.notAMountPoint`): fino al
+        /// 2026-09-19 `hasSufficientSpace` lasciava partire il job in questo caso, scrivendo
+        /// sul disco del Mac — lo stesso buco che #40 ha chiuso per `ssdMounted`.
+        case notADisk
+        case unreadable
+    }
+
+    /// Il margine e' **copiato** da `BackupRunner.hasSufficientSpace` (rimossa), non
+    /// riscritto: stesso `max(5% di bytesNeeded, 500 MB)`, stesso confronto
+    /// `available >= bytesNeeded + margin`.
+    static func verdict(bytesNeeded: Int64, reading: VolumeCapacityReading) -> Verdict {
+        switch reading {
+        case .notAMountPoint: return .notADisk
+        case .unreadable: return .unreadable
+        case .measured(_, let available):
+            let margin = max(Int64(Double(bytesNeeded) * 0.05), 500_000_000)
+            return available >= bytesNeeded + margin ? .enough : .notEnough(available: available)
+        }
+    }
+
+    static func notADiskMessage(diskName: String) -> String {
+        "L'\(diskName) non sembra collegato: al suo posto c'è una cartella normale del Mac. "
+            + "Ricollega l'\(diskName) e riprova."
+    }
+
+    static func unreadableMessage(diskName: String) -> String {
+        "Non riesco a leggere quanto spazio libero c'è sull'\(diskName) in questo momento "
+            + "(può succedere se il disco si sta ancora svegliando). Riprova tra qualche secondo."
     }
 }
 
@@ -7455,10 +7906,11 @@ final class BackupRunner: ObservableObject {
     /// altrimenti imposta il flag e restituisce `nil`. Controllo e impostazione sono
     /// atomici rispetto a ogni altro gate perche' girano entrambi sul MainActor.
     func beginDuplicateTrashing() -> SimpleAlert? {
-        guard !isTrashingDuplicates, !isRunning, !isIndexing else {
+        guard !isTrashingDuplicates, !isRunning, !isIndexing, !isRestoringFromTrash else {
             return SimpleAlert(title: "Meglio non farlo adesso",
                 message: "C'è già un'altra operazione in corso (un backup, una lettura "
-                    + "dell'elenco o un altro spostamento nel Cestino). Aspetta che finisca.")
+                    + "dell'elenco, un altro spostamento nel Cestino o un annullamento). "
+                    + "Aspetta che finisca.")
         }
         isTrashingDuplicates = true
         return nil
@@ -7468,6 +7920,119 @@ final class BackupRunner: ObservableObject {
     /// `DuplicateTrasher.run` non lancia mai, quindi nessun percorso lo salta.
     func endDuplicateTrashing() {
         isTrashingDuplicates = false
+    }
+
+    /// Vero mentre `TrashRestorer.run` sta rimettendo a posto l'ultimo blocco spostato nel
+    /// Cestino (ADR-0009). Stesso motivo di `isTrashingDuplicates`: vive nel runner, non in
+    /// uno `@State` di `DuplicatesView` — riaprire la finestra non deve far perdere la
+    /// mutua esclusione con un job, una lettura o uno spostamento in corso.
+    @Published private(set) var isRestoringFromTrash = false
+
+    /// Prova ad avviare un annullamento. Rifiuta (restituendo l'avviso da mostrare) se e'
+    /// gia' in corso uno spostamento nel Cestino, un job, una lettura dell'elenco o un altro
+    /// annullamento; altrimenti imposta il flag e restituisce `nil`. Controllo e
+    /// impostazione sono atomici perche' girano entrambi sul MainActor.
+    func beginTrashRestore() -> SimpleAlert? {
+        guard !isRestoringFromTrash, !isTrashingDuplicates, !isRunning, !isIndexing else {
+            return SimpleAlert(title: "Meglio non farlo adesso",
+                message: "C'è già un'altra operazione in corso (un backup, una lettura "
+                    + "dell'elenco, uno spostamento nel Cestino o un altro annullamento). "
+                    + "Aspetta che finisca.")
+        }
+        isRestoringFromTrash = true
+        return nil
+    }
+
+    /// Chiamato SEMPRE dallo stesso `MainActor.run` che pubblica l'esito dell'annullamento —
+    /// `TrashRestorer.run` non lancia mai, quindi nessun percorso lo salta.
+    func endTrashRestore() {
+        isRestoringFromTrash = false
+    }
+
+    // MARK: Annullamento dell'ultimo spostamento (Task 7, ADR-0009)
+
+    /// Stato dell'annullamento vive QUI, non in `@State` di `DuplicatesView` — stesso motivo
+    /// di `isRestoringFromTrash`: chiudere e riaprire la finestra Doppioni non deve far
+    /// perdere barra e «Interrompi» di un annullamento ancora in corso (e' esattamente il
+    /// difetto gia' noto dello spostamento nel Cestino, vedi ROADMAP #41).
+    @Published var trashRestoreProgress: (done: Int, total: Int)? = nil
+    @Published private(set) var trashRestoreStopRequested = false
+    @Published var lastTrashRestoreOutcome: RestoreOutcome? = nil
+    /// Cosa resta da rimettere a posto, calcolato fuori dal main (D8): la UI lo legge in O(1)
+    /// invece di rifare `pendingInLastBatch()` a ogni ridisegno.
+    @Published private(set) var restorableBatch: RestorableBatchSummary? = nil
+    private var trashRestoreCancelFlag: CancelFlag? = nil
+
+    /// Ricalcola `restorableBatch` fuori dal main. Chiamato all'apertura della finestra
+    /// Doppioni, a fine spostamento e a fine annullamento.
+    func refreshRestorableBatch() {
+        guard let manifest = trashManifestStore else { restorableBatch = nil; return }
+        // `guard let self` e non `self?.`: una `var` weak riferita da una closure
+        // concorrente e' un errore in Swift 6, e qui una referenza forte per la durata di
+        // una query non cambia niente (il runner vive quanto l'app) — stesso schema di
+        // `refreshIndexedFileCount`.
+        Task.detached(priority: .utility) { [weak self] in
+            guard let self else { return }
+            let summary = manifest.restorableSummary()
+            await MainActor.run {
+                // Non ripubblicare lo stesso valore (lezione del 2026-09-03): evita un
+                // ridisegno che nessuno ha chiesto.
+                guard self.restorableBatch != summary else { return }
+                self.restorableBatch = summary
+            }
+        }
+    }
+
+    /// Avvia l'annullamento dell'ultimo blocco non ancora rimesso a posto. `onAlert` e' il
+    /// canale della finestra Doppioni (regola `AlertSink`): mai `pendingAlert`, che ha un
+    /// solo presentatore nella finestra principale.
+    func startTrashRestore(onAlert: @escaping (SimpleAlert) -> Void) {
+        if let alert = beginTrashRestore() {
+            onAlert(alert)
+            return
+        }
+        guard let manifest = trashManifestStore, let root = BookmarkManager.shared.urls[.ssd] else {
+            endTrashRestore()
+            onAlert(SimpleAlert(title: "Non è stato possibile procedere",
+                message: "Il registro di ripristino o l'SSD non sono disponibili in questo "
+                    + "momento. Riprova dopo aver ricontrollato Diagnostica."))
+            return
+        }
+
+        let flag = CancelFlag()
+        trashRestoreCancelFlag = flag
+        trashRestoreStopRequested = false
+        lastTrashRestoreOutcome = nil
+        let items = manifest.pendingInLastBatch()
+        trashRestoreProgress = (0, items.count)
+
+        Task.detached(priority: .utility) {
+            let restorer = TrashRestorer(libraryRoot: root, manifest: manifest)
+            var throttle = ProgressThrottle()
+            let outcome = restorer.run(items, onProgress: { done, total in
+                guard throttle.shouldEmit(nowNanos: DispatchTime.now().uptimeNanoseconds,
+                                          isFinal: done == total) else { return }
+                Task { @MainActor in self.trashRestoreProgress = (done, total) }
+            }, isCancelled: { flag.isCancelled })
+
+            await MainActor.run {
+                self.endTrashRestore()
+                self.trashRestoreProgress = nil
+                self.trashRestoreStopRequested = false
+                self.trashRestoreCancelFlag = nil
+                self.lastTrashRestoreOutcome = outcome
+                self.refreshRestorableBatch()
+            }
+        }
+    }
+
+    /// «Interrompi» durante l'annullamento. Una foto grande puo' richiedere secondi di
+    /// rilettura prima che l'interruzione abbia effetto: la rilettura non si interrompe a
+    /// meta' per poi spostare comunque il file.
+    func stopTrashRestore() {
+        guard !trashRestoreStopRequested else { return }
+        trashRestoreStopRequested = true
+        trashRestoreCancelFlag?.cancel()
     }
 
     private let syncer = FileSyncer()
@@ -7662,7 +8227,8 @@ final class BackupRunner: ObservableObject {
         // far comparire niente.
         if let reason = LibraryIndexCommandGate.disabledReason(isIndexing: isIndexing,
                                                               jobIsRunning: isRunning,
-                                                              isTrashingDuplicates: isTrashingDuplicates) {
+                                                              isTrashingDuplicates: isTrashingDuplicates,
+                                                              isRestoringFromTrash: isRestoringFromTrash) {
             onAlert?(SimpleAlert(title: "Meglio non farlo adesso", message: reason))
             return
         }
@@ -7756,13 +8322,6 @@ final class BackupRunner: ObservableObject {
     private var smoothedEtaSec: Double = 0
     private var elapsedTimer: AnyCancellable?
 
-    private func hasSufficientSpace(bytesNeeded: Int64, atVolumeOf url: URL) -> (ok: Bool, availableBytes: Int64) {
-        let values = try? url.resourceValues(forKeys: [.volumeAvailableCapacityKey])
-        let available = Int64(values?.volumeAvailableCapacity ?? 0)
-        let margin = max(Int64(Double(bytesNeeded) * 0.05), 500_000_000)
-        return (available >= bytesNeeded + margin, available)
-    }
-
     func runMacToSSD() {
         speedUnit = "file/s"
         guard let photosURL = bm.startAccessing(.photos) else {
@@ -7785,13 +8344,32 @@ final class BackupRunner: ObservableObject {
         Task { @MainActor [weak self] in
             guard let self else { return }
             let preview = await self.syncer.previewSync(from: photosURL, to: dst, deep: false)
-            let space = self.hasSufficientSpace(bytesNeeded: preview.toAddBytes, atVolumeOf: ssdURL)
-            guard space.ok else {
+            // Fuori dal main (ROADMAP #39): `VolumeCapacityReader.read` gira gia' su una
+            // coda di background, `hasSufficientSpace` invece leggeva `resourceValues`
+            // direttamente dentro questo `Task { @MainActor }`.
+            let ssdPath = ssdURL.path
+            let reading = await Task.detached(priority: .userInitiated) {
+                VolumeCapacityReader.read(path: ssdPath)
+            }.value
+            switch FreeSpaceCheck.verdict(bytesNeeded: preview.toAddBytes, reading: reading) {
+            case .enough:
+                break
+            case .notEnough(let available):
                 self.bm.stopAccessing(.photos); self.bm.stopAccessing(.ssd)
                 pendingAlert = SimpleAlert(
                     title: "Spazio insufficiente sull'SSD",
                     message: "Servono circa \(ByteCountFormatter.string(fromByteCount: preview.toAddBytes, countStyle: .file)), "
-                        + "liberi \(ByteCountFormatter.string(fromByteCount: space.availableBytes, countStyle: .file)) su \(ssdURL.path).")
+                        + "liberi \(ByteCountFormatter.string(fromByteCount: available, countStyle: .file)) su \(ssdURL.path).")
+                return
+            case .notADisk:
+                self.bm.stopAccessing(.photos); self.bm.stopAccessing(.ssd)
+                pendingAlert = SimpleAlert(title: "SSD non disponibile",
+                    message: FreeSpaceCheck.notADiskMessage(diskName: "SSD"))
+                return
+            case .unreadable:
+                self.bm.stopAccessing(.photos); self.bm.stopAccessing(.ssd)
+                pendingAlert = SimpleAlert(title: "Spazio libero non disponibile",
+                    message: FreeSpaceCheck.unreadableMessage(diskName: "SSD"))
                 return
             }
             self.run(label: "MAC -> SSD", refreshesLibraryIndex: true) { [weak self] in
@@ -7836,13 +8414,29 @@ final class BackupRunner: ObservableObject {
         Task { @MainActor [weak self] in
             guard let self else { return }
             let preview = await self.syncer.previewSync(from: ssdURL, to: hddURL, deep: deep)
-            let space = self.hasSufficientSpace(bytesNeeded: preview.toAddBytes, atVolumeOf: hddURL)
-            guard space.ok else {
+            let hddPath = hddURL.path
+            let reading = await Task.detached(priority: .userInitiated) {
+                VolumeCapacityReader.read(path: hddPath)
+            }.value
+            switch FreeSpaceCheck.verdict(bytesNeeded: preview.toAddBytes, reading: reading) {
+            case .enough:
+                break
+            case .notEnough(let available):
                 self.bm.stopAccessing(.ssd); self.bm.stopAccessing(.hdd)
                 pendingAlert = SimpleAlert(
                     title: "Spazio insufficiente sull'HDD",
                     message: "Servono circa \(ByteCountFormatter.string(fromByteCount: preview.toAddBytes, countStyle: .file)), "
-                        + "liberi \(ByteCountFormatter.string(fromByteCount: space.availableBytes, countStyle: .file)) su \(hddURL.path).")
+                        + "liberi \(ByteCountFormatter.string(fromByteCount: available, countStyle: .file)) su \(hddURL.path).")
+                return
+            case .notADisk:
+                self.bm.stopAccessing(.ssd); self.bm.stopAccessing(.hdd)
+                pendingAlert = SimpleAlert(title: "HDD non disponibile",
+                    message: FreeSpaceCheck.notADiskMessage(diskName: "HDD"))
+                return
+            case .unreadable:
+                self.bm.stopAccessing(.ssd); self.bm.stopAccessing(.hdd)
+                pendingAlert = SimpleAlert(title: "Spazio libero non disponibile",
+                    message: FreeSpaceCheck.unreadableMessage(diskName: "HDD"))
                 return
             }
             self.run(label: label) { [weak self] in
@@ -8209,13 +8803,29 @@ final class BackupRunner: ObservableObject {
             // l'alert sotto lo dice esplicitamente ("al massimo") per non contraddire quanto
             // l'utente ha appena letto un passo prima.
             let preview = await self.syncer.previewSync(from: source, to: dst, deep: false)
-            let space = self.hasSufficientSpace(bytesNeeded: preview.toAddBytes, atVolumeOf: ssdURL)
-            guard space.ok else {
+            let ssdPath = ssdURL.path
+            let reading = await Task.detached(priority: .userInitiated) {
+                VolumeCapacityReader.read(path: ssdPath)
+            }.value
+            switch FreeSpaceCheck.verdict(bytesNeeded: preview.toAddBytes, reading: reading) {
+            case .enough:
+                break
+            case .notEnough(let available):
                 self.bm.stopAccessing(.ssd)
                 pendingAlert = SimpleAlert(
                     title: "Spazio insufficiente sull'SSD",
                     message: "Servono al massimo circa \(ByteCountFormatter.string(fromByteCount: preview.toAddBytes, countStyle: .file)), "
-                        + "liberi \(ByteCountFormatter.string(fromByteCount: space.availableBytes, countStyle: .file)) su \(ssdURL.path).")
+                        + "liberi \(ByteCountFormatter.string(fromByteCount: available, countStyle: .file)) su \(ssdURL.path).")
+                return
+            case .notADisk:
+                self.bm.stopAccessing(.ssd)
+                pendingAlert = SimpleAlert(title: "SSD non disponibile",
+                    message: FreeSpaceCheck.notADiskMessage(diskName: "SSD"))
+                return
+            case .unreadable:
+                self.bm.stopAccessing(.ssd)
+                pendingAlert = SimpleAlert(title: "Spazio libero non disponibile",
+                    message: FreeSpaceCheck.unreadableMessage(diskName: "SSD"))
                 return
             }
             // Dedup per contenuto (roadmap #31). Lo store puo' essere `nil`: in quel caso
@@ -8468,7 +9078,8 @@ final class BackupRunner: ObservableObject {
                      work: @escaping () async throws -> FileSyncer.SyncResult?) {
         guard !isRunning else { return }
         if let reason = JobStartGate.blockedReason(isIndexing: isIndexing,
-                                                    isTrashingDuplicates: isTrashingDuplicates) {
+                                                    isTrashingDuplicates: isTrashingDuplicates,
+                                                    isRestoringFromTrash: isRestoringFromTrash) {
             pendingAlert = SimpleAlert(title: "Meglio non farlo adesso", message: reason)
             return
         }
@@ -8704,10 +9315,12 @@ enum JobHistoryStore {
 /// successivo pulito sovrascriverebbe il record e il debito sparirebbe in silenzio, che e'
 /// esattamente il problema da risolvere. Il debito e' cumulativo e si chiude un file alla
 /// volta, quindi ha una chiave sua.
-struct UnverifiedCopies: Codable, Equatable {
+// `nonisolated`: value type senza stato condiviso — vedi il commento su `UnverifiedCopiesStore`,
+// che decodifica/codifica questo tipo fuori dal main dal 2026-09-20 (ROADMAP #33).
+nonisolated struct UnverifiedCopies: Codable, Equatable {
     /// Una copia da ricontrollare: il percorso piu' l'istante in cui il debito e' stato
     /// contratto. La data serve solo alla scadenza (`UnverifiedCopiesStore.expiryDays`).
-    struct Entry: Codable, Equatable {
+    nonisolated struct Entry: Codable, Equatable {
         var path: String
         /// `nil` solo nei record scritti dalla versione che non aveva ancora questo campo.
         /// Una voce senza data **non scade mai**: far sparire un debito reale sulla base di
@@ -8733,7 +9346,7 @@ struct UnverifiedCopies: Codable, Equatable {
     var paths: [String] { entries.map(\.path) }
 }
 
-extension UnverifiedCopies {
+nonisolated extension UnverifiedCopies {
     private enum CodingKeys: String, CodingKey { case totalCount, entries, lastSeenAt }
     /// Chiavi della forma **vecchia** del record. Enum separata perche' la sintesi di
     /// `encode(to:)` pretende che ogni caso di `CodingKeys` corrisponda a una proprieta'
@@ -8764,7 +9377,13 @@ extension UnverifiedCopies {
     }
 }
 
-enum UnverifiedCopiesStore {
+// `nonisolated` (2026-09-20, ROADMAP #33): `record` e' gia' chiamato dalla coda di lavoro di
+// `FileSyncer`, fuori dal MainActor — il commento su `record` lo dice da sempre. `load`/
+// `clear` sono ora chiamati anche da `integritySampleLocalPair`, fuori dal main (Task.detached
+// da `ReviewEngine.runIntegritySample`). Thread-safe per costruzione: `record`/`clear` sono
+// dietro il proprio `NSLock` (leggi-modifica-scrivi), `load`/`save` toccano solo `UserDefaults`
+// (thread-safe di suo). Nessuno stato mutabile fuori da quello protetto dal lock.
+nonisolated enum UnverifiedCopiesStore {
     /// Tetto ai percorsi conservati. 200 e' ampiamente sopra il numero di file che una
     /// sorgente in uso puo' rendere non verificabili in un job (misurato: unita'), e sotto
     /// la soglia oltre la quale il record in `UserDefaults` diventa un problema di suo.
@@ -8901,7 +9520,9 @@ struct ReviewFinding: Identifiable {
     let detail: String
 }
 
-struct IntegrityCheckResult: Identifiable {
+// `nonisolated` (2026-09-20, ROADMAP #33): value type senza stato condiviso, costruito e
+// restituito da `integritySampleLocalPair`, fuori dal main.
+nonisolated struct IntegrityCheckResult: Identifiable {
     let id = UUID()
     let pairName: String
     var checked: Int = 0
@@ -8915,6 +9536,97 @@ struct IntegrityCheckResult: Identifiable {
     /// (`sha256(of:)` ora restituisce `nil` anche per un file che si muove sotto di noi).
     var skippedUnreadable: Int = 0
     var error: String? = nil
+}
+
+/// Il campione d'integrita' Mac<->SSD / SSD<->HDD, fuori dal main (2026-09-20, ROADMAP #33).
+///
+/// Misurato con Enrico il 2026-09-19 (`sample`, ~80s, 20 file Mac<->SSD): i frame di
+/// `sampleLocalPair`/`sha256` erano presenti sul main in ogni istantanea, ma solo ~0,4-1,3%
+/// del tempo, perche' i file del campione erano piccoli. Il rischio vero e' un file grande:
+/// sull'SSD ci sono zip da 40-50 GB (cartella `Zip/`), e quella lettura bloccherebbe l'app per
+/// minuti se restasse sul MainActor. `ReviewEngine` resta `@MainActor` (default del target);
+/// solo questa funzione — enumerazione + SHA256, il lavoro pesante — e' `nonisolated`, chiamata
+/// da `runIntegritySample` tramite `Task.detached`. Nessun cambio al criterio di
+/// campionamento, alla precedenza di `UnverifiedCopiesStore`, ne' agli esiti mostrati: e'
+/// esattamente il corpo che prima stava dentro `ReviewEngine.sampleLocalPair`.
+// `nonisolated`: nessuno stato condiviso proprio. `fm`/`defaults` sono thread-safe di suo
+// (`FileManager`, `UserDefaults`); `UnverifiedCopiesStore` e' a sua volta `nonisolated`,
+// protetta dal proprio `NSLock`.
+nonisolated func integritySampleLocalPair(srcRoot: URL, dstRoot: URL, pairName: String, sampleSize: Int,
+                                           defaults: UserDefaults) -> IntegrityCheckResult {
+    let fm = FileManager.default
+    var result = IntegrityCheckResult(pairName: pairName)
+    let resolvedDstRoot = URL(fileURLWithPath: realResolvedPath(dstRoot), isDirectory: true)
+    guard let enumerator = fm.enumerator(
+        at: resolvedDstRoot, includingPropertiesForKeys: [.isRegularFileKey],
+        options: [.skipsHiddenFiles]) else {
+        result.error = "Impossibile enumerare \(dstRoot.path)"
+        return result
+    }
+
+    var relPaths: [String] = []
+    let base = resolvedDstRoot.path
+    while let f = enumerator.nextObject() as? URL {
+        let vals = try? f.resourceValues(forKeys: [.isRegularFileKey])
+        guard vals?.isRegularFile == true else { continue }
+        let name = f.lastPathComponent
+        if name.hasPrefix("._") || name == ".DS_Store" { continue }
+        relPaths.append(String(f.path.dropFirst(base.count).drop(while: { $0 == "/" })))
+    }
+    guard !relPaths.isEmpty else { return result }
+
+    // Precedenza ai file copiati ma non verificati. Sono gli unici che nessun altro
+    // meccanismo ricontrollera' mai: per la regola zero-overwrite non verranno ricopiati,
+    // e il conteggio di fine job sparisce con la finestra. Qui la verifica ha buone
+    // probabilita' di riuscire, perche' gira a distanza di tempo e la sorgente non e'
+    // piu' in uso. Il resto del campione resta casuale come prima.
+    let roots = [dstRoot.standardizedFileURL.path, resolvedDstRoot.path].map {
+        $0.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+    }
+    let known = Set(relPaths)
+    var debtByRel: [String: String] = [:]   // percorso relativo -> percorso assoluto registrato
+    var prioritized: [String] = []
+    for stored in UnverifiedCopiesStore.load(defaults: defaults).paths {
+        guard let rel = roots.lazy.compactMap({ relativePath(of: stored, under: $0) }).first,
+              known.contains(rel), debtByRel[rel] == nil else { continue }
+        // Se la sorgente non c'e' piu' il file non e' verificabile in questa coppia (un
+        // import da dispositivo: la sorgente era il telefono, ora scollegato). Non gli si
+        // da' la precedenza, altrimenti brucerebbe uno slot del campione a ogni
+        // esecuzione, per sempre, senza mai potersi chiudere.
+        guard fm.fileExists(atPath: srcRoot.appendingPathComponent(rel).path) else { continue }
+        debtByRel[rel] = stored
+        prioritized.append(rel)
+    }
+
+    var sample = Array(prioritized.prefix(sampleSize))
+    if sample.count < sampleSize {
+        let alreadyChosen = Set(sample)
+        sample += relPaths.shuffled()
+            .filter { !alreadyChosen.contains($0) }
+            .prefix(sampleSize - sample.count)
+    }
+
+    for rel in sample {
+        let dstFile = dstRoot.appendingPathComponent(rel)
+        let srcFile = srcRoot.appendingPathComponent(rel)
+        guard fm.fileExists(atPath: srcFile.path) else {
+            result.skippedNoSource += 1
+            continue
+        }
+        result.checked += 1
+        if let srcHash = sha256(of: srcFile), let dstHash = sha256(of: dstFile), srcHash == dstHash {
+            result.matched += 1
+            // Il debito si chiude: questo file e' stato ricontrollato e corrisponde alla
+            // sorgente. Su mismatch invece resta in lista — e' appena diventato un
+            // problema vero, gia' riportato in `mismatches`.
+            if let stored = debtByRel[rel] {
+                UnverifiedCopiesStore.clear(stored, defaults: defaults)
+            }
+        } else {
+            result.mismatches.append(rel)
+        }
+    }
+    return result
 }
 
 final class ReviewEngine {
@@ -8934,79 +9646,14 @@ final class ReviewEngine {
     // due canonicalizzazioni diverse per lo stesso problema producono forme opposte.
     // Vedi il commento sulla funzione.
 
+    /// Involucro sul MainActor: chiamato direttamente dai test (che girano sul MainActor,
+    /// XCTestCase lo e' di suo) e da `runIntegritySample` tramite `Task.detached` (ROADMAP
+    /// #33) — il vero lavoro e' in `integritySampleLocalPair`, `nonisolated`, cosi' puo'
+    /// girare davvero fuori dal main quando lo chiama `runIntegritySample`. Nessun cambio al
+    /// criterio di campionamento ne' alle priorita' di `UnverifiedCopiesStore`.
     func sampleLocalPair(srcRoot: URL, dstRoot: URL, pairName: String, sampleSize: Int) -> IntegrityCheckResult {
-        var result = IntegrityCheckResult(pairName: pairName)
-        let resolvedDstRoot = URL(fileURLWithPath: realResolvedPath(dstRoot), isDirectory: true)
-        guard let enumerator = fm.enumerator(
-            at: resolvedDstRoot, includingPropertiesForKeys: [.isRegularFileKey],
-            options: [.skipsHiddenFiles]) else {
-            result.error = "Impossibile enumerare \(dstRoot.path)"
-            return result
-        }
-
-        var relPaths: [String] = []
-        let base = resolvedDstRoot.path
-        while let f = enumerator.nextObject() as? URL {
-            let vals = try? f.resourceValues(forKeys: [.isRegularFileKey])
-            guard vals?.isRegularFile == true else { continue }
-            let name = f.lastPathComponent
-            if name.hasPrefix("._") || name == ".DS_Store" { continue }
-            relPaths.append(String(f.path.dropFirst(base.count).drop(while: { $0 == "/" })))
-        }
-        guard !relPaths.isEmpty else { return result }
-
-        // Precedenza ai file copiati ma non verificati. Sono gli unici che nessun altro
-        // meccanismo ricontrollera' mai: per la regola zero-overwrite non verranno ricopiati,
-        // e il conteggio di fine job sparisce con la finestra. Qui la verifica ha buone
-        // probabilita' di riuscire, perche' gira a distanza di tempo e la sorgente non e'
-        // piu' in uso. Il resto del campione resta casuale come prima.
-        let roots = [dstRoot.standardizedFileURL.path, resolvedDstRoot.path].map {
-            $0.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
-        }
-        let known = Set(relPaths)
-        var debtByRel: [String: String] = [:]   // percorso relativo -> percorso assoluto registrato
-        var prioritized: [String] = []
-        for stored in UnverifiedCopiesStore.load(defaults: defaults).paths {
-            guard let rel = roots.lazy.compactMap({ relativePath(of: stored, under: $0) }).first,
-                  known.contains(rel), debtByRel[rel] == nil else { continue }
-            // Se la sorgente non c'e' piu' il file non e' verificabile in questa coppia (un
-            // import da dispositivo: la sorgente era il telefono, ora scollegato). Non gli si
-            // da' la precedenza, altrimenti brucerebbe uno slot del campione a ogni
-            // esecuzione, per sempre, senza mai potersi chiudere.
-            guard fm.fileExists(atPath: srcRoot.appendingPathComponent(rel).path) else { continue }
-            debtByRel[rel] = stored
-            prioritized.append(rel)
-        }
-
-        var sample = Array(prioritized.prefix(sampleSize))
-        if sample.count < sampleSize {
-            let alreadyChosen = Set(sample)
-            sample += relPaths.shuffled()
-                .filter { !alreadyChosen.contains($0) }
-                .prefix(sampleSize - sample.count)
-        }
-
-        for rel in sample {
-            let dstFile = dstRoot.appendingPathComponent(rel)
-            let srcFile = srcRoot.appendingPathComponent(rel)
-            guard fm.fileExists(atPath: srcFile.path) else {
-                result.skippedNoSource += 1
-                continue
-            }
-            result.checked += 1
-            if let srcHash = sha256(of: srcFile), let dstHash = sha256(of: dstFile), srcHash == dstHash {
-                result.matched += 1
-                // Il debito si chiude: questo file e' stato ricontrollato e corrisponde alla
-                // sorgente. Su mismatch invece resta in lista — e' appena diventato un
-                // problema vero, gia' riportato in `mismatches`.
-                if let stored = debtByRel[rel] {
-                    UnverifiedCopiesStore.clear(stored, defaults: defaults)
-                }
-            } else {
-                result.mismatches.append(rel)
-            }
-        }
-        return result
+        integritySampleLocalPair(srcRoot: srcRoot, dstRoot: dstRoot, pairName: pairName,
+                                 sampleSize: sampleSize, defaults: defaults)
     }
 
     private func sampleS3Pair(ssdRoot: URL, sampleSize: Int,
@@ -9022,13 +9669,18 @@ final class ReviewEngine {
             onProgress("Verifica S3: \(key)")
             let localFile = ssdRoot.appendingPathComponent(key)
             // Il file esiste (`candidates` e' gia' filtrato su `fileExists`): se l'hash
-            // non si calcola e' illeggibile o si e' mosso, non "sorgente mancante".
-            guard let localHash = sha256(of: localFile) else { result.skippedUnreadable += 1; continue }
+            // non si calcola e' illeggibile o si e' mosso, non "sorgente mancante". Lo SHA256
+            // gira fuori dal main (ROADMAP #33, `sha256(of:)` e' gia' `nonisolated`): sull'SSD
+            // ci sono zip da 40-50 GB, e quella lettura bloccherebbe l'app per minuti se
+            // restasse qui sul MainActor come faceva fino al 2026-09-20.
+            guard let localHash = await Task.detached(priority: .utility, operation: { sha256(of: localFile) }).value
+            else { result.skippedUnreadable += 1; continue }
             result.checked += 1
             do {
                 let tempURL = try await s3Syncer.downloadToTemp(key: key, config: config)
                 defer { try? fm.removeItem(at: tempURL) }
-                if let remoteHash = sha256(of: tempURL), remoteHash == localHash {
+                let remoteHash = await Task.detached(priority: .utility, operation: { sha256(of: tempURL) }).value
+                if let remoteHash, remoteHash == localHash {
                     result.matched += 1
                 } else {
                     result.mismatches.append(key)
@@ -9055,9 +9707,15 @@ final class ReviewEngine {
 
         onProgress("Campionamento Mac ↔ SSD…")
         if let photosURL, let ssdURL {
-            results.append(sampleLocalPair(srcRoot: photosURL,
-                                            dstRoot: ssdURL.appendingPathComponent("Foto iPhone"),
-                                            pairName: "Mac ↔ SSD", sampleSize: sampleSize))
+            // Fuori dal main (ROADMAP #33): chiama direttamente la funzione `nonisolated`,
+            // non `self.sampleLocalPair` (che e' sul MainActor e vanificherebbe il
+            // `Task.detached` — caso A della tabella dei sei casi, `.claude/rules/architecture.md`).
+            let dst = ssdURL.appendingPathComponent("Foto iPhone")
+            let usedDefaults = defaults
+            results.append(await Task.detached(priority: .utility) {
+                integritySampleLocalPair(srcRoot: photosURL, dstRoot: dst, pairName: "Mac ↔ SSD",
+                                         sampleSize: sampleSize, defaults: usedDefaults)
+            }.value)
         } else {
             var r = IntegrityCheckResult(pairName: "Mac ↔ SSD")
             r.error = "Bookmark Foto o SSD non accessibile"
@@ -9066,8 +9724,11 @@ final class ReviewEngine {
 
         onProgress("Campionamento SSD ↔ HDD…")
         if let ssdURL, let hddURL {
-            results.append(sampleLocalPair(srcRoot: ssdURL, dstRoot: hddURL,
-                                            pairName: "SSD ↔ HDD", sampleSize: sampleSize))
+            let usedDefaults = defaults
+            results.append(await Task.detached(priority: .utility) {
+                integritySampleLocalPair(srcRoot: ssdURL, dstRoot: hddURL, pairName: "SSD ↔ HDD",
+                                         sampleSize: sampleSize, defaults: usedDefaults)
+            }.value)
         } else {
             var r = IntegrityCheckResult(pairName: "SSD ↔ HDD")
             r.error = "Bookmark SSD o HDD non accessibile"
@@ -11638,7 +12299,8 @@ struct LibraryIndexCard: View {
     private var commandsDisabledReason: String? {
         LibraryIndexCommandGate.disabledReason(isIndexing: runner.isIndexing,
                                                jobIsRunning: runner.isRunning,
-                                               isTrashingDuplicates: runner.isTrashingDuplicates)
+                                               isTrashingDuplicates: runner.isTrashingDuplicates,
+                                               isRestoringFromTrash: runner.isRestoringFromTrash)
     }
 
     private var commandsDisabled: Bool { commandsDisabledReason != nil }
@@ -11845,6 +12507,36 @@ struct DiagRow: View {
     }
 }
 
+/// Dirada gli aggiornamenti di progresso verso la UI: al massimo uno ogni `minimumIntervalNanos`,
+/// e **sempre** quello finale. Nasce da una misura del 2026-09-19 (ROADMAP #37): durante un
+/// MAC -> SSD con quasi tutti i file gia' presenti (~575 file/s) il main thread era al ~100%
+/// in ridisegno, perche' ogni file pubblicava il proprio progresso. Il tempo e non il numero di
+/// file: a 575 file/s e a 5 file/s serve la stessa cadenza a schermo (ADR-0010).
+// `nonisolated`: value type senza stato condiviso; ogni istanza vive sullo stack del thread
+// che la usa (il thread di `FileSyncer.sync`, quello di `TrashRestorer.run`).
+nonisolated struct ProgressThrottle {
+    static let defaultMinimumIntervalNanos: UInt64 = 100_000_000
+    let minimumIntervalNanos: UInt64
+    private var lastEmitNanos: UInt64?
+
+    init(minimumIntervalNanos: UInt64 = ProgressThrottle.defaultMinimumIntervalNanos) {
+        self.minimumIntervalNanos = minimumIntervalNanos
+    }
+
+    /// `true` se l'aggiornamento va pubblicato adesso. `isFinal` pubblica sempre. Un orologio
+    /// che va all'indietro (non dovrebbe: i chiamanti usano `DispatchTime.now().uptimeNanoseconds`,
+    /// monotono) pubblica e riparte da li', mai un silenzio permanente.
+    mutating func shouldEmit(nowNanos: UInt64, isFinal: Bool) -> Bool {
+        guard !isFinal, let last = lastEmitNanos, nowNanos >= last else {
+            lastEmitNanos = nowNanos
+            return true
+        }
+        guard nowNanos - last >= minimumIntervalNanos else { return false }
+        lastEmitNanos = nowNanos
+        return true
+    }
+}
+
 // MARK: - Pannello Doppioni (roadmap #31, Task 6)
 
 /// Piccola scatola di riferimento con lock: l'interruzione arriva da un bottone sul thread
@@ -11926,6 +12618,11 @@ struct DuplicatesView: View {
     @State private var activeCancelFlag: CancelFlag? = nil
     @State private var lastOutcome: DuplicateTrashOutcome? = nil
 
+    /// Conferma non distruttiva prima di «Annulla l'ultimo spostamento» (ADR-0009, decisione
+    /// 2 di Enrico): numero di foto e data, mai un semplice clic diretto — l'operazione ora
+    /// dura minuti e ferma i backup per quel tempo.
+    @State private var showUndoConfirm = false
+
     @State private var thumbnailCache = DuplicateThumbnailCache()
 
     var body: some View {
@@ -11966,18 +12663,28 @@ struct DuplicatesView: View {
                 }
             }
 
+            if runner.isRestoringFromTrash, let progress = runner.trashRestoreProgress {
+                trashRestoreProgressBar(progress)
+            }
+
+            if let outcome = runner.lastTrashRestoreOutcome {
+                VStack(alignment: .leading, spacing: AppSpacing.xs) {
+                    ForEach(TrashRestoreStatus.outcomeLines(outcome)) { line in
+                        Text(line.text).font(AppFont.caption).foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+
+            if let reason = undoDisabledReasonNow {
+                Label(reason, systemImage: "info.circle")
+                    .font(AppFont.caption).foregroundStyle(.secondary)
+            }
+
             HStack {
-                // `runner.isTrashingDuplicates` nella condizione non e' ridondante, ed e' il rilievo di
-                // review del 2026-09-01: `lastBatch()` e' l'ultimo blocco **registrato**,
-                // e durante una corsa quello e' il blocco ancora in esecuzione. Senza
-                // questa guardia l'utente che preme qui a meta' corsa non annulla il blocco
-                // precedente, come crede: rimette a posto i gruppi gia' smaltiti di quello
-                // che sta guardando avanzare, mentre il trasher prosegue sui restanti.
-                // Nessun file si corrompe (le guardie di `restore()` reggono), ma salta il
-                // modello "blocco atomico" su cui e' costruita tutta la doppia conferma.
-                Button("Annulla l'ultimo spostamento") { undoLastBatch() }
+                Button("Annulla l'ultimo spostamento") { showUndoConfirm = true }
                     .buttonStyle(.bordered).controlSize(.small)
-                    .disabled(!hasRestorableBatch || runner.isTrashingDuplicates)
+                    .disabled(undoDisabledReasonNow != nil)
 
                 Spacer()
 
@@ -11988,7 +12695,16 @@ struct DuplicatesView: View {
         }
         .padding(AppSpacing.lg)
         .frame(minWidth: 640, minHeight: 520)
-        .task { if case .idle = loadState { loadGroups() } }
+        .task {
+            if case .idle = loadState { loadGroups() }
+            runner.refreshRestorableBatch()
+        }
+        .onChange(of: runner.isRestoringFromTrash) { _, isRestoring in
+            // A fine annullamento l'elenco potrebbe essere cambiato (le foto tornate a posto
+            // non ricompaiono come doppioni finche' non si rifa' l'elenco, ma un blocco
+            // interrotto puo' aver cambiato lo store): si ricarica come dopo uno spostamento.
+            if !isRestoring { loadGroups() }
+        }
         .sheet(isPresented: $showSummarySheet) {
             if let batch = pendingBatch { summarySheet(batch) }
         }
@@ -12001,6 +12717,13 @@ struct DuplicatesView: View {
             Text("Ogni copia viene riverificata sul disco un'ultima volta prima di essere "
                 + "spostata. Puoi annullare lo spostamento dopo, con «Annulla l'ultimo "
                 + "spostamento».")
+        }
+        .alert(undoConfirmationText?.title ?? "Rimettere a posto le foto?",
+               isPresented: $showUndoConfirm) {
+            Button("Rimetti a posto") { startUndo() }
+            Button("Annulla", role: .cancel) {}
+        } message: {
+            Text(undoConfirmationText?.message ?? "")
         }
         .alert(pendingAlert?.title ?? "", isPresented: Binding(
             get: { pendingAlert != nil },
@@ -12033,15 +12756,28 @@ struct DuplicatesView: View {
         DuplicatesStatus.trashDisabledReason(isRunning: runner.isRunning,
                                              isIndexing: runner.isIndexing,
                                              ssdMounted: volumes.ssdMounted,
-                                             isTrashingDuplicates: runner.isTrashingDuplicates)
+                                             isTrashingDuplicates: runner.isTrashingDuplicates,
+                                             isRestoringFromTrash: runner.isRestoringFromTrash)
     }
 
     private var canRequestTrash: Bool {
         trashDisabledReasonNow == nil && !selectedHashes.isEmpty && !runner.isTrashingDuplicates
     }
 
-    private var hasRestorableBatch: Bool {
-        !(runner.trashManifestStore?.lastBatch() ?? []).isEmpty
+    /// Perche' «Annulla l'ultimo spostamento» e' disattivato adesso, o `nil` se si puo'
+    /// premere. `hasEverTrashed` distingue "non hai mai spostato niente da qui" da "l'ultimo
+    /// spostamento e' gia' stato annullato" — due frasi diverse per lo stesso `nil` di
+    /// `restorableBatch`.
+    private var undoDisabledReasonNow: String? {
+        DuplicatesStatus.undoDisabledReason(
+            ssdMounted: volumes.ssdMounted, isRunning: runner.isRunning, isIndexing: runner.isIndexing,
+            isTrashingDuplicates: runner.isTrashingDuplicates, isRestoringFromTrash: runner.isRestoringFromTrash,
+            summary: runner.restorableBatch, hasEverTrashed: (runner.trashManifestStore?.totalRecorded ?? 0) > 0)
+    }
+
+    private var undoConfirmationText: TrashRestoreStatus.Confirmation? {
+        guard let summary = runner.restorableBatch else { return nil }
+        return TrashRestoreStatus.confirmation(summary: summary)
     }
 
     @ViewBuilder
@@ -12087,6 +12823,24 @@ struct DuplicatesView: View {
                 Spacer()
                 Button("Interrompi") { activeCancelFlag?.cancel() }
                     .buttonStyle(.bordered).controlSize(.small)
+            }
+        }
+    }
+
+    private func trashRestoreProgressBar(_ progress: (done: Int, total: Int)) -> some View {
+        VStack(alignment: .leading, spacing: AppSpacing.xs) {
+            ProgressView(value: Double(progress.done), total: Double(max(progress.total, 1)))
+            HStack {
+                Text(TrashRestoreStatus.progressLine(done: progress.done, total: progress.total))
+                    .font(AppFont.caption).foregroundStyle(.secondary)
+                Spacer()
+                if runner.trashRestoreStopRequested {
+                    Text(TrashRestoreStatus.stoppingLine)
+                        .font(AppFont.caption).foregroundStyle(.secondary)
+                } else {
+                    Button("Interrompi") { runner.stopTrashRestore() }
+                        .buttonStyle(.bordered).controlSize(.small)
+                }
             }
         }
     }
@@ -12218,6 +12972,9 @@ struct DuplicatesView: View {
         activeCancelFlag = cancelFlag
 
         lastOutcome = nil
+        // Un nuovo spostamento rende obsoleto l'ultimo esito di annullamento mostrato: quello
+        // riguardava un blocco diverso.
+        runner.lastTrashRestoreOutcome = nil
         trashProgress = (0, decisions.count)
 
         Task.detached(priority: .utility) {
@@ -12238,30 +12995,16 @@ struct DuplicatesView: View {
                 // Le chiavi dei file davvero cestinati sono gia' state rimosse dallo store
                 // dentro `run(...)`: si ricarica l'elenco per riflettere i gruppi rimasti.
                 loadGroups()
+                runner.refreshRestorableBatch()
             }
         }
     }
 
-    /// «Annulla l'ultimo spostamento»: rimette a posto l'ultimo blocco registrato, se ce n'e'
-    /// uno ripristinabile. `TrashManifestStore.restore` non lancia mai: ogni voce che non si
-    /// puo' ripristinare finisce fra gli `skipped`, le altre proseguono comunque.
-    private func undoLastBatch() {
-        guard let manifest = runner.trashManifestStore else { return }
-        let items = manifest.lastBatch()
-        guard !items.isEmpty else { return }
-        let outcome = manifest.restore(items)
-        let restoredCount = outcome.restored.count
-        let skippedCount = outcome.skipped.count
-        pendingAlert = SimpleAlert(
-            title: "Spostamento annullato",
-            message: skippedCount == 0
-                ? "\(restoredCount.formatted()) file sono tornati al loro posto."
-                : "\(restoredCount.formatted()) file sono tornati al loro posto. "
-                    + "\(skippedCount.formatted()) non sono stati ripristinati: guarda il "
-                    + "Cestino del volume per recuperarli a mano.")
-        // Il ripristino non reinserisce le entry a mano nell'elenco: la prossima lettura le
-        // rivedra' come file nuovi e le rihashera' da sola (stessa regola di ADR-0005).
-        loadGroups()
+    /// «Annulla l'ultimo spostamento», dopo la conferma non distruttiva: avvia
+    /// `TrashRestorer.run` fuori dal main tramite il runner (ADR-0009). Barra, «Interrompi»
+    /// ed esito arrivano da li' — questa funzione fa solo partire.
+    private func startUndo() {
+        runner.startTrashRestore(onAlert: { pendingAlert = $0 })
     }
 }
 

@@ -21,6 +21,11 @@
 		D0C1BB22CC33DD44EE55FF72 /* DuplicateKeepChoiceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D0C1BB22CC33DD44EE55FF73 /* DuplicateKeepChoiceTests.swift */; };
 		D0C1BB22CC33DD44EE55FF74 /* DuplicateBatchTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D0C1BB22CC33DD44EE55FF75 /* DuplicateBatchTests.swift */; };
 		D0C1BB22CC33DD44EE55FF76 /* TrashManifestTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D0C1BB22CC33DD44EE55FF77 /* TrashManifestTests.swift */; };
+		58488A0902F04A168B7553E1 /* TrashRestorerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A29B402284C444A93181476 /* TrashRestorerTests.swift */; };
+		2CB9B025EE254AF4A5E3F502 /* ProgressThrottleTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DC1893AB477B4EA4AA583495 /* ProgressThrottleTests.swift */; };
+		8250291BED1C400990ED9768 /* FileSyncerProgressThrottleTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = EEE65611964E4251B361F368 /* FileSyncerProgressThrottleTests.swift */; };
+		EDEA2FA58F194D58A40AC7C4 /* FreeSpaceCheckTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A49701F6FF645979559A63F /* FreeSpaceCheckTests.swift */; };
+		4C38D66A854B4632A03B4CF0 /* TrashRestoreStatusTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D146EE1C0EC64686BD5F7F16 /* TrashRestoreStatusTests.swift */; };
 		D0C1BB22CC33DD44EE55FF78 /* DuplicateTrasherTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D0C1BB22CC33DD44EE55FF79 /* DuplicateTrasherTests.swift */; };
 		D0C1BB22CC33DD44EE55FF7A /* DuplicatesStatusTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D0C1BB22CC33DD44EE55FF7B /* DuplicatesStatusTests.swift */; };
 		D0C1BB22CC33DD44EE55FF9A /* ImmichVMPathTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D0C1BB22CC33DD44EE55FF9B /* ImmichVMPathTests.swift */; };
@@ -84,6 +89,11 @@
 		D0C1BB22CC33DD44EE55FF73 /* DuplicateKeepChoiceTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = DuplicateKeepChoiceTests.swift; sourceTree = "<group>"; };
 		D0C1BB22CC33DD44EE55FF75 /* DuplicateBatchTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = DuplicateBatchTests.swift; sourceTree = "<group>"; };
 		D0C1BB22CC33DD44EE55FF77 /* TrashManifestTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = TrashManifestTests.swift; sourceTree = "<group>"; };
+		4A29B402284C444A93181476 /* TrashRestorerTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = TrashRestorerTests.swift; sourceTree = "<group>"; };
+		DC1893AB477B4EA4AA583495 /* ProgressThrottleTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ProgressThrottleTests.swift; sourceTree = "<group>"; };
+		EEE65611964E4251B361F368 /* FileSyncerProgressThrottleTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = FileSyncerProgressThrottleTests.swift; sourceTree = "<group>"; };
+		5A49701F6FF645979559A63F /* FreeSpaceCheckTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = FreeSpaceCheckTests.swift; sourceTree = "<group>"; };
+		D146EE1C0EC64686BD5F7F16 /* TrashRestoreStatusTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = TrashRestoreStatusTests.swift; sourceTree = "<group>"; };
 		D0C1BB22CC33DD44EE55FF79 /* DuplicateTrasherTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = DuplicateTrasherTests.swift; sourceTree = "<group>"; };
 		D0C1BB22CC33DD44EE55FF7B /* DuplicatesStatusTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = DuplicatesStatusTests.swift; sourceTree = "<group>"; };
 		D0C1BB22CC33DD44EE55FF9B /* ImmichVMPathTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ImmichVMPathTests.swift; sourceTree = "<group>"; };
@@ -174,6 +184,11 @@
 				D0C1BB22CC33DD44EE55FF73 /* DuplicateKeepChoiceTests.swift */,
 				D0C1BB22CC33DD44EE55FF75 /* DuplicateBatchTests.swift */,
 				D0C1BB22CC33DD44EE55FF77 /* TrashManifestTests.swift */,
+				4A29B402284C444A93181476 /* TrashRestorerTests.swift */,
+				DC1893AB477B4EA4AA583495 /* ProgressThrottleTests.swift */,
+				EEE65611964E4251B361F368 /* FileSyncerProgressThrottleTests.swift */,
+				5A49701F6FF645979559A63F /* FreeSpaceCheckTests.swift */,
+				D146EE1C0EC64686BD5F7F16 /* TrashRestoreStatusTests.swift */,
 				D0C1BB22CC33DD44EE55FF79 /* DuplicateTrasherTests.swift */,
 				D0C1BB22CC33DD44EE55FF7B /* DuplicatesStatusTests.swift */,
 				D0C1BB22CC33DD44EE55FF9B /* ImmichVMPathTests.swift */,
@@ -357,6 +372,11 @@
 				D0C1BB22CC33DD44EE55FF72 /* DuplicateKeepChoiceTests.swift in Sources */,
 				D0C1BB22CC33DD44EE55FF74 /* DuplicateBatchTests.swift in Sources */,
 				D0C1BB22CC33DD44EE55FF76 /* TrashManifestTests.swift in Sources */,
+				58488A0902F04A168B7553E1 /* TrashRestorerTests.swift in Sources */,
+				2CB9B025EE254AF4A5E3F502 /* ProgressThrottleTests.swift in Sources */,
+				8250291BED1C400990ED9768 /* FileSyncerProgressThrottleTests.swift in Sources */,
+				EDEA2FA58F194D58A40AC7C4 /* FreeSpaceCheckTests.swift in Sources */,
+				4C38D66A854B4632A03B4CF0 /* TrashRestoreStatusTests.swift in Sources */,
 				D0C1BB22CC33DD44EE55FF78 /* DuplicateTrasherTests.swift in Sources */,
 				D0C1BB22CC33DD44EE55FF7A /* DuplicatesStatusTests.swift in Sources */,
 				D0C1BB22CC33DD44EE55FF9A /* ImmichVMPathTests.swift in Sources */,

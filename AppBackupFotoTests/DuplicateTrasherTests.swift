@@ -392,6 +392,11 @@ final class DuplicateTrasherTests: XCTestCase {
             XCTAssertTrue(FileManager.default.fileExists(atPath: libraryRoot.appendingPathComponent(e.displayPath).path),
                           "\(e.displayPath) doveva essere rimesso a posto")
         }
+        // Task 4, ADR-0009: il ripristino passa da `TrashRestorer`, che marca le voci
+        // rimesse a posto nel registro — non piu' solo mosse sul disco.
+        for item in manifest.lastBatch() {
+            XCTAssertNotNil(item.restoredAt, "\(item.originalDisplayPath) non risulta marcata come tornata")
+        }
     }
 
     func testIndexLosesOnlyTrashedKeys() throws {
@@ -499,7 +504,7 @@ final class DuplicateTrasherTests: XCTestCase {
         let (decision, entries) = try healthyTrio()
         _ = makeTrasher().run([decision])
 
-        let esito = manifest.restore(manifest.lastBatch())
+        let esito = TrashRestorer(libraryRoot: libraryRoot, manifest: manifest).run(manifest.lastBatch())
 
         XCTAssertEqual(esito.restored.count, 2)
         XCTAssertTrue(esito.skipped.isEmpty)
