@@ -49,3 +49,7 @@ Due questioni tecniche misurate durante il brainstorming, entrambe nella spec:
 - `S3Syncer.listAll` non cambia firma né comportamento visibile ai sei chiamanti esistenti — il troncamento silenzioso su stop resta, dichiarato fuori scope (già lo era nella spec).
 - Nessuna scrittura su SSD, HDD o Cubbit: solo `statfs` via Foundation e `GET` di elenco S3.
 - Nessuno schema SQLite toccato. Nuova chiave `UserDefaults` (`cloudUsageSnapshot`) per la persistenza del numero Cubbit.
+
+---
+
+**2026-09-20**: `VolumeCapacityReader.read` è ora usato anche dal controllo di spazio libero prima di un job (ROADMAP #39), fuori dal main come il resto — `BackupRunner.hasSufficientSpace` (che leggeva `resourceValues` sull'URL del bookmark, sul main, dentro un `Task { @MainActor }`) è stata rimossa. La lettura passa da `await Task.detached(priority: .userInitiated) { VolumeCapacityReader.read(path:) }.value`, e il margine (`max(5% di bytesNeeded, 500 MB)`) è invariato — copiato in un nuovo tipo puro `FreeSpaceCheck`, non riscritto. Vedi `Docs/superpowers/specs/2026-09-19-remaining-main-thread-work-design.md` §4 e ADR-0009/0010 per il resto dell'intervento.
