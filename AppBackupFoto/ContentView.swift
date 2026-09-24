@@ -3154,11 +3154,25 @@ enum DuplicatesStatus {
             + "sono: il backup continua a conservare tutto, doppioni compresi."
     }
 
-    static func headerLine(indexBuilt: Bool, groupCount: Int, reclaimableBytes: Int64) -> Line {
+    /// `groupsKnown` (ROADMAP #41, senza valore di default): un chiamante vecchio che non lo
+    /// passasse comincerebbe a compilare col comportamento sbagliato — esattamente il modo in
+    /// cui questa classe di bug sopravvive (stessa disciplina dei parametri di gate aggiunti
+    /// in #34, nessuno dei quali ha un default). `false` significa "l'elenco non e' ancora
+    /// stato letto in questa finestra" — durante il caricamento iniziale, o perche' la
+    /// finestra e' stata riaperta a meta' di uno spostamento nel Cestino e la lista non si
+    /// ricarica finche' non finisce (D4 della spec del 2026-09-20). E' la stessa classe di
+    /// errore gia' corretta con `sawNothing` in #31: un elenco che non si conosce e un elenco
+    /// costruito e vuoto sono due situazioni opposte, e la seconda non deve mai leggersi al
+    /// posto della prima.
+    static func headerLine(indexBuilt: Bool, groupsKnown: Bool, groupCount: Int, reclaimableBytes: Int64) -> Line {
         guard indexBuilt else {
             return Line(id: "no-index", tone: .info, text:
                 "Non hai ancora creato l'elenco delle foto già salvate sull'SSD. Vai in "
                 + "Diagnostica → «\(LibraryIndexCommands.cardTitle)» e crealo da lì, poi torna qui.")
+        }
+        guard groupsKnown else {
+            return Line(id: "groups-unknown", tone: .info, text:
+                "L'elenco delle copie doppie non è ancora stato letto in questa finestra.")
         }
         guard groupCount > 0 else {
             return Line(id: "zero-groups", tone: .ok, text:
@@ -3171,6 +3185,19 @@ enum DuplicatesStatus {
             + "\(ByteCountFormatter.string(fromByteCount: reclaimableBytes, countStyle: .file)) "
             + "recuperabili sull'SSD.")
     }
+
+    /// Quanti gruppi sono stati processati sul totale del blocco (ROADMAP #41), stesso testo
+    /// di oggi ma con il plurale corretto — deciso su `total`, non su `done`: un blocco da 4
+    /// gruppi comincia dicendo "1 di 4 gruppi", non "1 di 4 gruppo".
+    static func trashProgressLine(done: Int, total: Int) -> String {
+        "Sposto le copie nel Cestino: \(done) di \(count(total, "gruppo", "gruppi"))"
+    }
+
+    /// Gemella di `TrashRestoreStatus.stoppingLine`, riferita al gruppo e non alla foto:
+    /// `DuplicateTrasher.run` controlla l'interruzione solo fra un gruppo e l'altro, e un
+    /// gruppo in corso puo' contenere file grandi da rileggere e rihashare — non deve
+    /// promettere lo stop immediato.
+    static let trashStoppingLine = "Mi fermo dopo il gruppo in corso…"
 
     /// Perche' il bottone di cancellazione e' disattivato adesso. `nil` = niente lo impedisce
     /// da qui (restano comunque le due conferme). Stessa disciplina di `RestoreView`: un
@@ -12749,6 +12776,7 @@ struct DuplicatesView: View {
         let groupCount = loadedBatch?.groups.count ?? 0
         let reclaimableBytes = loadedBatch?.reclaimableBytes ?? 0
         return Text(DuplicatesStatus.headerLine(indexBuilt: indexBuilt,
+                                                groupsKnown: loadedBatch != nil,
                                                 groupCount: groupCount,
                                                 reclaimableBytes: reclaimableBytes).text)
             .font(AppFont.body).foregroundStyle(.secondary)

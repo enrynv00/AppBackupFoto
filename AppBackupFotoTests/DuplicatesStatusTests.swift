@@ -12,7 +12,7 @@ final class DuplicatesStatusTests: XCTestCase {
     /// Indice mai costruito: la riga deve rimandare alla card, MAI leggersi come "non hai
     /// doppioni" — stessa classe di errore già corretta con `sawNothing` in #31.
     func testNeverBuilt_pointsToTheCard() {
-        let line = DuplicatesStatus.headerLine(indexBuilt: false, groupCount: 0, reclaimableBytes: 0)
+        let line = DuplicatesStatus.headerLine(indexBuilt: false, groupsKnown: true, groupCount: 0, reclaimableBytes: 0)
         XCTAssertTrue(line.text.contains("Diagnostica"), "deve rimandare alla card")
         XCTAssertFalse(line.text.lowercased().contains("non ci sono copie"),
                        "non deve leggersi come 'niente da segnalare': l'elenco non esiste proprio")
@@ -21,17 +21,104 @@ final class DuplicatesStatusTests: XCTestCase {
     /// Indice costruito, zero gruppi: riga diversa dalla precedente, altrimenti le due
     /// situazioni opposte (elenco mai fatto / elenco fatto e pulito) sarebbero indistinguibili.
     func testBuiltZeroGroups_differsFromNeverBuilt() {
-        let never = DuplicatesStatus.headerLine(indexBuilt: false, groupCount: 0, reclaimableBytes: 0)
-        let zero = DuplicatesStatus.headerLine(indexBuilt: true, groupCount: 0, reclaimableBytes: 0)
+        let never = DuplicatesStatus.headerLine(indexBuilt: false, groupsKnown: true, groupCount: 0, reclaimableBytes: 0)
+        let zero = DuplicatesStatus.headerLine(indexBuilt: true, groupsKnown: true, groupCount: 0, reclaimableBytes: 0)
         XCTAssertNotEqual(never.text, zero.text)
         XCTAssertNotEqual(never.id, zero.id)
     }
 
     /// N gruppi: la riga nomina sia il numero di gruppi sia i byte recuperabili.
     func testNGroups_namesCountAndBytes() {
-        let line = DuplicatesStatus.headerLine(indexBuilt: true, groupCount: 7, reclaimableBytes: 3_000_000_000)
+        let line = DuplicatesStatus.headerLine(indexBuilt: true, groupsKnown: true, groupCount: 7, reclaimableBytes: 3_000_000_000)
         XCTAssertTrue(line.text.contains("7"))
         XCTAssertTrue(line.text.contains(ByteCountFormatter.string(fromByteCount: 3_000_000_000, countStyle: .file)))
+    }
+
+    /// `groupsKnown == false` (ROADMAP #41): l'elenco non e' ancora stato letto in questa
+    /// finestra. Non deve MAI leggersi come "non ci sono doppioni" — un elenco che non si
+    /// conosce e un elenco vuoto sono due situazioni opposte.
+    func testHeaderLine_groupsUnknown_neverSaysThereAreNoDuplicates() {
+        let line = DuplicatesStatus.headerLine(indexBuilt: true, groupsKnown: false, groupCount: 0, reclaimableBytes: 0)
+        let zeroGroupsLine = DuplicatesStatus.headerLine(indexBuilt: true, groupsKnown: true, groupCount: 0, reclaimableBytes: 0)
+        XCTAssertNotEqual(line.text, zeroGroupsLine.text)
+        XCTAssertNotEqual(line.id, "zero-groups")
+    }
+
+    /// Il conteggio non e' attendibile quando l'elenco non e' stato letto: non si mostra,
+    /// qualunque sia il valore passato.
+    func testHeaderLine_groupsUnknown_ignoresTheCount() {
+        let withoutCount = DuplicatesStatus.headerLine(indexBuilt: true, groupsKnown: false, groupCount: 0, reclaimableBytes: 0)
+        let withCount = DuplicatesStatus.headerLine(indexBuilt: true, groupsKnown: false, groupCount: 12, reclaimableBytes: 0)
+        XCTAssertEqual(withoutCount.text, withCount.text)
+        XCTAssertEqual(withoutCount.id, withCount.id)
+    }
+
+    /// `groupsKnown == true` non cambia nessuna delle tre diramazioni di oggi rispetto a
+    /// prima che il parametro esistesse.
+    func testHeaderLine_groupsKnown_keepsTodaysThreeBranches() {
+        let noIndex = DuplicatesStatus.headerLine(indexBuilt: false, groupsKnown: true, groupCount: 0, reclaimableBytes: 0)
+        XCTAssertEqual(noIndex.id, "no-index")
+        let zeroGroups = DuplicatesStatus.headerLine(indexBuilt: true, groupsKnown: true, groupCount: 0, reclaimableBytes: 0)
+        XCTAssertEqual(zeroGroups.id, "zero-groups")
+        let groups = DuplicatesStatus.headerLine(indexBuilt: true, groupsKnown: true, groupCount: 3, reclaimableBytes: 1_000)
+        XCTAssertEqual(groups.id, "groups")
+    }
+
+    // MARK: - `trashProgressLine`
+
+    /// I due numeri devono comparire NELL'ORDINE giusto: `done` prima di `total`, non solo
+    /// presenti da qualche parte nel testo.
+    func testTrashProgressLine_showsBothNumbers() {
+        let text = DuplicatesStatus.trashProgressLine(done: 3, total: 10)
+        guard let doneRange = text.range(of: "3"), let totalRange = text.range(of: "10") else {
+            return XCTFail("mancano i due numeri in: \(text)")
+        }
+        XCTAssertTrue(doneRange.lowerBound < totalRange.lowerBound, "«3» deve venire prima di «10»: \(text)")
+    }
+
+    func testTrashProgressLine_singularTotal() {
+        let text = DuplicatesStatus.trashProgressLine(done: 0, total: 1)
+        XCTAssertTrue(text.contains("gruppo"))
+        XCTAssertFalse(text.contains("gruppi"))
+    }
+
+    func testTrashProgressLine_pluralTotal() {
+        let text = DuplicatesStatus.trashProgressLine(done: 0, total: 2)
+        XCTAssertTrue(text.contains("gruppi"))
+    }
+
+    /// Il mutante da uccidere: decidere il plurale su `done` invece che su `total`.
+    func testTrashProgressLine_singularDependsOnTotal_notOnDone() {
+        let text = DuplicatesStatus.trashProgressLine(done: 1, total: 4)
+        XCTAssertTrue(text.contains("gruppi"), "il plurale deve seguire `total` (4), non `done` (1): \(text)")
+    }
+
+    func testTrashProgressLine_hasNoJargon() {
+        let forbidden = ["hash", "indice", "sha256", "entry", "scansione"]
+        let text = DuplicatesStatus.trashProgressLine(done: 3, total: 10).lowercased()
+        for word in forbidden {
+            XCTAssertFalse(text.contains(word), "'\(word)' non deve comparire in: \(text)")
+        }
+    }
+
+    // MARK: - `trashStoppingLine`
+
+    func testTrashStoppingLine_isNotEmptyAndHasNoJargon() {
+        let forbidden = ["hash", "indice", "sha256", "entry", "scansione"]
+        let text = DuplicatesStatus.trashStoppingLine
+        XCTAssertFalse(text.isEmpty)
+        let lower = text.lowercased()
+        for word in forbidden {
+            XCTAssertFalse(lower.contains(word), "'\(word)' non deve comparire in: \(text)")
+        }
+    }
+
+    /// `DuplicateTrasher.run` controlla l'interruzione solo fra un gruppo e l'altro: la riga
+    /// non deve promettere uno stop immediato.
+    func testTrashStoppingLine_doesNotPromiseAnImmediateStop() {
+        let lower = DuplicatesStatus.trashStoppingLine.lowercased()
+        XCTAssertFalse(lower.contains("subito"))
+        XCTAssertFalse(lower.contains("immediat"))
     }
 
     // MARK: - Perché la cancellazione è disattivata
@@ -55,7 +142,7 @@ final class DuplicatesStatusTests: XCTestCase {
     /// uno è "non ho niente da segnalare", l'altro è "non posso controllare adesso".
     func testSSDDisconnected_ownReason_differsFromNoGroups() {
         let reason = DuplicatesStatus.trashDisabledReason(isRunning: false, isIndexing: false, ssdMounted: false, isTrashingDuplicates: false, isRestoringFromTrash: false)
-        let noGroupsLine = DuplicatesStatus.headerLine(indexBuilt: true, groupCount: 0, reclaimableBytes: 0)
+        let noGroupsLine = DuplicatesStatus.headerLine(indexBuilt: true, groupsKnown: true, groupCount: 0, reclaimableBytes: 0)
         XCTAssertNotNil(reason)
         XCTAssertNotEqual(reason!, noGroupsLine.text)
         XCTAssertTrue(reason!.contains("SSD"))
@@ -166,9 +253,9 @@ final class DuplicatesStatusTests: XCTestCase {
         let forbidden = ["hash", "indice", "sha256", "entry", "scansione"]
         var allTexts: [String] = []
 
-        allTexts.append(DuplicatesStatus.headerLine(indexBuilt: false, groupCount: 0, reclaimableBytes: 0).text)
-        allTexts.append(DuplicatesStatus.headerLine(indexBuilt: true, groupCount: 0, reclaimableBytes: 0).text)
-        allTexts.append(DuplicatesStatus.headerLine(indexBuilt: true, groupCount: 3, reclaimableBytes: 1_000).text)
+        allTexts.append(DuplicatesStatus.headerLine(indexBuilt: false, groupsKnown: true, groupCount: 0, reclaimableBytes: 0).text)
+        allTexts.append(DuplicatesStatus.headerLine(indexBuilt: true, groupsKnown: true, groupCount: 0, reclaimableBytes: 0).text)
+        allTexts.append(DuplicatesStatus.headerLine(indexBuilt: true, groupsKnown: true, groupCount: 3, reclaimableBytes: 1_000).text)
         allTexts.append(DuplicatesStatus.trashDisabledReason(isRunning: true, isIndexing: false, ssdMounted: true, isTrashingDuplicates: false, isRestoringFromTrash: false) ?? "")
         allTexts.append(DuplicatesStatus.trashDisabledReason(isRunning: false, isIndexing: true, ssdMounted: true, isTrashingDuplicates: false, isRestoringFromTrash: false) ?? "")
         allTexts.append(DuplicatesStatus.trashDisabledReason(isRunning: false, isIndexing: false, ssdMounted: false, isTrashingDuplicates: false, isRestoringFromTrash: false) ?? "")
