@@ -47,3 +47,12 @@ Il ripristino riceve la stessa cura del cestinamento, letta al contrario: una vo
 - Nessuno schema SQLite, nessuna chiave `UserDefaults` nuova o rinominata.
 
 Vedi `.claude/rules/architecture.md` per i dettagli implementativi, spec `Docs/superpowers/specs/2026-09-19-remaining-main-thread-work-design.md` §2, piano `Docs/superpowers/plans/2026-09-19-remaining-main-thread-work.md`.
+
+---
+
+**2026-09-24**: lo stesso schema è stato applicato allo spostamento nel Cestino (ROADMAP #41, spec `Docs/superpowers/specs/2026-09-20-trash-progress-survives-window-close-design.md`, piano `Docs/superpowers/plans/2026-09-20-trash-progress-survives-window-close.md`): `BackupRunner` guadagna `duplicateTrashProgress`/`duplicateTrashStopRequested`/`lastDuplicateTrashOutcome`/`startDuplicateTrashing`/`stopDuplicateTrashing`, simmetrici a quelli dell'annullamento. Il difetto che questo doc-comment citava come «ancora aperto dello spostamento nel Cestino» (righe di `architecture.md` su `restorableBatch`) è **chiuso**: chiudere e riaprire la finestra Doppioni durante uno spostamento non fa più perdere barra, «Interrompi» o l'esito.
+
+Due scelte minori decise in questo secondo intervento, non nuove architetture:
+
+- **L'elenco dei gruppi non si ricarica mentre lo spostamento è in corso** (a differenza della ricarica a fine operazione): un elenco letto a metà è già vecchio quando compare, perché il trasher toglie chiavi dallo stesso elenco mentre lo spostamento procede sullo stesso volume.
+- **L'esito dello spostamento vive solo in memoria nel runner, non su disco**: il documento durevole di cosa è stato spostato resta il registro (`TrashManifestStore`), e un secondo posto dove la stessa verità può divergere non aggiunge nulla.
