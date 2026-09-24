@@ -7999,9 +7999,16 @@ final class BackupRunner: ObservableObject {
     /// di `isRestoringFromTrash`: chiudere e riaprire la finestra Doppioni non deve far
     /// perdere barra e «Interrompi» di un annullamento ancora in corso (e' esattamente il
     /// difetto gia' noto dello spostamento nel Cestino, vedi ROADMAP #41).
-    @Published var trashRestoreProgress: (done: Int, total: Int)? = nil
+    ///
+    /// `private(set)` da quando #41 e' stato chiuso allo stesso modo (2026-09-24): l'unico
+    /// scrittore esterno che restava (`DuplicatesView.startTrashing`, che azzerava
+    /// `lastTrashRestoreOutcome` all'avvio di uno spostamento) e' stato spostato dentro
+    /// `startDuplicateTrashing` qui sotto — l'invariante "un `begin` riuscito e' sempre
+    /// seguito da un `end` nello stesso `MainActor.run` che pubblica l'esito" e' verificabile
+    /// leggendo una sola funzione solo se nessun altro puo' muovere questo stato.
+    @Published private(set) var trashRestoreProgress: (done: Int, total: Int)? = nil
     @Published private(set) var trashRestoreStopRequested = false
-    @Published var lastTrashRestoreOutcome: RestoreOutcome? = nil
+    @Published private(set) var lastTrashRestoreOutcome: RestoreOutcome? = nil
     /// Cosa resta da rimettere a posto, calcolato fuori dal main (D8): la UI lo legge in O(1)
     /// invece di rifare `pendingInLastBatch()` a ogni ridisegno.
     @Published private(set) var restorableBatch: RestorableBatchSummary? = nil
@@ -8047,6 +8054,9 @@ final class BackupRunner: ObservableObject {
         trashRestoreCancelFlag = flag
         trashRestoreStopRequested = false
         lastTrashRestoreOutcome = nil
+        // Invalidazione reciproca (D5, ROADMAP #41): un annullamento rende obsoleto l'esito
+        // di uno spostamento mostrato in precedenza, riguardava un blocco diverso.
+        lastDuplicateTrashOutcome = nil
         let items = manifest.pendingInLastBatch()
         trashRestoreProgress = (0, items.count)
 
@@ -8077,6 +8087,108 @@ final class BackupRunner: ObservableObject {
         guard !trashRestoreStopRequested else { return }
         trashRestoreStopRequested = true
         trashRestoreCancelFlag?.cancel()
+    }
+
+    // MARK: Spostamento nel Cestino (ROADMAP #41, 2026-09-24)
+
+    /// Stato dello spostamento vive QUI, non in `@State` di `DuplicatesView` — stesso motivo
+    /// gia' scritto sopra per l'annullamento: chiudere e riaprire la finestra Doppioni non
+    /// deve far perdere barra, «Interrompi» o l'esito di uno spostamento ancora in corso. E'
+    /// il difetto che ROADMAP #41 chiude: fino a questo intervento erano tre `@State` della
+    /// view (`trashProgress`/`activeCancelFlag`/`lastOutcome`), spariti alla chiusura della
+    /// finestra pur restando vivo il lavoro sul disco (`isTrashingDuplicates` era gia' nel
+    /// runner dal Task 4 del 2026-09-19, ma non bastava a mostrare barra ed esito).
+    @Published private(set) var duplicateTrashProgress: (done: Int, total: Int)? = nil
+    @Published private(set) var duplicateTrashStopRequested = false
+    @Published private(set) var lastDuplicateTrashOutcome: DuplicateTrashOutcome? = nil
+    private var duplicateTrashCancelFlag: CancelFlag? = nil
+
+    /// Avvia lo spostamento nel Cestino del blocco congelato. `onAlert` e' il canale della
+    /// finestra Doppioni (regola `AlertSink`): mai `pendingAlert`, che ha un solo presentatore
+    /// nella finestra principale. Corpo spostato da `DuplicatesView.startTrashing(_:)` di
+    /// prima di questo intervento, non riscritto.
+    func startDuplicateTrashing(_ batch: DuplicateBatch, onAlert: @escaping (SimpleAlert) -> Void) {
+        // Precondizioni del blocco (item 1 della sequenza in spec: nessun job in corso,
+        // nessuna scansione dell'indice in corso, SSD montato, nessun annullamento in corso),
+        // **rivalutate qui, all'avvio vero**. Rilievo di review del 2026-09-01 (gia' pagato
+        // anche in `rebuildLibraryIndex`): valutarle solo all'apertura del riepilogo non
+        // basta. Il riepilogo e' fatto per essere letto con calma — e' li' che sta tutto il
+        // peso della conferma — e nel frattempo puo' partire un backup automatico al
+        // ricollegamento dell'SSD, o l'aggancio automatico dell'indice a fine di un altro
+        // job. Cestinare mentre un mirror legge gli stessi file e' esattamente il modo,
+        // descritto dalla spec, di trasformare due operazioni corrette in un guasto.
+        // Lo `st_dev` del trasher non copre questo caso: intercetta lo scollegamento, non
+        // un secondo lettore sul volume ancora montato. `VolumeMonitor.shared` e' una lettura
+        // di un `Bool` sul MainActor, nessun I/O (il polling sta sulla `probeQueue`) e nessuna
+        // sottoscrizione a `objectWillChange` — non aggiunge ridisegni.
+        let reason = DuplicatesStatus.trashDisabledReason(isRunning: isRunning,
+                                                           isIndexing: isIndexing,
+                                                           ssdMounted: VolumeMonitor.shared.ssdMounted,
+                                                           isTrashingDuplicates: isTrashingDuplicates,
+                                                           isRestoringFromTrash: isRestoringFromTrash)
+        if let reason {
+            onAlert(SimpleAlert(title: "Meglio non farlo adesso", message: reason))
+            return
+        }
+
+        guard let store = libraryIndexStore,
+              let manifest = trashManifestStore,
+              let root = BookmarkManager.shared.urls[.ssd] else {
+            onAlert(SimpleAlert(
+                title: "Non è stato possibile procedere",
+                message: "L'elenco delle foto, il registro di ripristino o l'SSD non sono "
+                    + "disponibili in questo momento. Riprova dopo aver ricontrollato "
+                    + "Diagnostica."))
+            return
+        }
+
+        // Lo stato "sto spostando" e' gia' nel runner da #34 (2026-09-19): questa chiamata
+        // non cambia, cambia solo che adesso e' il runner stesso a farla, non la view.
+        // Chiamato subito prima del `Task.detached` (nessun `return` fra qui e li'), cosi' un
+        // `begin` che riesce e' sempre seguito da un `end` — vedi il commento sul blocco
+        // finale sotto.
+        if let alert = beginDuplicateTrashing() {
+            onAlert(alert)
+            return
+        }
+
+        let decisions = batch.groups.map { DuplicateTrasher.Decision(group: $0.group, keeper: $0.choice.keeper) }
+        let trasher = DuplicateTrasher(libraryRoot: root, store: store, manifest: manifest)
+        let cancelFlag = CancelFlag()
+        duplicateTrashCancelFlag = cancelFlag
+        duplicateTrashStopRequested = false
+        lastDuplicateTrashOutcome = nil
+        // Un nuovo spostamento rende obsoleto l'ultimo esito di annullamento mostrato: quello
+        // riguardava un blocco diverso (invalidazione reciproca, D5, simmetrica a quella
+        // scritta sopra in `startTrashRestore`).
+        lastTrashRestoreOutcome = nil
+        duplicateTrashProgress = (0, decisions.count)
+
+        Task.detached(priority: .utility) {
+            let outcome = trasher.run(decisions, onProgress: { done, total in
+                Task { @MainActor in self.duplicateTrashProgress = (done, total) }
+            }, isCancelled: { cancelFlag.isCancelled })
+
+            await MainActor.run {
+                // `endDuplicateTrashing()` nello STESSO blocco che pubblica l'esito: `run`
+                // non lancia mai, quindi nessun percorso di questo `Task.detached` salta
+                // questa chiamata e lascia il flag bloccato a `true` per sempre.
+                self.endDuplicateTrashing()
+                self.duplicateTrashProgress = nil
+                self.duplicateTrashStopRequested = false
+                self.duplicateTrashCancelFlag = nil
+                self.lastDuplicateTrashOutcome = outcome
+                self.refreshRestorableBatch()
+            }
+        }
+    }
+
+    /// «Interrompi» durante lo spostamento. `DuplicateTrasher.run` controlla l'interruzione
+    /// solo fra un gruppo e l'altro: un gruppo in corso viene chiuso, non lasciato a meta'.
+    func stopDuplicateTrashing() {
+        guard !duplicateTrashStopRequested else { return }
+        duplicateTrashStopRequested = true
+        duplicateTrashCancelFlag?.cancel()
     }
 
     private let syncer = FileSyncer()
@@ -13017,9 +13129,11 @@ struct DuplicatesView: View {
         activeCancelFlag = cancelFlag
 
         lastOutcome = nil
-        // Un nuovo spostamento rende obsoleto l'ultimo esito di annullamento mostrato: quello
-        // riguardava un blocco diverso.
-        runner.lastTrashRestoreOutcome = nil
+        // L'invalidazione reciproca (D5) e' ora dentro `runner.startDuplicateTrashing`, che
+        // il Task 5 collega qui al posto di questo corpo — `lastTrashRestoreOutcome` e'
+        // `private(set)` da questo stesso task (Task 4 Step 4) e non e' piu' scrivibile da
+        // qui: nessun'altra riga di questo metodo, ormai superato, deve essere "corretta" per
+        // farla tornare a compilare, sarebbe lavoro buttato a un passo dalla sua rimozione.
         trashProgress = (0, decisions.count)
 
         Task.detached(priority: .utility) {
