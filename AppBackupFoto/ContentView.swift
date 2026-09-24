@@ -3312,6 +3312,20 @@ enum DuplicatesStatus {
     }
 }
 
+/// Quando la finestra Doppioni deve rileggere l'elenco all'apertura (ROADMAP #41, D4 della
+/// spec del 2026-09-20). L'elenco letto a meta' di uno spostamento nel Cestino e' un bersaglio
+/// in movimento — il trasher toglie chiavi dallo stesso elenco mentre rilegge e rihasha sullo
+/// stesso volume — ed e' gia' vecchio quando compare: costa il percorso pesante misurato il
+/// 2026-09-02 (`DuplicateBatch.init` su migliaia di gruppi) proprio mentre il volume e' occupato
+/// da un'altra operazione, e il bottone e' comunque disattivato con il motivo scritto
+/// (`DuplicatesStatus.trashDisabledReason`/`undoDisabledReason`). L'elenco arriva da solo
+/// quando l'operazione finisce, via `.onChange`.
+enum DuplicatesPanelLoad {
+    static func shouldLoadOnAppear(isIdle: Bool, isTrashingDuplicates: Bool, isRestoringFromTrash: Bool) -> Bool {
+        isIdle && !isTrashingDuplicates && !isRestoringFromTrash
+    }
+}
+
 /// Cache delle miniature del pannello Doppioni: una per gruppo, letta dal file tenuto, pigra.
 /// Tetto fisso: senza, scorrere centinaia di gruppi terrebbe in RAM altrettante `NSImage` — su
 /// questo progetto una lettura senza tetto e' gia' costata 41 GB una volta (bug di

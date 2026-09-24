@@ -121,6 +121,37 @@ final class DuplicatesStatusTests: XCTestCase {
         XCTAssertFalse(lower.contains("immediat"))
     }
 
+    // MARK: - `DuplicatesPanelLoad.shouldLoadOnAppear`
+
+    func testLoadsOnAppear_whenIdleAndNothingIsRunning() {
+        XCTAssertTrue(DuplicatesPanelLoad.shouldLoadOnAppear(isIdle: true, isTrashingDuplicates: false, isRestoringFromTrash: false))
+    }
+
+    /// Elenco gia' caricato o in caricamento (`isIdle == false`): non si rilegge, qualunque
+    /// sia lo stato delle altre due operazioni — tutte e quattro le combinazioni.
+    func testDoesNotLoad_whenNotIdle() {
+        for isTrashing in [false, true] {
+            for isRestoring in [false, true] {
+                XCTAssertFalse(DuplicatesPanelLoad.shouldLoadOnAppear(isIdle: false, isTrashingDuplicates: isTrashing, isRestoringFromTrash: isRestoring),
+                                "isTrashing=\(isTrashing) isRestoring=\(isRestoring)")
+            }
+        }
+    }
+
+    func testDoesNotLoad_whileTrashing() {
+        XCTAssertFalse(DuplicatesPanelLoad.shouldLoadOnAppear(isIdle: true, isTrashingDuplicates: true, isRestoringFromTrash: false))
+    }
+
+    func testDoesNotLoad_whileRestoringFromTrash() {
+        XCTAssertFalse(DuplicatesPanelLoad.shouldLoadOnAppear(isIdle: true, isTrashingDuplicates: false, isRestoringFromTrash: true))
+    }
+
+    /// Combinazione impossibile per la mutua esclusione (spostamento e annullamento non
+    /// possono coesistere), ma il predicato non deve dipendere da quell'ipotesi.
+    func testDoesNotLoad_whileBothFlagsSomehowTrue() {
+        XCTAssertFalse(DuplicatesPanelLoad.shouldLoadOnAppear(isIdle: true, isTrashingDuplicates: true, isRestoringFromTrash: true))
+    }
+
     // MARK: - Perché la cancellazione è disattivata
 
     /// Job in corso: motivo scritto, non un bottone grigio senza spiegazione.
