@@ -8038,6 +8038,21 @@ final class BackupRunner: ObservableObject {
     /// canale della finestra Doppioni (regola `AlertSink`): mai `pendingAlert`, che ha un
     /// solo presentatore nella finestra principale.
     func startTrashRestore(onAlert: @escaping (SimpleAlert) -> Void) {
+        // Stessa disciplina di `startDuplicateTrashing` (Task 4, ROADMAP #41): il motivo
+        // **specifico** prima dell'alert generico. Senza questa rivalutazione, uno
+        // scollegamento dell'SSD mentre la conferma non distruttiva e' aperta farebbe
+        // comunque partire l'annullamento — si fermerebbe da solo con un esito onesto
+        // (`TrashRestorer` legge `st_dev` prima di toccare qualunque cosa), ma con una frase
+        // piu' tortuosa di «L'SSD non è collegato» (domanda 3 della spec del 2026-09-20,
+        // decisa: si').
+        if let reason = DuplicatesStatus.undoDisabledReason(ssdMounted: VolumeMonitor.shared.ssdMounted,
+                                                             isRunning: isRunning, isIndexing: isIndexing,
+                                                             isTrashingDuplicates: isTrashingDuplicates,
+                                                             isRestoringFromTrash: isRestoringFromTrash,
+                                                             summary: restorableBatch, hasEverTrashed: (trashManifestStore?.totalRecorded ?? 0) > 0) {
+            onAlert(SimpleAlert(title: "Meglio non farlo adesso", message: reason))
+            return
+        }
         if let alert = beginTrashRestore() {
             onAlert(alert)
             return

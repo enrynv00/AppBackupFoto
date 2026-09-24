@@ -394,6 +394,18 @@ final class DuplicatesStatusTests: XCTestCase {
         XCTAssertTrue(reason!.contains("SSD"))
     }
 
+    /// `ssdMounted == false` ha la precedenza su TUTTO il resto (Task 6, ROADMAP #41): anche
+    /// con un job, uno spostamento e un annullamento tutti "in corso" insieme, la frase deve
+    /// restare quella sull'SSD scollegato — e' il motivo che `startTrashRestore` rivaluta
+    /// prima dell'alert generico.
+    func testUndoDisabled_ssdNotMounted_takesPrecedenceOverEverythingElse() {
+        let reason = DuplicatesStatus.undoDisabledReason(ssdMounted: false, isRunning: true, isIndexing: true,
+                                                          isTrashingDuplicates: true, isRestoringFromTrash: true,
+                                                          summary: summary(), hasEverTrashed: true)
+        XCTAssertNotNil(reason)
+        XCTAssertTrue(reason!.contains("SSD"))
+    }
+
     func testUndoDisabled_trashingInProgress() {
         let reason = DuplicatesStatus.undoDisabledReason(ssdMounted: true, isRunning: false, isIndexing: false,
                                                           isTrashingDuplicates: true, isRestoringFromTrash: false,
