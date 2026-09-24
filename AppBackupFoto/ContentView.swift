@@ -12770,10 +12770,6 @@ struct DuplicatesView: View {
     @State private var pendingBatch: DuplicateBatch? = nil
     @State private var showDestructiveConfirm = false
 
-    @State private var trashProgress: (done: Int, total: Int)? = nil
-    @State private var activeCancelFlag: CancelFlag? = nil
-    @State private var lastOutcome: DuplicateTrashOutcome? = nil
-
     /// Conferma non distruttiva prima di «Annulla l'ultimo spostamento» (ADR-0009, decisione
     /// 2 di Enrico): numero di foto e data, mai un semplice clic diretto — l'operazione ora
     /// dura minuti e ferma i backup per quel tempo.
@@ -12806,13 +12802,13 @@ struct DuplicatesView: View {
 
             listArea
 
-            if runner.isTrashingDuplicates, let progress = trashProgress {
+            if runner.isTrashingDuplicates, let progress = runner.duplicateTrashProgress {
                 trashProgressBar(progress)
             }
 
-            if let lastOutcome {
+            if let outcome = runner.lastDuplicateTrashOutcome {
                 VStack(alignment: .leading, spacing: AppSpacing.xs) {
-                    ForEach(DuplicatesStatus.outcomeLines(lastOutcome)) { line in
+                    ForEach(DuplicatesStatus.outcomeLines(outcome)) { line in
                         Text(line.text).font(AppFont.caption).foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
@@ -12852,7 +12848,15 @@ struct DuplicatesView: View {
         .padding(AppSpacing.lg)
         .frame(minWidth: 640, minHeight: 520)
         .task {
-            if case .idle = loadState { loadGroups() }
+            // Rilegge l'elenco all'apertura solo se non c'e' un'operazione in corso che lo
+            // rende un bersaglio in movimento (ROADMAP #41, D4) — vedi doc-comment su
+            // `DuplicatesPanelLoad`. Scritto come booleano leggibile, non un'espressione
+            // compressa dentro la chiamata.
+            if DuplicatesPanelLoad.shouldLoadOnAppear(isIdle: loadStateIsIdle,
+                                                       isTrashingDuplicates: runner.isTrashingDuplicates,
+                                                       isRestoringFromTrash: runner.isRestoringFromTrash) {
+                loadGroups()
+            }
             runner.refreshRestorableBatch()
         }
         .onChange(of: runner.isRestoringFromTrash) { _, isRestoring in
@@ -12860,6 +12864,20 @@ struct DuplicatesView: View {
             // non ricompaiono come doppioni finche' non si rifa' l'elenco, ma un blocco
             // interrotto puo' aver cambiato lo store): si ricarica come dopo uno spostamento.
             if !isRestoring { loadGroups() }
+        }
+        // Gemella di quella sopra, ma per lo spostamento — deliberatamente SEPARATA e non
+        // fusa in un `if !isTrashing && !isRestoring` (rischio 5 della spec): le due
+        // operazioni si escludono a vicenda, ma un `if` unico ricaricherebbe anche
+        // all'apertura della finestra, non solo a fine operazione. Qui finisce quello che
+        // prima stava nel blocco finale del `Task.detached` di `startTrashing`: le chiavi dei
+        // file davvero cestinati sono gia' state tolte dall'elenco dentro `run(...)`, quindi
+        // si rilegge per mostrare i gruppi rimasti.
+        .onChange(of: runner.isTrashingDuplicates) { _, isTrashing in
+            if !isTrashing {
+                selectedHashes.removeAll()
+                pendingBatch = nil
+                loadGroups()
+            }
         }
         .sheet(isPresented: $showSummarySheet) {
             if let batch = pendingBatch { summarySheet(batch) }
@@ -12921,6 +12939,13 @@ struct DuplicatesView: View {
         trashDisabledReasonNow == nil && !selectedHashes.isEmpty && !runner.isTrashingDuplicates
     }
 
+    /// Letto da `.task` per `DuplicatesPanelLoad.shouldLoadOnAppear` — scritto come booleano
+    /// leggibile invece che dentro un `if case` compresso nella chiamata.
+    private var loadStateIsIdle: Bool {
+        if case .idle = loadState { return true }
+        return false
+    }
+
     /// Perche' «Annulla l'ultimo spostamento» e' disattivato adesso, o `nil` se si puo'
     /// premere. `hasEverTrashed` distingue "non hai mai spostato niente da qui" da "l'ultimo
     /// spostamento e' gia' stato annullato" — due frasi diverse per lo stesso `nil` di
@@ -12975,11 +13000,16 @@ struct DuplicatesView: View {
         VStack(alignment: .leading, spacing: AppSpacing.xs) {
             ProgressView(value: Double(progress.done), total: Double(max(progress.total, 1)))
             HStack {
-                Text("Sposto le copie nel Cestino: \(progress.done) di \(progress.total) gruppi")
+                Text(DuplicatesStatus.trashProgressLine(done: progress.done, total: progress.total))
                     .font(AppFont.caption).foregroundStyle(.secondary)
                 Spacer()
-                Button("Interrompi") { activeCancelFlag?.cancel() }
-                    .buttonStyle(.bordered).controlSize(.small)
+                if runner.duplicateTrashStopRequested {
+                    Text(DuplicatesStatus.trashStoppingLine)
+                        .font(AppFont.caption).foregroundStyle(.secondary)
+                } else {
+                    Button("Interrompi") { runner.stopDuplicateTrashing() }
+                        .buttonStyle(.bordered).controlSize(.small)
+                }
             }
         }
     }
@@ -13083,80 +13113,13 @@ struct DuplicatesView: View {
         showSummarySheet = true
     }
 
-    /// La conferma vera: smaltisce il blocco congelato. Gira fuori dal main thread — la
-    /// rilettura/rihash di ogni membro puo' richiedere minuti su un SSD USB (spec: 50 GB
-    /// sono grosso modo 2-4 minuti) e bloccherebbe la finestra per tutta la durata.
+    /// Avvia lo spostamento nel Cestino, dopo la doppia conferma: avvia
+    /// `BackupRunner.startDuplicateTrashing`, che gira fuori dal main tramite il runner
+    /// (ROADMAP #41). Barra, «Interrompi» ed esito arrivano da li' — la selezione e
+    /// l'elenco si ricaricano da `.onChange(of: runner.isTrashingDuplicates)` sopra, non da
+    /// qui. Simmetrica a `startUndo()` sotto.
     private func startTrashing(_ batch: DuplicateBatch) {
-        // Precondizioni del blocco (item 1 della sequenza in spec: nessun job in corso,
-        // nessuna scansione dell'indice in corso, SSD montato), **rivalutate qui**.
-        // Rilievo di review del 2026-09-01: valutarle solo all'apertura del riepilogo non
-        // basta. Il riepilogo e' fatto per essere letto con calma — e' li' che sta tutto il
-        // peso della conferma — e nel frattempo puo' partire un backup automatico al
-        // ricollegamento dell'SSD, o l'aggancio automatico dell'indice a fine di un altro
-        // job. Cestinare mentre un mirror legge gli stessi file e' esattamente il modo,
-        // descritto dalla spec, di trasformare due operazioni corrette in un guasto.
-        // Lo `st_dev` del trasher non copre questo caso: intercetta lo scollegamento, non
-        // un secondo lettore sul volume ancora montato.
-        if let reason = trashDisabledReasonNow {
-            pendingAlert = SimpleAlert(title: "Meglio non farlo adesso", message: reason)
-            return
-        }
-
-        guard let store = runner.libraryIndexStore,
-              let manifest = runner.trashManifestStore,
-              let root = BookmarkManager.shared.urls[.ssd] else {
-            pendingAlert = SimpleAlert(
-                title: "Non è stato possibile procedere",
-                message: "L'elenco delle foto, il registro di ripristino o l'SSD non sono "
-                    + "disponibili in questo momento. Riprova dopo aver ricontrollato "
-                    + "Diagnostica.")
-            return
-        }
-
-        // Lo stato "sto spostando" vive nel runner, non in uno `@State` di questa view:
-        // riaprire la finestra Doppioni farebbe tornare `false` uno `@State`, permettendo un
-        // secondo spostamento in parallelo al primo (Task 4, ADR-0006). Chiamato subito
-        // prima del `Task.detached` (nessun `return` fra qui e li'), cosi' un `begin` che
-        // riesce e' sempre seguito da un `end` — vedi il commento sul blocco finale sotto.
-        if let alert = runner.beginDuplicateTrashing() {
-            pendingAlert = alert
-            return
-        }
-
-        let decisions = batch.groups.map { DuplicateTrasher.Decision(group: $0.group, keeper: $0.choice.keeper) }
-        let trasher = DuplicateTrasher(libraryRoot: root, store: store, manifest: manifest)
-        let cancelFlag = CancelFlag()
-        activeCancelFlag = cancelFlag
-
-        lastOutcome = nil
-        // L'invalidazione reciproca (D5) e' ora dentro `runner.startDuplicateTrashing`, che
-        // il Task 5 collega qui al posto di questo corpo — `lastTrashRestoreOutcome` e'
-        // `private(set)` da questo stesso task (Task 4 Step 4) e non e' piu' scrivibile da
-        // qui: nessun'altra riga di questo metodo, ormai superato, deve essere "corretta" per
-        // farla tornare a compilare, sarebbe lavoro buttato a un passo dalla sua rimozione.
-        trashProgress = (0, decisions.count)
-
-        Task.detached(priority: .utility) {
-            let outcome = trasher.run(decisions, onProgress: { done, total in
-                Task { @MainActor in trashProgress = (done, total) }
-            }, isCancelled: { cancelFlag.isCancelled })
-
-            await MainActor.run {
-                // `endDuplicateTrashing()` nello STESSO blocco che pubblica l'esito: `run`
-                // non lancia mai, quindi nessun percorso di questo `Task.detached` salta
-                // questa chiamata e lascia il flag bloccato a `true` per sempre.
-                runner.endDuplicateTrashing()
-                trashProgress = nil
-                activeCancelFlag = nil
-                lastOutcome = outcome
-                selectedHashes.removeAll()
-                pendingBatch = nil
-                // Le chiavi dei file davvero cestinati sono gia' state rimosse dallo store
-                // dentro `run(...)`: si ricarica l'elenco per riflettere i gruppi rimasti.
-                loadGroups()
-                runner.refreshRestorableBatch()
-            }
-        }
+        runner.startDuplicateTrashing(batch, onAlert: { pendingAlert = $0 })
     }
 
     /// «Annulla l'ultimo spostamento», dopo la conferma non distruttiva: avvia
