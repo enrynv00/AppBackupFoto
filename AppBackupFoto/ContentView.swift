@@ -2486,23 +2486,45 @@ nonisolated struct DuplicateFilter {
 
 /// Quanti file al massimo si cestinano in un blocco solo.
 ///
-/// Il numero **non** viene dalla durata: il cestinamento misura ~56 file/s, quindi 500 file
-/// sono ~9 secondi, e il tempo vero se lo prende la rilettura che li precede. Viene dal
-/// **raggio di un guasto a meta' blocco**, che la misura 3 della spec mostra essere uno
-/// stato reale e non teorico: lo scollegamento dell'SSD a meta' produce lo stesso errore di
-/// "file inesistente" (2672 casi indistinguibili misurati), quindi un blocco interrotto
-/// lascia un registro di ripristino da leggere a mano. Piu' e' piccolo il blocco, meno c'e'
-/// da rimettere a posto.
+/// **Non e' piu' "un numero prudente": e' la granularita' dell'annullamento automatico**
+/// (ADR-0012, 2026-09-24). Il registro di ripristino tiene al massimo
+/// `TrashManifestStore.maxItems` voci e pota le piu' vecchie: sopra quel numero, un blocco
+/// poterebbe le voci **del blocco stesso** mentre le sta ancora scrivendo, e «Annulla
+/// l'ultimo spostamento» rimetterebbe a posto solo l'ultima parte — senza saperlo e senza
+/// dirlo. Da cui l'invariante protetto da un test (`DuplicateCapInvariantTests`):
+/// **`duplicateBatchFileCap <= TrashManifestStore.maxItems`**. La domanda da farsi, per chi
+/// un giorno volesse alzare questo numero, non e' "quanto dura un blocco" ma "quante foto
+/// voglio poter rimettere a posto con un clic".
 ///
-/// Prudente e **ritarabile alla prima passata reale con l'SSD collegato**: nessuno ha ancora
-/// visto quanti doppioni ci siano davvero, e 500 potrebbe rivelarsi scomodo in eccesso.
-nonisolated let duplicateBatchFileCap = 500
+/// **Il numero (2.000) e' condizionato a una misura, non scelto a tavolino** (Task 2 del
+/// piano `2026-09-24-duplicates-at-real-scale`): `TrashManifestStore.record` riscrive
+/// l'intero registro a ogni file, quindi il costo di un blocco al tetto e' quello del
+/// registro — misurato **il 2026-09-24: 6,58 secondi per 2.000 voci** scritte con percorsi
+/// di forma realistica (`ASUS/foto/recup_dir.NN/f<numero>.jpg`), ben sotto la soglia di
+/// decisione di ~30 s fissata da Enrico. Se in futuro la libreria crescesse abbastanza da
+/// spostare quel numero sopra i 30 s, il tetto scende al valore che la misura consente (si
+/// riprova 1.500, poi 1.000) — non si ritocca a occhio.
+///
+/// **Numeri della prima passata reale** (2026-09-24, 141.683 voci nell'elenco): 89.541
+/// copie in eccesso in 27.798 gruppi, 1,75 MB medi per copia. A 2.000 file per blocco sono
+/// **45 blocchi**; un blocco al tetto costa **~55 secondi** (~4,5 GB da rileggere — copie
+/// in eccesso piu' copie tenute — a 224 MiB/s misurati sull'SSD reale il 2026-09-01 ≈ 19 s,
+/// piu' 2.000 `trashItem` a 55,8 file/s misurati il 2026-08-27 ≈ 36 s): il raggio di un
+/// guasto resta un minuto di lavoro, e il blocco e' **interamente coperto**
+/// dall'annullamento automatico.
+nonisolated let duplicateBatchFileCap = 2_000
 
 /// Stesso ragionamento del tetto sui file, sull'altra grandezza che conta.
 ///
 /// **Decimale** (50 × 1000⁴) e non binario, per coerenza con `ByteCountFormatter(.file)`,
 /// che e' il modo in cui questa app scrive i byte all'utente ovunque: un tetto binario
 /// scatterebbe a un numero diverso da quello mostrato nel riepilogo.
+///
+/// **Non si alza insieme al tetto sui file** (ADR-0012): sulla libreria reale, a 1,75 MB
+/// medi per copia in eccesso, 2.000 file sono ~3,5 GB — i 50 GB restano **14 volte piu'
+/// larghi** del tetto sui file (erano 57 volte a 500). E' quasi sempre il tetto sui file a
+/// decidere; quello sui byte resta una guardia per una selezione fatta di video, che e' il
+/// suo lavoro, e alzarlo non cambierebbe niente sulla libreria di oggi.
 nonisolated let duplicateBatchByteCap: Int64 = 50_000_000_000
 
 /// Il blocco di doppioni che l'utente sta per confermare: quali gruppi, quale copia si
@@ -2691,6 +2713,78 @@ nonisolated struct DuplicateBatch {
 
     private static func count(_ n: Int, _ singular: String, _ plural: String) -> String {
         "\(n.formatted()) \(n == 1 ? singular : plural)"
+    }
+}
+
+/// La sequenza di blocchi in cui si divide una selezione confermata — **una corsa**
+/// (ADR-0012, spec §3.2). L'utente conferma la corsa intera; `BackupRunner` (Task 10) la
+/// smaltisce un blocco alla volta, con `DuplicateTrasher.run` invariato.
+///
+/// **Divide ai due tetti (file e byte), il primo che scatta, e non spezza mai un gruppo fra
+/// due blocchi**: le `Entry` di un gruppo restano sempre tutte nello stesso blocco. Un
+/// gruppo la cui sola dimensione supera gia' un tetto finisce comunque in un blocco tutto
+/// suo — rifiutarlo lo renderebbe inarrivabile per sempre, ed e' l'unico caso in cui un
+/// blocco puo' superare il tetto.
+///
+/// **Ordine**: quello gia' deterministico del pannello, cosi' com'e' nell'array ricevuto —
+/// nessun riordino qui. `DuplicateBatch.groups` arriva gia' ordinato (spazio recuperabile
+/// decrescente, poi copie, poi hash), quindi il piano e' riproducibile e i primi blocchi
+/// sono quelli che recuperano piu' spazio.
+///
+/// **La stima della durata** usa due costanti **misurate sul volume reale**, non stimate a
+/// tavolino: 224 MiB/s di lettura+SHA256 (misurato 2026-09-01) e 55,8 file/s di `trashItem`
+/// (misurato 2026-08-27, su un'immagine disco — non ancora sull'SSD vero via FSKit, rischio
+/// noto della spec §8 punto 6). E' dichiarata come "circa", mai come una promessa.
+// `nonisolated`: value type puro, nessuno stato mutabile condiviso.
+nonisolated struct DuplicateRunPlan {
+    /// Misurato sull'SSD reale il 2026-09-01 (campione di 300 file, 1103 MiB in 4,9 s).
+    static let measuredReadThroughputBytesPerSecond: Double = 224 * 1024 * 1024
+    /// Misurato su immagine disco ExFAT il 2026-08-27.
+    static let measuredTrashItemsPerSecond: Double = 55.8
+
+    let blocks: [[DuplicateBatch.Entry]]
+    /// "Circa" quanto dura l'intera corsa: rilettura+rihash di ogni membro (copia tenuta
+    /// compresa, ADR-0005) piu' i `trashItem` dei file che se ne vanno. Mai zero per una
+    /// corsa non vuota: anche una manciata di file richiede un tempo reale non nullo, e "0
+    /// secondi" si leggerebbe come "istantaneo".
+    let estimatedSeconds: Double
+
+    init(entries: [DuplicateBatch.Entry],
+         fileCap: Int = duplicateBatchFileCap,
+         byteCap: Int64 = duplicateBatchByteCap) {
+        var blocks: [[DuplicateBatch.Entry]] = []
+        var current: [DuplicateBatch.Entry] = []
+        var currentFiles = 0
+        var currentBytes: Int64 = 0
+
+        for entry in entries {
+            let entryFiles = entry.leaving.count
+            let entryBytes = entry.reclaimableBytes
+            // Il gruppo che farebbe sforare un tetto chiude il blocco corrente — ma solo se
+            // il blocco corrente non e' vuoto: un gruppo da solo sopra il tetto deve avere
+            // comunque un blocco, mai essere scartato. `>` e non `>=`: alla soglia esatta
+            // il blocco resta lo stesso, stessa regola di `DuplicateBatch.exceedsCap`.
+            if !current.isEmpty,
+               (currentFiles + entryFiles > fileCap || currentBytes + entryBytes > byteCap) {
+                blocks.append(current)
+                current = []
+                currentFiles = 0
+                currentBytes = 0
+            }
+            current.append(entry)
+            currentFiles += entryFiles
+            currentBytes += entryBytes
+        }
+        if !current.isEmpty { blocks.append(current) }
+        self.blocks = blocks
+
+        // La rilettura tocca OGNI membro, la copia tenuta compresa (ADR-0005): stessa
+        // grandezza di `DuplicateBatch.verifiedBytes`, sommata qui sull'intera corsa.
+        let totalBytesToVerify = entries.reduce(Int64(0)) { $0 + $1.group.size * Int64($1.group.members.count) }
+        let totalFilesToTrash = entries.reduce(0) { $0 + $1.leaving.count }
+        let readSeconds = Double(totalBytesToVerify) / Self.measuredReadThroughputBytesPerSecond
+        let trashSeconds = Double(totalFilesToTrash) / Self.measuredTrashItemsPerSecond
+        self.estimatedSeconds = entries.isEmpty ? 0 : max(readSeconds + trashSeconds, 1)
     }
 }
 
