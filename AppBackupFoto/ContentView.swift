@@ -2514,11 +2514,19 @@ nonisolated let duplicateBatchByteCap: Int64 = 50_000_000_000
 /// c'e' alert che tenga.
 ///
 /// **Congela la copia tenuta di ogni gruppo.** `duplicateKeepChoice` gira una volta sola,
-/// qui, e il risultato viaggia dentro il blocco fino al `DuplicateTrasher`. Non e' un
-/// dettaglio di efficienza: fra il riepilogo che l'utente legge e il cestinamento l'indice
-/// puo' essere cambiato, e una scelta ricalcolata su dati nuovi puo' nominare **un'altra
-/// copia** — l'utente acconsente a cestinare A e viene cestinato B. Chi consuma questo tipo
-/// non deve mai ricalcolare la scelta: deve usare quella che trova qui dentro.
+/// dentro `init(groups:rule:)`, e il risultato viaggia dentro il blocco fino al
+/// `DuplicateTrasher`. Non e' un dettaglio di efficienza: fra il riepilogo che l'utente
+/// legge e il cestinamento l'indice puo' essere cambiato, e una scelta ricalcolata su dati
+/// nuovi puo' nominare **un'altra copia** — l'utente acconsente a cestinare A e viene
+/// cestinato B. Chi consuma questo tipo non deve mai ricalcolare la scelta: deve usare
+/// quella che trova qui dentro.
+///
+/// **Il congelamento vale anche attraverso un sottoinsieme (ADR-0011, 2026-09-24).**
+/// `init(entries:)` costruisce un blocco filtrando `Entry` gia' congelate altrove — senza
+/// chiamare `duplicateKeepChoice` nemmeno una volta — proprio perche' un secondo calcolo su
+/// un sottoinsieme e' la stessa trappola: con una regola dell'utente che puo' cambiare fra
+/// la lista e la conferma, ricalcolare puo' nominare un sopravvissuto diverso da quello che
+/// l'utente ha visto. E' per questo che questo costruttore esiste.
 ///
 /// Logica **pura**: nessun filesystem, nessun database.
 // `nonisolated`: costruita dal pannello Doppioni fuori dal main thread (Task 5) — e' il tipo
@@ -2553,20 +2561,40 @@ nonisolated struct DuplicateBatch {
     /// I **file** che si spostano, non i gruppi: e' il numero che l'utente deve leggere.
     let fileCount: Int
     let reclaimableBytes: Int64
-    /// Da quali cartelle se ne vanno, e quanti file per cartella. Solo le cartelle che
-    /// **perdono** file: quella della copia tenuta non compare se da li' non esce niente.
+    /// I byte che si **rileggono** per verificare l'intero blocco: **ogni** membro di ogni
+    /// gruppo, la copia tenuta compresa — e' la rilettura che precede il cestinamento
+    /// (ADR-0005), non lo spazio che si libera. **Non e' `reclaimableBytes`**: quella
+    /// esclude la copia tenuta, questa la include, perche' anche lei viene riletta e
+    /// rihashata per pretendere l'unanimita' del gruppo.
+    let verifiedBytes: Int64
+    /// Da quali **cartelle di primo livello** se ne vanno, e quanti gruppi per cartella.
+    /// Solo le cartelle che **perdono** file: quella della copia tenuta non compare se da
+    /// li' non esce niente. Cartella di primo livello e non genitore completo (ADR-0011,
+    /// 2026-09-24): con le copie in eccesso sparse su migliaia di `ASUS/foto/recup_dir.NN`,
+    /// la cartella genitrice completa produrrebbe migliaia di righe nel riepilogo — proprio
+    /// dove sta tutto il peso della prima conferma (ADR-0005, decisione 4).
     let folderBreakdown: [(folder: String, count: Int)]
     let exceedsCap: Bool
 
-    init(groups: [DuplicateGroup]) {
-        // La scelta si calcola qui, una volta, e da qui in poi non si ricalcola piu'.
+    /// Punto **unico** in cui la scelta si calcola: `duplicateKeepChoice` gira una volta
+    /// per gruppo, qui, con la regola dell'utente passata esplicitamente (parametro senza
+    /// default, stessa disciplina dei quattro gate di ADR-0009).
+    init(groups: [DuplicateGroup], rule: DuplicateFolderRule?) {
         // I gruppi ridotti a un solo membro si scartano prima: `duplicateKeepChoice` ha una
         // precondition su almeno due membri, e questo e' il confine dove il filtro va messo
         // (non ammorbidendo la guardia).
         let entries = groups
             .filter { $0.members.count > 1 }
-            .map { Entry(group: $0, choice: duplicateKeepChoice($0, rule: nil)) }
+            .map { Entry(group: $0, choice: duplicateKeepChoice($0, rule: rule)) }
+        self.init(entries: entries)
+    }
 
+    /// Costruisce il blocco da `Entry` **già congelate altrove** — non chiama mai
+    /// `duplicateKeepChoice`, nemmeno una volta: ricalcola solo i totali (ordine, conteggi,
+    /// ripartizione per cartella, tetto) sul sottoinsieme ricevuto. È il modo corretto di
+    /// ricavare un blocco da una selezione: filtrare le `Entry` di un blocco già costruito,
+    /// mai ricostruire dai gruppi.
+    init(entries: [Entry]) {
         // Ordine: spazio recuperabile decrescente, poi numero di copie decrescente, poi
         // l'hash. La terza chiave non e' decorativa: senza, due gruppi equivalenti sulle
         // prime due si disporrebbero secondo l'ordine di arrivo, e l'elenco che l'utente
@@ -2580,6 +2608,10 @@ nonisolated struct DuplicateBatch {
 
         self.fileCount = entries.reduce(0) { $0 + $1.leaving.count }
         self.reclaimableBytes = entries.reduce(0) { $0 + $1.reclaimableBytes }
+        // Ogni membro del gruppo, copia tenuta compresa: `group.size` e' la stessa
+        // grandezza usata da `reclaimableBytes`, moltiplicata per TUTTI i membri e non
+        // solo per quelli che se ne vanno.
+        self.verifiedBytes = entries.reduce(0) { $0 + $1.group.size * Int64($1.group.members.count) }
 
         var perFolder: [String: Int] = [:]
         for entry in entries {
@@ -2599,11 +2631,16 @@ nonisolated struct DuplicateBatch {
             || self.reclaimableBytes > duplicateBatchByteCap
     }
 
-    /// La cartella che contiene il file, come e' scritta su disco: l'utente la deve poter
-    /// ritrovare nel Finder, quindi `displayPath` e non la chiave minuscola.
+    /// La cartella di **primo livello** che contiene il file, come e' scritta su disco:
+    /// l'utente la deve poter ritrovare nel Finder, quindi `displayPath` e non la chiave
+    /// minuscola. Non l'intero percorso genitore (ADR-0011): vedi il doc-comment di
+    /// `folderBreakdown`.
     private static func folder(of entry: LibraryIndexEntry) -> String {
-        let components = entry.displayPath.split(separator: "/", omittingEmptySubsequences: true).dropLast()
-        return components.isEmpty ? "(sull'SSD, fuori da ogni cartella)" : components.joined(separator: "/")
+        let components = entry.displayPath.split(separator: "/", omittingEmptySubsequences: true)
+        guard components.count > 1, let first = components.first else {
+            return "(sull'SSD, fuori da ogni cartella)"
+        }
+        return String(first)
     }
 
     /// Il testo del riepilogo. Puro, cosi' e' verificabile senza aprire la finestra.
@@ -2631,6 +2668,13 @@ nonisolated struct DuplicateBatch {
         // tempo che si sta per svuotare la cartella sbagliata.
         for riga in folderBreakdown {
             out.append("Da «\(riga.folder)»: \(DuplicateBatch.count(riga.count, "file", "file")).")
+        }
+        // Riga di coda, solo se le cartelle sono piu' di una: a questa scala e' l'unico
+        // modo per accorgersi subito di aver puntato la cartella sbagliata, senza dover
+        // contare le righe sopra a mano.
+        if folderBreakdown.count > 1 {
+            out.append("In tutto, i file escono da "
+                + "\(DuplicateBatch.count(folderBreakdown.count, "cartella", "cartelle")) diverse.")
         }
 
         out.append("Le copie che stanno sull'HDD e su Cubbit restano dove sono: questa operazione "
@@ -13282,7 +13326,7 @@ struct DuplicatesView: View {
                 // Ordinamento + scelta di chi tenere per OGNI gruppo: e' il lavoro pesante,
                 // e va fatto qui, fuori dal main thread, una volta sola (vedi doc-comment
                 // su `loadedBatch`), non dentro la view a ogni ridisegno.
-                let batch = DuplicateBatch(groups: groups)
+                let batch = DuplicateBatch(groups: groups, rule: nil)
                 await MainActor.run {
                     loadState = .loaded(groups)
                     loadedBatch = batch
@@ -13303,7 +13347,7 @@ struct DuplicatesView: View {
         guard case .loaded(let groups) = loadState else { return }
         let selected = groups.filter { selectedHashes.contains($0.hash) }
         guard !selected.isEmpty else { return }
-        pendingBatch = DuplicateBatch(groups: selected)
+        pendingBatch = DuplicateBatch(groups: selected, rule: nil)
         showSummarySheet = true
     }
 

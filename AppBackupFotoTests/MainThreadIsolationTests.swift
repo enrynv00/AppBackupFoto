@@ -84,7 +84,7 @@ final class MainThreadIsolationTests: XCTestCase {
     func testDuplicateBatch_runsWithoutTheMainThread() {
         let done = DispatchSemaphore(value: 0)
         Task.detached {
-            _ = DuplicateBatch(groups: [])
+            _ = DuplicateBatch(groups: [], rule: nil)
             done.signal()
         }
         XCTAssertEqual(done.wait(timeout: .now() + 10), .success,
