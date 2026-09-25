@@ -2708,11 +2708,16 @@ nonisolated struct DuplicateBatch {
         out.append("Le copie che stanno sull'HDD e su Cubbit restano dove sono: questa operazione "
             + "tocca soltanto l'SSD.")
 
-        if exceedsCap {
-            out.append("Hai selezionato troppi file in una volta sola. Togli qualche gruppo e "
-                + "procedi in più passaggi: se qualcosa va storto a metà, un blocco più piccolo "
-                + "è molto più facile da rimettere a posto.")
-        }
+        // La riga "Hai selezionato troppi file in una volta sola..." (che invitava a togliere
+        // gruppi a mano) e' stata rimossa il 2026-09-25, assenso di Enrico — TERZA eccezione
+        // autorizzata alla regola 6/7 dei piani di questo progetto (oltre a folderBreakdown e
+        // confirmationBlockedReason): con la corsa a piu' blocchi (ADR-0012) una selezione
+        // sopra il tetto non e' piu' rifiutata, si smaltisce da sola in blocchi automatici, e
+        // quella frase — pensata per il vecchio tetto che bloccava — diceva ora il contrario
+        // di quello che il riepilogo (DuplicatesStatus.runPlanLine/undoScopeLine, Task 9/11)
+        // dice un rigo sopra. Due frasi per la stessa informazione, di cui una falsa, erano
+        // una di troppo. `exceedsCap` resta sul tipo (usato altrove, es. duplicateBatchFileCap)
+        // ma non produce piu' nessuna riga qui.
 
         return out
     }
@@ -8724,8 +8729,9 @@ final class BackupRunner: ObservableObject {
     ///
     /// `private(set)` da quando #41 e' stato chiuso allo stesso modo (2026-09-24): l'unico
     /// scrittore esterno che restava (`DuplicatesView.startTrashing`, che azzerava
-    /// `lastTrashRestoreOutcome` all'avvio di uno spostamento) e' stato spostato dentro
-    /// `startDuplicateTrashing` qui sotto — l'invariante "un `begin` riuscito e' sempre
+    /// `lastTrashRestoreOutcome` all'avvio di uno spostamento) e' stato spostato dentro il
+    /// runner — oggi `startDuplicateTrashRun` (Task 10/11, il percorso a blocco singolo di
+    /// #41 e' stato rimosso il 2026-09-25) — l'invariante "un `begin` riuscito e' sempre
     /// seguito da un `end` nello stesso `MainActor.run` che pubblica l'esito" e' verificabile
     /// leggendo una sola funzione solo se nessun altro puo' muovere questo stato.
     @Published private(set) var trashRestoreProgress: (done: Int, total: Int)? = nil
@@ -8760,7 +8766,7 @@ final class BackupRunner: ObservableObject {
     /// canale della finestra Doppioni (regola `AlertSink`): mai `pendingAlert`, che ha un
     /// solo presentatore nella finestra principale.
     func startTrashRestore(onAlert: @escaping (SimpleAlert) -> Void) {
-        // Stessa disciplina di `startDuplicateTrashing` (Task 4, ROADMAP #41): il motivo
+        // Stessa disciplina di `startDuplicateTrashRun` sotto: il motivo
         // **specifico** prima dell'alert generico. Senza questa rivalutazione, uno
         // scollegamento dell'SSD mentre la conferma non distruttiva e' aperta farebbe
         // comunque partire l'annullamento — si fermerebbe da solo con un esito onesto
@@ -8792,8 +8798,9 @@ final class BackupRunner: ObservableObject {
         trashRestoreStopRequested = false
         lastTrashRestoreOutcome = nil
         // Invalidazione reciproca (D5, ROADMAP #41): un annullamento rende obsoleto l'esito
-        // di uno spostamento mostrato in precedenza, riguardava un blocco diverso.
-        lastDuplicateTrashOutcome = nil
+        // di una corsa mostrato in precedenza, riguardava blocchi diversi. Dal 2026-09-25
+        // (Task 14) il percorso a blocco singolo e' rimosso: si invalida `lastDuplicateRunOutcome`.
+        lastDuplicateRunOutcome = nil
         let items = manifest.pendingInLastBatch()
         trashRestoreProgress = (0, items.count)
 
@@ -8826,116 +8833,21 @@ final class BackupRunner: ObservableObject {
         trashRestoreCancelFlag?.cancel()
     }
 
-    // MARK: Spostamento nel Cestino (ROADMAP #41, 2026-09-24)
-
-    /// Stato dello spostamento vive QUI, non in `@State` di `DuplicatesView` — stesso motivo
-    /// gia' scritto sopra per l'annullamento: chiudere e riaprire la finestra Doppioni non
-    /// deve far perdere barra, «Interrompi» o l'esito di uno spostamento ancora in corso. E'
-    /// il difetto che ROADMAP #41 chiude: fino a questo intervento erano tre `@State` della
-    /// view (`trashProgress`/`activeCancelFlag`/`lastOutcome`), spariti alla chiusura della
-    /// finestra pur restando vivo il lavoro sul disco (`isTrashingDuplicates` era gia' nel
-    /// runner dal Task 4 del 2026-09-19, ma non bastava a mostrare barra ed esito).
-    @Published private(set) var duplicateTrashProgress: (done: Int, total: Int)? = nil
-    @Published private(set) var duplicateTrashStopRequested = false
-    @Published private(set) var lastDuplicateTrashOutcome: DuplicateTrashOutcome? = nil
-    private var duplicateTrashCancelFlag: CancelFlag? = nil
-
-    /// Avvia lo spostamento nel Cestino del blocco congelato. `onAlert` e' il canale della
-    /// finestra Doppioni (regola `AlertSink`): mai `pendingAlert`, che ha un solo presentatore
-    /// nella finestra principale. Corpo spostato da `DuplicatesView.startTrashing(_:)` di
-    /// prima di questo intervento, non riscritto.
-    func startDuplicateTrashing(_ batch: DuplicateBatch, onAlert: @escaping (SimpleAlert) -> Void) {
-        // Precondizioni del blocco (item 1 della sequenza in spec: nessun job in corso,
-        // nessuna scansione dell'indice in corso, SSD montato, nessun annullamento in corso),
-        // **rivalutate qui, all'avvio vero**. Rilievo di review del 2026-09-01 (gia' pagato
-        // anche in `rebuildLibraryIndex`): valutarle solo all'apertura del riepilogo non
-        // basta. Il riepilogo e' fatto per essere letto con calma — e' li' che sta tutto il
-        // peso della conferma — e nel frattempo puo' partire un backup automatico al
-        // ricollegamento dell'SSD, o l'aggancio automatico dell'indice a fine di un altro
-        // job. Cestinare mentre un mirror legge gli stessi file e' esattamente il modo,
-        // descritto dalla spec, di trasformare due operazioni corrette in un guasto.
-        // Lo `st_dev` del trasher non copre questo caso: intercetta lo scollegamento, non
-        // un secondo lettore sul volume ancora montato. `VolumeMonitor.shared` e' una lettura
-        // di un `Bool` sul MainActor, nessun I/O (il polling sta sulla `probeQueue`) e nessuna
-        // sottoscrizione a `objectWillChange` — non aggiunge ridisegni.
-        let reason = DuplicatesStatus.trashDisabledReason(isRunning: isRunning,
-                                                           isIndexing: isIndexing,
-                                                           ssdMounted: VolumeMonitor.shared.ssdMounted,
-                                                           isTrashingDuplicates: isTrashingDuplicates,
-                                                           isRestoringFromTrash: isRestoringFromTrash)
-        if let reason {
-            onAlert(SimpleAlert(title: "Meglio non farlo adesso", message: reason))
-            return
-        }
-
-        guard let store = libraryIndexStore,
-              let manifest = trashManifestStore,
-              let root = BookmarkManager.shared.urls[.ssd] else {
-            onAlert(SimpleAlert(
-                title: "Non è stato possibile procedere",
-                message: "L'elenco delle foto, il registro di ripristino o l'SSD non sono "
-                    + "disponibili in questo momento. Riprova dopo aver ricontrollato "
-                    + "Diagnostica."))
-            return
-        }
-
-        // Lo stato "sto spostando" e' gia' nel runner da #34 (2026-09-19): questa chiamata
-        // non cambia, cambia solo che adesso e' il runner stesso a farla, non la view.
-        // Chiamato subito prima del `Task.detached` (nessun `return` fra qui e li'), cosi' un
-        // `begin` che riesce e' sempre seguito da un `end` — vedi il commento sul blocco
-        // finale sotto.
-        if let alert = beginDuplicateTrashing() {
-            onAlert(alert)
-            return
-        }
-
-        let decisions = batch.groups.map { DuplicateTrasher.Decision(group: $0.group, keeper: $0.choice.keeper) }
-        let trasher = DuplicateTrasher(libraryRoot: root, store: store, manifest: manifest)
-        let cancelFlag = CancelFlag()
-        duplicateTrashCancelFlag = cancelFlag
-        duplicateTrashStopRequested = false
-        lastDuplicateTrashOutcome = nil
-        // Un nuovo spostamento rende obsoleto l'ultimo esito di annullamento mostrato: quello
-        // riguardava un blocco diverso (invalidazione reciproca, D5, simmetrica a quella
-        // scritta sopra in `startTrashRestore`).
-        lastTrashRestoreOutcome = nil
-        duplicateTrashProgress = (0, decisions.count)
-
-        Task.detached(priority: .utility) {
-            let outcome = trasher.run(decisions, onProgress: { done, total in
-                Task { @MainActor in self.duplicateTrashProgress = (done, total) }
-            }, isCancelled: { cancelFlag.isCancelled })
-
-            await MainActor.run {
-                // `endDuplicateTrashing()` nello STESSO blocco che pubblica l'esito: `run`
-                // non lancia mai, quindi nessun percorso di questo `Task.detached` salta
-                // questa chiamata e lascia il flag bloccato a `true` per sempre.
-                self.endDuplicateTrashing()
-                self.duplicateTrashProgress = nil
-                self.duplicateTrashStopRequested = false
-                self.duplicateTrashCancelFlag = nil
-                self.lastDuplicateTrashOutcome = outcome
-                self.refreshRestorableBatch()
-            }
-        }
-    }
-
-    /// «Interrompi» durante lo spostamento. `DuplicateTrasher.run` controlla l'interruzione
-    /// solo fra un gruppo e l'altro: un gruppo in corso viene chiuso, non lasciato a meta'.
-    func stopDuplicateTrashing() {
-        guard !duplicateTrashStopRequested else { return }
-        duplicateTrashStopRequested = true
-        duplicateTrashCancelFlag?.cancel()
-    }
-
     // MARK: Corsa a piu' blocchi (Task 10, ADR-0011/0012)
+    //
+    // Il percorso a blocco singolo (`startDuplicateTrashing`/`stopDuplicateTrashing`/
+    // `duplicateTrashProgress`/`duplicateTrashStopRequested`/`lastDuplicateTrashOutcome`/
+    // `duplicateTrashCancelFlag`, nati con ROADMAP #41 il 2026-09-24) e' stato **rimosso il
+    // 2026-09-25 (Task 14)**: la corsa a piu' blocchi qui sotto li ha sostituiti per intero
+    // — `DuplicatesView` non li chiamava piu' da quando il Task 11 ha ricablato
+    // `startTrashing(_:)` su `startDuplicateTrashRun`, e `grep` su tutto il progetto (test
+    // compresi) confermava zero chiamanti rimasti. Vedi la nota in coda ad ADR-0009.
 
     /// Stato di una **corsa** (la sequenza di blocchi di un `DuplicateRunPlan`) — vive QUI,
-    /// non in `@State` di `DuplicatesView`, stesso motivo di `duplicateTrashProgress` sopra:
-    /// chiudere e riaprire la finestra Doppioni non deve far perdere barra, «Interrompi» o
-    /// l'esito di una corsa in corso. Distinto apposta da `duplicateTrashProgress`/
-    /// `lastDuplicateTrashOutcome` (blocco singolo, ROADMAP #41): quelli restano finche' il
-    /// Task 11 non ricabla `DuplicatesView` su questi.
+    /// non in `@State` di `DuplicatesView`: chiudere e riaprire la finestra Doppioni non deve
+    /// far perdere barra, «Interrompi» o l'esito di una corsa in corso — lo stesso principio
+    /// gia' scritto sopra per l'annullamento e per il percorso a blocco singolo che questi
+    /// campi hanno sostituito (rimosso il 2026-09-25, vedi la nota sopra).
     @Published private(set) var duplicateRunProgress: (blockIndex: Int, blockCount: Int, filesDone: Int, filesTotal: Int)? = nil
     @Published private(set) var duplicateRunStopRequested = false
     @Published private(set) var lastDuplicateRunOutcome: DuplicateRunOutcome? = nil
@@ -8955,7 +8867,7 @@ final class BackupRunner: ObservableObject {
     /// scollegamento fisico dell'SSD, controllato di nuovo prima di ogni blocco qui sotto.
     ///
     /// `DuplicateTrasher.run`/`verify` non cambiano di una riga: questa funzione li chiama,
-    /// uno per blocco, esattamente come faceva `startDuplicateTrashing` per un blocco solo.
+    /// uno per blocco.
     ///
     /// **La catena si ferma** se l'esito di un blocco ha `stoppedBecauseVolumeVanished` o
     /// contiene un gruppo saltato con motivo `.trashFailed` — mai per gli altri gruppi
@@ -8996,7 +8908,7 @@ final class BackupRunner: ObservableObject {
         duplicateRunCancelFlag = cancelFlag
         duplicateRunStopRequested = false
         lastDuplicateRunOutcome = nil
-        // Invalidazione reciproca (D5, stesso principio di `startDuplicateTrashing`): una
+        // Invalidazione reciproca (D5): una
         // nuova corsa rende obsoleto l'ultimo esito di annullamento mostrato.
         lastTrashRestoreOutcome = nil
         let totalBlocks = plan.blocks.count
@@ -9079,7 +8991,7 @@ final class BackupRunner: ObservableObject {
 
             await MainActor.run {
                 // `endDuplicateTrashing()` nello STESSO blocco che pubblica l'esito, stessa
-                // disciplina di `startDuplicateTrashing`: nessun percorso di questo ciclo
+                // disciplina di `startTrashRestore`: nessun percorso di questo ciclo
                 // salta questa chiamata e lascia il flag bloccato a `true` per sempre.
                 self.endDuplicateTrashing()
                 self.duplicateRunProgress = nil
@@ -9091,7 +9003,7 @@ final class BackupRunner: ObservableObject {
         }
     }
 
-    /// «Interrompi» durante una corsa. Come `stopDuplicateTrashing`: `DuplicateTrasher.run`
+    /// «Interrompi» durante una corsa (idempotente, come `stopTrashRestore`): `DuplicateTrasher.run`
     /// controlla l'interruzione solo fra un gruppo e l'altro, quindi un gruppo in corso viene
     /// chiuso, mai lasciato a meta' — e un blocco in corso finisce di essere processato
     /// prima che la corsa si fermi davvero.

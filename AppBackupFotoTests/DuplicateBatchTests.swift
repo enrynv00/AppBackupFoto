@@ -256,16 +256,6 @@ final class DuplicateBatchTests: XCTestCase {
                       b.summaryLines().joined(separator: "\n"))
     }
 
-    /// Il riepilogo dice quando il blocco supera il tetto, invece di troncare in silenzio.
-    func testSummary_saysWhenTheBatchIsTooBig() {
-        let b = DuplicateBatch(groups: (0...duplicateBatchFileCap).map {
-            group([entry("A/\($0)-a.jpg", size: 1), entry("A/\($0)-b.jpg", size: 1)], hash: "h\($0)")
-        }, rule: nil)
-        XCTAssertTrue(b.exceedsCap)
-        XCTAssertTrue(b.summaryLines().contains { $0.contains("troppi file in una volta sola") },
-                      b.summaryLines().joined(separator: "\n"))
-    }
-
     /// Registro anti-gergo, come per `LibraryIndexStatus` e `duplicateKeepExplanation`.
     func testSummary_hasNoJargon() {
         let b = DuplicateBatch(groups: [group([entry("A/a.jpg"), entry("A/b.jpg")])], rule: nil)
