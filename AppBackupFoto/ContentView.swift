@@ -3701,23 +3701,6 @@ enum DuplicatesStatus {
         return nil
     }
 
-    /// Se il blocco selezionato puo' procedere alla conferma vera. Sopra il tetto la UI lo
-    /// dice invece di rifiutare senza spiegare (deciso il 2026-08-28).
-    ///
-    /// **Deviazione dal piano, decisa da Enrico il 2026-09-24**: il Task 9 del piano
-    /// `2026-09-24-duplicates-at-real-scale` chiedeva di rimuovere questa funzione qui.
-    /// Resta fino al Task 11, che la rimuove nello stesso commit in cui ricabla
-    /// `DuplicatesView.summarySheet` sul piano della corsa (`runPlanLine`/`undoScopeLine`):
-    /// toglierla ora avrebbe lasciato, per i commit fra Task 9 e Task 10, un bottone
-    /// distruttivo premibile su un blocco piu' grande di quanto l'orchestrazione sappia
-    /// gestire — l'orchestrazione e' il Task 10, che non esiste ancora a questo punto della
-    /// storia. Ogni commit deve restare sicuro da solo.
-    static func confirmationBlockedReason(exceedsCap: Bool) -> String? {
-        guard exceedsCap else { return nil }
-        return "Hai selezionato troppi file in una volta sola: procedi in più passaggi più "
-            + "piccoli, così un eventuale intoppo a metà resta facile da rimettere a posto."
-    }
-
     /// Come si racconta l'esito di un blocco appena smaltito: mai un silenzio, sempre un
     /// numero onesto — sia sui file gia' spostati sia sui gruppi rimasti intatti.
     static func outcomeLines(_ outcome: DuplicateTrashOutcome) -> [Line] {
@@ -13551,6 +13534,11 @@ struct DuplicatesView: View {
     /// del Task 2 e ripreso nel Task 4: fra il riepilogo e il cestinamento la scelta di quale
     /// copia tenere non deve poter cambiare sotto i piedi dell'utente.
     @State private var pendingBatch: DuplicateBatch? = nil
+    /// Il piano della corsa (ADR-0012) per `pendingBatch`, congelato nello stesso istante e
+    /// dalla stessa funzione (`beginConfirmation()`) — mai ricalcolato dentro `summarySheet`,
+    /// che SwiftUI puo' richiamare a ogni ridisegno: `DuplicateRunPlan.init` gira su tutta la
+    /// selezione, e ricalcolarlo nel `body` e' esattamente il bug del 2026-09-02 (regola 9).
+    @State private var pendingPlan: DuplicateRunPlan? = nil
     @State private var showDestructiveConfirm = false
 
     /// Conferma non distruttiva prima di «Annulla l'ultimo spostamento» (ADR-0009, decisione
@@ -13585,13 +13573,13 @@ struct DuplicatesView: View {
 
             listArea
 
-            if runner.isTrashingDuplicates, let progress = runner.duplicateTrashProgress {
-                trashProgressBar(progress)
+            if runner.isTrashingDuplicates, let progress = runner.duplicateRunProgress {
+                duplicateRunProgressBar(progress)
             }
 
-            if let outcome = runner.lastDuplicateTrashOutcome {
+            if let outcome = runner.lastDuplicateRunOutcome {
                 VStack(alignment: .leading, spacing: AppSpacing.xs) {
-                    ForEach(DuplicatesStatus.outcomeLines(outcome)) { line in
+                    ForEach(DuplicatesStatus.runOutcomeLines(outcome)) { line in
                         Text(line.text).font(AppFont.caption).foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
@@ -13659,6 +13647,7 @@ struct DuplicatesView: View {
             if !isTrashing {
                 selectedHashes.removeAll()
                 pendingBatch = nil
+                pendingPlan = nil
                 loadGroups()
             }
         }
@@ -13779,18 +13768,22 @@ struct DuplicatesView: View {
         }
     }
 
-    private func trashProgressBar(_ progress: (done: Int, total: Int)) -> some View {
+    /// Barra di avanzamento di una **corsa** a piu' blocchi (Task 10/11, ADR-0012) — non di
+    /// un blocco solo: `DuplicatesStatus.runProgressLine` conta i file di TUTTA la corsa, non
+    /// del solo blocco in esecuzione.
+    private func duplicateRunProgressBar(_ progress: (blockIndex: Int, blockCount: Int, filesDone: Int, filesTotal: Int)) -> some View {
         VStack(alignment: .leading, spacing: AppSpacing.xs) {
-            ProgressView(value: Double(progress.done), total: Double(max(progress.total, 1)))
+            ProgressView(value: Double(progress.filesDone), total: Double(max(progress.filesTotal, 1)))
             HStack {
-                Text(DuplicatesStatus.trashProgressLine(done: progress.done, total: progress.total))
+                Text(DuplicatesStatus.runProgressLine(blockIndex: progress.blockIndex, blockCount: progress.blockCount,
+                                                       filesDone: progress.filesDone, filesTotal: progress.filesTotal))
                     .font(AppFont.caption).foregroundStyle(.secondary)
                 Spacer()
-                if runner.duplicateTrashStopRequested {
+                if runner.duplicateRunStopRequested {
                     Text(DuplicatesStatus.trashStoppingLine)
                         .font(AppFont.caption).foregroundStyle(.secondary)
                 } else {
-                    Button("Interrompi") { runner.stopDuplicateTrashing() }
+                    Button("Interrompi") { runner.stopDuplicateTrashRun() }
                         .buttonStyle(.bordered).controlSize(.small)
                 }
             }
@@ -13830,8 +13823,20 @@ struct DuplicatesView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
 
-            if let capReason = DuplicatesStatus.confirmationBlockedReason(exceedsCap: batch.exceedsCap) {
-                Text(capReason).font(AppFont.caption).foregroundStyle(AppColor.warning)
+            // Il piano della corsa (ADR-0012) e — solo se piu' di un blocco — la frase
+            // sull'annullamento a un livello: Enrico deve saperlo PRIMA di confermare, non
+            // scoprirlo dopo un guasto a meta' corsa. `pendingPlan` e' gia' calcolato,
+            // congelato insieme a `batch` in `beginConfirmation()` — mai ricalcolato qui,
+            // che SwiftUI puo' richiamare a ogni ridisegno (regola 9).
+            if let plan = pendingPlan {
+                Text(DuplicatesStatus.runPlanLine(blockCount: plan.blocks.count, files: batch.fileCount,
+                                                  estimatedSeconds: plan.estimatedSeconds))
+                    .font(AppFont.body)
+                if let undoScope = DuplicatesStatus.undoScopeLine(blockCount: plan.blocks.count,
+                                                                   fileCapPerBlock: duplicateBatchFileCap) {
+                    Text(undoScope).font(AppFont.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
 
             HStack {
@@ -13842,7 +13847,7 @@ struct DuplicatesView: View {
                     showDestructiveConfirm = true
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(batch.exceedsCap || trashDisabledReasonNow != nil)
+                .disabled(trashDisabledReasonNow != nil)
             }
         }
         .padding(AppSpacing.xl)
@@ -13888,21 +13893,33 @@ struct DuplicatesView: View {
     /// Congela il blocco selezionato e apre il riepilogo — la prima delle due conferme
     /// (decisione 4 di Enrico). Il blocco non viene piu' ricalcolato da qui in avanti: la
     /// stessa istanza arriva fino a `startTrashing(_:)`.
+    ///
+    /// **Filtra le `Entry` gia' congelate di `loadedBatch`, non ricostruisce dai gruppi
+    /// grezzi** (fix del difetto latente di ADR-0011, 2026-09-25): `DuplicateBatch(entries:)`
+    /// non richiama mai `duplicateKeepChoice` — quella e' gia' stata decisa una volta sola in
+    /// `loadGroups()`. Ricostruire da `DuplicateBatch(groups:rule:)` qui aprirebbe un secondo
+    /// posto in cui la scelta di quale copia tenere potrebbe, in futuro, divergere da quella
+    /// mostrata nella lista — la classe di errore che questo progetto ha gia' pagato tre
+    /// volte (`LibraryExclusions`, `realResolvedPath`, `makeThumbnail`).
     private func beginConfirmation() {
-        guard case .loaded(let groups) = loadState else { return }
-        let selected = groups.filter { selectedHashes.contains($0.hash) }
+        guard let loadedBatch else { return }
+        let selected = loadedBatch.groups.filter { selectedHashes.contains($0.group.hash) }
         guard !selected.isEmpty else { return }
-        pendingBatch = DuplicateBatch(groups: selected, rule: nil)
+        let batch = DuplicateBatch(entries: selected)
+        pendingBatch = batch
+        pendingPlan = DuplicateRunPlan(entries: batch.groups)
         showSummarySheet = true
     }
 
     /// Avvia lo spostamento nel Cestino, dopo la doppia conferma: avvia
-    /// `BackupRunner.startDuplicateTrashing`, che gira fuori dal main tramite il runner
-    /// (ROADMAP #41). Barra, «Interrompi» ed esito arrivano da li' — la selezione e
+    /// `BackupRunner.startDuplicateTrashRun` (Task 10, ADR-0012) sul piano gia' calcolato in
+    /// `beginConfirmation()`, che gira fuori dal main tramite il runner e smaltisce la corsa
+    /// un blocco alla volta. Barra, «Interrompi» ed esito arrivano da li' — la selezione e
     /// l'elenco si ricaricano da `.onChange(of: runner.isTrashingDuplicates)` sopra, non da
     /// qui. Simmetrica a `startUndo()` sotto.
     private func startTrashing(_ batch: DuplicateBatch) {
-        runner.startDuplicateTrashing(batch, onAlert: { pendingAlert = $0 })
+        let plan = pendingPlan ?? DuplicateRunPlan(entries: batch.groups)
+        runner.startDuplicateTrashRun(plan, onAlert: { pendingAlert = $0 })
     }
 
     /// «Annulla l'ultimo spostamento», dopo la conferma non distruttiva: avvia

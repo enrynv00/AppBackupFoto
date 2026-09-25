@@ -196,20 +196,6 @@ final class DuplicatesStatusTests: XCTestCase {
         XCTAssertTrue(reason!.lowercased().contains("cestino"))
     }
 
-    // MARK: - Tetto del blocco
-
-    /// Sopra il tetto: la UI dice "fallo in più volte", non un rifiuto muto.
-    func testExceedsCap_saysDoItInMultiplePasses() {
-        let reason = DuplicatesStatus.confirmationBlockedReason(exceedsCap: true)
-        XCTAssertNotNil(reason)
-        XCTAssertTrue(reason!.lowercased().contains("più pass") || reason!.lowercased().contains("più volte"))
-    }
-
-    /// Sotto il tetto: nessun motivo di blocco.
-    func testWithinCap_noBlockingReason() {
-        XCTAssertNil(DuplicatesStatus.confirmationBlockedReason(exceedsCap: false))
-    }
-
     // MARK: - Esito di un blocco
 
     private func skipReasonSample(_ path: String) -> DuplicateTrashSkipReason {
@@ -291,7 +277,6 @@ final class DuplicatesStatusTests: XCTestCase {
         allTexts.append(DuplicatesStatus.trashDisabledReason(isRunning: false, isIndexing: true, ssdMounted: true, isTrashingDuplicates: false, isRestoringFromTrash: false) ?? "")
         allTexts.append(DuplicatesStatus.trashDisabledReason(isRunning: false, isIndexing: false, ssdMounted: false, isTrashingDuplicates: false, isRestoringFromTrash: false) ?? "")
         allTexts.append(DuplicatesStatus.trashDisabledReason(isRunning: false, isIndexing: false, ssdMounted: true, isTrashingDuplicates: true, isRestoringFromTrash: false) ?? "")
-        allTexts.append(DuplicatesStatus.confirmationBlockedReason(exceedsCap: true) ?? "")
 
         var skipped = DuplicateTrashOutcome()
         skipped.skippedGroups = [(DuplicateGroup(hash: "h", size: 1,
