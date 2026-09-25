@@ -2657,7 +2657,13 @@ nonisolated struct DuplicateBatch {
     /// l'utente la deve poter ritrovare nel Finder, quindi `displayPath` e non la chiave
     /// minuscola. Non l'intero percorso genitore (ADR-0011): vedi il doc-comment di
     /// `folderBreakdown`.
-    private static func folder(of entry: LibraryIndexEntry) -> String {
+    ///
+    /// Non piu' `private` da Task 11 (Step 1): `DuplicatesView` la riusa per mostrare i nomi
+    /// dei filtri con le maiuscole vere, invece di duplicare questa stessa trasformazione
+    /// una seconda volta — la classe di errore gia' pagata da `LibraryExclusions`/
+    /// `realResolvedPath`/`makeThumbnail`. Solo la visibilita' e' cambiata, zero righe di
+    /// comportamento.
+    static func folder(of entry: LibraryIndexEntry) -> String {
         let components = entry.displayPath.split(separator: "/", omittingEmptySubsequences: true)
         guard components.count > 1, let first = components.first else {
             return "(sull'SSD, fuori da ogni cartella)"
@@ -3873,6 +3879,34 @@ enum DuplicatesStatus {
         }
 
         return out
+    }
+
+    // MARK: - Filtri e regola per cartella (Task 11, Step 1-4, ADR-0011)
+
+    /// Mostrato mentre filtro o regola vengono applicati fuori dal main (~5s su tutta la
+    /// libreria, misurato — Regola 9 del piano): uno stato, non una barra di progresso, che
+    /// il piano vieta esplicitamente di aggiungere per un ricalcolo di questa durata.
+    static let applyingLine = "Sto applicando…"
+
+    /// La riga sopra la lista quando il filtro «Tutte le copie nella stessa cartella» è
+    /// attivo (spec §2.5, categoria 1): dice **con quale criterio** l'app ha scelto, non
+    /// «l'app ha scelto per te», che non è un'informazione. Fissa (nessun parametro): il
+    /// criterio non cambia da un gruppo interno all'altro, è sempre lo stesso — data più
+    /// vecchia, poi percorso più corto.
+    static let internalGroupsCriterionLine =
+        "Queste copie stanno tutte nella stessa cartella: tengo quella con la data più vecchia "
+        + "e, a parità, quella col percorso più corto. Le copie sono identiche fra loro, quindi "
+        + "qualunque delle due si tenga il contenuto resta."
+
+    /// Quanti gruppi copre la regola per cartella attiva, e quanti la toccano ma restano
+    /// fuori perché hanno una copia anche in una terza cartella (spec §2.4/§2.5, categoria 3).
+    static func ruleCoverageLine(covered: Int, excludedByThirdFolder: Int) -> String {
+        let coveredText = "La regola copre \(count(covered, "gruppo", "gruppi"))"
+        guard excludedByThirdFolder > 0 else { return "\(coveredText)." }
+        let subject = excludedByThirdFolder == 1 ? "gruppo ha" : "gruppi hanno"
+        let verb = excludedByThirdFolder == 1 ? "resta" : "restano"
+        return "\(coveredText); \(excludedByThirdFolder.formatted()) \(subject) una copia anche "
+            + "in un'altra cartella e \(verb) fuori."
     }
 
     private static func count(_ n: Int, _ singular: String, _ plural: String) -> String {
@@ -13520,6 +13554,54 @@ struct DuplicatesView: View {
     /// **una volta sola**, fuori dal main thread, quando i gruppi arrivano.
     @State private var loadedBatch: DuplicateBatch? = nil
     @State private var selectedHashes: Set<String> = []
+    /// Indice `hash → Entry` sul `loadedBatch` corrente, per leggere `leaving`/
+    /// `reclaimableBytes` di una foto selezionata in O(1) — mai filtrando di nuovo
+    /// `loadedBatch.groups` (27.798 elementi) per ogni checkbox (Regola 9).
+    @State private var entryByHash: [String: DuplicateBatch.Entry] = [:]
+    /// Totali della selezione, ricalcolati SOLO sull'insieme selezionato (tipicamente
+    /// piccolo), mai su tutti i gruppi: la riga di selezione li legge in O(1).
+    @State private var selectionStats: (files: Int, bytes: Int64) = (0, 0)
+
+    // MARK: - Filtri e regola per cartella (Task 11, Step 1-4, ADR-0011)
+
+    /// I tre filtri del pannello, componibili in AND (`DuplicateFilter`, ADR-0011). Il
+    /// ricalcolo dell'insieme filtrato non avviene mai qui dentro un `.onChange`: ogni
+    /// mutazione passa da una delle funzioni sotto, che chiama `rebuildBatch(from:rule:)`
+    /// subito dopo — un solo punto che ricalcola, mai una `.onChange` implicita da cui e'
+    /// facile perdere un caso.
+    @State private var filter = DuplicateFilter()
+    /// Indici in `loadedBatch.groups` che soddisfano `filter` — mai una copia dei gruppi
+    /// (spec §2.8, punto 1): l'elenco stesso resta quello di sempre, `visibleIndices` dice
+    /// solo quali righe mostrare.
+    @State private var visibleIndices: [Int] = []
+    /// Le cartelle di primo livello che compaiono nei gruppi, con il conteggio — da
+    /// `duplicateFolderList`, ricalcolato insieme al resto in `rebuildBatch`.
+    @State private var folderList: [(folder: String, count: Int)] = []
+    /// Nome da mostrare per ogni cartella (maiuscole vere, `DuplicateBatch.folder(of:)`),
+    /// perche' `folderList`/`DuplicateFilter` lavorano sulla chiave normalizzata
+    /// (minuscola, NFC) e mostrarla cosi' com'e' sarebbe illeggibile e non ritrovabile nel
+    /// Finder.
+    @State private var folderDisplayNames: [String: String] = [:]
+    /// Vero mentre filtro o regola vengono applicati fuori dal main: uno stato «sto
+    /// applicando…» (`DuplicatesStatus.applyingLine`), non una barra — il ricalcolo dura
+    /// pochi secondi su tutta la libreria, non minuti (Regola 9 del piano).
+    @State private var isApplyingFilter = false
+
+    /// La regola per cartella attiva, o `nil`. Caricata da `UserDefaults` una volta
+    /// all'apertura della finestra (ADR-0011: persiste fra le sessioni) — un valore
+    /// assente o corrotto decodifica a `nil` da `loadDuplicateFolderRule` stesso.
+    @State private var folderRule: DuplicateFolderRule? = loadDuplicateFolderRule()
+    @State private var showRuleEditor = false
+    /// Campi temporanei dell'editor della regola, popolati da `folderRule` quando si apre
+    /// la sheet — mai scritti in `folderRule` finche' l'utente non preme "Applica".
+    @State private var ruleEditorKeepIn: String?
+    @State private var ruleEditorTrashIn: Set<String> = []
+    /// Quanti gruppi la regola attiva copre, e quanti la toccano ma restano fuori perche'
+    /// hanno una copia anche in una terza cartella (spec §2.4/§2.5) — `nil` se non c'e'
+    /// nessuna regola attiva.
+    @State private var ruleCoverage: (covered: Int, excludedByThirdFolder: Int)? = nil
+
+    private enum GroupKindFilter: Hashable { case all, sameFolder, crossFolder }
 
     /// Avvisi **locali della view**, mai `runner.pendingAlert`: quello ha un solo
     /// presentatore, il `.alert` di `ContentView` nella scena `main` (sezione `AlertSink` in
@@ -13571,7 +13653,31 @@ struct DuplicatesView: View {
                     .font(AppFont.caption).foregroundStyle(.secondary)
             }
 
+            filterBar
+
+            if filter.internalOnly == true {
+                Text(DuplicatesStatus.internalGroupsCriterionLine)
+                    .font(AppFont.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if isApplyingFilter {
+                Text(DuplicatesStatus.applyingLine).font(AppFont.caption).foregroundStyle(.secondary)
+            }
+
             listArea
+
+            HStack {
+                Button("Seleziona tutti quelli visibili") { selectAllVisible() }
+                    .buttonStyle(.bordered).controlSize(.small)
+                    .disabled(visibleIndices.isEmpty)
+                Button("Togli la selezione da quelli visibili") { deselectAllVisible() }
+                    .buttonStyle(.bordered).controlSize(.small)
+                    .disabled(visibleIndices.isEmpty)
+                Spacer()
+            }
+
+            selectionStatusLine
 
             if runner.isTrashingDuplicates, let progress = runner.duplicateRunProgress {
                 duplicateRunProgressBar(progress)
@@ -13654,6 +13760,7 @@ struct DuplicatesView: View {
         .sheet(isPresented: $showSummarySheet) {
             if let batch = pendingBatch { summarySheet(batch) }
         }
+        .sheet(isPresented: $showRuleEditor) { ruleEditorSheet }
         .alert("Spostare queste copie nel Cestino?",
                isPresented: $showDestructiveConfirm,
                presenting: pendingBatch) { batch in
@@ -13734,6 +13841,135 @@ struct DuplicatesView: View {
         return TrashRestoreStatus.confirmation(summary: summary)
     }
 
+    /// La barra dei filtri (Task 11, Step 1). Tre controlli discreti, come da spec §2.2 —
+    /// nessun campo di testo: cercare per testo su 141.683 percorsi a ogni tasto premuto e'
+    /// il profilo esatto del bug di prestazioni del 2026-09-02.
+    private var filterBar: some View {
+        HStack(spacing: AppSpacing.sm) {
+            Menu {
+                Button("Tutte (\(loadedBatch?.groups.count ?? 0))") { setFolder(nil) }
+                if !folderList.isEmpty { Divider() }
+                ForEach(folderList, id: \.folder) { entry in
+                    Button("\(folderDisplayNames[entry.folder] ?? entry.folder) (\(entry.count))") {
+                        setFolder(entry.folder)
+                    }
+                }
+            } label: {
+                Label(filter.folder.map { folderDisplayNames[$0] ?? $0 } ?? "Tutte le cartelle",
+                     systemImage: "folder")
+            }
+            .menuStyle(.borderlessButton).fixedSize()
+
+            Picker("", selection: Binding(get: { groupKindSelection }, set: { setGroupKind($0) })) {
+                Text("Tutti").tag(GroupKindFilter.all)
+                Text("Tutte le copie nella stessa cartella").tag(GroupKindFilter.sameFolder)
+                Text("Copie in cartelle diverse").tag(GroupKindFilter.crossFolder)
+            }
+            .pickerStyle(.menu)
+            .fixedSize()
+
+            if folderRule != nil {
+                Toggle("Solo i gruppi coperti dalla regola", isOn: Binding(
+                    get: { filter.rule != nil },
+                    set: { setRuleFilterOnly($0) }
+                )).toggleStyle(.checkbox)
+            }
+
+            Spacer()
+
+            Button(folderRule == nil ? "Regola per cartella…" : "Modifica regola…") {
+                ruleEditorKeepIn = folderRule?.keepIn
+                ruleEditorTrashIn = folderRule?.trashIn ?? []
+                showRuleEditor = true
+            }.buttonStyle(.bordered).controlSize(.small)
+        }
+    }
+
+    private var groupKindSelection: GroupKindFilter {
+        switch filter.internalOnly {
+        case .some(true): return .sameFolder
+        case .some(false): return .crossFolder
+        case .none: return .all
+        }
+    }
+
+    /// «Selezionati N gruppi: M file da spostare, circa X GB recuperabili» (Task 9,
+    /// `DuplicatesStatus.selectionLine`) — valori tutti precalcolati, mai un `reduce` qui.
+    private var selectionStatusLine: some View {
+        Text(DuplicatesStatus.selectionLine(visibleGroups: visibleIndices.count,
+                                            totalGroups: loadedBatch?.groups.count ?? 0,
+                                            selectedGroups: selectedHashes.count,
+                                            files: selectionStats.files,
+                                            reclaimableBytes: selectionStats.bytes))
+            .font(AppFont.caption).foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    /// L'editor della regola per cartella (Task 11, Step 3, ADR-0011).
+    private var ruleEditorSheet: some View {
+        VStack(alignment: .leading, spacing: AppSpacing.md) {
+            Text("Regola per cartella").font(AppFont.title)
+            Text("Scegli una cartella da tenere e una o più cartelle da cestinare: un gruppo "
+                + "con una copia in ognuna e nessun'altra copia altrove verrà proposto così, "
+                + "senza dover spuntarlo a mano.")
+                .font(AppFont.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Picker("Tieni la copia in", selection: $ruleEditorKeepIn) {
+                Text("Scegli…").tag(String?.none)
+                ForEach(folderList, id: \.folder) { entry in
+                    Text(folderDisplayNames[entry.folder] ?? entry.folder).tag(String?.some(entry.folder))
+                }
+            }
+
+            Text("Sposta nel Cestino le copie in:").font(AppFont.body)
+            ScrollView {
+                VStack(alignment: .leading, spacing: AppSpacing.xs) {
+                    ForEach(folderList, id: \.folder) { entry in
+                        if entry.folder != ruleEditorKeepIn {
+                            Toggle(folderDisplayNames[entry.folder] ?? entry.folder, isOn: Binding(
+                                get: { ruleEditorTrashIn.contains(entry.folder) },
+                                set: { on in
+                                    if on { ruleEditorTrashIn.insert(entry.folder) }
+                                    else { ruleEditorTrashIn.remove(entry.folder) }
+                                }
+                            )).toggleStyle(.checkbox)
+                        }
+                    }
+                }
+            }.frame(maxHeight: 180)
+
+            if isApplyingFilter {
+                Text(DuplicatesStatus.applyingLine).font(AppFont.caption).foregroundStyle(.secondary)
+            } else if let coverage = ruleCoverage {
+                Text(DuplicatesStatus.ruleCoverageLine(covered: coverage.covered,
+                                                       excludedByThirdFolder: coverage.excludedByThirdFolder))
+                    .font(AppFont.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            HStack {
+                if folderRule != nil {
+                    Button("Rimuovi regola", role: .destructive) {
+                        ruleEditorKeepIn = nil
+                        ruleEditorTrashIn = []
+                        applyRule(nil)
+                    }.buttonStyle(.bordered)
+                }
+                Spacer()
+                Button("Chiudi") { showRuleEditor = false }.buttonStyle(.bordered)
+                Button("Applica") {
+                    guard let keepIn = ruleEditorKeepIn, !ruleEditorTrashIn.isEmpty else { return }
+                    applyRule(DuplicateFolderRule(keepIn: keepIn, trashIn: ruleEditorTrashIn))
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(ruleEditorKeepIn == nil || ruleEditorTrashIn.isEmpty)
+            }
+        }
+        .padding(AppSpacing.xl)
+        .frame(minWidth: 460, minHeight: 420)
+    }
+
     @ViewBuilder
     private var listArea: some View {
         switch loadState {
@@ -13748,11 +13984,14 @@ struct DuplicatesView: View {
         case .loaded:
             // `loadedBatch`, non una ricostruzione da `groups` — vedi doc-comment sul
             // `@State`. `loadState`/`loadedBatch` sono pubblicati insieme in `loadGroups()`,
-            // quindi sono sempre coerenti quando si arriva qui.
-            if let batch = loadedBatch, !batch.groups.isEmpty {
+            // quindi sono sempre coerenti quando si arriva qui. L'elenco mostrato e'
+            // `visibleIndices`, non `batch.groups` per intero (Task 11, Step 1): un semplice
+            // giro su un array di indici gia' calcolato, non un filtro dentro il `body`.
+            if let batch = loadedBatch, !visibleIndices.isEmpty {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: AppSpacing.sm) {
-                        ForEach(batch.groups, id: \.group.hash) { entry in
+                        ForEach(visibleIndices, id: \.self) { i in
+                            let entry = batch.groups[i]
                             DuplicateGroupRow(entry: entry,
                                               isSelected: selectedHashes.contains(entry.group.hash),
                                               libraryRootPath: BookmarkManager.shared.urls[.ssd]?.path,
@@ -13858,6 +14097,88 @@ struct DuplicatesView: View {
 
     private func toggleSelection(_ hash: String) {
         if selectedHashes.contains(hash) { selectedHashes.remove(hash) } else { selectedHashes.insert(hash) }
+        recomputeSelectionStats()
+    }
+
+    /// «Seleziona tutti quelli visibili» (Task 11, Step 2, spec §2.3) — sul solo insieme
+    /// filtrato, mai su tutti i gruppi. La selezione **sopravvive** al cambio di filtro: qui
+    /// si aggiunge soltanto, non si sostituisce l'insieme selezionato.
+    private func selectAllVisible() {
+        guard let loadedBatch else { return }
+        for i in visibleIndices { selectedHashes.insert(loadedBatch.groups[i].group.hash) }
+        recomputeSelectionStats()
+    }
+
+    private func deselectAllVisible() {
+        guard let loadedBatch else { return }
+        for i in visibleIndices { selectedHashes.remove(loadedBatch.groups[i].group.hash) }
+        recomputeSelectionStats()
+    }
+
+    /// Ricalcola i totali della selezione **solo sull'insieme selezionato**, mai filtrando
+    /// di nuovo tutti i gruppi (Regola 9): `entryByHash` da' l'`Entry` di ogni hash selezionato
+    /// in O(1), quindi il costo e' proporzionale a quanto e' selezionato, non alla libreria.
+    private func recomputeSelectionStats() {
+        var files = 0
+        var bytes: Int64 = 0
+        for hash in selectedHashes {
+            guard let entry = entryByHash[hash] else { continue }
+            files += entry.leaving.count
+            bytes += entry.reclaimableBytes
+        }
+        selectionStats = (files, bytes)
+    }
+
+    private func setFolder(_ folder: String?) {
+        filter.folder = folder
+        reapplyFilter()
+    }
+
+    private func setGroupKind(_ kind: GroupKindFilter) {
+        switch kind {
+        case .all: filter.internalOnly = nil
+        case .sameFolder: filter.internalOnly = true
+        case .crossFolder: filter.internalOnly = false
+        }
+        reapplyFilter()
+    }
+
+    private func setRuleFilterOnly(_ on: Bool) {
+        filter.rule = on ? folderRule : nil
+        reapplyFilter()
+    }
+
+    /// Ricalcola solo l'insieme filtrato (`rebuildBatch` senza toccare il blocco stesso): un
+    /// cambio di filtro non cambia mai la scelta di chi tenere, quindi non serve
+    /// ricostruire `DuplicateBatch` — solo `DuplicateFilter.apply(to:)` sul batch che c'e'
+    /// gia'. Usa comunque `Task.detached` con lo stato «sto applicando…» (Regola 9): alla
+    /// scala reale anche un solo `filter` su 27.798 gruppi non va fatto nel `body`.
+    private func reapplyFilter() {
+        guard let loadedBatch else { return }
+        isApplyingFilter = true
+        let currentFilter = filter
+        let groupsOnly = loadedBatch.groups.map(\.group)
+        Task.detached(priority: .utility) {
+            let indices = currentFilter.apply(to: groupsOnly)
+            await MainActor.run {
+                self.visibleIndices = indices
+                self.isApplyingFilter = false
+            }
+        }
+    }
+
+    /// Applica (o rimuove) la regola per cartella: persiste la scelta, **azzera la
+    /// selezione** (spec §2.6 — una selezione fatta su una proposta e confermata su
+    /// un'altra e' lo stesso difetto che questo pannello esiste per chiudere), e ricostruisce
+    /// il blocco una volta, fuori dal main.
+    private func applyRule(_ rule: DuplicateFolderRule?) {
+        folderRule = rule
+        saveDuplicateFolderRule(rule)
+        selectedHashes.removeAll()
+        selectionStats = (0, 0)
+        showRuleEditor = false
+        guard case .loaded(let groups) = loadState else { return }
+        rebuildBatch(from: groups, rule: rule)
     }
 
     /// Carica i gruppi **fuori dal main thread**: `duplicateGroups()` passa dalla coda
@@ -13870,22 +14191,80 @@ struct DuplicatesView: View {
             return
         }
         loadState = .loading
+        let rule = folderRule
         Task.detached(priority: .utility) {
             do {
                 let groups = try store.duplicateGroups()
-                // Ordinamento + scelta di chi tenere per OGNI gruppo: e' il lavoro pesante,
-                // e va fatto qui, fuori dal main thread, una volta sola (vedi doc-comment
-                // su `loadedBatch`), non dentro la view a ogni ridisegno.
-                let batch = DuplicateBatch(groups: groups, rule: nil)
                 await MainActor.run {
-                    loadState = .loaded(groups)
-                    loadedBatch = batch
+                    self.loadState = .loaded(groups)
+                    self.rebuildBatch(from: groups, rule: rule)
                 }
             } catch {
                 await MainActor.run {
-                    loadState = .failed("Non è stato possibile leggere l'elenco delle copie doppie: "
+                    self.loadState = .failed("Non è stato possibile leggere l'elenco delle copie doppie: "
                         + error.localizedDescription)
                 }
+            }
+        }
+    }
+
+    /// Ricostruisce `DuplicateBatch`, l'elenco delle cartelle, l'indice per hash, l'insieme
+    /// filtrato e — se una regola e' attiva — quanti gruppi copre, **sempre insieme, fuori
+    /// dal main**, con uno stato «sto applicando…» (Regola 9 della spec): filtro e regola
+    /// non toccano mai i 27.798 gruppi dentro il `body`. `duplicateKeepChoice` gira qui
+    /// dentro (via `DuplicateBatch(groups:rule:)`), **una volta sola**, esattamente come
+    /// prima — non e' un secondo posto che scelga fra i membri di un gruppo, e' l'unico
+    /// posto, chiamato di nuovo perche' la regola e' cambiata.
+    private func rebuildBatch(from rawGroups: [DuplicateGroup], rule: DuplicateFolderRule?) {
+        isApplyingFilter = true
+        let currentFilter = filter
+        Task.detached(priority: .utility) {
+            let batch = DuplicateBatch(groups: rawGroups, rule: rule)
+            let groupsOnly = batch.groups.map(\.group)
+            let folders = duplicateFolderList(groupsOnly)
+            var byHash: [String: DuplicateBatch.Entry] = [:]
+            var displayNames: [String: String] = [:]
+            for entry in batch.groups {
+                byHash[entry.group.hash] = entry
+                for member in entry.group.members {
+                    guard let key = topLevelFolderKey(of: member.path), displayNames[key] == nil else { continue }
+                    displayNames[key] = DuplicateBatch.folder(of: member)
+                }
+            }
+            let indices = currentFilter.apply(to: groupsOnly)
+            var coverage: (covered: Int, excludedByThirdFolder: Int)? = nil
+            if let rule {
+                let covered = groupsOnly.filter { rule.covers($0) }.count
+                let excluded = groupsOnly.filter { g in
+                    guard !rule.covers(g) else { return false }
+                    return g.members.contains(where: {
+                        guard let f = topLevelFolderKey(of: $0.path) else { return false }
+                        return f == rule.keepIn || rule.trashIn.contains(f)
+                    })
+                }.count
+                coverage = (covered, excluded)
+            }
+            // Snapshot immutabili prima del salto sul main: `byHash`/`displayNames`/`coverage`
+            // sono `var` mutate qui sopra, e Swift 6 non permette di catturarle cosi' come
+            // sono in una chiusura che esegue concorrentemente (`await MainActor.run`) — lo
+            // stesso fix di `startDuplicateTrashRun` nel runner (Task 10).
+            let finalByHash = byHash
+            let finalDisplayNames = displayNames
+            let finalCoverage = coverage
+            await MainActor.run {
+                self.loadedBatch = batch
+                self.folderList = folders
+                self.folderDisplayNames = finalDisplayNames
+                self.entryByHash = finalByHash
+                self.visibleIndices = indices
+                self.ruleCoverage = finalCoverage
+                self.isApplyingFilter = false
+                // Difesa, non l'azzeramento richiesto dalla spec (quello lo fa `applyRule`
+                // ESPLICITAMENTE, prima di arrivare qui): un hash selezionato che non esiste
+                // piu' nel batch appena ricostruito (rilettura dopo un annullamento, un
+                // gruppo scomparso) non deve restare a contare in `selectionStats`.
+                self.selectedHashes = self.selectedHashes.filter { finalByHash[$0] != nil }
+                self.recomputeSelectionStats()
             }
         }
     }
