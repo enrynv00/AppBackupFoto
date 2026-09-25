@@ -13919,9 +13919,20 @@ struct DuplicatesView: View {
             Button("Sposta nel Cestino", role: .destructive) { startTrashing(batch) }
             Button("Annulla", role: .cancel) {}
         } message: { _ in
-            Text("Ogni copia viene riverificata sul disco un'ultima volta prima di essere "
-                + "spostata. Puoi annullare lo spostamento dopo, con «Annulla l'ultimo "
-                + "spostamento».")
+            // Rilievo di review del 2026-09-25: con più di un blocco (ADR-0012), «Annulla
+            // l'ultimo spostamento» copre SOLO l'ultimo blocco — l'utente l'ha già letto in
+            // `undoScopeLine` dentro il riepilogo, ma questo alert (l'ultimo schermo prima del
+            // punto di non ritorno) diceva senza qualifica «puoi annullare lo spostamento dopo»,
+            // contraddicendolo. Riusa `DuplicatesStatus.undoScopeLine` (già testata) invece di
+            // scrivere qui una seconda frase sullo stesso fatto: con un blocco solo resta `nil`
+            // e il testo è quello di sempre.
+            let base = "Ogni copia viene riverificata sul disco un'ultima volta prima di essere spostata. "
+            if let scope = DuplicatesStatus.undoScopeLine(blockCount: pendingPlan?.blocks.count ?? 1,
+                                                           fileCapPerBlock: duplicateBatchFileCap) {
+                Text(base + scope)
+            } else {
+                Text(base + "Puoi annullare lo spostamento dopo, con «Annulla l'ultimo spostamento».")
+            }
         }
         .alert(undoConfirmationText?.title ?? "Rimettere a posto le foto?",
                isPresented: $showUndoConfirm) {
@@ -14432,6 +14443,12 @@ struct DuplicatesView: View {
     /// posto in cui la scelta di quale copia tenere potrebbe, in futuro, divergere da quella
     /// mostrata nella lista — la classe di errore che questo progetto ha gia' pagato tre
     /// volte (`LibraryExclusions`, `realResolvedPath`, `makeThumbnail`).
+    ///
+    /// **Deviazione dichiarata dal piano (Task 11 Step 5, 2026-09-25)**: resta sincrona sul
+    /// main, non "fuori dal main se la selezione e' grande". E' un `filter` su un array di
+    /// `Entry` gia' calcolate (non un `init(groups:)`, che e' il costo che causo' l'incidente
+    /// del 2026-09-02) — costo non misurato sul caso peggiore (27.798 gruppi selezionati). Vedi
+    /// la nota nel piano prima di "correggerlo" senza prima misurarlo.
     private func beginConfirmation() {
         guard let loadedBatch else { return }
         let selected = loadedBatch.groups.filter { selectedHashes.contains($0.group.hash) }
