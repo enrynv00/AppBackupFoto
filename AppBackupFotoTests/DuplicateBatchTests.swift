@@ -242,7 +242,7 @@ final class DuplicateBatchTests: XCTestCase {
         let b = DuplicateBatch(groups: [g])
         XCTAssertEqual(b.groups.first?.choice.keeper.path, normalizedIndexKey("Foto iPhone/a.jpg"))
         XCTAssertEqual(b.groups.first?.choice.keeper.path,
-                       duplicateKeepChoice(g).keeper.path,
+                       duplicateKeepChoice(g, rule: nil).keeper.path,
                        "la scelta congelata deve essere la stessa che la regola produce ora")
     }
 }

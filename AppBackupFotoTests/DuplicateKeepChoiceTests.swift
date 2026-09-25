@@ -26,7 +26,101 @@ final class DuplicateKeepChoiceTests: XCTestCase {
     }
 
     private func choice(_ members: [LibraryIndexEntry]) -> DuplicateKeepChoice {
-        duplicateKeepChoice(group(members))
+        duplicateKeepChoice(group(members), rule: nil)
+    }
+
+    private func choice(_ members: [LibraryIndexEntry], rule: DuplicateFolderRule) -> DuplicateKeepChoice {
+        duplicateKeepChoice(group(members), rule: rule)
+    }
+
+    private func rule(keepIn: String, trashIn: Set<String>) -> DuplicateFolderRule {
+        DuplicateFolderRule(keepIn: normalizedIndexKey(keepIn), trashIn: Set(trashIn.map(normalizedIndexKey)))
+    }
+
+    // MARK: Regola 0 — la regola dell'utente (ADR-0011)
+
+    // La regola precede le tre euristiche esistenti: una copia in "Takeout" vince su una in
+    // "Foto iPhone", che senza regola vincerebbe sempre (regola 1).
+    func testUserRule_winsOverTheMainLibrary() {
+        let keeper = entry("Takeout/IMG_0001.JPG")
+        let r = rule(keepIn: "Takeout", trashIn: ["Foto iPhone"])
+        let c = choice([entry("Foto iPhone/IMG_0001.JPG"), keeper], rule: r)
+        XCTAssertEqual(c.keeper.path, keeper.path)
+        XCTAssertEqual(c.reason, .userFolderRule)
+    }
+
+    // Un gruppo che la regola non copre (qui: nessuna copia in "Takeout") produce esattamente
+    // lo stesso risultato, bit per bit, di `rule: nil` — la regola 0 e' un no-op sui gruppi
+    // che non copre.
+    func testUserRule_changesNothingOnGroupsItDoesNotCover() {
+        let members = [entry("Foto iPhone/IMG_0001.JPG"), entry("Import/Scheda/IMG_0001.JPG")]
+        let withoutRule = choice(members)
+        let withRule = choice(members, rule: rule(keepIn: "Takeout", trashIn: ["Other"]))
+        XCTAssertEqual(withRule.keeper.path, withoutRule.keeper.path)
+        XCTAssertEqual(withRule.reason, withoutRule.reason)
+        XCTAssertEqual(withRule.tiedCandidates, withoutRule.tiedCandidates)
+        XCTAssertEqual(withRule.tiedPaths, withoutRule.tiedPaths)
+    }
+
+    // Con due copie nella cartella da tenere, la regola 0 le isola entrambe — e fra loro
+    // decide la regola 3 esistente (la piu' vecchia), non un criterio nuovo: il motivo
+    // finale torna a essere quello della regola che ha davvero discriminato, non
+    // `.userFolderRule`.
+    func testUserRule_withSeveralCopiesInTheKeepFolder_fallsBackToTheExistingRules() {
+        let older = entry("Takeout/a/IMG_0001.JPG", mtime: 1_600_000_000)
+        let newer = entry("Takeout/b/IMG_0001.JPG", mtime: 1_700_000_000)
+        let c = choice([older, newer, entry("Foto iPhone/IMG_0001.JPG", mtime: 1_500_000_000)],
+                       rule: rule(keepIn: "Takeout", trashIn: ["Foto iPhone"]))
+        XCTAssertEqual(c.keeper.path, older.path)
+        XCTAssertEqual(c.reason, .oldest)
+    }
+
+    // `covers` garantisce gia' almeno un membro sotto `keepIn`: la regola 0 non deve mai
+    // restringere i candidati a un insieme vuoto. Verificato osservando che il vincitore
+    // resta sempre sotto `keepIn`, mai un crash o un fallback silenzioso a un'altra cartella.
+    func testUserRule_neverEmptiesTheCandidates() {
+        let keeper = entry("Other/IMG_0001.JPG")
+        let r = rule(keepIn: "Other", trashIn: ["Takeout"])
+        let c = choice([keeper, entry("Takeout/IMG_0001.JPG")], rule: r)
+        XCTAssertEqual(c.reason, .userFolderRule)
+        XCTAssertEqual(c.keeper.path.split(separator: "/").first.map(String.init), r.keepIn)
+    }
+
+    // La copia tenuta non e' mai una di quelle che la regola cestina: se un mutante narrows
+    // erroneamente sui membri di `trashIn` invece che su quelli di `keepIn`, questo test lo
+    // scopre confrontando i percorsi, non solo il conteggio.
+    func testKeeperIsNeverAmongTheLeavingCopies() {
+        let trashed1 = entry("Takeout/a/IMG_0001.JPG")
+        let trashed2 = entry("Takeout 2/b/IMG_0001.JPG")
+        let r = rule(keepIn: "Foto iPhone", trashIn: ["Takeout", "Takeout 2"])
+        let c = choice([entry("Foto iPhone/IMG_0001.JPG"), trashed1, trashed2], rule: r)
+        XCTAssertNotEqual(c.keeper.path, trashed1.path)
+        XCTAssertNotEqual(c.keeper.path, trashed2.path)
+    }
+
+    // La spiegazione deve dire che la scelta viene dalla regola dell'utente, non da
+    // un'euristica dell'app — altrimenti l'utente legge una motivazione che non è la vera
+    // ragione per cui quella copia resta.
+    func testExplanation_namesTheUserRule() {
+        let keeper = entry("Takeout/IMG_0001.JPG")
+        let g = group([entry("Foto iPhone/IMG_0001.JPG"), keeper])
+        let c = duplicateKeepChoice(g, rule: rule(keepIn: "Takeout", trashIn: ["Foto iPhone"]))
+        let text = duplicateKeepExplanation(c, in: g)
+        XCTAssertTrue(text.contains("hai chiesto di tenere le copie che stanno lì"), text)
+        XCTAssertTrue(text.contains("«Takeout»"), text)
+    }
+
+    // Stesso registro anti-gergo di `testExplanation_avoidsJargon`, sul ramo nuovo: quel
+    // test itera `explanationsByReason()`, che non passa mai una regola e quindi non
+    // eserciterebbe mai `.userFolderRule`.
+    func testExplanation_hasNoJargon() {
+        let keeper = entry("Takeout/IMG_0001.JPG")
+        let g = group([entry("Foto iPhone/IMG_0001.JPG"), keeper])
+        let c = duplicateKeepChoice(g, rule: rule(keepIn: "Takeout", trashIn: ["Foto iPhone"]))
+        let text = duplicateKeepExplanation(c, in: g).lowercased()
+        for word in ["hash", "indice", "sha256", "scansione", "entry", "registro", "cache"] {
+            XCTAssertFalse(text.contains(word), "la spiegazione dice «\(word)»: \(text)")
+        }
     }
 
     // MARK: Regola 1 — la libreria principale vince
@@ -100,7 +194,7 @@ final class DuplicateKeepChoiceTests: XCTestCase {
         let c = entry("Other/ccc/IMG_0001.JPG")
         let permutations = [[a, b, c], [a, c, b], [b, a, c], [b, c, a], [c, a, b], [c, b, a]]
         for members in permutations {
-            let result = duplicateKeepChoice(group(members))
+            let result = duplicateKeepChoice(group(members), rule: nil)
             XCTAssertEqual(result.keeper.path, a.path,
                            "ordine di input \(members.map(\.displayPath))")
             XCTAssertEqual(result.reason, .deterministicTieBreak)
@@ -233,7 +327,7 @@ final class DuplicateKeepChoiceTests: XCTestCase {
 
     private func explanation(_ members: [LibraryIndexEntry]) -> String {
         let g = group(members)
-        return duplicateKeepExplanation(duplicateKeepChoice(g), in: g)
+        return duplicateKeepExplanation(duplicateKeepChoice(g, rule: nil), in: g)
     }
 
     func testExplanation_namesTheRealFolderOfTheKeptFile() {
@@ -273,7 +367,7 @@ final class DuplicateKeepChoiceTests: XCTestCase {
         var out: [DuplicateKeepReason: String] = [:]
         for members in cases {
             let g = group(members)
-            let c = duplicateKeepChoice(g)
+            let c = duplicateKeepChoice(g, rule: nil)
             out[c.reason] = duplicateKeepExplanation(c, in: g)
         }
         return out
@@ -355,7 +449,7 @@ final class DuplicateKeepChoiceTests: XCTestCase {
         let members = [entry("Foto iPhone/a/IMG_0001.JPG", mtime: 1_700_000_100),
                        entry("Foto iPhone/b/IMG_0001.JPG", mtime: 1_700_000_100),
                        entry("Foto iPhone/c/IMG_0001.JPG", mtime: 1_700_000_200)]
-        let c = duplicateKeepChoice(group(members))
+        let c = duplicateKeepChoice(group(members), rule: nil)
         XCTAssertEqual(c.reason, .oldest)
         XCTAssertEqual(c.tiedCandidates, 2)
         let text = duplicateKeepExplanation(c, in: group(members))

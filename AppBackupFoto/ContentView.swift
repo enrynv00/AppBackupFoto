@@ -2023,6 +2023,9 @@ nonisolated let importFolderKey = normalizedIndexKey("Import")
 /// una spiegazione ricostruita a posteriori dalla UI divergerebbe dalla regola alla prima
 /// modifica di una delle due.
 nonisolated enum DuplicateKeepReason {
+    /// L'utente ha chiesto di tenere le copie in questa cartella (ADR-0011, regola 0):
+    /// precede le tre euristiche sotto, ma solo sui gruppi che la regola copre.
+    case userFolderRule
     /// Sta nella libreria principale, e le altre copie no.
     case mainLibrary
     /// Sta in una cartella organizzata a mano, e le altre copie stanno in un import.
@@ -2169,11 +2172,22 @@ nonisolated func saveDuplicateFolderRule(_ rule: DuplicateFolderRule?, defaults:
 /// Sceglie quale copia di un gruppo di doppioni tenere, e dice perche'.
 ///
 /// Funzione **pura**: nessun filesystem, nessun database, nessun ordine di input che conti.
-/// Precedenza: libreria principale -> cartella organizzata invece che import -> la piu'
-/// vecchia -> tie-break deterministico (percorso piu' corto, poi ordine della chiave).
-/// Il motivo riportato e' quello dell'**ultima** regola che ha davvero discriminato: due
-/// copie entrambe in `Foto iPhone/` non si distinguono per la prima regola, quindi la
-/// scelta (e la frase mostrata all'utente) scende a quella dopo.
+/// Precedenza: **la regola dell'utente, se copre il gruppo** -> libreria principale ->
+/// cartella organizzata invece che import -> la piu' vecchia -> tie-break deterministico
+/// (percorso piu' corto, poi ordine della chiave). Il motivo riportato e' quello
+/// dell'**ultima** regola che ha davvero discriminato: due copie entrambe in `Foto iPhone/`
+/// non si distinguono per la prima regola, quindi la scelta (e la frase mostrata
+/// all'utente) scende a quella dopo.
+///
+/// **Regola 0 — la regola per cartella dell'utente (ADR-0011, 2026-09-24).** `rule` precede
+/// le tre euristiche sotto, ma **solo sui gruppi che `rule.covers(group)` copre**: sugli
+/// altri gruppi non cambia nulla, bit per bit, rispetto a `rule: nil`. Un'istruzione
+/// esplicita dell'utente vale piu' di un'euristica, un'euristica vale piu' del silenzio.
+/// Quando piu' copie stanno nella cartella da tenere, fra loro decidono le tre regole 1-3
+/// gia' esistenti, applicate ai soli sopravvissuti — esattamente come fa gia' `narrow` per
+/// ognuna di esse: **nessun tie-break nuovo**. Il parametro non ha un default apposta
+/// (stessa disciplina dei quattro gate di ADR-0009): un chiamante che dimentica di passarlo
+/// deve fallire in compilazione, non silenziosamente ignorare la regola.
 ///
 /// **Layout riconfermato e decisione chiusa il 2026-09-01**, col volume reale collegato.
 /// `ls -1` dell'SSD ha dato esattamente il layout su cui la regola era stata scritta il
@@ -2192,11 +2206,19 @@ nonisolated func saveDuplicateFolderRule(_ rule: DuplicateFolderRule?, defaults:
 /// il tie-break — arbitrario ma deterministico, e innocuo perche' i membri di un gruppo
 /// sono identici per definizione ed entrambe le cartelle sono mirrorate sull'HDD.
 ///
-/// **Nota misurata sulla regola 2**: `Import/` **non esiste** sull'SSD reale (2026-09-01),
-/// quindi `notAnImport` oggi non discrimina nulla. Va tenuta comunque — il wizard di #27-A
-/// creera' quella cartella — ma chi legge i test non deve credere che sia lei a decidere.
-/// Distribuzione reale dei 47.482 file media: `Foto iPhone` 18.180, `Takeout` 13.139,
-/// `Takeout 2` 10.708, `Foto Google Drive` 3.947, `Other` 1.508.
+/// **Nota misurata sulla regola 2, corretta il 2026-09-24**: fino a quel giorno qui si
+/// leggeva che `Import/` non esiste sull'SSD reale, quindi `notAnImport` non discrimina
+/// nulla. **Non e' piu' vero**: la passata del 2026-09-24 ha trovato `Import/` con 30 voci
+/// (il wizard di #27-A l'ha creata). La regola si attiva davvero, anche se raramente.
+///
+/// **`ASUS/` e' comparsa dopo il censimento del 2026-09-01 e oggi e' due terzi
+/// dell'elenco** (93.824 voci su 141.683, in gran parte `ASUS/foto/recup_dir.NN/`, un
+/// recupero PhotoRec/TestDisk da un PC morto). **Decisione di Enrico del 2026-09-24: resta
+/// di pari dignita' con le altre cartelle, `recup_dir.*` non si declassa** — stesso
+/// argomento gia' usato per `Takeout/`: l'origine automatica non dice niente sul valore del
+/// contenuto. **Non riaprire.** Distribuzione reale (2026-09-24, 141.683 voci): `ASUS`
+/// 93.824, `Foto iPhone` 18.530, `Takeout` 13.138, `Takeout 2` 10.708, `Foto Google Drive`
+/// 3.945, `Other` 1.508, `Import` 30.
 ///
 /// La proposta resta comunque solo una proposta, che l'utente puo' cambiare gruppo per
 /// gruppo prima di confermare.
@@ -2217,7 +2239,7 @@ nonisolated func saveDuplicateFolderRule(_ rule: DuplicateFolderRule?, defaults:
 ///   di "tenere" l'unica copia esistente e' una riga che nel pannello Doppioni dichiara
 ///   doppione un file che copie non ne ha.
 // `nonisolated`: pura, chiamata dal pannello Doppioni fuori dal main thread (Task 5).
-nonisolated func duplicateKeepChoice(_ group: DuplicateGroup) -> DuplicateKeepChoice {
+nonisolated func duplicateKeepChoice(_ group: DuplicateGroup, rule: DuplicateFolderRule?) -> DuplicateKeepChoice {
     precondition(group.members.count > 1, "un gruppo di doppioni ha sempre almeno due membri")
 
     var candidates = group.members
@@ -2239,6 +2261,13 @@ nonisolated func duplicateKeepChoice(_ group: DuplicateGroup) -> DuplicateKeepCh
         reason = because
     }
 
+    // 0. La regola dell'utente, solo sui gruppi che copre (ADR-0011): un'istruzione
+    //    esplicita precede le euristiche sotto. `covers` garantisce gia' almeno un membro
+    //    sotto `keepIn`, quindi questo filtro non svuota mai i candidati; il guard di
+    //    `narrow` resta comunque la difesa strutturale, non duplicata qui.
+    if let rule, rule.covers(group) {
+        narrow(candidates.filter { topLevelFolderKey(of: $0.path) == rule.keepIn }, .userFolderRule)
+    }
     // 1. La libreria principale vince: e' la cartella che il job Mac -> SSD riscriverebbe
     //    comunque, e da cui partono i mirror su HDD e su Cubbit.
     narrow(candidates.filter(isInMainLibrary), .mainLibrary)
@@ -2318,6 +2347,8 @@ func duplicateKeepExplanation(_ choice: DuplicateKeepChoice, in group: Duplicate
 
     let lead: String
     switch choice.reason {
+    case .userFolderRule:
+        lead = "Tengo la copia che si trova \(place): hai chiesto di tenere le copie che stanno lì."
     case .mainLibrary:
         lead = "Tengo la copia che si trova \(place): è nella tua libreria principale, "
             + "quella che l'app riempie a ogni backup delle foto del Mac."
@@ -2459,7 +2490,7 @@ nonisolated struct DuplicateBatch {
         // (non ammorbidendo la guardia).
         let entries = groups
             .filter { $0.members.count > 1 }
-            .map { Entry(group: $0, choice: duplicateKeepChoice($0)) }
+            .map { Entry(group: $0, choice: duplicateKeepChoice($0, rule: nil)) }
 
         // Ordine: spazio recuperabile decrescente, poi numero di copie decrescente, poi
         // l'hash. La terza chiave non e' decorativa: senza, due gruppi equivalenti sulle
