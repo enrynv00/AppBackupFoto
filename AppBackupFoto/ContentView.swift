@@ -4632,6 +4632,17 @@ nonisolated final class LibraryIndexStore: @unchecked Sendable {
         try queue.sync { try countUnsynchronized() }
     }
 
+    /// `MAX(hashed_at)` su tutte le entry, o `nil` su un indice vuoto (Task 12, D15 della
+    /// spec 2026-09-24). **Ripiego dichiarato**, non la fonte principale: quella e'
+    /// `libraryListLastCompleteReadDefaultsKey`, scritta una volta a lettura finita. Questo
+    /// numero serve solo per gli elenchi costruiti prima che quella chiave esistesse, o se
+    /// per qualunque motivo manca. E' un limite **inferiore**: una lettura incrementale che
+    /// non trova niente di nuovo non tocca nessun `hashed_at`, quindi puo' far sembrare
+    /// l'elenco PIU' vecchio di quanto e' — mai il contrario, mai un avviso taciuto.
+    func newestHashedAt() throws -> Double? {
+        try queue.sync { try newestHashedAtUnsynchronized() }
+    }
+
     // MARK: Implementazioni (gia' sulla coda: non chiamarle dall'esterno)
 
     private func upsertUnsynchronized(_ entries: [LibraryIndexEntry]) throws {
@@ -4790,6 +4801,17 @@ nonisolated final class LibraryIndexStore: @unchecked Sendable {
         defer { sqlite3_finalize(stmt) }
         guard try stepRow(stmt) else { throw sqlError() }
         return Int(sqlite3_column_int64(stmt, 0))
+    }
+
+    private func newestHashedAtUnsynchronized() throws -> Double? {
+        let stmt = try prepare("SELECT MAX(hashed_at) FROM entries;")
+        defer { sqlite3_finalize(stmt) }
+        guard try stepRow(stmt) else { throw sqlError() }
+        // MAX su una tabella vuota restituisce NULL, non un errore: si legge il TIPO della
+        // colonna, non un valore surrogato (0.0) che si confonderebbe con una data vera
+        // (1 gennaio 1970).
+        guard sqlite3_column_type(stmt, 0) != SQLITE_NULL else { return nil }
+        return sqlite3_column_double(stmt, 0)
     }
 }
 
@@ -5506,6 +5528,104 @@ enum LibraryIndexAutoRefresh {
     /// contrario di quello che dice l'interruttore in Impostazioni.
     static func isEnabled(defaults: UserDefaults = .standard) -> Bool {
         defaults.object(forKey: defaultsKey) as? Bool ?? true
+    }
+}
+
+// MARK: - Da quando l'elenco non e' aggiornato (Task 12, D15-D17)
+
+/// Chiave `UserDefaults` dell'istante dell'ultima lettura arrivata **in fondo** (D15, spec
+/// 2026-09-24 §4.1). Scritta in **un punto solo**: il `onFinish` di
+/// `BackupRunner.startLibraryIndexScan`, dove la completezza e' gia' nota. Vale per tutti gli
+/// ingressi (bottone manuale, passo 2 del backup): passano tutti da quella funzione.
+/// `deleteIndexAndRecreate()` la azzera.
+nonisolated let libraryListLastCompleteReadDefaultsKey = "libraryListLastCompleteReadAt"
+
+/// Da quanto l'elenco delle foto gia' sull'SSD non viene rimesso in pari. Usato **sia** dal
+/// passo di anteprima del wizard di import **sia** dalla card di Diagnostica: una sola fonte
+/// per il testo, come `LibraryIndexStatus`/`DuplicatesStatus`. Registro anti-gergo: niente
+/// "indice"/"hash"/"scansione"/"registro"/"cache" in nessuna delle cinque diramazioni.
+nonisolated enum LibraryListFreshness {
+    enum Tone { case ok, info, warning }
+    struct Line: Identifiable { let id: String; let tone: Tone; let text: String }
+
+    /// 14 giorni (D16): l'asimmetria fra i due errori — a 30 giorni l'avviso comparirebbe
+    /// troppo raramente, col ritmo reale di backup, per essere utile; a 2-3 giorni
+    /// comparirebbe sempre, e "sovrastimare i problemi insegna a ignorare l'allarme" e' un
+    /// principio gia' applicato in questo progetto (ADR-0007). Due settimane e' abbastanza
+    /// per aver dimenticato di aver copiato qualcosa dal Finder, abbastanza poco perche'
+    /// rimediare costi pochi minuti.
+    static let thresholdDays = 14
+
+    private static let dateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "it_IT")
+        f.setLocalizedDateFormatFromTemplate("EEEE d MMMM")
+        return f
+    }()
+
+    /// Vero solo se la lettura e' arrivata davvero in fondo: niente lanciato, e la
+    /// traversata ha coperto tutta la libreria. `traversalIncomplete` include GIA'
+    /// `cancelled`/`volumeVanished`/le cartelle illeggibili (vedi i doc-comment su
+    /// `LibraryIndexer.Progress` e la riga che li assegna in `scan`): un controllo solo, non
+    /// tre che potrebbero divergere silenziosamente l'uno dall'altro in futuro.
+    static func readReachedTheEnd(progress: LibraryIndexer.Progress?, error: Error?) -> Bool {
+        guard error == nil, let progress else { return false }
+        return !progress.traversalIncomplete
+    }
+
+    /// La riga da mostrare — cinque diramazioni (spec §4.3), non due: "mai creato" e "data
+    /// non disponibile" sono situazioni diverse (la prima non ha nessuna foto conosciuta, la
+    /// seconda ne ha ma non sa da quando), e leggerle come la stessa cosa direbbe il falso
+    /// in una delle due.
+    ///
+    /// - Parameter hasAnyEntries: l'elenco esiste (almeno una foto conosciuta)? Se `false`,
+    ///   `lastCompleteReadAt` non conta: e' sempre la diramazione 1, mai la 4.
+    /// - Parameter lastCompleteReadAt: la data dell'ultima lettura arrivata in fondo, letta
+    ///   dalla chiave dedicata — o il ripiego `LibraryIndexStore.newestHashedAt()` se quella
+    ///   manca. E' un limite **inferiore**: una lettura incrementale che non trova niente di
+    ///   nuovo non tocca nessun `hashed_at`, quindi il ripiego puo' far sembrare l'elenco PIU'
+    ///   vecchio di quanto e' — mai il contrario, mai un avviso taciuto.
+    /// - Parameter isReading: una lettura e' in corso adesso — precede tutto il resto; il
+    ///   bottone di avvio e' comunque gia' disattivato da `JobStartGate`.
+    static func line(hasAnyEntries: Bool, lastCompleteReadAt: Date?, isReading: Bool,
+                     now: Date = Date()) -> Line {
+        if isReading {
+            return Line(id: "reading", tone: .info, text:
+                "L'app sta controllando l'SSD per rimettere in pari l'elenco: aspetta che finisca.")
+        }
+        guard hasAnyEntries else {
+            return Line(id: "never-built", tone: .warning, text:
+                "Non hai ancora creato l'elenco delle foto già salvate sull'SSD: l'app non può "
+                    + "sapere quali di queste foto hai già, e le copierà tutte.")
+        }
+        guard let lastCompleteReadAt else {
+            return Line(id: "unknown", tone: .info, text:
+                "L'app non sa da quando l'elenco delle foto già sull'SSD non viene rimesso in pari.")
+        }
+        // Giorni interi trascorsi, mai frazionari: alla soglia esatta (14 giorni, zero
+        // secondi in piu') deve scattare l'avviso, non restare neutro per un arrotondamento.
+        let days = Int(now.timeIntervalSince(lastCompleteReadAt) / 86_400)
+        let dateText = dateFormatter.string(from: lastCompleteReadAt)
+        guard days >= thresholdDays else {
+            return Line(id: "fresh", tone: .ok, text:
+                "L'elenco delle foto già sull'SSD è aggiornato a \(dateText).")
+        }
+        return Line(id: "stale", tone: .warning, text:
+            "L'elenco delle foto già sull'SSD è fermo al \(dateText), \(agoText(days: days)). Se "
+                + "da allora hai copiato foto sull'SSD dal Finder, l'app non le conosce e "
+                + "potrebbe importarle di nuovo.")
+    }
+
+    /// "tre settimane fa" — mai una cifra grezza di giorni sopra la soglia: si scrive in
+    /// settimane, come l'esempio della spec. Sotto una settimana resta in giorni, col
+    /// plurale giusto. **Non `private`**, apposta: con `thresholdDays == 14` la diramazione
+    /// "stale" di `line(...)` non raggiunge mai `weeks < 2`, quindi i plurali di giorni e la
+    /// settimana singola sono testabili solo chiamando questa funzione **direttamente** — la
+    /// stessa ragione per cui `FileSyncer.SyncResult.hms` non e' `private`.
+    static func agoText(days: Int) -> String {
+        let weeks = days / 7
+        guard weeks > 0 else { return days == 1 ? "un giorno fa" : "\(days) giorni fa" }
+        return weeks == 1 ? "una settimana fa" : "\(weeks) settimane fa"
     }
 }
 
@@ -9154,6 +9274,14 @@ final class BackupRunner: ObservableObject {
                 self.bm.stopAccessing(.ssd)
                 self.isIndexing = false
                 self.indexer = nil
+                // Scritta in QUESTO punto solo (Task 12, D15): vale per ogni ingresso — il
+                // bottone manuale e il passo 2 del backup passano entrambi da qui. Non si
+                // scrive su una lettura interrotta o incompleta: non ha rimesso in pari
+                // l'elenco, e registrarla direbbe il contrario.
+                if LibraryListFreshness.readReachedTheEnd(progress: finalProgress, error: finalError) {
+                    UserDefaults.standard.set(Date().timeIntervalSince1970,
+                                              forKey: libraryListLastCompleteReadDefaultsKey)
+                }
                 onFinish(finalProgress, finalError)
             }
         }
@@ -9171,7 +9299,8 @@ final class BackupRunner: ObservableObject {
         // Precondizioni rivalutate **qui**, all'avvio vero, non solo sul bottone che ha
         // aperto il flusso. Rilievo di review del 2026-09-01: fra il click e la conferma sta
         // un alert che l'utente puo' lasciare aperto per minuti (il messaggio stesso parla di
-        // 15-25 minuti di lettura, quindi ci si pensa), e in quel tempo puo' partire un
+        // 25-35 minuti di lettura — 390,6 GB a 224 MiB/s, ricalcolato Task 12 — quindi ci si
+        // pensa), e in quel tempo puo' partire un
         // backup — a mano o da solo al ricollegamento dell'SSD. Il gate sul bottone da solo
         // riaprirebbe esattamente il difetto che questo commit dichiara chiuso. E' la stessa
         // lezione gia' pagata nel pannello Doppioni, dove le precondizioni del blocco erano
@@ -9248,6 +9377,10 @@ final class BackupRunner: ObservableObject {
             indexProgress = nil
             indexInterruptedByUser = false
             indexedFileCount = 0
+            // L'elenco appena svuotato non e' "aggiornato ad oggi": e' vuoto, e la
+            // prossima lettura (manuale, la ricostruzione non parte da sola) e' la prima
+            // vera dopo lo svuotamento (Task 12, D15).
+            UserDefaults.standard.removeObject(forKey: libraryListLastCompleteReadDefaultsKey)
         } catch {
             // Se la cancellazione fallisce lo store resta aperto sul vecchio file ed e'
             // ancora utilizzabile: si mostra l'errore e si prosegue, mai un errore fatale.
@@ -11334,6 +11467,10 @@ struct ImportView: View {
     /// `realResolvedPath`/`makeThumbnail`.
     @State private var previewCancelFlag: CancelFlag?
     @State private var label: String = ""
+    /// Da quanto l'elenco non e' aggiornato (Task 12, spec §4): calcolato quando si entra
+    /// nel passo di anteprima e ricalcolato quando una lettura in corso finisce. `nil` solo
+    /// finche' non e' ancora stato calcolato la prima volta.
+    @State private var libraryListFreshness: LibraryListFreshness.Line?
 
     private static let dateFormatter: DateFormatter = {
         let f = DateFormatter()
@@ -11375,6 +11512,16 @@ struct ImportView: View {
             previewUnavailableReason = ImportPreviewStatus.unavailableReason(
                 ssdConfigured: bm.urls[.ssd] != nil, ssdMounted: false)
         }
+        // A lettura finita (bottone "Aggiorna l'elenco adesso" qui sotto, o qualunque altra
+        // lettura in corso altrove — Diagnostica, il passo 2 di un backup) l'anteprima si
+        // rifa': l'insieme dei doppioni riconosciuti e' cambiato, e mostrare un numero
+        // calcolato PRIMA dell'aggiornamento e' tutto il punto contro cui l'avviso esiste
+        // (Task 12, D18).
+        .onChange(of: runner.isIndexing) { _, isIndexing in
+            guard step == .preview, !isIndexing else { return }
+            refreshLibraryListFreshness()
+            startPreview()
+        }
     }
 
     private var chooseSourceStep: some View {
@@ -11403,6 +11550,28 @@ struct ImportView: View {
     private var previewStep: some View {
         VStack(spacing: AppSpacing.lg) {
             Text("Anteprima").font(AppFont.title)
+            // Le righe di freschezza dell'elenco stanno SOPRA quelle dell'anteprima (Task 12,
+            // D18): l'utente deve sapere se il numero che sta per leggere e' calcolato su un
+            // elenco vecchio PRIMA di leggerlo, non dopo.
+            if let freshness = libraryListFreshness {
+                HStack(alignment: .top, spacing: AppSpacing.sm) {
+                    Image(systemName: icon(freshness.tone)).foregroundStyle(color(freshness.tone))
+                        .font(.system(size: 12))
+                    Text(freshness.text).font(AppFont.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer()
+                }
+                if freshness.id == "stale" || freshness.id == "unknown" {
+                    HStack {
+                        Button("Aggiorna l'elenco adesso") { refreshLibraryListNow() }
+                            .buttonStyle(.bordered).controlSize(.small)
+                            .disabled(runner.isIndexing)
+                        Button("Continua così") {}
+                            .buttonStyle(.bordered).controlSize(.small)
+                        Spacer()
+                    }
+                }
+            }
             if let previewUnavailableReason {
                 Text(previewUnavailableReason).font(AppFont.caption).foregroundStyle(AppColor.error)
                     .multilineTextAlignment(.center)
@@ -11499,6 +11668,25 @@ struct ImportView: View {
         }
     }
 
+    /// Overload per `LibraryListFreshness.Tone` (Task 12): stessi tre casi, stessa mappa —
+    /// due enum diversi con gli stessi nomi di caso, non un motivo per due funzioni con nomi
+    /// diversi.
+    private func icon(_ tone: LibraryListFreshness.Tone) -> String {
+        switch tone {
+        case .ok: return "checkmark.circle.fill"
+        case .info: return "info.circle.fill"
+        case .warning: return "exclamationmark.triangle.fill"
+        }
+    }
+
+    private func color(_ tone: LibraryListFreshness.Tone) -> Color {
+        switch tone {
+        case .ok: return AppColor.success
+        case .info: return .secondary
+        case .warning: return AppColor.warning
+        }
+    }
+
     private var labelStep: some View {
         VStack(spacing: AppSpacing.lg) {
             Text("Nome della cartella di destinazione").font(AppFont.title)
@@ -11542,11 +11730,57 @@ struct ImportView: View {
         }
         sourceURL = url
         label = "\(url.lastPathComponent) - \(Self.dateFormatter.string(from: Date()))"
+        step = .preview
+        refreshLibraryListFreshness()
+        startPreview()
+    }
+
+    /// Calcola `libraryListFreshness` (Task 12, D15/D17): prova prima la data dell'ultima
+    /// lettura arrivata in fondo (`libraryListLastCompleteReadDefaultsKey`); se manca, il
+    /// ripiego `LibraryIndexStore.newestHashedAt()`, letto fuori dal main — e' una query
+    /// SQLite, non va fatta sul MainActor (stessa regola di `BackupRunner.indexedFileCount`).
+    private func refreshLibraryListFreshness() {
+        let hasAnyEntries = runner.indexedFileCount > 0
+        let isReading = runner.isIndexing
+        if let ts = UserDefaults.standard.object(forKey: libraryListLastCompleteReadDefaultsKey) as? Double {
+            libraryListFreshness = LibraryListFreshness.line(hasAnyEntries: hasAnyEntries,
+                                                              lastCompleteReadAt: Date(timeIntervalSince1970: ts),
+                                                              isReading: isReading)
+            return
+        }
+        guard let store = runner.libraryIndexStore else {
+            libraryListFreshness = LibraryListFreshness.line(hasAnyEntries: hasAnyEntries,
+                                                              lastCompleteReadAt: nil, isReading: isReading)
+            return
+        }
+        Task.detached(priority: .utility) {
+            let fallbackTimestamp = try? store.newestHashedAt()
+            await MainActor.run {
+                let date = fallbackTimestamp.map { Date(timeIntervalSince1970: $0) }
+                self.libraryListFreshness = LibraryListFreshness.line(hasAnyEntries: hasAnyEntries,
+                                                                      lastCompleteReadAt: date, isReading: isReading)
+            }
+        }
+    }
+
+    /// «Aggiorna l'elenco adesso» (Task 12, D18): l'aggiornamento **incrementale**
+    /// (`full: false`), mai la ricostruzione completa — quella resta un'azione esplicita
+    /// separata, in Diagnostica. L'anteprima si rifa' da sola quando la lettura finisce,
+    /// tramite `.onChange(of: runner.isIndexing)` nel `body`.
+    private func refreshLibraryListNow() {
+        runner.rebuildLibraryIndex(full: false, onAlert: { previewUnavailableReason = $0.message })
+    }
+
+    /// Il corpo di `pickSource()` da `guard let url = sourceURL` in avanti, estratto per
+    /// poter essere richiamato anche dopo un aggiornamento dell'elenco (Task 12, D18):
+    /// l'insieme dei doppioni riconosciuti e' cambiato, e mostrare un numero calcolato PRIMA
+    /// dell'aggiornamento e' tutto il punto contro cui l'avviso di freschezza esiste.
+    private func startPreview() {
+        guard let url = sourceURL else { return }
         previewResult = nil
         previewInterruption = .none
         previewProgress = nil
         previewUnavailableReason = nil
-        step = .preview
 
         // Gate obbligatorio (spec, "Gate obbligatorio: SSD montato"): senza il volume,
         // `isAlreadyInLibrary` fallirebbe la rilettura per ogni candidato e l'anteprima
@@ -13285,11 +13519,17 @@ struct LibraryIndexCard: View {
     /// **Numero misurato, non stimato** (2026-09-01, primo collegamento dell'SSD dopo
     /// la scrittura della card). Throughput reale di lettura+SHA256 dall'SSD: 224 MiB/s
     /// su un campione di 300 file distribuiti, contro 237,4 GiB di media indicizzabili
-    /// (47.482 file) = **~18 minuti**. La prima stesura diceva "dai 5 ai 15 minuti" ed
+    /// (47.482 file) = ~18 minuti. La prima stesura diceva "dai 5 ai 15 minuti" ed
     /// era un ordine di grandezza scritto a tavolino, con l'estremo superiore sotto la
-    /// misura vera. Se il contenuto dell'SSD cambia sensibilmente, si rimisura: non si
-    /// ritocca a occhio.
-    private let durata = "di solito servono dai 15 ai 25 minuti"
+    /// misura vera.
+    ///
+    /// **Ricalcolato il 2026-09-25 (Task 12): la libreria e' cresciuta a 390,6 GB**
+    /// (`ASUS/foto/recup_dir.NN/` misurato il 2026-09-24, vedi `duplicateKeepChoice`) —
+    /// allo stesso throughput di 224 MiB/s fanno **~28 minuti**, non piu' i ~18 di
+    /// settembre. "Dai 15 ai 25" era di nuovo sottostimato, con lo stesso errore della
+    /// prima stesura: l'estremo superiore sotto la misura vera. Se il contenuto dell'SSD
+    /// cambia sensibilmente, si rimisura: non si ritocca a occhio.
+    private let durata = "di solito servono dai 25 ai 35 minuti"
 
     var body: some View {
         GroupBox(LibraryIndexCommands.cardTitle) {
