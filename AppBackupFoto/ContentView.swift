@@ -2409,6 +2409,81 @@ func duplicateKeepExplanation(_ choice: DuplicateKeepChoice, in group: Duplicate
     return lead + tie + copies
 }
 
+/// Vero se **tutte** le copie del gruppo stanno sotto la stessa cartella di primo livello
+/// (ADR-0011, spec §2.2): il caso più numeroso della libreria (11.082 gruppi solo dentro
+/// `ASUS/`). Un file in radice (nessuna cartella) non ha una cartella con cui accomunarsi:
+/// un gruppo che ne contiene uno **non** è mai interno, anche se l'altro membro sta in una
+/// cartella vera — non c'è una cartella comune da nominare.
+// `nonisolated`: pura, nessuno stato.
+nonisolated func duplicateGroupIsInternal(_ group: DuplicateGroup) -> Bool {
+    let keys = group.members.map { topLevelFolderKey(of: $0.path) }
+    guard let first = keys.first, let firstKey = first else { return false }
+    return keys.allSatisfy { $0 == firstKey }
+}
+
+/// Le cartelle di primo livello che compaiono **davvero** fra i membri dei gruppi, con
+/// quanti gruppi hanno almeno una copia lì — l'elenco onesto (solo le cartelle che hanno
+/// doppioni, non tutte quelle che esistono sull'SSD), ricavato dai gruppi già in memoria:
+/// **nessuna query nuova**, coerente con `duplicateGroups()` che non cambia (regola 3 dei
+/// piani di questo progetto). Il conteggio è **per gruppo, non per file**: un gruppo con
+/// tre copie nella stessa cartella conta una volta sola. Un file in radice non ha cartella
+/// e non produce nessuna voce. Ordine alfabetico sulla chiave normalizzata, per un elenco
+/// che non cambia posizione da un'apertura all'altra a parità di dati.
+// `nonisolated`: pura, chiamata dal pannello Doppioni fuori dal main thread.
+nonisolated func duplicateFolderList(_ groups: [DuplicateGroup]) -> [(folder: String, count: Int)] {
+    var counts: [String: Int] = [:]
+    for group in groups {
+        let foldersInGroup = Set(group.members.compactMap { topLevelFolderKey(of: $0.path) })
+        for folder in foldersInGroup {
+            counts[folder, default: 0] += 1
+        }
+    }
+    return counts.map { (folder: $0.key, count: $0.value) }.sorted { $0.folder < $1.folder }
+}
+
+/// I tre filtri del pannello Doppioni alla scala reale (ADR-0011, spec §2.2): per cartella,
+/// per tipo di gruppo (interno/incrociato), per copertura della regola dell'utente.
+///
+/// **Nessuno dei tre è un motore di decisione**: restringono quali gruppi si vedono, non
+/// nominano mai un sopravvissuto (regola 3 dei piani di questo progetto — quello resta
+/// compito esclusivo di `duplicateKeepChoice`). I tre campi sono opzionali e si compongono
+/// **in AND**: `nil` significa "nessun vincolo su questo filtro".
+///
+/// `apply(to:)` restituisce **indici**, non copie di gruppi: alla scala reale (27.798
+/// gruppi) copiare l'array a ogni cambio di filtro sarebbe il profilo esatto del bug di
+/// prestazioni del 2026-09-02.
+// `nonisolated`: value type puro, nessuno stato mutabile condiviso — nessuna riga di
+// sicurezza necessaria.
+nonisolated struct DuplicateFilter {
+    /// Cartella di primo livello richiesta, o `nil` per "Tutte". Un gruppo la soddisfa se
+    /// **almeno una** copia sta sotto questa cartella — non tutte: è il filtro «dov'è
+    /// successo», non «è tutto lì dentro» (quello è `internalOnly`).
+    var folder: String?
+    /// `nil` = "Tutti"; `true` = solo i gruppi **interni** (tutte le copie nella stessa
+    /// cartella di primo livello); `false` = solo quelli **incrociati** — il complemento
+    /// esatto: ogni gruppo è nell'uno o nell'altro, mai in entrambi, mai in nessuno dei due.
+    var internalOnly: Bool?
+    /// Se non `nil`, tiene solo i gruppi che la regola dell'utente copre (ADR-0011).
+    var rule: DuplicateFolderRule?
+
+    func apply(to groups: [DuplicateGroup]) -> [Int] {
+        groups.indices.filter { matches(groups[$0]) }
+    }
+
+    private func matches(_ group: DuplicateGroup) -> Bool {
+        if let folder, !group.members.contains(where: { topLevelFolderKey(of: $0.path) == folder }) {
+            return false
+        }
+        if let internalOnly, duplicateGroupIsInternal(group) != internalOnly {
+            return false
+        }
+        if let rule, !rule.covers(group) {
+            return false
+        }
+        return true
+    }
+}
+
 /// Quanti file al massimo si cestinano in un blocco solo.
 ///
 /// Il numero **non** viene dalla durata: il cestinamento misura ~56 file/s, quindi 500 file
