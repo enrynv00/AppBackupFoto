@@ -3525,6 +3525,36 @@ nonisolated struct DuplicateTrashOutcome {
     var interrupted: Bool = false
 }
 
+/// Perche' una **corsa** (la sequenza di blocchi di un `DuplicateRunPlan`) si e' fermata
+/// prima dell'ultimo blocco pianificato (ADR-0012, D12). Un blocco che finisce con
+/// `.volumeVanished` o `.trashFailed` interrompe l'intera catena — sono guasti del volume,
+/// e proseguire su altri blocchi moltiplicherebbe il raggio del danno. I gruppi saltati
+/// dalla verifica (`DuplicateTrashSkipReason`, diversi da `trashFailed`) **non** fermano
+/// niente: su questa libreria sono la normalita' (ADR-0002), e fermarsi li' vorrebbe dire
+/// non arrivare mai in fondo a una corsa vera.
+nonisolated enum DuplicateRunStopReason: Equatable {
+    case volumeVanished
+    case trashFailed(displayPath: String, detail: String)
+    case interrupted
+}
+
+/// L'esito di un'intera corsa: l'aggregazione di tutti i blocchi smaltiti prima che la
+/// catena si fermasse — per un guasto vero, per l'utente, o perche' e' arrivata in fondo
+/// (`stopReason == nil`). Puro: `BackupRunner` (Task 10) lo costruisce accumulando i
+/// `DuplicateTrashOutcome` di ogni blocco via `DuplicateTrasher.run`, invariato.
+// `nonisolated`: value type senza stato condiviso.
+nonisolated struct DuplicateRunOutcome {
+    /// Blocchi del piano arrivati in fondo con successo (smaltiti, non necessariamente senza
+    /// gruppi saltati). Non conta il blocco su cui la corsa si e' eventualmente fermata.
+    var blocksCompleted: Int = 0
+    var totalBlocks: Int = 0
+    /// Tutti i file spostati nel Cestino, di ogni blocco della corsa.
+    var trashedFiles: [TrashedItem] = []
+    /// Tutti i gruppi saltati, di ogni blocco della corsa.
+    var skippedGroups: [(group: DuplicateGroup, reason: DuplicateTrashSkipReason)] = []
+    var stopReason: DuplicateRunStopReason? = nil
+}
+
 // MARK: - Righe di stato del pannello Doppioni (Task 6, 2026-08-31)
 
 /// Cosa dire in cima al pannello Doppioni, perche' la cancellazione e' disattivata in questo
@@ -3673,6 +3703,15 @@ enum DuplicatesStatus {
 
     /// Se il blocco selezionato puo' procedere alla conferma vera. Sopra il tetto la UI lo
     /// dice invece di rifiutare senza spiegare (deciso il 2026-08-28).
+    ///
+    /// **Deviazione dal piano, decisa da Enrico il 2026-09-24**: il Task 9 del piano
+    /// `2026-09-24-duplicates-at-real-scale` chiedeva di rimuovere questa funzione qui.
+    /// Resta fino al Task 11, che la rimuove nello stesso commit in cui ricabla
+    /// `DuplicatesView.summarySheet` sul piano della corsa (`runPlanLine`/`undoScopeLine`):
+    /// toglierla ora avrebbe lasciato, per i commit fra Task 9 e Task 10, un bottone
+    /// distruttivo premibile su un blocco piu' grande di quanto l'orchestrazione sappia
+    /// gestire — l'orchestrazione e' il Task 10, che non esiste ancora a questo punto della
+    /// storia. Ogni commit deve restare sicuro da solo.
     static func confirmationBlockedReason(exceedsCap: Bool) -> String? {
         guard exceedsCap else { return nil }
         return "Hai selezionato troppi file in una volta sola: procedi in più passaggi più "
@@ -3710,6 +3749,146 @@ enum DuplicatesStatus {
             out.append(Line(id: "done", tone: .ok, text:
                 "Fatto: \(count(outcome.trashedFiles.count, "file spostato nel Cestino", "file spostati nel Cestino"))."))
         }
+        return out
+    }
+
+    // MARK: - Righe della corsa (Task 9, ADR-0011/0012, 2026-09-25)
+
+    /// Quanto e' selezionato adesso, rispetto a quanto e' visibile (una regola cartella puo'
+    /// nascondere gruppi, ADR-0011) e a quanto esiste in tutto. Mostra SEMPRE sia il visibile
+    /// sia il selezionato — mai uno solo dei due, altrimenti "quanti gruppi vedo" e "quanti ne
+    /// ho scelti" si confondono. Dice sempre "recuperabili" (potenziale): niente e' stato
+    /// ancora spostato qui, la corsa non e' nemmeno cominciata.
+    static func selectionLine(visibleGroups: Int, totalGroups: Int, selectedGroups: Int,
+                              files: Int, reclaimableBytes: Int64) -> String {
+        let visibility = "\(visibleGroups.formatted()) di \(totalGroups.formatted()) gruppi visibili"
+        guard selectedGroups > 0 else {
+            return "\(visibility): non hai ancora selezionato niente."
+        }
+        let bytesText = ByteCountFormatter.string(fromByteCount: reclaimableBytes, countStyle: .file)
+        return "\(visibility) · hai selezionato \(count(selectedGroups, "gruppo", "gruppi")), "
+            + "\(count(files, "file", "file")), \(bytesText) recuperabili."
+    }
+
+    /// Quanti blocchi servira' la corsa e quanto durera' all'incirca (ADR-0012). Un solo
+    /// blocco e' il caso comune: la frase non deve nominare "blocco"/"blocchi" in quel caso,
+    /// altrimenti l'utente si chiede cosa sia un blocco quando per lui non esiste.
+    static func runPlanLine(blockCount: Int, files: Int, estimatedSeconds: Double) -> String {
+        let duration = FileSyncer.SyncResult.hms(Int(estimatedSeconds.rounded()))
+        guard blockCount > 1 else {
+            return "Sposterò \(count(files, "file", "file")) nel Cestino, in circa \(duration)."
+        }
+        return "Sposterò \(count(files, "file", "file")) nel Cestino in \(count(blockCount, "blocco", "blocchi")), "
+            + "in circa \(duration) in totale."
+    }
+
+    /// Cosa copre davvero «Annulla l'ultimo spostamento» quando la corsa e' divisa in piu' di
+    /// un blocco: solo l'ultimo. L'utente deve saperlo PRIMA di confermare, non scoprirlo dopo
+    /// un guasto a meta' corsa. `nil` con un blocco solo: non c'e' niente da spiegare, "annulla"
+    /// copre gia' tutto.
+    static func undoScopeLine(blockCount: Int, fileCapPerBlock: Int) -> String? {
+        guard blockCount > 1 else { return nil }
+        return "«Annulla l'ultimo spostamento» rimette a posto solo l'ultimo blocco (fino a "
+            + "\(count(fileCapPerBlock, "foto", "foto")) alla volta). Le altre restano nel Cestino "
+            + "dell'SSD, da dove puoi comunque recuperarle a mano — e restano comunque anche "
+            + "sull'HDD e su Cubbit."
+    }
+
+    /// L'avanzamento durante una corsa a piu' blocchi: `filesTotal` e' il totale di TUTTA la
+    /// corsa, non del solo blocco in esecuzione — altrimenti la barra ripartirebbe da zero
+    /// percepito a ogni blocco, quando invece sta continuando a lavorare sulla stessa corsa.
+    static func runProgressLine(blockIndex: Int, blockCount: Int, filesDone: Int, filesTotal: Int) -> String {
+        "Blocco \(blockIndex) di \(blockCount) · \(filesDone.formatted()) di \(count(filesTotal, "file", "file"))"
+    }
+
+    /// Una categoria stabile per raggruppare i gruppi saltati di un'intera corsa: due gruppi
+    /// saltati per lo stesso motivo diventano una riga sola con un conteggio, mai due righe
+    /// identiche ne' un "e altri" che ne nasconde qualcuno.
+    private static func skipCategoryKey(_ reason: DuplicateTrashSkipReason) -> String {
+        switch reason {
+        case .contentDisagrees: return "content-disagrees"
+        case .unreadable: return "unreadable"
+        case .sizeChanged: return "size-changed"
+        case .outsideLibrary: return "outside-library"
+        case .notMedia: return "not-media"
+        case .nothingToTrash: return "nothing-to-trash"
+        case .trashFailed: return "trash-failed"
+        case .keeperVanished: return "keeper-vanished"
+        }
+    }
+
+    private static func skipCategoryDescription(_ reason: DuplicateTrashSkipReason) -> String {
+        switch reason {
+        case .contentDisagrees:
+            return "perché il contenuto non era più identico fra le copie"
+        case .unreadable:
+            return "perché una copia non si è lasciata rileggere"
+        case .sizeChanged:
+            return "perché una dimensione non coincideva più con quella registrata"
+        case .outsideLibrary:
+            return "perché un percorso risolveva fuori dalla libreria"
+        case .notMedia:
+            return "perché non erano foto né video"
+        case .nothingToTrash:
+            return "perché era rimasta una copia sola"
+        case .trashFailed:
+            return "perché lo spostamento è fallito"
+        case .keeperVanished:
+            return "perché la copia da tenere è sparita a metà"
+        }
+    }
+
+    /// Come si racconta l'esito di un'intera corsa (piu' blocchi, ADR-0012) — non di un
+    /// blocco solo, quella resta `outcomeLines`. Il motivo dello stop, se c'e' n'e' uno, viene
+    /// prima di tutto; i gruppi saltati sono raggruppati per motivo su tutta la corsa, mai
+    /// troncati con "e altri".
+    static func runOutcomeLines(_ outcome: DuplicateRunOutcome) -> [Line] {
+        var out: [Line] = []
+
+        switch outcome.stopReason {
+        case .volumeVanished:
+            out.append(Line(id: "run-volume-vanished", tone: .warning, text:
+                "L'SSD si è scollegato durante la corsa, quindi mi sono fermato subito: "
+                + "\(count(outcome.blocksCompleted, "blocco è stato completato", "blocchi sono stati completati")) "
+                + "su \(count(outcome.totalBlocks, "previsto", "previsti")), "
+                + "\(count(outcome.trashedFiles.count, "file era già stato spostato nel Cestino", "file erano già stati spostati nel Cestino")) in totale."))
+        case .trashFailed(let path, let detail):
+            out.append(Line(id: "run-trash-failed", tone: .warning, text:
+                "Non è stato possibile spostare \(path) nel Cestino (\(detail)): mi sono fermato qui. "
+                + "\(count(outcome.blocksCompleted, "blocco è stato completato", "blocchi sono stati completati")) "
+                + "su \(count(outcome.totalBlocks, "previsto", "previsti"))."))
+        case .interrupted:
+            out.append(Line(id: "run-interrupted", tone: .info, text:
+                "Hai fermato tu la corsa: "
+                + "\(count(outcome.blocksCompleted, "blocco è stato completato", "blocchi sono stati completati")) "
+                + "su \(count(outcome.totalBlocks, "previsto", "previsti"))."))
+        case nil:
+            out.append(Line(id: "run-completed", tone: .ok, text:
+                "Fatto: \(count(outcome.totalBlocks, "blocco completato", "blocchi completati")), "
+                + "\(count(outcome.trashedFiles.count, "file spostato nel Cestino", "file spostati nel Cestino"))."))
+        }
+
+        if !outcome.skippedGroups.isEmpty {
+            var order: [String] = []
+            var counts: [String: Int] = [:]
+            var descriptions: [String: String] = [:]
+            for skipped in outcome.skippedGroups {
+                let key = skipCategoryKey(skipped.reason)
+                if counts[key] == nil {
+                    order.append(key)
+                    descriptions[key] = skipCategoryDescription(skipped.reason)
+                }
+                counts[key, default: 0] += 1
+            }
+            out.append(Line(id: "run-skipped-count", tone: .warning, text:
+                "\(count(outcome.skippedGroups.count, "gruppo non è stato smaltito", "gruppi non sono stati smaltiti")) "
+                + "in tutta la corsa: trovi il motivo di ciascuno qui sotto."))
+            for key in order {
+                out.append(Line(id: "run-skipped-\(key)", tone: .warning, text:
+                    "\(count(counts[key] ?? 0, "gruppo", "gruppi")) \(descriptions[key] ?? "")."))
+            }
+        }
+
         return out
     }
 

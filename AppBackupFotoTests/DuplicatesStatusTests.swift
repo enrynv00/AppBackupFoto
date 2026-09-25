@@ -491,4 +491,201 @@ final class DuplicatesStatusTests: XCTestCase {
         let allReasons = Set(cases.compactMap(\.1))
         XCTAssertEqual(allReasons.count, cases.count, "due casi diversi condividono la stessa frase")
     }
+
+    // MARK: - Righe della corsa (Task 9, ADR-0011/0012)
+
+    private func groupWithSkip(hash: String, path: String, reason: DuplicateTrashSkipReason)
+        -> (group: DuplicateGroup, reason: DuplicateTrashSkipReason) {
+        let g = DuplicateGroup(hash: hash, size: 10,
+                               members: [LibraryIndexEntry(path: path, displayPath: path, size: 10,
+                                                           mtime: 0, hash: hash, hashedAt: 0)])
+        return (g, reason)
+    }
+
+    // `selectionLine`
+
+    /// Il visibile e il selezionato non sono la stessa cosa (una regola cartella puo'
+    /// nascondere gruppi, ADR-0011): devono comparire entrambi, con i numeri giusti.
+    func testSelectionLine_saysVisibleAndSelectedSeparately() {
+        let text = DuplicatesStatus.selectionLine(visibleGroups: 12, totalGroups: 40, selectedGroups: 5,
+                                                   files: 8, reclaimableBytes: 3_000_000_000)
+        XCTAssertTrue(text.contains("12"), "manca il numero di gruppi visibili: \(text)")
+        XCTAssertTrue(text.contains("40"), "manca il totale: \(text)")
+        XCTAssertTrue(text.contains("5"), "manca il numero di gruppi selezionati: \(text)")
+    }
+
+    /// Mai "hai recuperato" (passato): niente e' stato ancora spostato, la corsa non e'
+    /// nemmeno cominciata quando questa riga si legge.
+    func testSelectionLine_neverSaysSpaceWasRecovered() {
+        let text = DuplicatesStatus.selectionLine(visibleGroups: 12, totalGroups: 40, selectedGroups: 5,
+                                                   files: 8, reclaimableBytes: 3_000_000_000).lowercased()
+        XCTAssertFalse(text.contains("recuperat"), "non deve promettere un recupero gia' avvenuto: \(text)")
+        XCTAssertTrue(text.contains("recuperabil"), "deve restare al potenziale: \(text)")
+    }
+
+    /// Zero selezionati: lo dice a parole, non mostra "hai selezionato 0 gruppi".
+    func testSelectionLine_zeroSelected_saysSoInsteadOfShowingZero() {
+        let text = DuplicatesStatus.selectionLine(visibleGroups: 12, totalGroups: 40, selectedGroups: 0,
+                                                   files: 0, reclaimableBytes: 0).lowercased()
+        XCTAssertTrue(text.contains("non hai ancora selezionato"), "deve dirlo a parole: \(text)")
+        XCTAssertFalse(text.contains("hai selezionato 0"), "non deve mostrare uno zero muto: \(text)")
+        XCTAssertFalse(text.contains("recuperabil"), "senza selezione non c'e' niente da recuperare: \(text)")
+    }
+
+    // `runPlanLine`
+
+    func testRunPlanLine_saysHowManyBlocksAndRoughlyHowLong() {
+        let text = DuplicatesStatus.runPlanLine(blockCount: 3, files: 4_500, estimatedSeconds: 754)
+        XCTAssertTrue(text.contains("3"), "manca il numero di blocchi: \(text)")
+        XCTAssertTrue(text.contains("4.500") || text.contains("4,500") || text.contains("4500"),
+                     "manca il numero di file: \(text)")
+        XCTAssertTrue(text.lowercased().contains("blocc"), "con piu' di un blocco deve nominarli: \(text)")
+    }
+
+    /// Un solo blocco (il caso comune): la frase non deve nominare "blocco"/"blocchi" affatto,
+    /// altrimenti l'utente si chiede cosa sia un blocco quando per lui non esiste.
+    func testRunPlanLine_singleBlock_doesNotMentionBlocks() {
+        let text = DuplicatesStatus.runPlanLine(blockCount: 1, files: 40, estimatedSeconds: 20).lowercased()
+        XCTAssertFalse(text.contains("blocc"), "un blocco solo non deve nominare i blocchi: \(text)")
+    }
+
+    // `undoScopeLine`
+
+    func testUndoScopeLine_appearsOnlyWithMoreThanOneBlock() {
+        XCTAssertNil(DuplicatesStatus.undoScopeLine(blockCount: 1, fileCapPerBlock: 2_000))
+        XCTAssertNotNil(DuplicatesStatus.undoScopeLine(blockCount: 2, fileCapPerBlock: 2_000))
+    }
+
+    /// L'utente deve saperlo PRIMA di confermare: solo l'ultimo blocco torna indietro, mai
+    /// tutta la corsa.
+    func testUndoScopeLine_saysOnlyTheLastBlockComesBack() {
+        let text = DuplicatesStatus.undoScopeLine(blockCount: 4, fileCapPerBlock: 2_000)!.lowercased()
+        XCTAssertTrue(text.contains("solo l'ultimo blocco") || text.contains("solo l’ultimo blocco"),
+                     "deve dire esplicitamente che copre solo l'ultimo blocco: \(text)")
+        XCTAssertTrue(text.contains("2.000") || text.contains("2,000") || text.contains("2000"),
+                     "manca il tetto per blocco: \(text)")
+    }
+
+    // `runProgressLine`
+
+    /// Il mutante da uccidere: contare i file del blocco invece che dell'intera corsa.
+    func testRunProgressLine_countsFilesOfTheWholeRun_notOfTheBlock() {
+        let text = DuplicatesStatus.runProgressLine(blockIndex: 2, blockCount: 3, filesDone: 150, filesTotal: 4_500)
+        XCTAssertTrue(text.contains("2"), "manca il blocco corrente: \(text)")
+        XCTAssertTrue(text.contains("3"), "manca il numero di blocchi: \(text)")
+        XCTAssertTrue(text.contains("150"), "manca quanto fatto: \(text)")
+        XCTAssertTrue(text.contains("4.500") || text.contains("4,500") || text.contains("4500"),
+                     "il totale mostrato deve essere quello DELL'INTERA CORSA, non del blocco: \(text)")
+    }
+
+    // `runOutcomeLines`
+
+    /// I blocchi completati e i file spostati sono la somma di TUTTA la corsa, non di un
+    /// blocco solo.
+    func testRunOutcome_aggregatesEveryBlock() {
+        var outcome = DuplicateRunOutcome()
+        outcome.blocksCompleted = 2
+        outcome.totalBlocks = 3
+        outcome.trashedFiles = [
+            TrashedItem(batchId: "b1", originalDisplayPath: "/x/a.jpg", originalKey: "a",
+                       trashedPath: "/x/.Trashes/a.jpg", size: 1, hash: "h", trashedAt: Date()),
+            TrashedItem(batchId: "b2", originalDisplayPath: "/x/b.jpg", originalKey: "b",
+                       trashedPath: "/x/.Trashes/b.jpg", size: 1, hash: "h", trashedAt: Date())
+        ]
+        outcome.stopReason = .interrupted
+        let joined = DuplicatesStatus.runOutcomeLines(outcome).map(\.text).joined(separator: " ")
+        XCTAssertTrue(joined.contains("2"), "manca il numero di blocchi completati: \(joined)")
+        XCTAssertTrue(joined.contains("3"), "manca il totale previsto: \(joined)")
+    }
+
+    /// Ognuno dei quattro motivi di stop produce una riga propria, distinta dalle altre tre.
+    func testRunOutcome_saysWhyTheChainStopped() {
+        func lines(_ reason: DuplicateRunStopReason?) -> String {
+            var outcome = DuplicateRunOutcome()
+            outcome.blocksCompleted = 1
+            outcome.totalBlocks = 2
+            outcome.stopReason = reason
+            return DuplicatesStatus.runOutcomeLines(outcome).map(\.text).joined(separator: " ")
+        }
+        let vanished = lines(.volumeVanished)
+        let failed = lines(.trashFailed(displayPath: "/x/a.jpg", detail: "permessi"))
+        let interrupted = lines(.interrupted)
+        let completed = lines(nil)
+
+        let all = [vanished, failed, interrupted, completed]
+        XCTAssertEqual(Set(all).count, all.count, "i quattro esiti devono produrre quattro frasi diverse")
+        XCTAssertTrue(vanished.lowercased().contains("scollegat") || vanished.lowercased().contains("ssd"))
+        XCTAssertTrue(failed.contains("permessi"), "deve nominare il dettaglio del fallimento: \(failed)")
+        XCTAssertTrue(interrupted.lowercased().contains("fermato tu") || interrupted.lowercased().contains("hai fermato"))
+    }
+
+    /// Gruppi saltati per lo stesso motivo diventano UNA riga con un conteggio — mai due righe
+    /// identiche, mai un "e altri" che nasconde qualcuno.
+    func testRunOutcome_skippedGroups_areCountedByReason_neverTruncatedSilently() {
+        var outcome = DuplicateRunOutcome()
+        outcome.blocksCompleted = 1
+        outcome.totalBlocks = 1
+        outcome.skippedGroups = [
+            groupWithSkip(hash: "h1", path: "a.jpg", reason: .unreadable(displayPath: "a.jpg")),
+            groupWithSkip(hash: "h2", path: "b.jpg", reason: .unreadable(displayPath: "b.jpg")),
+            groupWithSkip(hash: "h3", path: "c.jpg", reason: .unreadable(displayPath: "c.jpg")),
+            groupWithSkip(hash: "h4", path: "d.jpg", reason: .nothingToTrash)
+        ]
+        let lines = DuplicatesStatus.runOutcomeLines(outcome)
+        let joined = lines.map(\.text).joined(separator: " ")
+        XCTAssertFalse(joined.lowercased().contains("e altri"), "non deve mai troncare con «e altri»: \(joined)")
+        XCTAssertTrue(joined.contains("4"), "deve nominare il totale saltato: \(joined)")
+        // Una riga sola per il motivo "unreadable" (3 gruppi), non tre righe ripetute.
+        let unreadableLines = lines.filter { $0.text.lowercased().contains("rileggere") }
+        XCTAssertEqual(unreadableLines.count, 1, "il motivo 'unreadable' deve comparire in una riga sola: \(joined)")
+        XCTAssertTrue(unreadableLines.first?.text.contains("3") ?? false,
+                     "la riga aggregata deve nominare il conteggio (3): \(joined)")
+    }
+
+    /// Registro anti-gergo su ogni diramazione nuova del Task 9 — non un campione, tutte.
+    func testNoJargon_onEveryNewBranch() {
+        let forbidden = ["hash", "indice", "scansione", "registro", "manifest", "volume", "entry", "cache", "sha"]
+        var allTexts: [String] = []
+
+        allTexts.append(DuplicatesStatus.selectionLine(visibleGroups: 12, totalGroups: 40, selectedGroups: 5,
+                                                        files: 8, reclaimableBytes: 3_000_000_000))
+        allTexts.append(DuplicatesStatus.selectionLine(visibleGroups: 12, totalGroups: 40, selectedGroups: 0,
+                                                        files: 0, reclaimableBytes: 0))
+        allTexts.append(DuplicatesStatus.runPlanLine(blockCount: 1, files: 40, estimatedSeconds: 20))
+        allTexts.append(DuplicatesStatus.runPlanLine(blockCount: 3, files: 4_500, estimatedSeconds: 754))
+        allTexts.append(DuplicatesStatus.undoScopeLine(blockCount: 4, fileCapPerBlock: 2_000) ?? "")
+        allTexts.append(DuplicatesStatus.runProgressLine(blockIndex: 2, blockCount: 3, filesDone: 150, filesTotal: 4_500))
+
+        for reason in [DuplicateRunStopReason.volumeVanished,
+                       .trashFailed(displayPath: "/x/a.jpg", detail: "permessi"),
+                       .interrupted, nil] {
+            var outcome = DuplicateRunOutcome()
+            outcome.blocksCompleted = 1
+            outcome.totalBlocks = 2
+            outcome.stopReason = reason
+            allTexts.append(contentsOf: DuplicatesStatus.runOutcomeLines(outcome).map(\.text))
+        }
+
+        var skippedAll = DuplicateRunOutcome()
+        skippedAll.blocksCompleted = 1
+        skippedAll.totalBlocks = 1
+        skippedAll.skippedGroups = [
+            groupWithSkip(hash: "h1", path: "a.jpg", reason: .contentDisagrees(displayPath: "a.jpg")),
+            groupWithSkip(hash: "h2", path: "b.jpg", reason: .unreadable(displayPath: "b.jpg")),
+            groupWithSkip(hash: "h3", path: "c.jpg", reason: .sizeChanged(displayPath: "c.jpg")),
+            groupWithSkip(hash: "h4", path: "d.jpg", reason: .outsideLibrary(displayPath: "d.jpg")),
+            groupWithSkip(hash: "h5", path: "e.jpg", reason: .notMedia(displayPath: "e.jpg")),
+            groupWithSkip(hash: "h6", path: "f.jpg", reason: .nothingToTrash),
+            groupWithSkip(hash: "h7", path: "g.jpg", reason: .trashFailed(displayPath: "g.jpg", detail: "d")),
+            groupWithSkip(hash: "h8", path: "h.jpg", reason: .keeperVanished(displayPath: "h.jpg"))
+        ]
+        allTexts.append(contentsOf: DuplicatesStatus.runOutcomeLines(skippedAll).map(\.text))
+
+        for text in allTexts {
+            let lower = text.lowercased()
+            for word in forbidden {
+                XCTAssertFalse(lower.contains(word), "'\(word)' non deve comparire in: \(text)")
+            }
+        }
+    }
 }
