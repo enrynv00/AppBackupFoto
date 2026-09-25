@@ -3086,6 +3086,95 @@ nonisolated final class TrashManifestStore: @unchecked Sendable {
     }
 }
 
+/// Una riga della storia degli spostamenti (`TrashHistory`): un blocco concluso, con i
+/// percorsi originali assoluti di tutte le foto che quel blocco ha spostato.
+nonisolated struct TrashHistoryEntry: Codable {
+    let blockId: String
+    let trashedAt: Date
+    /// Percorsi **assoluti**, come `TrashedItem.originalDisplayPath`: e' li' che la foto
+    /// stava prima di finire nel Cestino.
+    let originalPaths: [String]
+}
+
+/// La storia degli spostamenti (ADR-0012, D13 punto 4): un file append-only sul disco
+/// interno, mai sull'SSD, su cui l'app scrive **una riga per blocco concluso** (JSON su una
+/// riga, `.jsonl`) con i percorsi originali delle foto di quel blocco.
+///
+/// **Non e' un annullamento.** Non ha bottoni, non legge mai il proprio contenuto per
+/// decidere niente, e non aggiunge nessun percorso distruttivo: `TrashManifestStore` resta
+/// l'unico documento da cui «Annulla l'ultimo spostamento» rimette a posto le foto. Questa
+/// storia esiste perche' il registro di ripristino ricorda al massimo
+/// `TrashManifestStore.maxItems` voci (2.000) e le pota, mentre una corsa puo' toccarne
+/// 89.541: dopo 45 blocchi, senza questa storia, il Cestino dell'SSD diventerebbe una
+/// cartella piatta di foto di cui nessuno saprebbe piu' il percorso d'origine. Si legge a
+/// mano, dal Finder o da un editor di testo, solo se serve ritrovare da dove veniva una foto
+/// che il registro ha gia' potato.
+///
+/// **Costa una scrittura per blocco, non per file**: non riapre il costo quadratico che ha
+/// condizionato il tetto di `duplicateBatchFileCap` (`TrashManifestStore.record` riscrive
+/// l'intero registro a ogni file; qui si aggiunge solo una riga, una volta per blocco).
+///
+/// **Il fallimento della scrittura non deve mai far fallire il blocco**: e' una storia, non
+/// un prerequisito del cestinamento. `append` non lancia: un file illeggibile, un permesso
+/// negato, qualunque guaio di I/O restano confinati qui dentro.
+// `nonisolated`: chiamata da `BackupRunner` (Task 10) fuori dal main thread, una volta per
+// blocco concluso. Sicura per costruzione: l'unico stato mutabile e' il file su disco,
+// toccato solo dentro `lock.withLock`; `url` e' `let`.
+nonisolated final class TrashHistory: @unchecked Sendable {
+
+    enum StoreError: Error, LocalizedError {
+        case invalidLocation(String)
+        var errorDescription: String? {
+            switch self {
+            case .invalidLocation(let p): return "Posizione non consentita per la storia degli spostamenti: \(p)"
+            }
+        }
+    }
+
+    private let url: URL
+    private let lock = NSLock()
+
+    init(url: URL) throws {
+        // Stessa allow-list di `TrashManifestStore`/`LibraryIndexStore`, non una seconda:
+        // questo file nomina i percorsi delle foto e non deve mai finire sul volume sorgente.
+        guard isAllowedStoreLocation(url) else { throw StoreError.invalidLocation(url.path) }
+        self.url = url
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
+                                                withIntermediateDirectories: true)
+    }
+
+    /// Scrive una riga per il blocco appena concluso. Un blocco senza file spostati non
+    /// produce nessuna riga: non c'e' niente da ricordare. Best-effort e silenzioso su
+    /// qualunque errore di I/O — vedi il doc-comment del tipo.
+    func append(blockId: String, trashed: [TrashedItem], at date: Date = Date()) {
+        guard !trashed.isEmpty else { return }
+        let entry = TrashHistoryEntry(blockId: blockId, trashedAt: date,
+                                      originalPaths: trashed.map(\.originalDisplayPath))
+        guard let data = try? JSONEncoder().encode(entry) else { return }
+        lock.withLock {
+            appendLineUnsynchronized(data)
+        }
+    }
+
+    /// Apertura POSIX a basso livello in **sola append**: `O_APPEND` garantisce che ogni
+    /// `write` finisca alla fine del file, atomicamente rispetto ad altri scrittori sullo
+    /// stesso file — e' cio' che rende impossibile riscrivere le righe precedenti, a
+    /// differenza di un `Data.write(to:)` che sostituirebbe l'intero contenuto. `O_CREAT`
+    /// crea il file con permessi `0600` se non esiste ancora; `fchmod` e' una seconda difesa
+    /// best-effort per il caso in cui il file esistesse gia' con permessi diversi.
+    private func appendLineUnsynchronized(_ data: Data) {
+        let fd = open(url.path, O_APPEND | O_CREAT | O_WRONLY, 0o600)
+        guard fd >= 0 else { return }
+        defer { close(fd) }
+        _ = fchmod(fd, 0o600)
+        var line = data
+        line.append(0x0A) // newline: una riga per blocco.
+        _ = line.withUnsafeBytes { buffer in
+            write(fd, buffer.baseAddress, buffer.count)
+        }
+    }
+}
+
 /// Rimette al loro posto le foto di un blocco — il motore dietro «Annulla l'ultimo
 /// spostamento» (ADR-0009). Stessa cura del cestinamento (`DuplicateTrasher`), letta al
 /// contrario: una voce alla volta, registro aggiornato subito dopo ogni successo, `st_dev`

@@ -175,6 +175,23 @@ final class MainThreadIsolationTests: XCTestCase {
                        "TrashRestorer.run ha avuto bisogno del main thread.")
     }
 
+    // MARK: - TrashHistory (Task 8, 2026-09-24)
+
+    func testTrashHistory_runsWithoutTheMainThread() throws {
+        let history = try TrashHistory(url: tmp.appendingPathComponent("trash-history.jsonl"))
+        let item = TrashedItem(batchId: "b1", originalDisplayPath: "/SSD/Foto iPhone/a.jpg",
+                               originalKey: normalizedIndexKey("Foto iPhone/a.jpg"),
+                               trashedPath: "/SSD/.Trashes/501/a.jpg", size: 1, hash: "h",
+                               trashedAt: Date())
+        let done = DispatchSemaphore(value: 0)
+        Task.detached {
+            history.append(blockId: "b1", trashed: [item])
+            done.signal()
+        }
+        XCTAssertEqual(done.wait(timeout: .now() + 10), .success,
+                       "TrashHistory.append ha avuto bisogno del main thread.")
+    }
+
     func testVolumeCapacityRead_runsWithoutTheMainThread() {
         let done = DispatchSemaphore(value: 0)
         Task.detached {
