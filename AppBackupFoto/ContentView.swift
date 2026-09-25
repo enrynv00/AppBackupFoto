@@ -2093,6 +2093,79 @@ private nonisolated func isInImportFolder(_ entry: LibraryIndexEntry) -> Bool {
     topLevelFolderKey(of: entry.path) == importFolderKey
 }
 
+/// La regola dell'utente «tieni la copia in X, cestina quelle in Y…» (ADR-0011).
+///
+/// **Non e' un secondo motore di decisione.** `covers` dice solo se un gruppo rientra nella
+/// regola; chi vince fra i sopravvissuti lo decide sempre e solo `duplicateKeepChoice`
+/// (Task 4) — qui non si nomina mai un sopravvissuto. E' la classe di errore («due copie
+/// della stessa decisione») gia' pagata tre volte in questo progetto (`LibraryExclusions`,
+/// `realResolvedPath`, `makeThumbnail`).
+///
+/// **Forma**: una cartella da tenere e un insieme di cartelle da cestinare, entrambe come
+/// **cartelle di primo livello**. Un gruppo e' coperto solo se ha almeno una copia sotto
+/// `keepIn` e **tutte** le altre sotto una delle cartelle di `trashIn`: se resta una copia
+/// in una terza cartella, il gruppo non e' coperto — non si cestina mai una parte di
+/// gruppo, altrimenti "gruppo smaltito a meta'" diventerebbe uno stato che ricompare alla
+/// prossima apertura senza che nessuno capisca perche' (ADR-0011).
+///
+/// `keepIn`/`trashIn` sono chiavi **gia' normalizzate** (minuscole, NFC): il confronto e'
+/// per cartella di primo livello via `topLevelFolderKey`, mai su `displayPath`. ExFAT e'
+/// case-insensitive e non normalizza l'Unicode, quindi una regola confrontata sulla forma
+/// scritta su disco smetterebbe di funzionare senza dirlo.
+// `nonisolated`: value type puro, nessuno stato mutabile condiviso.
+nonisolated struct DuplicateFolderRule: Codable, Equatable {
+    let keepIn: String
+    let trashIn: Set<String>
+
+    /// Vero se il gruppo e' coperto da questa regola (vedi il doc-comment del tipo). Una
+    /// regola vuota o contraddittoria (`trashIn` che contiene `keepIn`) non copre niente:
+    /// non si "interpreta al meglio" una regola che l'utente non ha davvero espresso.
+    func covers(_ group: DuplicateGroup) -> Bool {
+        guard !keepIn.isEmpty, !trashIn.isEmpty, !trashIn.contains(keepIn) else { return false }
+        var hasKeepMember = false
+        var hasTrashMember = false
+        for member in group.members {
+            // Un file sciolto in radice non ha cartella di primo livello: non appartiene
+            // a nessuna regola, quindi il gruppo che lo contiene non e' coperto.
+            guard let folder = topLevelFolderKey(of: member.path) else { return false }
+            if folder == keepIn {
+                hasKeepMember = true
+            } else if trashIn.contains(folder) {
+                hasTrashMember = true
+            } else {
+                return false
+            }
+        }
+        // Serve almeno un membro da tenere E almeno uno da cestinare: un gruppo
+        // interamente dentro `keepIn` non ha niente da smaltire, e proporlo come coperto
+        // gonfierebbe il numero di gruppi confermati senza nessun file da spostare.
+        return hasKeepMember && hasTrashMember
+    }
+}
+
+/// Chiave `UserDefaults` della regola per cartella. Persiste fra le sessioni (ADR-0011,
+/// domanda 6 della spec, risposta di Enrico): 45 blocchi non si fanno in una sola sessione,
+/// e una regola riscritta a memoria alla seconda sessione e' un'altra regola.
+nonisolated let duplicateFolderRuleDefaultsKey = "duplicateFolderRule"
+
+/// Legge la regola persistita. Un valore assente o corrotto decodifica a `nil` — «nessuna
+/// regola», mai un crash: stessa disciplina di uno schema inatteso sull'indice (ADR-0002).
+nonisolated func loadDuplicateFolderRule(defaults: UserDefaults = .standard) -> DuplicateFolderRule? {
+    guard let data = defaults.data(forKey: duplicateFolderRuleDefaultsKey) else { return nil }
+    return try? JSONDecoder().decode(DuplicateFolderRule.self, from: data)
+}
+
+/// Scrive la regola, o la rimuove se `nil` (l'utente ha tolto la regola attiva).
+nonisolated func saveDuplicateFolderRule(_ rule: DuplicateFolderRule?, defaults: UserDefaults = .standard) {
+    guard let rule else {
+        defaults.removeObject(forKey: duplicateFolderRuleDefaultsKey)
+        return
+    }
+    if let data = try? JSONEncoder().encode(rule) {
+        defaults.set(data, forKey: duplicateFolderRuleDefaultsKey)
+    }
+}
+
 /// Sceglie quale copia di un gruppo di doppioni tenere, e dice perche'.
 ///
 /// Funzione **pura**: nessun filesystem, nessun database, nessun ordine di input che conti.
