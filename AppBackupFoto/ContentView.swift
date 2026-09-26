@@ -6408,6 +6408,7 @@ final class S3Syncer {
                   URLQueryItem(name: "max-keys", value: "1000")]
         if let t = token { qi.append(URLQueryItem(name: "continuation-token", value: t)) }
         comps.queryItems = qi
+        comps.percentEncodedQuery = Self.encodePlusInQuery(comps.percentEncodedQuery)
         guard let url = comps.url else {
             throw NSError(domain: "S3", code: 8,
                 userInfo: [NSLocalizedDescriptionKey: "URL non valido per list"])
@@ -6857,21 +6858,52 @@ final class S3Syncer {
             forHTTPHeaderField: "Authorization")
     }
 
-    private func xmlDecode(_ s: String) -> String {
-        s.replacingOccurrences(of: "&amp;",  with: "&")
-         .replacingOccurrences(of: "&lt;",   with: "<")
-         .replacingOccurrences(of: "&gt;",   with: ">")
-         .replacingOccurrences(of: "&apos;", with: "'")
-         .replacingOccurrences(of: "&quot;", with: "\"")
+    // Cubbit usa come continuation-token la chiave stessa. URLComponents lascia il `+` nella
+    // query e il server lo legge come spazio: la pagina dopo una chiave con `+` fallisce con
+    // SignatureDoesNotMatch. `sign()` decodifica e ricodifica, quindi `%2B` resta coerente.
+    static func encodePlusInQuery(_ query: String?) -> String? {
+        query?.replacingOccurrences(of: "+", with: "%2B")
+    }
+
+    // Una sola passata, così `&amp;#39;` resta il testo `&#39;` e non diventa un apostrofo.
+    // Cubbit scrive l'apostrofo come `&#39;`: senza i riferimenti numerici la chiave letta
+    // era sbagliata, e il token ricavato da lei faceva fallire la lista con InvalidRequest.
+    static func xmlDecode(_ s: String) -> String {
+        guard s.contains("&") else { return s }
+        let named: [Substring: String] = ["amp": "&", "lt": "<", "gt": ">", "apos": "'", "quot": "\""]
+        var out = ""
+        var rest = s[...]
+        while let amp = rest.firstIndex(of: "&") {
+            out += rest[..<amp]
+            rest = rest[amp...]
+            let afterAmp = rest.index(after: amp)
+            guard let semi = rest[afterAmp...].firstIndex(of: ";") else { break }
+            let entity = rest[afterAmp..<semi]
+            var decoded: String? = named[entity]
+            if decoded == nil, entity.hasPrefix("#") {
+                let num = entity.dropFirst()
+                let code = num.hasPrefix("x") || num.hasPrefix("X")
+                    ? UInt32(num.dropFirst(), radix: 16) : UInt32(num, radix: 10)
+                decoded = code.flatMap(Unicode.Scalar.init).map { String(Character($0)) }
+            }
+            if let decoded {
+                out += decoded
+                rest = rest[rest.index(after: semi)...]
+            } else {
+                out += "&"
+                rest = rest[afterAmp...]
+            }
+        }
+        return out + rest
     }
     private func xmlFirst(_ xml: String, tag: String) -> String? {
         guard let s = xml.range(of: "<\(tag)>"), let e = xml.range(of: "</\(tag)>") else { return nil }
-        return xmlDecode(String(xml[s.upperBound..<e.lowerBound]))
+        return Self.xmlDecode(String(xml[s.upperBound..<e.lowerBound]))
     }
     private func xmlAll(_ xml: String, tag: String) -> [String] {
         var results: [String] = []; var search = xml
         while let s = search.range(of: "<\(tag)>"), let e = search.range(of: "</\(tag)>") {
-            results.append(xmlDecode(String(search[s.upperBound..<e.lowerBound])))
+            results.append(Self.xmlDecode(String(search[s.upperBound..<e.lowerBound])))
             search = String(search[e.upperBound...])
         }
         return results
