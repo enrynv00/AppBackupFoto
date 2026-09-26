@@ -13341,9 +13341,9 @@ private struct DuplicateGroupRow: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: AppSpacing.sm) {
-            Button(action: toggle) {
-                Image(systemName: isSelected ? "checkmark.square.fill" : "square")
-            }.buttonStyle(.plain)
+            Toggle("", isOn: Binding(get: { isSelected }, set: { _ in toggle() }))
+                .toggleStyle(.checkbox)
+                .labelsHidden()
 
             thumbnailView
 
@@ -13397,8 +13397,16 @@ private struct DuplicateGroupRow: View {
         .task(id: entry.group.hash) { await loadThumbnail() }
     }
 
-    @ViewBuilder
+    // `.allowsHitTesting(false)`: con `scaledToFill` un fotogramma 16:9 sborda di ~28 punti
+    // oltre il riquadro da 72, e `clipShape` taglia solo il disegno, non l'area che riceve
+    // i clic. Quella parte invisibile copriva la casella accanto: dopo il caricamento delle
+    // miniature le caselle non si spuntavano piu' (2026-09-26).
     private var thumbnailView: some View {
+        thumbnailImage.allowsHitTesting(false)
+    }
+
+    @ViewBuilder
+    private var thumbnailImage: some View {
         if let thumbnail {
             Image(nsImage: thumbnail)
                 .resizable().scaledToFill()
