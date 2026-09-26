@@ -2023,6 +2023,9 @@ nonisolated let importFolderKey = normalizedIndexKey("Import")
 /// una spiegazione ricostruita a posteriori dalla UI divergerebbe dalla regola alla prima
 /// modifica di una delle due.
 nonisolated enum DuplicateKeepReason {
+    /// L'utente ha chiesto di tenere le copie in questa cartella (ADR-0011, regola 0):
+    /// precede le tre euristiche sotto, ma solo sui gruppi che la regola copre.
+    case userFolderRule
     /// Sta nella libreria principale, e le altre copie no.
     case mainLibrary
     /// Sta in una cartella organizzata a mano, e le altre copie stanno in un import.
@@ -2093,14 +2096,98 @@ private nonisolated func isInImportFolder(_ entry: LibraryIndexEntry) -> Bool {
     topLevelFolderKey(of: entry.path) == importFolderKey
 }
 
+/// La regola dell'utente «tieni la copia in X, cestina quelle in Y…» (ADR-0011).
+///
+/// **Non e' un secondo motore di decisione.** `covers` dice solo se un gruppo rientra nella
+/// regola; chi vince fra i sopravvissuti lo decide sempre e solo `duplicateKeepChoice`
+/// (Task 4) — qui non si nomina mai un sopravvissuto. E' la classe di errore («due copie
+/// della stessa decisione») gia' pagata tre volte in questo progetto (`LibraryExclusions`,
+/// `realResolvedPath`, `makeThumbnail`).
+///
+/// **Forma**: una cartella da tenere e un insieme di cartelle da cestinare, entrambe come
+/// **cartelle di primo livello**. Un gruppo e' coperto solo se ha almeno una copia sotto
+/// `keepIn` e **tutte** le altre sotto una delle cartelle di `trashIn`: se resta una copia
+/// in una terza cartella, il gruppo non e' coperto — non si cestina mai una parte di
+/// gruppo, altrimenti "gruppo smaltito a meta'" diventerebbe uno stato che ricompare alla
+/// prossima apertura senza che nessuno capisca perche' (ADR-0011).
+///
+/// `keepIn`/`trashIn` sono chiavi **gia' normalizzate** (minuscole, NFC): il confronto e'
+/// per cartella di primo livello via `topLevelFolderKey`, mai su `displayPath`. ExFAT e'
+/// case-insensitive e non normalizza l'Unicode, quindi una regola confrontata sulla forma
+/// scritta su disco smetterebbe di funzionare senza dirlo.
+// `nonisolated`: value type puro, nessuno stato mutabile condiviso.
+nonisolated struct DuplicateFolderRule: Codable, Equatable {
+    let keepIn: String
+    let trashIn: Set<String>
+
+    /// Vero se il gruppo e' coperto da questa regola (vedi il doc-comment del tipo). Una
+    /// regola vuota o contraddittoria (`trashIn` che contiene `keepIn`) non copre niente:
+    /// non si "interpreta al meglio" una regola che l'utente non ha davvero espresso.
+    func covers(_ group: DuplicateGroup) -> Bool {
+        guard !keepIn.isEmpty, !trashIn.isEmpty, !trashIn.contains(keepIn) else { return false }
+        var hasKeepMember = false
+        var hasTrashMember = false
+        for member in group.members {
+            // Un file sciolto in radice non ha cartella di primo livello: non appartiene
+            // a nessuna regola, quindi il gruppo che lo contiene non e' coperto.
+            guard let folder = topLevelFolderKey(of: member.path) else { return false }
+            if folder == keepIn {
+                hasKeepMember = true
+            } else if trashIn.contains(folder) {
+                hasTrashMember = true
+            } else {
+                return false
+            }
+        }
+        // Serve almeno un membro da tenere E almeno uno da cestinare: un gruppo
+        // interamente dentro `keepIn` non ha niente da smaltire, e proporlo come coperto
+        // gonfierebbe il numero di gruppi confermati senza nessun file da spostare.
+        return hasKeepMember && hasTrashMember
+    }
+}
+
+/// Chiave `UserDefaults` della regola per cartella. Persiste fra le sessioni (ADR-0011,
+/// domanda 6 della spec, risposta di Enrico): 45 blocchi non si fanno in una sola sessione,
+/// e una regola riscritta a memoria alla seconda sessione e' un'altra regola.
+nonisolated let duplicateFolderRuleDefaultsKey = "duplicateFolderRule"
+
+/// Legge la regola persistita. Un valore assente o corrotto decodifica a `nil` — «nessuna
+/// regola», mai un crash: stessa disciplina di uno schema inatteso sull'indice (ADR-0002).
+nonisolated func loadDuplicateFolderRule(defaults: UserDefaults = .standard) -> DuplicateFolderRule? {
+    guard let data = defaults.data(forKey: duplicateFolderRuleDefaultsKey) else { return nil }
+    return try? JSONDecoder().decode(DuplicateFolderRule.self, from: data)
+}
+
+/// Scrive la regola, o la rimuove se `nil` (l'utente ha tolto la regola attiva).
+nonisolated func saveDuplicateFolderRule(_ rule: DuplicateFolderRule?, defaults: UserDefaults = .standard) {
+    guard let rule else {
+        defaults.removeObject(forKey: duplicateFolderRuleDefaultsKey)
+        return
+    }
+    if let data = try? JSONEncoder().encode(rule) {
+        defaults.set(data, forKey: duplicateFolderRuleDefaultsKey)
+    }
+}
+
 /// Sceglie quale copia di un gruppo di doppioni tenere, e dice perche'.
 ///
 /// Funzione **pura**: nessun filesystem, nessun database, nessun ordine di input che conti.
-/// Precedenza: libreria principale -> cartella organizzata invece che import -> la piu'
-/// vecchia -> tie-break deterministico (percorso piu' corto, poi ordine della chiave).
-/// Il motivo riportato e' quello dell'**ultima** regola che ha davvero discriminato: due
-/// copie entrambe in `Foto iPhone/` non si distinguono per la prima regola, quindi la
-/// scelta (e la frase mostrata all'utente) scende a quella dopo.
+/// Precedenza: **la regola dell'utente, se copre il gruppo** -> libreria principale ->
+/// cartella organizzata invece che import -> la piu' vecchia -> tie-break deterministico
+/// (percorso piu' corto, poi ordine della chiave). Il motivo riportato e' quello
+/// dell'**ultima** regola che ha davvero discriminato: due copie entrambe in `Foto iPhone/`
+/// non si distinguono per la prima regola, quindi la scelta (e la frase mostrata
+/// all'utente) scende a quella dopo.
+///
+/// **Regola 0 — la regola per cartella dell'utente (ADR-0011, 2026-09-24).** `rule` precede
+/// le tre euristiche sotto, ma **solo sui gruppi che `rule.covers(group)` copre**: sugli
+/// altri gruppi non cambia nulla, bit per bit, rispetto a `rule: nil`. Un'istruzione
+/// esplicita dell'utente vale piu' di un'euristica, un'euristica vale piu' del silenzio.
+/// Quando piu' copie stanno nella cartella da tenere, fra loro decidono le tre regole 1-3
+/// gia' esistenti, applicate ai soli sopravvissuti — esattamente come fa gia' `narrow` per
+/// ognuna di esse: **nessun tie-break nuovo**. Il parametro non ha un default apposta
+/// (stessa disciplina dei quattro gate di ADR-0009): un chiamante che dimentica di passarlo
+/// deve fallire in compilazione, non silenziosamente ignorare la regola.
 ///
 /// **Layout riconfermato e decisione chiusa il 2026-09-01**, col volume reale collegato.
 /// `ls -1` dell'SSD ha dato esattamente il layout su cui la regola era stata scritta il
@@ -2119,11 +2206,19 @@ private nonisolated func isInImportFolder(_ entry: LibraryIndexEntry) -> Bool {
 /// il tie-break — arbitrario ma deterministico, e innocuo perche' i membri di un gruppo
 /// sono identici per definizione ed entrambe le cartelle sono mirrorate sull'HDD.
 ///
-/// **Nota misurata sulla regola 2**: `Import/` **non esiste** sull'SSD reale (2026-09-01),
-/// quindi `notAnImport` oggi non discrimina nulla. Va tenuta comunque — il wizard di #27-A
-/// creera' quella cartella — ma chi legge i test non deve credere che sia lei a decidere.
-/// Distribuzione reale dei 47.482 file media: `Foto iPhone` 18.180, `Takeout` 13.139,
-/// `Takeout 2` 10.708, `Foto Google Drive` 3.947, `Other` 1.508.
+/// **Nota misurata sulla regola 2, corretta il 2026-09-24**: fino a quel giorno qui si
+/// leggeva che `Import/` non esiste sull'SSD reale, quindi `notAnImport` non discrimina
+/// nulla. **Non e' piu' vero**: la passata del 2026-09-24 ha trovato `Import/` con 30 voci
+/// (il wizard di #27-A l'ha creata). La regola si attiva davvero, anche se raramente.
+///
+/// **`ASUS/` e' comparsa dopo il censimento del 2026-09-01 e oggi e' due terzi
+/// dell'elenco** (93.824 voci su 141.683, in gran parte `ASUS/foto/recup_dir.NN/`, un
+/// recupero PhotoRec/TestDisk da un PC morto). **Decisione di Enrico del 2026-09-24: resta
+/// di pari dignita' con le altre cartelle, `recup_dir.*` non si declassa** — stesso
+/// argomento gia' usato per `Takeout/`: l'origine automatica non dice niente sul valore del
+/// contenuto. **Non riaprire.** Distribuzione reale (2026-09-24, 141.683 voci): `ASUS`
+/// 93.824, `Foto iPhone` 18.530, `Takeout` 13.138, `Takeout 2` 10.708, `Foto Google Drive`
+/// 3.945, `Other` 1.508, `Import` 30.
 ///
 /// La proposta resta comunque solo una proposta, che l'utente puo' cambiare gruppo per
 /// gruppo prima di confermare.
@@ -2144,7 +2239,7 @@ private nonisolated func isInImportFolder(_ entry: LibraryIndexEntry) -> Bool {
 ///   di "tenere" l'unica copia esistente e' una riga che nel pannello Doppioni dichiara
 ///   doppione un file che copie non ne ha.
 // `nonisolated`: pura, chiamata dal pannello Doppioni fuori dal main thread (Task 5).
-nonisolated func duplicateKeepChoice(_ group: DuplicateGroup) -> DuplicateKeepChoice {
+nonisolated func duplicateKeepChoice(_ group: DuplicateGroup, rule: DuplicateFolderRule?) -> DuplicateKeepChoice {
     precondition(group.members.count > 1, "un gruppo di doppioni ha sempre almeno due membri")
 
     var candidates = group.members
@@ -2166,6 +2261,13 @@ nonisolated func duplicateKeepChoice(_ group: DuplicateGroup) -> DuplicateKeepCh
         reason = because
     }
 
+    // 0. La regola dell'utente, solo sui gruppi che copre (ADR-0011): un'istruzione
+    //    esplicita precede le euristiche sotto. `covers` garantisce gia' almeno un membro
+    //    sotto `keepIn`, quindi questo filtro non svuota mai i candidati; il guard di
+    //    `narrow` resta comunque la difesa strutturale, non duplicata qui.
+    if let rule, rule.covers(group) {
+        narrow(candidates.filter { topLevelFolderKey(of: $0.path) == rule.keepIn }, .userFolderRule)
+    }
     // 1. La libreria principale vince: e' la cartella che il job Mac -> SSD riscriverebbe
     //    comunque, e da cui partono i mirror su HDD e su Cubbit.
     narrow(candidates.filter(isInMainLibrary), .mainLibrary)
@@ -2245,6 +2347,8 @@ func duplicateKeepExplanation(_ choice: DuplicateKeepChoice, in group: Duplicate
 
     let lead: String
     switch choice.reason {
+    case .userFolderRule:
+        lead = "Tengo la copia che si trova \(place): hai chiesto di tenere le copie che stanno lì."
     case .mainLibrary:
         lead = "Tengo la copia che si trova \(place): è nella tua libreria principale, "
             + "quella che l'app riempie a ogni backup delle foto del Mac."
@@ -2305,25 +2409,122 @@ func duplicateKeepExplanation(_ choice: DuplicateKeepChoice, in group: Duplicate
     return lead + tie + copies
 }
 
+/// Vero se **tutte** le copie del gruppo stanno sotto la stessa cartella di primo livello
+/// (ADR-0011, spec §2.2): il caso più numeroso della libreria (11.082 gruppi solo dentro
+/// `ASUS/`). Un file in radice (nessuna cartella) non ha una cartella con cui accomunarsi:
+/// un gruppo che ne contiene uno **non** è mai interno, anche se l'altro membro sta in una
+/// cartella vera — non c'è una cartella comune da nominare.
+// `nonisolated`: pura, nessuno stato.
+nonisolated func duplicateGroupIsInternal(_ group: DuplicateGroup) -> Bool {
+    let keys = group.members.map { topLevelFolderKey(of: $0.path) }
+    guard let first = keys.first, let firstKey = first else { return false }
+    return keys.allSatisfy { $0 == firstKey }
+}
+
+/// Le cartelle di primo livello che compaiono **davvero** fra i membri dei gruppi, con
+/// quanti gruppi hanno almeno una copia lì — l'elenco onesto (solo le cartelle che hanno
+/// doppioni, non tutte quelle che esistono sull'SSD), ricavato dai gruppi già in memoria:
+/// **nessuna query nuova**, coerente con `duplicateGroups()` che non cambia (regola 3 dei
+/// piani di questo progetto). Il conteggio è **per gruppo, non per file**: un gruppo con
+/// tre copie nella stessa cartella conta una volta sola. Un file in radice non ha cartella
+/// e non produce nessuna voce. Ordine alfabetico sulla chiave normalizzata, per un elenco
+/// che non cambia posizione da un'apertura all'altra a parità di dati.
+// `nonisolated`: pura, chiamata dal pannello Doppioni fuori dal main thread.
+nonisolated func duplicateFolderList(_ groups: [DuplicateGroup]) -> [(folder: String, count: Int)] {
+    var counts: [String: Int] = [:]
+    for group in groups {
+        let foldersInGroup = Set(group.members.compactMap { topLevelFolderKey(of: $0.path) })
+        for folder in foldersInGroup {
+            counts[folder, default: 0] += 1
+        }
+    }
+    return counts.map { (folder: $0.key, count: $0.value) }.sorted { $0.folder < $1.folder }
+}
+
+/// I tre filtri del pannello Doppioni alla scala reale (ADR-0011, spec §2.2): per cartella,
+/// per tipo di gruppo (interno/incrociato), per copertura della regola dell'utente.
+///
+/// **Nessuno dei tre è un motore di decisione**: restringono quali gruppi si vedono, non
+/// nominano mai un sopravvissuto (regola 3 dei piani di questo progetto — quello resta
+/// compito esclusivo di `duplicateKeepChoice`). I tre campi sono opzionali e si compongono
+/// **in AND**: `nil` significa "nessun vincolo su questo filtro".
+///
+/// `apply(to:)` restituisce **indici**, non copie di gruppi: alla scala reale (27.798
+/// gruppi) copiare l'array a ogni cambio di filtro sarebbe il profilo esatto del bug di
+/// prestazioni del 2026-09-02.
+// `nonisolated`: value type puro, nessuno stato mutabile condiviso — nessuna riga di
+// sicurezza necessaria.
+nonisolated struct DuplicateFilter {
+    /// Cartella di primo livello richiesta, o `nil` per "Tutte". Un gruppo la soddisfa se
+    /// **almeno una** copia sta sotto questa cartella — non tutte: è il filtro «dov'è
+    /// successo», non «è tutto lì dentro» (quello è `internalOnly`).
+    var folder: String?
+    /// `nil` = "Tutti"; `true` = solo i gruppi **interni** (tutte le copie nella stessa
+    /// cartella di primo livello); `false` = solo quelli **incrociati** — il complemento
+    /// esatto: ogni gruppo è nell'uno o nell'altro, mai in entrambi, mai in nessuno dei due.
+    var internalOnly: Bool?
+    /// Se non `nil`, tiene solo i gruppi che la regola dell'utente copre (ADR-0011).
+    var rule: DuplicateFolderRule?
+
+    func apply(to groups: [DuplicateGroup]) -> [Int] {
+        groups.indices.filter { matches(groups[$0]) }
+    }
+
+    private func matches(_ group: DuplicateGroup) -> Bool {
+        if let folder, !group.members.contains(where: { topLevelFolderKey(of: $0.path) == folder }) {
+            return false
+        }
+        if let internalOnly, duplicateGroupIsInternal(group) != internalOnly {
+            return false
+        }
+        if let rule, !rule.covers(group) {
+            return false
+        }
+        return true
+    }
+}
+
 /// Quanti file al massimo si cestinano in un blocco solo.
 ///
-/// Il numero **non** viene dalla durata: il cestinamento misura ~56 file/s, quindi 500 file
-/// sono ~9 secondi, e il tempo vero se lo prende la rilettura che li precede. Viene dal
-/// **raggio di un guasto a meta' blocco**, che la misura 3 della spec mostra essere uno
-/// stato reale e non teorico: lo scollegamento dell'SSD a meta' produce lo stesso errore di
-/// "file inesistente" (2672 casi indistinguibili misurati), quindi un blocco interrotto
-/// lascia un registro di ripristino da leggere a mano. Piu' e' piccolo il blocco, meno c'e'
-/// da rimettere a posto.
+/// **Non e' piu' "un numero prudente": e' la granularita' dell'annullamento automatico**
+/// (ADR-0012, 2026-09-24). Il registro di ripristino tiene al massimo
+/// `TrashManifestStore.maxItems` voci e pota le piu' vecchie: sopra quel numero, un blocco
+/// poterebbe le voci **del blocco stesso** mentre le sta ancora scrivendo, e «Annulla
+/// l'ultimo spostamento» rimetterebbe a posto solo l'ultima parte — senza saperlo e senza
+/// dirlo. Da cui l'invariante protetto da un test (`DuplicateCapInvariantTests`):
+/// **`duplicateBatchFileCap <= TrashManifestStore.maxItems`**. La domanda da farsi, per chi
+/// un giorno volesse alzare questo numero, non e' "quanto dura un blocco" ma "quante foto
+/// voglio poter rimettere a posto con un clic".
 ///
-/// Prudente e **ritarabile alla prima passata reale con l'SSD collegato**: nessuno ha ancora
-/// visto quanti doppioni ci siano davvero, e 500 potrebbe rivelarsi scomodo in eccesso.
-nonisolated let duplicateBatchFileCap = 500
+/// **Il numero (2.000) e' condizionato a una misura, non scelto a tavolino** (Task 2 del
+/// piano `2026-09-24-duplicates-at-real-scale`): `TrashManifestStore.record` riscrive
+/// l'intero registro a ogni file, quindi il costo di un blocco al tetto e' quello del
+/// registro — misurato **il 2026-09-24: 6,58 secondi per 2.000 voci** scritte con percorsi
+/// di forma realistica (`ASUS/foto/recup_dir.NN/f<numero>.jpg`), ben sotto la soglia di
+/// decisione di ~30 s fissata da Enrico. Se in futuro la libreria crescesse abbastanza da
+/// spostare quel numero sopra i 30 s, il tetto scende al valore che la misura consente (si
+/// riprova 1.500, poi 1.000) — non si ritocca a occhio.
+///
+/// **Numeri della prima passata reale** (2026-09-24, 141.683 voci nell'elenco): 89.541
+/// copie in eccesso in 27.798 gruppi, 1,75 MB medi per copia. A 2.000 file per blocco sono
+/// **45 blocchi**; un blocco al tetto costa **~55 secondi** (~4,5 GB da rileggere — copie
+/// in eccesso piu' copie tenute — a 224 MiB/s misurati sull'SSD reale il 2026-09-01 ≈ 19 s,
+/// piu' 2.000 `trashItem` a 55,8 file/s misurati il 2026-08-27 ≈ 36 s): il raggio di un
+/// guasto resta un minuto di lavoro, e il blocco e' **interamente coperto**
+/// dall'annullamento automatico.
+nonisolated let duplicateBatchFileCap = 2_000
 
 /// Stesso ragionamento del tetto sui file, sull'altra grandezza che conta.
 ///
 /// **Decimale** (50 × 1000⁴) e non binario, per coerenza con `ByteCountFormatter(.file)`,
 /// che e' il modo in cui questa app scrive i byte all'utente ovunque: un tetto binario
 /// scatterebbe a un numero diverso da quello mostrato nel riepilogo.
+///
+/// **Non si alza insieme al tetto sui file** (ADR-0012): sulla libreria reale, a 1,75 MB
+/// medi per copia in eccesso, 2.000 file sono ~3,5 GB — i 50 GB restano **14 volte piu'
+/// larghi** del tetto sui file (erano 57 volte a 500). E' quasi sempre il tetto sui file a
+/// decidere; quello sui byte resta una guardia per una selezione fatta di video, che e' il
+/// suo lavoro, e alzarlo non cambierebbe niente sulla libreria di oggi.
 nonisolated let duplicateBatchByteCap: Int64 = 50_000_000_000
 
 /// Il blocco di doppioni che l'utente sta per confermare: quali gruppi, quale copia si
@@ -2335,11 +2536,19 @@ nonisolated let duplicateBatchByteCap: Int64 = 50_000_000_000
 /// c'e' alert che tenga.
 ///
 /// **Congela la copia tenuta di ogni gruppo.** `duplicateKeepChoice` gira una volta sola,
-/// qui, e il risultato viaggia dentro il blocco fino al `DuplicateTrasher`. Non e' un
-/// dettaglio di efficienza: fra il riepilogo che l'utente legge e il cestinamento l'indice
-/// puo' essere cambiato, e una scelta ricalcolata su dati nuovi puo' nominare **un'altra
-/// copia** — l'utente acconsente a cestinare A e viene cestinato B. Chi consuma questo tipo
-/// non deve mai ricalcolare la scelta: deve usare quella che trova qui dentro.
+/// dentro `init(groups:rule:)`, e il risultato viaggia dentro il blocco fino al
+/// `DuplicateTrasher`. Non e' un dettaglio di efficienza: fra il riepilogo che l'utente
+/// legge e il cestinamento l'indice puo' essere cambiato, e una scelta ricalcolata su dati
+/// nuovi puo' nominare **un'altra copia** — l'utente acconsente a cestinare A e viene
+/// cestinato B. Chi consuma questo tipo non deve mai ricalcolare la scelta: deve usare
+/// quella che trova qui dentro.
+///
+/// **Il congelamento vale anche attraverso un sottoinsieme (ADR-0011, 2026-09-24).**
+/// `init(entries:)` costruisce un blocco filtrando `Entry` gia' congelate altrove — senza
+/// chiamare `duplicateKeepChoice` nemmeno una volta — proprio perche' un secondo calcolo su
+/// un sottoinsieme e' la stessa trappola: con una regola dell'utente che puo' cambiare fra
+/// la lista e la conferma, ricalcolare puo' nominare un sopravvissuto diverso da quello che
+/// l'utente ha visto. E' per questo che questo costruttore esiste.
 ///
 /// Logica **pura**: nessun filesystem, nessun database.
 // `nonisolated`: costruita dal pannello Doppioni fuori dal main thread (Task 5) — e' il tipo
@@ -2374,20 +2583,40 @@ nonisolated struct DuplicateBatch {
     /// I **file** che si spostano, non i gruppi: e' il numero che l'utente deve leggere.
     let fileCount: Int
     let reclaimableBytes: Int64
-    /// Da quali cartelle se ne vanno, e quanti file per cartella. Solo le cartelle che
-    /// **perdono** file: quella della copia tenuta non compare se da li' non esce niente.
+    /// I byte che si **rileggono** per verificare l'intero blocco: **ogni** membro di ogni
+    /// gruppo, la copia tenuta compresa — e' la rilettura che precede il cestinamento
+    /// (ADR-0005), non lo spazio che si libera. **Non e' `reclaimableBytes`**: quella
+    /// esclude la copia tenuta, questa la include, perche' anche lei viene riletta e
+    /// rihashata per pretendere l'unanimita' del gruppo.
+    let verifiedBytes: Int64
+    /// Da quali **cartelle di primo livello** se ne vanno, e quanti gruppi per cartella.
+    /// Solo le cartelle che **perdono** file: quella della copia tenuta non compare se da
+    /// li' non esce niente. Cartella di primo livello e non genitore completo (ADR-0011,
+    /// 2026-09-24): con le copie in eccesso sparse su migliaia di `ASUS/foto/recup_dir.NN`,
+    /// la cartella genitrice completa produrrebbe migliaia di righe nel riepilogo — proprio
+    /// dove sta tutto il peso della prima conferma (ADR-0005, decisione 4).
     let folderBreakdown: [(folder: String, count: Int)]
     let exceedsCap: Bool
 
-    init(groups: [DuplicateGroup]) {
-        // La scelta si calcola qui, una volta, e da qui in poi non si ricalcola piu'.
+    /// Punto **unico** in cui la scelta si calcola: `duplicateKeepChoice` gira una volta
+    /// per gruppo, qui, con la regola dell'utente passata esplicitamente (parametro senza
+    /// default, stessa disciplina dei quattro gate di ADR-0009).
+    init(groups: [DuplicateGroup], rule: DuplicateFolderRule?) {
         // I gruppi ridotti a un solo membro si scartano prima: `duplicateKeepChoice` ha una
         // precondition su almeno due membri, e questo e' il confine dove il filtro va messo
         // (non ammorbidendo la guardia).
         let entries = groups
             .filter { $0.members.count > 1 }
-            .map { Entry(group: $0, choice: duplicateKeepChoice($0)) }
+            .map { Entry(group: $0, choice: duplicateKeepChoice($0, rule: rule)) }
+        self.init(entries: entries)
+    }
 
+    /// Costruisce il blocco da `Entry` **già congelate altrove** — non chiama mai
+    /// `duplicateKeepChoice`, nemmeno una volta: ricalcola solo i totali (ordine, conteggi,
+    /// ripartizione per cartella, tetto) sul sottoinsieme ricevuto. È il modo corretto di
+    /// ricavare un blocco da una selezione: filtrare le `Entry` di un blocco già costruito,
+    /// mai ricostruire dai gruppi.
+    init(entries: [Entry]) {
         // Ordine: spazio recuperabile decrescente, poi numero di copie decrescente, poi
         // l'hash. La terza chiave non e' decorativa: senza, due gruppi equivalenti sulle
         // prime due si disporrebbero secondo l'ordine di arrivo, e l'elenco che l'utente
@@ -2401,6 +2630,10 @@ nonisolated struct DuplicateBatch {
 
         self.fileCount = entries.reduce(0) { $0 + $1.leaving.count }
         self.reclaimableBytes = entries.reduce(0) { $0 + $1.reclaimableBytes }
+        // Ogni membro del gruppo, copia tenuta compresa: `group.size` e' la stessa
+        // grandezza usata da `reclaimableBytes`, moltiplicata per TUTTI i membri e non
+        // solo per quelli che se ne vanno.
+        self.verifiedBytes = entries.reduce(0) { $0 + $1.group.size * Int64($1.group.members.count) }
 
         var perFolder: [String: Int] = [:]
         for entry in entries {
@@ -2420,11 +2653,22 @@ nonisolated struct DuplicateBatch {
             || self.reclaimableBytes > duplicateBatchByteCap
     }
 
-    /// La cartella che contiene il file, come e' scritta su disco: l'utente la deve poter
-    /// ritrovare nel Finder, quindi `displayPath` e non la chiave minuscola.
-    private static func folder(of entry: LibraryIndexEntry) -> String {
-        let components = entry.displayPath.split(separator: "/", omittingEmptySubsequences: true).dropLast()
-        return components.isEmpty ? "(sull'SSD, fuori da ogni cartella)" : components.joined(separator: "/")
+    /// La cartella di **primo livello** che contiene il file, come e' scritta su disco:
+    /// l'utente la deve poter ritrovare nel Finder, quindi `displayPath` e non la chiave
+    /// minuscola. Non l'intero percorso genitore (ADR-0011): vedi il doc-comment di
+    /// `folderBreakdown`.
+    ///
+    /// Non piu' `private` da Task 11 (Step 1): `DuplicatesView` la riusa per mostrare i nomi
+    /// dei filtri con le maiuscole vere, invece di duplicare questa stessa trasformazione
+    /// una seconda volta — la classe di errore gia' pagata da `LibraryExclusions`/
+    /// `realResolvedPath`/`makeThumbnail`. Solo la visibilita' e' cambiata, zero righe di
+    /// comportamento.
+    static func folder(of entry: LibraryIndexEntry) -> String {
+        let components = entry.displayPath.split(separator: "/", omittingEmptySubsequences: true)
+        guard components.count > 1, let first = components.first else {
+            return "(sull'SSD, fuori da ogni cartella)"
+        }
+        return String(first)
     }
 
     /// Il testo del riepilogo. Puro, cosi' e' verificabile senza aprire la finestra.
@@ -2453,21 +2697,105 @@ nonisolated struct DuplicateBatch {
         for riga in folderBreakdown {
             out.append("Da «\(riga.folder)»: \(DuplicateBatch.count(riga.count, "file", "file")).")
         }
+        // Riga di coda, solo se le cartelle sono piu' di una: a questa scala e' l'unico
+        // modo per accorgersi subito di aver puntato la cartella sbagliata, senza dover
+        // contare le righe sopra a mano.
+        if folderBreakdown.count > 1 {
+            out.append("In tutto, i file escono da "
+                + "\(DuplicateBatch.count(folderBreakdown.count, "cartella", "cartelle")) diverse.")
+        }
 
         out.append("Le copie che stanno sull'HDD e su Cubbit restano dove sono: questa operazione "
             + "tocca soltanto l'SSD.")
 
-        if exceedsCap {
-            out.append("Hai selezionato troppi file in una volta sola. Togli qualche gruppo e "
-                + "procedi in più passaggi: se qualcosa va storto a metà, un blocco più piccolo "
-                + "è molto più facile da rimettere a posto.")
-        }
+        // La riga "Hai selezionato troppi file in una volta sola..." (che invitava a togliere
+        // gruppi a mano) e' stata rimossa il 2026-09-25, assenso di Enrico — TERZA eccezione
+        // autorizzata alla regola 6/7 dei piani di questo progetto (oltre a folderBreakdown e
+        // confirmationBlockedReason): con la corsa a piu' blocchi (ADR-0012) una selezione
+        // sopra il tetto non e' piu' rifiutata, si smaltisce da sola in blocchi automatici, e
+        // quella frase — pensata per il vecchio tetto che bloccava — diceva ora il contrario
+        // di quello che il riepilogo (DuplicatesStatus.runPlanLine/undoScopeLine, Task 9/11)
+        // dice un rigo sopra. Due frasi per la stessa informazione, di cui una falsa, erano
+        // una di troppo. `exceedsCap` resta sul tipo (usato altrove, es. duplicateBatchFileCap)
+        // ma non produce piu' nessuna riga qui.
 
         return out
     }
 
     private static func count(_ n: Int, _ singular: String, _ plural: String) -> String {
         "\(n.formatted()) \(n == 1 ? singular : plural)"
+    }
+}
+
+/// La sequenza di blocchi in cui si divide una selezione confermata — **una corsa**
+/// (ADR-0012, spec §3.2). L'utente conferma la corsa intera; `BackupRunner` (Task 10) la
+/// smaltisce un blocco alla volta, con `DuplicateTrasher.run` invariato.
+///
+/// **Divide ai due tetti (file e byte), il primo che scatta, e non spezza mai un gruppo fra
+/// due blocchi**: le `Entry` di un gruppo restano sempre tutte nello stesso blocco. Un
+/// gruppo la cui sola dimensione supera gia' un tetto finisce comunque in un blocco tutto
+/// suo — rifiutarlo lo renderebbe inarrivabile per sempre, ed e' l'unico caso in cui un
+/// blocco puo' superare il tetto.
+///
+/// **Ordine**: quello gia' deterministico del pannello, cosi' com'e' nell'array ricevuto —
+/// nessun riordino qui. `DuplicateBatch.groups` arriva gia' ordinato (spazio recuperabile
+/// decrescente, poi copie, poi hash), quindi il piano e' riproducibile e i primi blocchi
+/// sono quelli che recuperano piu' spazio.
+///
+/// **La stima della durata** usa due costanti **misurate sul volume reale**, non stimate a
+/// tavolino: 224 MiB/s di lettura+SHA256 (misurato 2026-09-01) e 55,8 file/s di `trashItem`
+/// (misurato 2026-08-27, su un'immagine disco — non ancora sull'SSD vero via FSKit, rischio
+/// noto della spec §8 punto 6). E' dichiarata come "circa", mai come una promessa.
+// `nonisolated`: value type puro, nessuno stato mutabile condiviso.
+nonisolated struct DuplicateRunPlan {
+    /// Misurato sull'SSD reale il 2026-09-01 (campione di 300 file, 1103 MiB in 4,9 s).
+    static let measuredReadThroughputBytesPerSecond: Double = 224 * 1024 * 1024
+    /// Misurato su immagine disco ExFAT il 2026-08-27.
+    static let measuredTrashItemsPerSecond: Double = 55.8
+
+    let blocks: [[DuplicateBatch.Entry]]
+    /// "Circa" quanto dura l'intera corsa: rilettura+rihash di ogni membro (copia tenuta
+    /// compresa, ADR-0005) piu' i `trashItem` dei file che se ne vanno. Mai zero per una
+    /// corsa non vuota: anche una manciata di file richiede un tempo reale non nullo, e "0
+    /// secondi" si leggerebbe come "istantaneo".
+    let estimatedSeconds: Double
+
+    init(entries: [DuplicateBatch.Entry],
+         fileCap: Int = duplicateBatchFileCap,
+         byteCap: Int64 = duplicateBatchByteCap) {
+        var blocks: [[DuplicateBatch.Entry]] = []
+        var current: [DuplicateBatch.Entry] = []
+        var currentFiles = 0
+        var currentBytes: Int64 = 0
+
+        for entry in entries {
+            let entryFiles = entry.leaving.count
+            let entryBytes = entry.reclaimableBytes
+            // Il gruppo che farebbe sforare un tetto chiude il blocco corrente — ma solo se
+            // il blocco corrente non e' vuoto: un gruppo da solo sopra il tetto deve avere
+            // comunque un blocco, mai essere scartato. `>` e non `>=`: alla soglia esatta
+            // il blocco resta lo stesso, stessa regola di `DuplicateBatch.exceedsCap`.
+            if !current.isEmpty,
+               (currentFiles + entryFiles > fileCap || currentBytes + entryBytes > byteCap) {
+                blocks.append(current)
+                current = []
+                currentFiles = 0
+                currentBytes = 0
+            }
+            current.append(entry)
+            currentFiles += entryFiles
+            currentBytes += entryBytes
+        }
+        if !current.isEmpty { blocks.append(current) }
+        self.blocks = blocks
+
+        // La rilettura tocca OGNI membro, la copia tenuta compresa (ADR-0005): stessa
+        // grandezza di `DuplicateBatch.verifiedBytes`, sommata qui sull'intera corsa.
+        let totalBytesToVerify = entries.reduce(Int64(0)) { $0 + $1.group.size * Int64($1.group.members.count) }
+        let totalFilesToTrash = entries.reduce(0) { $0 + $1.leaving.count }
+        let readSeconds = Double(totalBytesToVerify) / Self.measuredReadThroughputBytesPerSecond
+        let trashSeconds = Double(totalFilesToTrash) / Self.measuredTrashItemsPerSecond
+        self.estimatedSeconds = entries.isEmpty ? 0 : max(readSeconds + trashSeconds, 1)
     }
 }
 
@@ -2766,6 +3094,95 @@ nonisolated final class TrashManifestStore: @unchecked Sendable {
         // contiene i **percorsi** di tutte le foto toccate, in chiaro. Best-effort — un
         // registro scritto e' piu' importante di un registro con i permessi giusti.
         try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    }
+}
+
+/// Una riga della storia degli spostamenti (`TrashHistory`): un blocco concluso, con i
+/// percorsi originali assoluti di tutte le foto che quel blocco ha spostato.
+nonisolated struct TrashHistoryEntry: Codable {
+    let blockId: String
+    let trashedAt: Date
+    /// Percorsi **assoluti**, come `TrashedItem.originalDisplayPath`: e' li' che la foto
+    /// stava prima di finire nel Cestino.
+    let originalPaths: [String]
+}
+
+/// La storia degli spostamenti (ADR-0012, D13 punto 4): un file append-only sul disco
+/// interno, mai sull'SSD, su cui l'app scrive **una riga per blocco concluso** (JSON su una
+/// riga, `.jsonl`) con i percorsi originali delle foto di quel blocco.
+///
+/// **Non e' un annullamento.** Non ha bottoni, non legge mai il proprio contenuto per
+/// decidere niente, e non aggiunge nessun percorso distruttivo: `TrashManifestStore` resta
+/// l'unico documento da cui «Annulla l'ultimo spostamento» rimette a posto le foto. Questa
+/// storia esiste perche' il registro di ripristino ricorda al massimo
+/// `TrashManifestStore.maxItems` voci (2.000) e le pota, mentre una corsa puo' toccarne
+/// 89.541: dopo 45 blocchi, senza questa storia, il Cestino dell'SSD diventerebbe una
+/// cartella piatta di foto di cui nessuno saprebbe piu' il percorso d'origine. Si legge a
+/// mano, dal Finder o da un editor di testo, solo se serve ritrovare da dove veniva una foto
+/// che il registro ha gia' potato.
+///
+/// **Costa una scrittura per blocco, non per file**: non riapre il costo quadratico che ha
+/// condizionato il tetto di `duplicateBatchFileCap` (`TrashManifestStore.record` riscrive
+/// l'intero registro a ogni file; qui si aggiunge solo una riga, una volta per blocco).
+///
+/// **Il fallimento della scrittura non deve mai far fallire il blocco**: e' una storia, non
+/// un prerequisito del cestinamento. `append` non lancia: un file illeggibile, un permesso
+/// negato, qualunque guaio di I/O restano confinati qui dentro.
+// `nonisolated`: chiamata da `BackupRunner` (Task 10) fuori dal main thread, una volta per
+// blocco concluso. Sicura per costruzione: l'unico stato mutabile e' il file su disco,
+// toccato solo dentro `lock.withLock`; `url` e' `let`.
+nonisolated final class TrashHistory: @unchecked Sendable {
+
+    enum StoreError: Error, LocalizedError {
+        case invalidLocation(String)
+        var errorDescription: String? {
+            switch self {
+            case .invalidLocation(let p): return "Posizione non consentita per la storia degli spostamenti: \(p)"
+            }
+        }
+    }
+
+    private let url: URL
+    private let lock = NSLock()
+
+    init(url: URL) throws {
+        // Stessa allow-list di `TrashManifestStore`/`LibraryIndexStore`, non una seconda:
+        // questo file nomina i percorsi delle foto e non deve mai finire sul volume sorgente.
+        guard isAllowedStoreLocation(url) else { throw StoreError.invalidLocation(url.path) }
+        self.url = url
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
+                                                withIntermediateDirectories: true)
+    }
+
+    /// Scrive una riga per il blocco appena concluso. Un blocco senza file spostati non
+    /// produce nessuna riga: non c'e' niente da ricordare. Best-effort e silenzioso su
+    /// qualunque errore di I/O — vedi il doc-comment del tipo.
+    func append(blockId: String, trashed: [TrashedItem], at date: Date = Date()) {
+        guard !trashed.isEmpty else { return }
+        let entry = TrashHistoryEntry(blockId: blockId, trashedAt: date,
+                                      originalPaths: trashed.map(\.originalDisplayPath))
+        guard let data = try? JSONEncoder().encode(entry) else { return }
+        lock.withLock {
+            appendLineUnsynchronized(data)
+        }
+    }
+
+    /// Apertura POSIX a basso livello in **sola append**: `O_APPEND` garantisce che ogni
+    /// `write` finisca alla fine del file, atomicamente rispetto ad altri scrittori sullo
+    /// stesso file — e' cio' che rende impossibile riscrivere le righe precedenti, a
+    /// differenza di un `Data.write(to:)` che sostituirebbe l'intero contenuto. `O_CREAT`
+    /// crea il file con permessi `0600` se non esiste ancora; `fchmod` e' una seconda difesa
+    /// best-effort per il caso in cui il file esistesse gia' con permessi diversi.
+    private func appendLineUnsynchronized(_ data: Data) {
+        let fd = open(url.path, O_APPEND | O_CREAT | O_WRONLY, 0o600)
+        guard fd >= 0 else { return }
+        defer { close(fd) }
+        _ = fchmod(fd, 0o600)
+        var line = data
+        line.append(0x0A) // newline: una riga per blocco.
+        _ = line.withUnsafeBytes { buffer in
+            write(fd, buffer.baseAddress, buffer.count)
+        }
     }
 }
 
@@ -3119,6 +3536,36 @@ nonisolated struct DuplicateTrashOutcome {
     var interrupted: Bool = false
 }
 
+/// Perche' una **corsa** (la sequenza di blocchi di un `DuplicateRunPlan`) si e' fermata
+/// prima dell'ultimo blocco pianificato (ADR-0012, D12). Un blocco che finisce con
+/// `.volumeVanished` o `.trashFailed` interrompe l'intera catena — sono guasti del volume,
+/// e proseguire su altri blocchi moltiplicherebbe il raggio del danno. I gruppi saltati
+/// dalla verifica (`DuplicateTrashSkipReason`, diversi da `trashFailed`) **non** fermano
+/// niente: su questa libreria sono la normalita' (ADR-0002), e fermarsi li' vorrebbe dire
+/// non arrivare mai in fondo a una corsa vera.
+nonisolated enum DuplicateRunStopReason: Equatable {
+    case volumeVanished
+    case trashFailed(displayPath: String, detail: String)
+    case interrupted
+}
+
+/// L'esito di un'intera corsa: l'aggregazione di tutti i blocchi smaltiti prima che la
+/// catena si fermasse — per un guasto vero, per l'utente, o perche' e' arrivata in fondo
+/// (`stopReason == nil`). Puro: `BackupRunner` (Task 10) lo costruisce accumulando i
+/// `DuplicateTrashOutcome` di ogni blocco via `DuplicateTrasher.run`, invariato.
+// `nonisolated`: value type senza stato condiviso.
+nonisolated struct DuplicateRunOutcome {
+    /// Blocchi del piano arrivati in fondo con successo (smaltiti, non necessariamente senza
+    /// gruppi saltati). Non conta il blocco su cui la corsa si e' eventualmente fermata.
+    var blocksCompleted: Int = 0
+    var totalBlocks: Int = 0
+    /// Tutti i file spostati nel Cestino, di ogni blocco della corsa.
+    var trashedFiles: [TrashedItem] = []
+    /// Tutti i gruppi saltati, di ogni blocco della corsa.
+    var skippedGroups: [(group: DuplicateGroup, reason: DuplicateTrashSkipReason)] = []
+    var stopReason: DuplicateRunStopReason? = nil
+}
+
 // MARK: - Righe di stato del pannello Doppioni (Task 6, 2026-08-31)
 
 /// Cosa dire in cima al pannello Doppioni, perche' la cancellazione e' disattivata in questo
@@ -3265,14 +3712,6 @@ enum DuplicatesStatus {
         return nil
     }
 
-    /// Se il blocco selezionato puo' procedere alla conferma vera. Sopra il tetto la UI lo
-    /// dice invece di rifiutare senza spiegare (deciso il 2026-08-28).
-    static func confirmationBlockedReason(exceedsCap: Bool) -> String? {
-        guard exceedsCap else { return nil }
-        return "Hai selezionato troppi file in una volta sola: procedi in più passaggi più "
-            + "piccoli, così un eventuale intoppo a metà resta facile da rimettere a posto."
-    }
-
     /// Come si racconta l'esito di un blocco appena smaltito: mai un silenzio, sempre un
     /// numero onesto — sia sui file gia' spostati sia sui gruppi rimasti intatti.
     static func outcomeLines(_ outcome: DuplicateTrashOutcome) -> [Line] {
@@ -3305,6 +3744,174 @@ enum DuplicatesStatus {
                 "Fatto: \(count(outcome.trashedFiles.count, "file spostato nel Cestino", "file spostati nel Cestino"))."))
         }
         return out
+    }
+
+    // MARK: - Righe della corsa (Task 9, ADR-0011/0012, 2026-09-25)
+
+    /// Quanto e' selezionato adesso, rispetto a quanto e' visibile (una regola cartella puo'
+    /// nascondere gruppi, ADR-0011) e a quanto esiste in tutto. Mostra SEMPRE sia il visibile
+    /// sia il selezionato — mai uno solo dei due, altrimenti "quanti gruppi vedo" e "quanti ne
+    /// ho scelti" si confondono. Dice sempre "recuperabili" (potenziale): niente e' stato
+    /// ancora spostato qui, la corsa non e' nemmeno cominciata.
+    static func selectionLine(visibleGroups: Int, totalGroups: Int, selectedGroups: Int,
+                              files: Int, reclaimableBytes: Int64) -> String {
+        let visibility = "\(visibleGroups.formatted()) di \(totalGroups.formatted()) gruppi visibili"
+        guard selectedGroups > 0 else {
+            return "\(visibility): non hai ancora selezionato niente."
+        }
+        let bytesText = ByteCountFormatter.string(fromByteCount: reclaimableBytes, countStyle: .file)
+        return "\(visibility) · hai selezionato \(count(selectedGroups, "gruppo", "gruppi")), "
+            + "\(count(files, "file", "file")), \(bytesText) recuperabili."
+    }
+
+    /// Quanti blocchi servira' la corsa e quanto durera' all'incirca (ADR-0012). Un solo
+    /// blocco e' il caso comune: la frase non deve nominare "blocco"/"blocchi" in quel caso,
+    /// altrimenti l'utente si chiede cosa sia un blocco quando per lui non esiste.
+    static func runPlanLine(blockCount: Int, files: Int, estimatedSeconds: Double) -> String {
+        let duration = FileSyncer.SyncResult.hms(Int(estimatedSeconds.rounded()))
+        guard blockCount > 1 else {
+            return "Sposterò \(count(files, "file", "file")) nel Cestino, in circa \(duration)."
+        }
+        return "Sposterò \(count(files, "file", "file")) nel Cestino in \(count(blockCount, "blocco", "blocchi")), "
+            + "in circa \(duration) in totale."
+    }
+
+    /// Cosa copre davvero «Annulla l'ultimo spostamento» quando la corsa e' divisa in piu' di
+    /// un blocco: solo l'ultimo. L'utente deve saperlo PRIMA di confermare, non scoprirlo dopo
+    /// un guasto a meta' corsa. `nil` con un blocco solo: non c'e' niente da spiegare, "annulla"
+    /// copre gia' tutto.
+    static func undoScopeLine(blockCount: Int, fileCapPerBlock: Int) -> String? {
+        guard blockCount > 1 else { return nil }
+        return "«Annulla l'ultimo spostamento» rimette a posto solo l'ultimo blocco (fino a "
+            + "\(count(fileCapPerBlock, "foto", "foto")) alla volta). Le altre restano nel Cestino "
+            + "dell'SSD, da dove puoi comunque recuperarle a mano — e restano comunque anche "
+            + "sull'HDD e su Cubbit."
+    }
+
+    /// L'avanzamento durante una corsa a piu' blocchi: `filesTotal` e' il totale di TUTTA la
+    /// corsa, non del solo blocco in esecuzione — altrimenti la barra ripartirebbe da zero
+    /// percepito a ogni blocco, quando invece sta continuando a lavorare sulla stessa corsa.
+    static func runProgressLine(blockIndex: Int, blockCount: Int, filesDone: Int, filesTotal: Int) -> String {
+        "Blocco \(blockIndex) di \(blockCount) · \(filesDone.formatted()) di \(count(filesTotal, "file", "file"))"
+    }
+
+    /// Una categoria stabile per raggruppare i gruppi saltati di un'intera corsa: due gruppi
+    /// saltati per lo stesso motivo diventano una riga sola con un conteggio, mai due righe
+    /// identiche ne' un "e altri" che ne nasconde qualcuno.
+    private static func skipCategoryKey(_ reason: DuplicateTrashSkipReason) -> String {
+        switch reason {
+        case .contentDisagrees: return "content-disagrees"
+        case .unreadable: return "unreadable"
+        case .sizeChanged: return "size-changed"
+        case .outsideLibrary: return "outside-library"
+        case .notMedia: return "not-media"
+        case .nothingToTrash: return "nothing-to-trash"
+        case .trashFailed: return "trash-failed"
+        case .keeperVanished: return "keeper-vanished"
+        }
+    }
+
+    private static func skipCategoryDescription(_ reason: DuplicateTrashSkipReason) -> String {
+        switch reason {
+        case .contentDisagrees:
+            return "perché il contenuto non era più identico fra le copie"
+        case .unreadable:
+            return "perché una copia non si è lasciata rileggere"
+        case .sizeChanged:
+            return "perché una dimensione non coincideva più con quella registrata"
+        case .outsideLibrary:
+            return "perché un percorso risolveva fuori dalla libreria"
+        case .notMedia:
+            return "perché non erano foto né video"
+        case .nothingToTrash:
+            return "perché era rimasta una copia sola"
+        case .trashFailed:
+            return "perché lo spostamento è fallito"
+        case .keeperVanished:
+            return "perché la copia da tenere è sparita a metà"
+        }
+    }
+
+    /// Come si racconta l'esito di un'intera corsa (piu' blocchi, ADR-0012) — non di un
+    /// blocco solo, quella resta `outcomeLines`. Il motivo dello stop, se c'e' n'e' uno, viene
+    /// prima di tutto; i gruppi saltati sono raggruppati per motivo su tutta la corsa, mai
+    /// troncati con "e altri".
+    static func runOutcomeLines(_ outcome: DuplicateRunOutcome) -> [Line] {
+        var out: [Line] = []
+
+        switch outcome.stopReason {
+        case .volumeVanished:
+            out.append(Line(id: "run-volume-vanished", tone: .warning, text:
+                "L'SSD si è scollegato durante la corsa, quindi mi sono fermato subito: "
+                + "\(count(outcome.blocksCompleted, "blocco è stato completato", "blocchi sono stati completati")) "
+                + "su \(count(outcome.totalBlocks, "previsto", "previsti")), "
+                + "\(count(outcome.trashedFiles.count, "file era già stato spostato nel Cestino", "file erano già stati spostati nel Cestino")) in totale."))
+        case .trashFailed(let path, let detail):
+            out.append(Line(id: "run-trash-failed", tone: .warning, text:
+                "Non è stato possibile spostare \(path) nel Cestino (\(detail)): mi sono fermato qui. "
+                + "\(count(outcome.blocksCompleted, "blocco è stato completato", "blocchi sono stati completati")) "
+                + "su \(count(outcome.totalBlocks, "previsto", "previsti"))."))
+        case .interrupted:
+            out.append(Line(id: "run-interrupted", tone: .info, text:
+                "Hai fermato tu la corsa: "
+                + "\(count(outcome.blocksCompleted, "blocco è stato completato", "blocchi sono stati completati")) "
+                + "su \(count(outcome.totalBlocks, "previsto", "previsti"))."))
+        case nil:
+            out.append(Line(id: "run-completed", tone: .ok, text:
+                "Fatto: \(count(outcome.totalBlocks, "blocco completato", "blocchi completati")), "
+                + "\(count(outcome.trashedFiles.count, "file spostato nel Cestino", "file spostati nel Cestino"))."))
+        }
+
+        if !outcome.skippedGroups.isEmpty {
+            var order: [String] = []
+            var counts: [String: Int] = [:]
+            var descriptions: [String: String] = [:]
+            for skipped in outcome.skippedGroups {
+                let key = skipCategoryKey(skipped.reason)
+                if counts[key] == nil {
+                    order.append(key)
+                    descriptions[key] = skipCategoryDescription(skipped.reason)
+                }
+                counts[key, default: 0] += 1
+            }
+            out.append(Line(id: "run-skipped-count", tone: .warning, text:
+                "\(count(outcome.skippedGroups.count, "gruppo non è stato smaltito", "gruppi non sono stati smaltiti")) "
+                + "in tutta la corsa: trovi il motivo di ciascuno qui sotto."))
+            for key in order {
+                out.append(Line(id: "run-skipped-\(key)", tone: .warning, text:
+                    "\(count(counts[key] ?? 0, "gruppo", "gruppi")) \(descriptions[key] ?? "")."))
+            }
+        }
+
+        return out
+    }
+
+    // MARK: - Filtri e regola per cartella (Task 11, Step 1-4, ADR-0011)
+
+    /// Mostrato mentre filtro o regola vengono applicati fuori dal main (~5s su tutta la
+    /// libreria, misurato — Regola 9 del piano): uno stato, non una barra di progresso, che
+    /// il piano vieta esplicitamente di aggiungere per un ricalcolo di questa durata.
+    static let applyingLine = "Sto applicando…"
+
+    /// La riga sopra la lista quando il filtro «Tutte le copie nella stessa cartella» è
+    /// attivo (spec §2.5, categoria 1): dice **con quale criterio** l'app ha scelto, non
+    /// «l'app ha scelto per te», che non è un'informazione. Fissa (nessun parametro): il
+    /// criterio non cambia da un gruppo interno all'altro, è sempre lo stesso — data più
+    /// vecchia, poi percorso più corto.
+    static let internalGroupsCriterionLine =
+        "Queste copie stanno tutte nella stessa cartella: tengo quella con la data più vecchia "
+        + "e, a parità, quella col percorso più corto. Le copie sono identiche fra loro, quindi "
+        + "qualunque delle due si tenga il contenuto resta."
+
+    /// Quanti gruppi copre la regola per cartella attiva, e quanti la toccano ma restano
+    /// fuori perché hanno una copia anche in una terza cartella (spec §2.4/§2.5, categoria 3).
+    static func ruleCoverageLine(covered: Int, excludedByThirdFolder: Int) -> String {
+        let coveredText = "La regola copre \(count(covered, "gruppo", "gruppi"))"
+        guard excludedByThirdFolder > 0 else { return "\(coveredText)." }
+        let subject = excludedByThirdFolder == 1 ? "gruppo ha" : "gruppi hanno"
+        let verb = excludedByThirdFolder == 1 ? "resta" : "restano"
+        return "\(coveredText); \(excludedByThirdFolder.formatted()) \(subject) una copia anche "
+            + "in un'altra cartella e \(verb) fuori."
     }
 
     private static func count(_ n: Int, _ singular: String, _ plural: String) -> String {
@@ -4030,6 +4637,17 @@ nonisolated final class LibraryIndexStore: @unchecked Sendable {
         try queue.sync { try countUnsynchronized() }
     }
 
+    /// `MAX(hashed_at)` su tutte le entry, o `nil` su un indice vuoto (Task 12, D15 della
+    /// spec 2026-09-24). **Ripiego dichiarato**, non la fonte principale: quella e'
+    /// `libraryListLastCompleteReadDefaultsKey`, scritta una volta a lettura finita. Questo
+    /// numero serve solo per gli elenchi costruiti prima che quella chiave esistesse, o se
+    /// per qualunque motivo manca. E' un limite **inferiore**: una lettura incrementale che
+    /// non trova niente di nuovo non tocca nessun `hashed_at`, quindi puo' far sembrare
+    /// l'elenco PIU' vecchio di quanto e' — mai il contrario, mai un avviso taciuto.
+    func newestHashedAt() throws -> Double? {
+        try queue.sync { try newestHashedAtUnsynchronized() }
+    }
+
     // MARK: Implementazioni (gia' sulla coda: non chiamarle dall'esterno)
 
     private func upsertUnsynchronized(_ entries: [LibraryIndexEntry]) throws {
@@ -4188,6 +4806,17 @@ nonisolated final class LibraryIndexStore: @unchecked Sendable {
         defer { sqlite3_finalize(stmt) }
         guard try stepRow(stmt) else { throw sqlError() }
         return Int(sqlite3_column_int64(stmt, 0))
+    }
+
+    private func newestHashedAtUnsynchronized() throws -> Double? {
+        let stmt = try prepare("SELECT MAX(hashed_at) FROM entries;")
+        defer { sqlite3_finalize(stmt) }
+        guard try stepRow(stmt) else { throw sqlError() }
+        // MAX su una tabella vuota restituisce NULL, non un errore: si legge il TIPO della
+        // colonna, non un valore surrogato (0.0) che si confonderebbe con una data vera
+        // (1 gennaio 1970).
+        guard sqlite3_column_type(stmt, 0) != SQLITE_NULL else { return nil }
+        return sqlite3_column_double(stmt, 0)
     }
 }
 
@@ -4904,6 +5533,104 @@ enum LibraryIndexAutoRefresh {
     /// contrario di quello che dice l'interruttore in Impostazioni.
     static func isEnabled(defaults: UserDefaults = .standard) -> Bool {
         defaults.object(forKey: defaultsKey) as? Bool ?? true
+    }
+}
+
+// MARK: - Da quando l'elenco non e' aggiornato (Task 12, D15-D17)
+
+/// Chiave `UserDefaults` dell'istante dell'ultima lettura arrivata **in fondo** (D15, spec
+/// 2026-09-24 §4.1). Scritta in **un punto solo**: il `onFinish` di
+/// `BackupRunner.startLibraryIndexScan`, dove la completezza e' gia' nota. Vale per tutti gli
+/// ingressi (bottone manuale, passo 2 del backup): passano tutti da quella funzione.
+/// `deleteIndexAndRecreate()` la azzera.
+nonisolated let libraryListLastCompleteReadDefaultsKey = "libraryListLastCompleteReadAt"
+
+/// Da quanto l'elenco delle foto gia' sull'SSD non viene rimesso in pari. Usato **sia** dal
+/// passo di anteprima del wizard di import **sia** dalla card di Diagnostica: una sola fonte
+/// per il testo, come `LibraryIndexStatus`/`DuplicatesStatus`. Registro anti-gergo: niente
+/// "indice"/"hash"/"scansione"/"registro"/"cache" in nessuna delle cinque diramazioni.
+nonisolated enum LibraryListFreshness {
+    enum Tone { case ok, info, warning }
+    struct Line: Identifiable { let id: String; let tone: Tone; let text: String }
+
+    /// 14 giorni (D16): l'asimmetria fra i due errori — a 30 giorni l'avviso comparirebbe
+    /// troppo raramente, col ritmo reale di backup, per essere utile; a 2-3 giorni
+    /// comparirebbe sempre, e "sovrastimare i problemi insegna a ignorare l'allarme" e' un
+    /// principio gia' applicato in questo progetto (ADR-0007). Due settimane e' abbastanza
+    /// per aver dimenticato di aver copiato qualcosa dal Finder, abbastanza poco perche'
+    /// rimediare costi pochi minuti.
+    static let thresholdDays = 14
+
+    private static let dateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "it_IT")
+        f.setLocalizedDateFormatFromTemplate("EEEE d MMMM")
+        return f
+    }()
+
+    /// Vero solo se la lettura e' arrivata davvero in fondo: niente lanciato, e la
+    /// traversata ha coperto tutta la libreria. `traversalIncomplete` include GIA'
+    /// `cancelled`/`volumeVanished`/le cartelle illeggibili (vedi i doc-comment su
+    /// `LibraryIndexer.Progress` e la riga che li assegna in `scan`): un controllo solo, non
+    /// tre che potrebbero divergere silenziosamente l'uno dall'altro in futuro.
+    static func readReachedTheEnd(progress: LibraryIndexer.Progress?, error: Error?) -> Bool {
+        guard error == nil, let progress else { return false }
+        return !progress.traversalIncomplete
+    }
+
+    /// La riga da mostrare — cinque diramazioni (spec §4.3), non due: "mai creato" e "data
+    /// non disponibile" sono situazioni diverse (la prima non ha nessuna foto conosciuta, la
+    /// seconda ne ha ma non sa da quando), e leggerle come la stessa cosa direbbe il falso
+    /// in una delle due.
+    ///
+    /// - Parameter hasAnyEntries: l'elenco esiste (almeno una foto conosciuta)? Se `false`,
+    ///   `lastCompleteReadAt` non conta: e' sempre la diramazione 1, mai la 4.
+    /// - Parameter lastCompleteReadAt: la data dell'ultima lettura arrivata in fondo, letta
+    ///   dalla chiave dedicata — o il ripiego `LibraryIndexStore.newestHashedAt()` se quella
+    ///   manca. E' un limite **inferiore**: una lettura incrementale che non trova niente di
+    ///   nuovo non tocca nessun `hashed_at`, quindi il ripiego puo' far sembrare l'elenco PIU'
+    ///   vecchio di quanto e' — mai il contrario, mai un avviso taciuto.
+    /// - Parameter isReading: una lettura e' in corso adesso — precede tutto il resto; il
+    ///   bottone di avvio e' comunque gia' disattivato da `JobStartGate`.
+    static func line(hasAnyEntries: Bool, lastCompleteReadAt: Date?, isReading: Bool,
+                     now: Date = Date()) -> Line {
+        if isReading {
+            return Line(id: "reading", tone: .info, text:
+                "L'app sta controllando l'SSD per rimettere in pari l'elenco: aspetta che finisca.")
+        }
+        guard hasAnyEntries else {
+            return Line(id: "never-built", tone: .warning, text:
+                "Non hai ancora creato l'elenco delle foto già salvate sull'SSD: l'app non può "
+                    + "sapere quali di queste foto hai già, e le copierà tutte.")
+        }
+        guard let lastCompleteReadAt else {
+            return Line(id: "unknown", tone: .info, text:
+                "L'app non sa da quando l'elenco delle foto già sull'SSD non viene rimesso in pari.")
+        }
+        // Giorni interi trascorsi, mai frazionari: alla soglia esatta (14 giorni, zero
+        // secondi in piu') deve scattare l'avviso, non restare neutro per un arrotondamento.
+        let days = Int(now.timeIntervalSince(lastCompleteReadAt) / 86_400)
+        let dateText = dateFormatter.string(from: lastCompleteReadAt)
+        guard days >= thresholdDays else {
+            return Line(id: "fresh", tone: .ok, text:
+                "L'elenco delle foto già sull'SSD è aggiornato a \(dateText).")
+        }
+        return Line(id: "stale", tone: .warning, text:
+            "L'elenco delle foto già sull'SSD è fermo al \(dateText), \(agoText(days: days)). Se "
+                + "da allora hai copiato foto sull'SSD dal Finder, l'app non le conosce e "
+                + "potrebbe importarle di nuovo.")
+    }
+
+    /// "tre settimane fa" — mai una cifra grezza di giorni sopra la soglia: si scrive in
+    /// settimane, come l'esempio della spec. Sotto una settimana resta in giorni, col
+    /// plurale giusto. **Non `private`**, apposta: con `thresholdDays == 14` la diramazione
+    /// "stale" di `line(...)` non raggiunge mai `weeks < 2`, quindi i plurali di giorni e la
+    /// settimana singola sono testabili solo chiamando questa funzione **direttamente** — la
+    /// stessa ragione per cui `FileSyncer.SyncResult.hms` non e' `private`.
+    static func agoText(days: Int) -> String {
+        let weeks = days / 7
+        guard weeks > 0 else { return days == 1 ? "un giorno fa" : "\(days) giorni fa" }
+        return weeks == 1 ? "una settimana fa" : "\(weeks) settimane fa"
     }
 }
 
@@ -8034,8 +8761,9 @@ final class BackupRunner: ObservableObject {
     ///
     /// `private(set)` da quando #41 e' stato chiuso allo stesso modo (2026-09-24): l'unico
     /// scrittore esterno che restava (`DuplicatesView.startTrashing`, che azzerava
-    /// `lastTrashRestoreOutcome` all'avvio di uno spostamento) e' stato spostato dentro
-    /// `startDuplicateTrashing` qui sotto — l'invariante "un `begin` riuscito e' sempre
+    /// `lastTrashRestoreOutcome` all'avvio di uno spostamento) e' stato spostato dentro il
+    /// runner — oggi `startDuplicateTrashRun` (Task 10/11, il percorso a blocco singolo di
+    /// #41 e' stato rimosso il 2026-09-25) — l'invariante "un `begin` riuscito e' sempre
     /// seguito da un `end` nello stesso `MainActor.run` che pubblica l'esito" e' verificabile
     /// leggendo una sola funzione solo se nessun altro puo' muovere questo stato.
     @Published private(set) var trashRestoreProgress: (done: Int, total: Int)? = nil
@@ -8070,7 +8798,7 @@ final class BackupRunner: ObservableObject {
     /// canale della finestra Doppioni (regola `AlertSink`): mai `pendingAlert`, che ha un
     /// solo presentatore nella finestra principale.
     func startTrashRestore(onAlert: @escaping (SimpleAlert) -> Void) {
-        // Stessa disciplina di `startDuplicateTrashing` (Task 4, ROADMAP #41): il motivo
+        // Stessa disciplina di `startDuplicateTrashRun` sotto: il motivo
         // **specifico** prima dell'alert generico. Senza questa rivalutazione, uno
         // scollegamento dell'SSD mentre la conferma non distruttiva e' aperta farebbe
         // comunque partire l'annullamento — si fermerebbe da solo con un esito onesto
@@ -8102,8 +8830,9 @@ final class BackupRunner: ObservableObject {
         trashRestoreStopRequested = false
         lastTrashRestoreOutcome = nil
         // Invalidazione reciproca (D5, ROADMAP #41): un annullamento rende obsoleto l'esito
-        // di uno spostamento mostrato in precedenza, riguardava un blocco diverso.
-        lastDuplicateTrashOutcome = nil
+        // di una corsa mostrato in precedenza, riguardava blocchi diversi. Dal 2026-09-25
+        // (Task 14) il percorso a blocco singolo e' rimosso: si invalida `lastDuplicateRunOutcome`.
+        lastDuplicateRunOutcome = nil
         let items = manifest.pendingInLastBatch()
         trashRestoreProgress = (0, items.count)
 
@@ -8136,38 +8865,50 @@ final class BackupRunner: ObservableObject {
         trashRestoreCancelFlag?.cancel()
     }
 
-    // MARK: Spostamento nel Cestino (ROADMAP #41, 2026-09-24)
+    // MARK: Corsa a piu' blocchi (Task 10, ADR-0011/0012)
+    //
+    // Il percorso a blocco singolo (`startDuplicateTrashing`/`stopDuplicateTrashing`/
+    // `duplicateTrashProgress`/`duplicateTrashStopRequested`/`lastDuplicateTrashOutcome`/
+    // `duplicateTrashCancelFlag`, nati con ROADMAP #41 il 2026-09-24) e' stato **rimosso il
+    // 2026-09-25 (Task 14)**: la corsa a piu' blocchi qui sotto li ha sostituiti per intero
+    // — `DuplicatesView` non li chiamava piu' da quando il Task 11 ha ricablato
+    // `startTrashing(_:)` su `startDuplicateTrashRun`, e `grep` su tutto il progetto (test
+    // compresi) confermava zero chiamanti rimasti. Vedi la nota in coda ad ADR-0009.
 
-    /// Stato dello spostamento vive QUI, non in `@State` di `DuplicatesView` — stesso motivo
-    /// gia' scritto sopra per l'annullamento: chiudere e riaprire la finestra Doppioni non
-    /// deve far perdere barra, «Interrompi» o l'esito di uno spostamento ancora in corso. E'
-    /// il difetto che ROADMAP #41 chiude: fino a questo intervento erano tre `@State` della
-    /// view (`trashProgress`/`activeCancelFlag`/`lastOutcome`), spariti alla chiusura della
-    /// finestra pur restando vivo il lavoro sul disco (`isTrashingDuplicates` era gia' nel
-    /// runner dal Task 4 del 2026-09-19, ma non bastava a mostrare barra ed esito).
-    @Published private(set) var duplicateTrashProgress: (done: Int, total: Int)? = nil
-    @Published private(set) var duplicateTrashStopRequested = false
-    @Published private(set) var lastDuplicateTrashOutcome: DuplicateTrashOutcome? = nil
-    private var duplicateTrashCancelFlag: CancelFlag? = nil
+    /// Stato di una **corsa** (la sequenza di blocchi di un `DuplicateRunPlan`) — vive QUI,
+    /// non in `@State` di `DuplicatesView`: chiudere e riaprire la finestra Doppioni non deve
+    /// far perdere barra, «Interrompi» o l'esito di una corsa in corso — lo stesso principio
+    /// gia' scritto sopra per l'annullamento e per il percorso a blocco singolo che questi
+    /// campi hanno sostituito (rimosso il 2026-09-25, vedi la nota sopra).
+    @Published private(set) var duplicateRunProgress: (blockIndex: Int, blockCount: Int, filesDone: Int, filesTotal: Int)? = nil
+    @Published private(set) var duplicateRunStopRequested = false
+    @Published private(set) var lastDuplicateRunOutcome: DuplicateRunOutcome? = nil
+    private var duplicateRunCancelFlag: CancelFlag? = nil
 
-    /// Avvia lo spostamento nel Cestino del blocco congelato. `onAlert` e' il canale della
-    /// finestra Doppioni (regola `AlertSink`): mai `pendingAlert`, che ha un solo presentatore
-    /// nella finestra principale. Corpo spostato da `DuplicatesView.startTrashing(_:)` di
-    /// prima di questo intervento, non riscritto.
-    func startDuplicateTrashing(_ batch: DuplicateBatch, onAlert: @escaping (SimpleAlert) -> Void) {
-        // Precondizioni del blocco (item 1 della sequenza in spec: nessun job in corso,
-        // nessuna scansione dell'indice in corso, SSD montato, nessun annullamento in corso),
-        // **rivalutate qui, all'avvio vero**. Rilievo di review del 2026-09-01 (gia' pagato
-        // anche in `rebuildLibraryIndex`): valutarle solo all'apertura del riepilogo non
-        // basta. Il riepilogo e' fatto per essere letto con calma — e' li' che sta tutto il
-        // peso della conferma — e nel frattempo puo' partire un backup automatico al
-        // ricollegamento dell'SSD, o l'aggancio automatico dell'indice a fine di un altro
-        // job. Cestinare mentre un mirror legge gli stessi file e' esattamente il modo,
-        // descritto dalla spec, di trasformare due operazioni corrette in un guasto.
-        // Lo `st_dev` del trasher non copre questo caso: intercetta lo scollegamento, non
-        // un secondo lettore sul volume ancora montato. `VolumeMonitor.shared` e' una lettura
-        // di un `Bool` sul MainActor, nessun I/O (il polling sta sulla `probeQueue`) e nessuna
-        // sottoscrizione a `objectWillChange` — non aggiunge ridisegni.
+    /// Avvia una corsa a piu' blocchi su un piano gia' diviso ai tetti (`DuplicateRunPlan`,
+    /// ADR-0012). `onAlert` e' il canale della finestra Doppioni (regola `AlertSink`).
+    ///
+    /// `beginDuplicateTrashing()`/`endDuplicateTrashing()` vengono chiamati **una volta per
+    /// l'intera corsa**, non per blocco: due chiamate per blocco riaprirebbero, fra un blocco
+    /// e l'altro, la finestra in cui un altro job/lettura/annullamento potrebbe partire —
+    /// esattamente la garanzia che `isTrashingDuplicates` esiste per chiudere (ADR-0009).
+    /// Conseguenza diretta e voluta: per tutta la durata della corsa nessun'altra operazione
+    /// puo' partire (`JobStartGate`/`LibraryIndexCommandGate`/`beginTrashRestore` guardano
+    /// tutti `isTrashingDuplicates`), quindi l'unica precondizione che puo' davvero cambiare
+    /// fra un blocco e l'altro — non gia' impedita alla fonte da questo stesso flag — e' lo
+    /// scollegamento fisico dell'SSD, controllato di nuovo prima di ogni blocco qui sotto.
+    ///
+    /// `DuplicateTrasher.run`/`verify` non cambiano di una riga: questa funzione li chiama,
+    /// uno per blocco.
+    ///
+    /// **La catena si ferma** se l'esito di un blocco ha `stoppedBecauseVolumeVanished` o
+    /// contiene un gruppo saltato con motivo `.trashFailed` — mai per gli altri gruppi
+    /// saltati dalla verifica (`DuplicateTrashSkipReason`), che su questa libreria sono la
+    /// normalita' (ADR-0002): fermarsi li' vorrebbe dire non arrivare mai in fondo a una
+    /// corsa vera.
+    func startDuplicateTrashRun(_ plan: DuplicateRunPlan, onAlert: @escaping (SimpleAlert) -> Void) {
+        guard !plan.blocks.isEmpty else { return }
+
         let reason = DuplicatesStatus.trashDisabledReason(isRunning: isRunning,
                                                            isIndexing: isIndexing,
                                                            ssdMounted: VolumeMonitor.shared.ssdMounted,
@@ -8180,62 +8921,128 @@ final class BackupRunner: ObservableObject {
 
         guard let store = libraryIndexStore,
               let manifest = trashManifestStore,
+              let history = trashHistoryStore,
               let root = BookmarkManager.shared.urls[.ssd] else {
             onAlert(SimpleAlert(
                 title: "Non è stato possibile procedere",
-                message: "L'elenco delle foto, il registro di ripristino o l'SSD non sono "
-                    + "disponibili in questo momento. Riprova dopo aver ricontrollato "
-                    + "Diagnostica."))
+                message: "L'elenco delle foto, il registro di ripristino, la storia degli "
+                    + "spostamenti o l'SSD non sono disponibili in questo momento. Riprova "
+                    + "dopo aver ricontrollato Diagnostica."))
             return
         }
 
-        // Lo stato "sto spostando" e' gia' nel runner da #34 (2026-09-19): questa chiamata
-        // non cambia, cambia solo che adesso e' il runner stesso a farla, non la view.
-        // Chiamato subito prima del `Task.detached` (nessun `return` fra qui e li'), cosi' un
-        // `begin` che riesce e' sempre seguito da un `end` — vedi il commento sul blocco
-        // finale sotto.
         if let alert = beginDuplicateTrashing() {
             onAlert(alert)
             return
         }
 
-        let decisions = batch.groups.map { DuplicateTrasher.Decision(group: $0.group, keeper: $0.choice.keeper) }
-        let trasher = DuplicateTrasher(libraryRoot: root, store: store, manifest: manifest)
         let cancelFlag = CancelFlag()
-        duplicateTrashCancelFlag = cancelFlag
-        duplicateTrashStopRequested = false
-        lastDuplicateTrashOutcome = nil
-        // Un nuovo spostamento rende obsoleto l'ultimo esito di annullamento mostrato: quello
-        // riguardava un blocco diverso (invalidazione reciproca, D5, simmetrica a quella
-        // scritta sopra in `startTrashRestore`).
+        duplicateRunCancelFlag = cancelFlag
+        duplicateRunStopRequested = false
+        lastDuplicateRunOutcome = nil
+        // Invalidazione reciproca (D5): una
+        // nuova corsa rende obsoleto l'ultimo esito di annullamento mostrato.
         lastTrashRestoreOutcome = nil
-        duplicateTrashProgress = (0, decisions.count)
+        let totalBlocks = plan.blocks.count
+        let totalFiles = plan.blocks.reduce(0) { $0 + $1.reduce(0) { $0 + $1.leaving.count } }
+        duplicateRunProgress = (blockIndex: 1, blockCount: totalBlocks, filesDone: 0, filesTotal: totalFiles)
 
         Task.detached(priority: .utility) {
-            let outcome = trasher.run(decisions, onProgress: { done, total in
-                Task { @MainActor in self.duplicateTrashProgress = (done, total) }
-            }, isCancelled: { cancelFlag.isCancelled })
+            var runOutcome = DuplicateRunOutcome(totalBlocks: totalBlocks)
+            var filesDoneSoFar = 0
+
+            for (index, block) in plan.blocks.enumerated() {
+                if cancelFlag.isCancelled {
+                    runOutcome.stopReason = .interrupted
+                    break
+                }
+                guard await MainActor.run(body: { VolumeMonitor.shared.ssdMounted }) else {
+                    runOutcome.stopReason = .volumeVanished
+                    break
+                }
+
+                let batchId = UUID().uuidString
+                let decisions = block.map { DuplicateTrasher.Decision(group: $0.group, keeper: $0.choice.keeper) }
+                let trasher = DuplicateTrasher(libraryRoot: root, store: store, manifest: manifest)
+                // Catturato per valore prima della corsa del blocco: l'`onProgress` sotto
+                // legge solo questa costante, mai `filesDoneSoFar` direttamente — quella
+                // cambia solo DOPO che il blocco e' finito, ma una chiusura che catturasse la
+                // `var` per riferimento potrebbe eseguire in ritardo (e' un `Task {}` non
+                // strutturato) e leggere il valore gia' aggiornato del blocco successivo.
+                let doneBeforeThisBlock = filesDoneSoFar
+
+                // `done`/`total` di `DuplicateTrasher.run` contano GRUPPI processati, non
+                // file: per il conteggio in file (quello che `DuplicatesStatus.runProgressLine`
+                // si aspetta) si sommano i file dei soli gruppi gia' processati in questo
+                // blocco (`block` e `decisions` condividono lo stesso ordine). Un gruppo
+                // saltato conta comunque come "processato", stessa filosofia del trasher
+                // stesso (il lavoro fatto, non solo quello riuscito).
+                let blockOutcome = trasher.run(decisions, batchId: batchId, onProgress: { done, _ in
+                    let filesInBlockSoFar = block.prefix(done).reduce(0) { $0 + $1.leaving.count }
+                    Task { @MainActor in
+                        self.duplicateRunProgress = (blockIndex: index + 1, blockCount: totalBlocks,
+                                                     filesDone: doneBeforeThisBlock + filesInBlockSoFar,
+                                                     filesTotal: totalFiles)
+                    }
+                }, isCancelled: { cancelFlag.isCancelled })
+
+                // Scritta per OGNI blocco su cui `run` e' tornato, completo o interrotto che
+                // sia: e' una storia di quello che e' successo, non solo dei blocchi finiti
+                // senza intoppi (`TrashHistory.append` non fa nulla se `trashed` e' vuoto).
+                history.append(blockId: batchId, trashed: blockOutcome.trashedFiles)
+
+                runOutcome.trashedFiles.append(contentsOf: blockOutcome.trashedFiles)
+                runOutcome.skippedGroups.append(contentsOf: blockOutcome.skippedGroups)
+                filesDoneSoFar += blockOutcome.trashedFiles.count
+
+                if blockOutcome.interrupted {
+                    runOutcome.stopReason = .interrupted
+                    break
+                }
+                if blockOutcome.stoppedBecauseVolumeVanished {
+                    runOutcome.stopReason = .volumeVanished
+                    break
+                }
+                if let failed = blockOutcome.skippedGroups.first(where: {
+                    if case .trashFailed = $0.reason { return true }
+                    return false
+                }), case .trashFailed(let path, let detail) = failed.reason {
+                    runOutcome.stopReason = .trashFailed(displayPath: path, detail: detail)
+                    break
+                }
+
+                runOutcome.blocksCompleted += 1
+            }
+
+            // Snapshot immutabile: il ciclo sopra e' finito qui, in sequenza (non c'e' nessuna
+            // corsa da coprire), ma `runOutcome` resta un `var` mutato nel ciclo e Swift 6 non
+            // permette di catturarlo cosi' com'e' in una chiusura che esegue concorrentemente
+            // (`await MainActor.run`). Un `let` non annota niente e non allarga l'isolamento
+            // di nessun tipo: la sua correttezza si legge per intero in queste due righe.
+            let finalOutcome = runOutcome
 
             await MainActor.run {
-                // `endDuplicateTrashing()` nello STESSO blocco che pubblica l'esito: `run`
-                // non lancia mai, quindi nessun percorso di questo `Task.detached` salta
-                // questa chiamata e lascia il flag bloccato a `true` per sempre.
+                // `endDuplicateTrashing()` nello STESSO blocco che pubblica l'esito, stessa
+                // disciplina di `startTrashRestore`: nessun percorso di questo ciclo
+                // salta questa chiamata e lascia il flag bloccato a `true` per sempre.
                 self.endDuplicateTrashing()
-                self.duplicateTrashProgress = nil
-                self.duplicateTrashStopRequested = false
-                self.duplicateTrashCancelFlag = nil
-                self.lastDuplicateTrashOutcome = outcome
+                self.duplicateRunProgress = nil
+                self.duplicateRunStopRequested = false
+                self.duplicateRunCancelFlag = nil
+                self.lastDuplicateRunOutcome = finalOutcome
                 self.refreshRestorableBatch()
             }
         }
     }
 
-    /// «Interrompi» durante lo spostamento. `DuplicateTrasher.run` controlla l'interruzione
-    /// solo fra un gruppo e l'altro: un gruppo in corso viene chiuso, non lasciato a meta'.
-    func stopDuplicateTrashing() {
-        guard !duplicateTrashStopRequested else { return }
-        duplicateTrashStopRequested = true
-        duplicateTrashCancelFlag?.cancel()
+    /// «Interrompi» durante una corsa (idempotente, come `stopTrashRestore`): `DuplicateTrasher.run`
+    /// controlla l'interruzione solo fra un gruppo e l'altro, quindi un gruppo in corso viene
+    /// chiuso, mai lasciato a meta' — e un blocco in corso finisce di essere processato
+    /// prima che la corsa si fermi davvero.
+    func stopDuplicateTrashRun() {
+        guard !duplicateRunStopRequested else { return }
+        duplicateRunStopRequested = true
+        duplicateRunCancelFlag?.cancel()
     }
 
     private let syncer = FileSyncer()
@@ -8257,6 +9064,16 @@ final class BackupRunner: ObservableObject {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("AppBackupFoto")
         return try? TrashManifestStore(url: dir.appendingPathComponent("trash-manifest.json"))
+    }()
+    /// La storia degli spostamenti (Task 8, ADR-0012 D13 punto 4). Stesso pattern lazy e
+    /// stessa cartella di `trashManifestStore`/`libraryIndexStore`: mai sull'SSD, sempre sul
+    /// disco interno. `TrashHistory.init` fallisce solo se la posizione non e' consentita —
+    /// non c'e' un formato di file da poter corrompere come per SQLite/JSON, quindi nessun
+    /// meccanismo di "riprova una volta" e' necessario qui.
+    private(set) lazy var trashHistoryStore: TrashHistory? = {
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("AppBackupFoto")
+        return try? TrashHistory(url: dir.appendingPathComponent("trash-history.jsonl"))
     }()
     private var syncTask: Task<Void, Never>?
     private var wasStopped = false
@@ -8401,6 +9218,14 @@ final class BackupRunner: ObservableObject {
                 self.bm.stopAccessing(.ssd)
                 self.isIndexing = false
                 self.indexer = nil
+                // Scritta in QUESTO punto solo (Task 12, D15): vale per ogni ingresso — il
+                // bottone manuale e il passo 2 del backup passano entrambi da qui. Non si
+                // scrive su una lettura interrotta o incompleta: non ha rimesso in pari
+                // l'elenco, e registrarla direbbe il contrario.
+                if LibraryListFreshness.readReachedTheEnd(progress: finalProgress, error: finalError) {
+                    UserDefaults.standard.set(Date().timeIntervalSince1970,
+                                              forKey: libraryListLastCompleteReadDefaultsKey)
+                }
                 onFinish(finalProgress, finalError)
             }
         }
@@ -8418,7 +9243,8 @@ final class BackupRunner: ObservableObject {
         // Precondizioni rivalutate **qui**, all'avvio vero, non solo sul bottone che ha
         // aperto il flusso. Rilievo di review del 2026-09-01: fra il click e la conferma sta
         // un alert che l'utente puo' lasciare aperto per minuti (il messaggio stesso parla di
-        // 15-25 minuti di lettura, quindi ci si pensa), e in quel tempo puo' partire un
+        // 25-35 minuti di lettura — 390,6 GB a 224 MiB/s, ricalcolato Task 12 — quindi ci si
+        // pensa), e in quel tempo puo' partire un
         // backup — a mano o da solo al ricollegamento dell'SSD. Il gate sul bottone da solo
         // riaprirebbe esattamente il difetto che questo commit dichiara chiuso. E' la stessa
         // lezione gia' pagata nel pannello Doppioni, dove le precondizioni del blocco erano
@@ -8495,6 +9321,10 @@ final class BackupRunner: ObservableObject {
             indexProgress = nil
             indexInterruptedByUser = false
             indexedFileCount = 0
+            // L'elenco appena svuotato non e' "aggiornato ad oggi": e' vuoto, e la
+            // prossima lettura (manuale, la ricostruzione non parte da sola) e' la prima
+            // vera dopo lo svuotamento (Task 12, D15).
+            UserDefaults.standard.removeObject(forKey: libraryListLastCompleteReadDefaultsKey)
         } catch {
             // Se la cancellazione fallisce lo store resta aperto sul vecchio file ed e'
             // ancora utilizzabile: si mostra l'errore e si prosegue, mai un errore fatale.
@@ -10581,6 +11411,10 @@ struct ImportView: View {
     /// `realResolvedPath`/`makeThumbnail`.
     @State private var previewCancelFlag: CancelFlag?
     @State private var label: String = ""
+    /// Da quanto l'elenco non e' aggiornato (Task 12, spec §4): calcolato quando si entra
+    /// nel passo di anteprima e ricalcolato quando una lettura in corso finisce. `nil` solo
+    /// finche' non e' ancora stato calcolato la prima volta.
+    @State private var libraryListFreshness: LibraryListFreshness.Line?
 
     private static let dateFormatter: DateFormatter = {
         let f = DateFormatter()
@@ -10622,6 +11456,16 @@ struct ImportView: View {
             previewUnavailableReason = ImportPreviewStatus.unavailableReason(
                 ssdConfigured: bm.urls[.ssd] != nil, ssdMounted: false)
         }
+        // A lettura finita (bottone "Aggiorna l'elenco adesso" qui sotto, o qualunque altra
+        // lettura in corso altrove — Diagnostica, il passo 2 di un backup) l'anteprima si
+        // rifa': l'insieme dei doppioni riconosciuti e' cambiato, e mostrare un numero
+        // calcolato PRIMA dell'aggiornamento e' tutto il punto contro cui l'avviso esiste
+        // (Task 12, D18).
+        .onChange(of: runner.isIndexing) { _, isIndexing in
+            guard step == .preview, !isIndexing else { return }
+            refreshLibraryListFreshness()
+            startPreview()
+        }
     }
 
     private var chooseSourceStep: some View {
@@ -10650,6 +11494,28 @@ struct ImportView: View {
     private var previewStep: some View {
         VStack(spacing: AppSpacing.lg) {
             Text("Anteprima").font(AppFont.title)
+            // Le righe di freschezza dell'elenco stanno SOPRA quelle dell'anteprima (Task 12,
+            // D18): l'utente deve sapere se il numero che sta per leggere e' calcolato su un
+            // elenco vecchio PRIMA di leggerlo, non dopo.
+            if let freshness = libraryListFreshness {
+                HStack(alignment: .top, spacing: AppSpacing.sm) {
+                    Image(systemName: icon(freshness.tone)).foregroundStyle(color(freshness.tone))
+                        .font(.system(size: 12))
+                    Text(freshness.text).font(AppFont.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer()
+                }
+                if freshness.id == "stale" || freshness.id == "unknown" {
+                    HStack {
+                        Button("Aggiorna l'elenco adesso") { refreshLibraryListNow() }
+                            .buttonStyle(.bordered).controlSize(.small)
+                            .disabled(runner.isIndexing)
+                        Button("Continua così") {}
+                            .buttonStyle(.bordered).controlSize(.small)
+                        Spacer()
+                    }
+                }
+            }
             if let previewUnavailableReason {
                 Text(previewUnavailableReason).font(AppFont.caption).foregroundStyle(AppColor.error)
                     .multilineTextAlignment(.center)
@@ -10746,6 +11612,25 @@ struct ImportView: View {
         }
     }
 
+    /// Overload per `LibraryListFreshness.Tone` (Task 12): stessi tre casi, stessa mappa —
+    /// due enum diversi con gli stessi nomi di caso, non un motivo per due funzioni con nomi
+    /// diversi.
+    private func icon(_ tone: LibraryListFreshness.Tone) -> String {
+        switch tone {
+        case .ok: return "checkmark.circle.fill"
+        case .info: return "info.circle.fill"
+        case .warning: return "exclamationmark.triangle.fill"
+        }
+    }
+
+    private func color(_ tone: LibraryListFreshness.Tone) -> Color {
+        switch tone {
+        case .ok: return AppColor.success
+        case .info: return .secondary
+        case .warning: return AppColor.warning
+        }
+    }
+
     private var labelStep: some View {
         VStack(spacing: AppSpacing.lg) {
             Text("Nome della cartella di destinazione").font(AppFont.title)
@@ -10789,11 +11674,57 @@ struct ImportView: View {
         }
         sourceURL = url
         label = "\(url.lastPathComponent) - \(Self.dateFormatter.string(from: Date()))"
+        step = .preview
+        refreshLibraryListFreshness()
+        startPreview()
+    }
+
+    /// Calcola `libraryListFreshness` (Task 12, D15/D17): prova prima la data dell'ultima
+    /// lettura arrivata in fondo (`libraryListLastCompleteReadDefaultsKey`); se manca, il
+    /// ripiego `LibraryIndexStore.newestHashedAt()`, letto fuori dal main — e' una query
+    /// SQLite, non va fatta sul MainActor (stessa regola di `BackupRunner.indexedFileCount`).
+    private func refreshLibraryListFreshness() {
+        let hasAnyEntries = runner.indexedFileCount > 0
+        let isReading = runner.isIndexing
+        if let ts = UserDefaults.standard.object(forKey: libraryListLastCompleteReadDefaultsKey) as? Double {
+            libraryListFreshness = LibraryListFreshness.line(hasAnyEntries: hasAnyEntries,
+                                                              lastCompleteReadAt: Date(timeIntervalSince1970: ts),
+                                                              isReading: isReading)
+            return
+        }
+        guard let store = runner.libraryIndexStore else {
+            libraryListFreshness = LibraryListFreshness.line(hasAnyEntries: hasAnyEntries,
+                                                              lastCompleteReadAt: nil, isReading: isReading)
+            return
+        }
+        Task.detached(priority: .utility) {
+            let fallbackTimestamp = try? store.newestHashedAt()
+            await MainActor.run {
+                let date = fallbackTimestamp.map { Date(timeIntervalSince1970: $0) }
+                self.libraryListFreshness = LibraryListFreshness.line(hasAnyEntries: hasAnyEntries,
+                                                                      lastCompleteReadAt: date, isReading: isReading)
+            }
+        }
+    }
+
+    /// «Aggiorna l'elenco adesso» (Task 12, D18): l'aggiornamento **incrementale**
+    /// (`full: false`), mai la ricostruzione completa — quella resta un'azione esplicita
+    /// separata, in Diagnostica. L'anteprima si rifa' da sola quando la lettura finisce,
+    /// tramite `.onChange(of: runner.isIndexing)` nel `body`.
+    private func refreshLibraryListNow() {
+        runner.rebuildLibraryIndex(full: false, onAlert: { previewUnavailableReason = $0.message })
+    }
+
+    /// Il corpo di `pickSource()` da `guard let url = sourceURL` in avanti, estratto per
+    /// poter essere richiamato anche dopo un aggiornamento dell'elenco (Task 12, D18):
+    /// l'insieme dei doppioni riconosciuti e' cambiato, e mostrare un numero calcolato PRIMA
+    /// dell'aggiornamento e' tutto il punto contro cui l'avviso di freschezza esiste.
+    private func startPreview() {
+        guard let url = sourceURL else { return }
         previewResult = nil
         previewInterruption = .none
         previewProgress = nil
         previewUnavailableReason = nil
-        step = .preview
 
         // Gate obbligatorio (spec, "Gate obbligatorio: SSD montato"): senza il volume,
         // `isAlreadyInLibrary` fallirebbe la rilettura per ogni candidato e l'anteprima
@@ -12532,11 +13463,17 @@ struct LibraryIndexCard: View {
     /// **Numero misurato, non stimato** (2026-09-01, primo collegamento dell'SSD dopo
     /// la scrittura della card). Throughput reale di lettura+SHA256 dall'SSD: 224 MiB/s
     /// su un campione di 300 file distribuiti, contro 237,4 GiB di media indicizzabili
-    /// (47.482 file) = **~18 minuti**. La prima stesura diceva "dai 5 ai 15 minuti" ed
+    /// (47.482 file) = ~18 minuti. La prima stesura diceva "dai 5 ai 15 minuti" ed
     /// era un ordine di grandezza scritto a tavolino, con l'estremo superiore sotto la
-    /// misura vera. Se il contenuto dell'SSD cambia sensibilmente, si rimisura: non si
-    /// ritocca a occhio.
-    private let durata = "di solito servono dai 15 ai 25 minuti"
+    /// misura vera.
+    ///
+    /// **Ricalcolato il 2026-09-25 (Task 12): la libreria e' cresciuta a 390,6 GB**
+    /// (`ASUS/foto/recup_dir.NN/` misurato il 2026-09-24, vedi `duplicateKeepChoice`) —
+    /// allo stesso throughput di 224 MiB/s fanno **~28 minuti**, non piu' i ~18 di
+    /// settembre. "Dai 15 ai 25" era di nuovo sottostimato, con lo stesso errore della
+    /// prima stesura: l'estremo superiore sotto la misura vera. Se il contenuto dell'SSD
+    /// cambia sensibilmente, si rimisura: non si ritocca a occhio.
+    private let durata = "di solito servono dai 25 ai 35 minuti"
 
     var body: some View {
         GroupBox(LibraryIndexCommands.cardTitle) {
@@ -12801,6 +13738,54 @@ struct DuplicatesView: View {
     /// **una volta sola**, fuori dal main thread, quando i gruppi arrivano.
     @State private var loadedBatch: DuplicateBatch? = nil
     @State private var selectedHashes: Set<String> = []
+    /// Indice `hash → Entry` sul `loadedBatch` corrente, per leggere `leaving`/
+    /// `reclaimableBytes` di una foto selezionata in O(1) — mai filtrando di nuovo
+    /// `loadedBatch.groups` (27.798 elementi) per ogni checkbox (Regola 9).
+    @State private var entryByHash: [String: DuplicateBatch.Entry] = [:]
+    /// Totali della selezione, ricalcolati SOLO sull'insieme selezionato (tipicamente
+    /// piccolo), mai su tutti i gruppi: la riga di selezione li legge in O(1).
+    @State private var selectionStats: (files: Int, bytes: Int64) = (0, 0)
+
+    // MARK: - Filtri e regola per cartella (Task 11, Step 1-4, ADR-0011)
+
+    /// I tre filtri del pannello, componibili in AND (`DuplicateFilter`, ADR-0011). Il
+    /// ricalcolo dell'insieme filtrato non avviene mai qui dentro un `.onChange`: ogni
+    /// mutazione passa da una delle funzioni sotto, che chiama `rebuildBatch(from:rule:)`
+    /// subito dopo — un solo punto che ricalcola, mai una `.onChange` implicita da cui e'
+    /// facile perdere un caso.
+    @State private var filter = DuplicateFilter()
+    /// Indici in `loadedBatch.groups` che soddisfano `filter` — mai una copia dei gruppi
+    /// (spec §2.8, punto 1): l'elenco stesso resta quello di sempre, `visibleIndices` dice
+    /// solo quali righe mostrare.
+    @State private var visibleIndices: [Int] = []
+    /// Le cartelle di primo livello che compaiono nei gruppi, con il conteggio — da
+    /// `duplicateFolderList`, ricalcolato insieme al resto in `rebuildBatch`.
+    @State private var folderList: [(folder: String, count: Int)] = []
+    /// Nome da mostrare per ogni cartella (maiuscole vere, `DuplicateBatch.folder(of:)`),
+    /// perche' `folderList`/`DuplicateFilter` lavorano sulla chiave normalizzata
+    /// (minuscola, NFC) e mostrarla cosi' com'e' sarebbe illeggibile e non ritrovabile nel
+    /// Finder.
+    @State private var folderDisplayNames: [String: String] = [:]
+    /// Vero mentre filtro o regola vengono applicati fuori dal main: uno stato «sto
+    /// applicando…» (`DuplicatesStatus.applyingLine`), non una barra — il ricalcolo dura
+    /// pochi secondi su tutta la libreria, non minuti (Regola 9 del piano).
+    @State private var isApplyingFilter = false
+
+    /// La regola per cartella attiva, o `nil`. Caricata da `UserDefaults` una volta
+    /// all'apertura della finestra (ADR-0011: persiste fra le sessioni) — un valore
+    /// assente o corrotto decodifica a `nil` da `loadDuplicateFolderRule` stesso.
+    @State private var folderRule: DuplicateFolderRule? = loadDuplicateFolderRule()
+    @State private var showRuleEditor = false
+    /// Campi temporanei dell'editor della regola, popolati da `folderRule` quando si apre
+    /// la sheet — mai scritti in `folderRule` finche' l'utente non preme "Applica".
+    @State private var ruleEditorKeepIn: String?
+    @State private var ruleEditorTrashIn: Set<String> = []
+    /// Quanti gruppi la regola attiva copre, e quanti la toccano ma restano fuori perche'
+    /// hanno una copia anche in una terza cartella (spec §2.4/§2.5) — `nil` se non c'e'
+    /// nessuna regola attiva.
+    @State private var ruleCoverage: (covered: Int, excludedByThirdFolder: Int)? = nil
+
+    private enum GroupKindFilter: Hashable { case all, sameFolder, crossFolder }
 
     /// Avvisi **locali della view**, mai `runner.pendingAlert`: quello ha un solo
     /// presentatore, il `.alert` di `ContentView` nella scena `main` (sezione `AlertSink` in
@@ -12815,6 +13800,11 @@ struct DuplicatesView: View {
     /// del Task 2 e ripreso nel Task 4: fra il riepilogo e il cestinamento la scelta di quale
     /// copia tenere non deve poter cambiare sotto i piedi dell'utente.
     @State private var pendingBatch: DuplicateBatch? = nil
+    /// Il piano della corsa (ADR-0012) per `pendingBatch`, congelato nello stesso istante e
+    /// dalla stessa funzione (`beginConfirmation()`) — mai ricalcolato dentro `summarySheet`,
+    /// che SwiftUI puo' richiamare a ogni ridisegno: `DuplicateRunPlan.init` gira su tutta la
+    /// selezione, e ricalcolarlo nel `body` e' esattamente il bug del 2026-09-02 (regola 9).
+    @State private var pendingPlan: DuplicateRunPlan? = nil
     @State private var showDestructiveConfirm = false
 
     /// Conferma non distruttiva prima di «Annulla l'ultimo spostamento» (ADR-0009, decisione
@@ -12847,15 +13837,39 @@ struct DuplicatesView: View {
                     .font(AppFont.caption).foregroundStyle(.secondary)
             }
 
-            listArea
+            filterBar
 
-            if runner.isTrashingDuplicates, let progress = runner.duplicateTrashProgress {
-                trashProgressBar(progress)
+            if filter.internalOnly == true {
+                Text(DuplicatesStatus.internalGroupsCriterionLine)
+                    .font(AppFont.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
-            if let outcome = runner.lastDuplicateTrashOutcome {
+            if isApplyingFilter {
+                Text(DuplicatesStatus.applyingLine).font(AppFont.caption).foregroundStyle(.secondary)
+            }
+
+            listArea
+
+            HStack {
+                Button("Seleziona tutti quelli visibili") { selectAllVisible() }
+                    .buttonStyle(.bordered).controlSize(.small)
+                    .disabled(visibleIndices.isEmpty)
+                Button("Togli la selezione da quelli visibili") { deselectAllVisible() }
+                    .buttonStyle(.bordered).controlSize(.small)
+                    .disabled(visibleIndices.isEmpty)
+                Spacer()
+            }
+
+            selectionStatusLine
+
+            if runner.isTrashingDuplicates, let progress = runner.duplicateRunProgress {
+                duplicateRunProgressBar(progress)
+            }
+
+            if let outcome = runner.lastDuplicateRunOutcome {
                 VStack(alignment: .leading, spacing: AppSpacing.xs) {
-                    ForEach(DuplicatesStatus.outcomeLines(outcome)) { line in
+                    ForEach(DuplicatesStatus.runOutcomeLines(outcome)) { line in
                         Text(line.text).font(AppFont.caption).foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
@@ -12923,21 +13937,34 @@ struct DuplicatesView: View {
             if !isTrashing {
                 selectedHashes.removeAll()
                 pendingBatch = nil
+                pendingPlan = nil
                 loadGroups()
             }
         }
         .sheet(isPresented: $showSummarySheet) {
             if let batch = pendingBatch { summarySheet(batch) }
         }
+        .sheet(isPresented: $showRuleEditor) { ruleEditorSheet }
         .alert("Spostare queste copie nel Cestino?",
                isPresented: $showDestructiveConfirm,
                presenting: pendingBatch) { batch in
             Button("Sposta nel Cestino", role: .destructive) { startTrashing(batch) }
             Button("Annulla", role: .cancel) {}
         } message: { _ in
-            Text("Ogni copia viene riverificata sul disco un'ultima volta prima di essere "
-                + "spostata. Puoi annullare lo spostamento dopo, con «Annulla l'ultimo "
-                + "spostamento».")
+            // Rilievo di review del 2026-09-25: con più di un blocco (ADR-0012), «Annulla
+            // l'ultimo spostamento» copre SOLO l'ultimo blocco — l'utente l'ha già letto in
+            // `undoScopeLine` dentro il riepilogo, ma questo alert (l'ultimo schermo prima del
+            // punto di non ritorno) diceva senza qualifica «puoi annullare lo spostamento dopo»,
+            // contraddicendolo. Riusa `DuplicatesStatus.undoScopeLine` (già testata) invece di
+            // scrivere qui una seconda frase sullo stesso fatto: con un blocco solo resta `nil`
+            // e il testo è quello di sempre.
+            let base = "Ogni copia viene riverificata sul disco un'ultima volta prima di essere spostata. "
+            if let scope = DuplicatesStatus.undoScopeLine(blockCount: pendingPlan?.blocks.count ?? 1,
+                                                           fileCapPerBlock: duplicateBatchFileCap) {
+                Text(base + scope)
+            } else {
+                Text(base + "Puoi annullare lo spostamento dopo, con «Annulla l'ultimo spostamento».")
+            }
         }
         .alert(undoConfirmationText?.title ?? "Rimettere a posto le foto?",
                isPresented: $showUndoConfirm) {
@@ -13009,6 +14036,135 @@ struct DuplicatesView: View {
         return TrashRestoreStatus.confirmation(summary: summary)
     }
 
+    /// La barra dei filtri (Task 11, Step 1). Tre controlli discreti, come da spec §2.2 —
+    /// nessun campo di testo: cercare per testo su 141.683 percorsi a ogni tasto premuto e'
+    /// il profilo esatto del bug di prestazioni del 2026-09-02.
+    private var filterBar: some View {
+        HStack(spacing: AppSpacing.sm) {
+            Menu {
+                Button("Tutte (\(loadedBatch?.groups.count ?? 0))") { setFolder(nil) }
+                if !folderList.isEmpty { Divider() }
+                ForEach(folderList, id: \.folder) { entry in
+                    Button("\(folderDisplayNames[entry.folder] ?? entry.folder) (\(entry.count))") {
+                        setFolder(entry.folder)
+                    }
+                }
+            } label: {
+                Label(filter.folder.map { folderDisplayNames[$0] ?? $0 } ?? "Tutte le cartelle",
+                     systemImage: "folder")
+            }
+            .menuStyle(.borderlessButton).fixedSize()
+
+            Picker("", selection: Binding(get: { groupKindSelection }, set: { setGroupKind($0) })) {
+                Text("Tutti").tag(GroupKindFilter.all)
+                Text("Tutte le copie nella stessa cartella").tag(GroupKindFilter.sameFolder)
+                Text("Copie in cartelle diverse").tag(GroupKindFilter.crossFolder)
+            }
+            .pickerStyle(.menu)
+            .fixedSize()
+
+            if folderRule != nil {
+                Toggle("Solo i gruppi coperti dalla regola", isOn: Binding(
+                    get: { filter.rule != nil },
+                    set: { setRuleFilterOnly($0) }
+                )).toggleStyle(.checkbox)
+            }
+
+            Spacer()
+
+            Button(folderRule == nil ? "Regola per cartella…" : "Modifica regola…") {
+                ruleEditorKeepIn = folderRule?.keepIn
+                ruleEditorTrashIn = folderRule?.trashIn ?? []
+                showRuleEditor = true
+            }.buttonStyle(.bordered).controlSize(.small)
+        }
+    }
+
+    private var groupKindSelection: GroupKindFilter {
+        switch filter.internalOnly {
+        case .some(true): return .sameFolder
+        case .some(false): return .crossFolder
+        case .none: return .all
+        }
+    }
+
+    /// «Selezionati N gruppi: M file da spostare, circa X GB recuperabili» (Task 9,
+    /// `DuplicatesStatus.selectionLine`) — valori tutti precalcolati, mai un `reduce` qui.
+    private var selectionStatusLine: some View {
+        Text(DuplicatesStatus.selectionLine(visibleGroups: visibleIndices.count,
+                                            totalGroups: loadedBatch?.groups.count ?? 0,
+                                            selectedGroups: selectedHashes.count,
+                                            files: selectionStats.files,
+                                            reclaimableBytes: selectionStats.bytes))
+            .font(AppFont.caption).foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    /// L'editor della regola per cartella (Task 11, Step 3, ADR-0011).
+    private var ruleEditorSheet: some View {
+        VStack(alignment: .leading, spacing: AppSpacing.md) {
+            Text("Regola per cartella").font(AppFont.title)
+            Text("Scegli una cartella da tenere e una o più cartelle da cestinare: un gruppo "
+                + "con una copia in ognuna e nessun'altra copia altrove verrà proposto così, "
+                + "senza dover spuntarlo a mano.")
+                .font(AppFont.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Picker("Tieni la copia in", selection: $ruleEditorKeepIn) {
+                Text("Scegli…").tag(String?.none)
+                ForEach(folderList, id: \.folder) { entry in
+                    Text(folderDisplayNames[entry.folder] ?? entry.folder).tag(String?.some(entry.folder))
+                }
+            }
+
+            Text("Sposta nel Cestino le copie in:").font(AppFont.body)
+            ScrollView {
+                VStack(alignment: .leading, spacing: AppSpacing.xs) {
+                    ForEach(folderList, id: \.folder) { entry in
+                        if entry.folder != ruleEditorKeepIn {
+                            Toggle(folderDisplayNames[entry.folder] ?? entry.folder, isOn: Binding(
+                                get: { ruleEditorTrashIn.contains(entry.folder) },
+                                set: { on in
+                                    if on { ruleEditorTrashIn.insert(entry.folder) }
+                                    else { ruleEditorTrashIn.remove(entry.folder) }
+                                }
+                            )).toggleStyle(.checkbox)
+                        }
+                    }
+                }
+            }.frame(maxHeight: 180)
+
+            if isApplyingFilter {
+                Text(DuplicatesStatus.applyingLine).font(AppFont.caption).foregroundStyle(.secondary)
+            } else if let coverage = ruleCoverage {
+                Text(DuplicatesStatus.ruleCoverageLine(covered: coverage.covered,
+                                                       excludedByThirdFolder: coverage.excludedByThirdFolder))
+                    .font(AppFont.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            HStack {
+                if folderRule != nil {
+                    Button("Rimuovi regola", role: .destructive) {
+                        ruleEditorKeepIn = nil
+                        ruleEditorTrashIn = []
+                        applyRule(nil)
+                    }.buttonStyle(.bordered)
+                }
+                Spacer()
+                Button("Chiudi") { showRuleEditor = false }.buttonStyle(.bordered)
+                Button("Applica") {
+                    guard let keepIn = ruleEditorKeepIn, !ruleEditorTrashIn.isEmpty else { return }
+                    applyRule(DuplicateFolderRule(keepIn: keepIn, trashIn: ruleEditorTrashIn))
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(ruleEditorKeepIn == nil || ruleEditorTrashIn.isEmpty)
+            }
+        }
+        .padding(AppSpacing.xl)
+        .frame(minWidth: 460, minHeight: 420)
+    }
+
     @ViewBuilder
     private var listArea: some View {
         switch loadState {
@@ -13023,11 +14179,14 @@ struct DuplicatesView: View {
         case .loaded:
             // `loadedBatch`, non una ricostruzione da `groups` — vedi doc-comment sul
             // `@State`. `loadState`/`loadedBatch` sono pubblicati insieme in `loadGroups()`,
-            // quindi sono sempre coerenti quando si arriva qui.
-            if let batch = loadedBatch, !batch.groups.isEmpty {
+            // quindi sono sempre coerenti quando si arriva qui. L'elenco mostrato e'
+            // `visibleIndices`, non `batch.groups` per intero (Task 11, Step 1): un semplice
+            // giro su un array di indici gia' calcolato, non un filtro dentro il `body`.
+            if let batch = loadedBatch, !visibleIndices.isEmpty {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: AppSpacing.sm) {
-                        ForEach(batch.groups, id: \.group.hash) { entry in
+                        ForEach(visibleIndices, id: \.self) { i in
+                            let entry = batch.groups[i]
                             DuplicateGroupRow(entry: entry,
                                               isSelected: selectedHashes.contains(entry.group.hash),
                                               libraryRootPath: BookmarkManager.shared.urls[.ssd]?.path,
@@ -13043,18 +14202,22 @@ struct DuplicatesView: View {
         }
     }
 
-    private func trashProgressBar(_ progress: (done: Int, total: Int)) -> some View {
+    /// Barra di avanzamento di una **corsa** a piu' blocchi (Task 10/11, ADR-0012) — non di
+    /// un blocco solo: `DuplicatesStatus.runProgressLine` conta i file di TUTTA la corsa, non
+    /// del solo blocco in esecuzione.
+    private func duplicateRunProgressBar(_ progress: (blockIndex: Int, blockCount: Int, filesDone: Int, filesTotal: Int)) -> some View {
         VStack(alignment: .leading, spacing: AppSpacing.xs) {
-            ProgressView(value: Double(progress.done), total: Double(max(progress.total, 1)))
+            ProgressView(value: Double(progress.filesDone), total: Double(max(progress.filesTotal, 1)))
             HStack {
-                Text(DuplicatesStatus.trashProgressLine(done: progress.done, total: progress.total))
+                Text(DuplicatesStatus.runProgressLine(blockIndex: progress.blockIndex, blockCount: progress.blockCount,
+                                                       filesDone: progress.filesDone, filesTotal: progress.filesTotal))
                     .font(AppFont.caption).foregroundStyle(.secondary)
                 Spacer()
-                if runner.duplicateTrashStopRequested {
+                if runner.duplicateRunStopRequested {
                     Text(DuplicatesStatus.trashStoppingLine)
                         .font(AppFont.caption).foregroundStyle(.secondary)
                 } else {
-                    Button("Interrompi") { runner.stopDuplicateTrashing() }
+                    Button("Interrompi") { runner.stopDuplicateTrashRun() }
                         .buttonStyle(.bordered).controlSize(.small)
                 }
             }
@@ -13094,8 +14257,20 @@ struct DuplicatesView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
 
-            if let capReason = DuplicatesStatus.confirmationBlockedReason(exceedsCap: batch.exceedsCap) {
-                Text(capReason).font(AppFont.caption).foregroundStyle(AppColor.warning)
+            // Il piano della corsa (ADR-0012) e — solo se piu' di un blocco — la frase
+            // sull'annullamento a un livello: Enrico deve saperlo PRIMA di confermare, non
+            // scoprirlo dopo un guasto a meta' corsa. `pendingPlan` e' gia' calcolato,
+            // congelato insieme a `batch` in `beginConfirmation()` — mai ricalcolato qui,
+            // che SwiftUI puo' richiamare a ogni ridisegno (regola 9).
+            if let plan = pendingPlan {
+                Text(DuplicatesStatus.runPlanLine(blockCount: plan.blocks.count, files: batch.fileCount,
+                                                  estimatedSeconds: plan.estimatedSeconds))
+                    .font(AppFont.body)
+                if let undoScope = DuplicatesStatus.undoScopeLine(blockCount: plan.blocks.count,
+                                                                   fileCapPerBlock: duplicateBatchFileCap) {
+                    Text(undoScope).font(AppFont.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
 
             HStack {
@@ -13106,7 +14281,7 @@ struct DuplicatesView: View {
                     showDestructiveConfirm = true
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(batch.exceedsCap || trashDisabledReasonNow != nil)
+                .disabled(trashDisabledReasonNow != nil)
             }
         }
         .padding(AppSpacing.xl)
@@ -13117,6 +14292,88 @@ struct DuplicatesView: View {
 
     private func toggleSelection(_ hash: String) {
         if selectedHashes.contains(hash) { selectedHashes.remove(hash) } else { selectedHashes.insert(hash) }
+        recomputeSelectionStats()
+    }
+
+    /// «Seleziona tutti quelli visibili» (Task 11, Step 2, spec §2.3) — sul solo insieme
+    /// filtrato, mai su tutti i gruppi. La selezione **sopravvive** al cambio di filtro: qui
+    /// si aggiunge soltanto, non si sostituisce l'insieme selezionato.
+    private func selectAllVisible() {
+        guard let loadedBatch else { return }
+        for i in visibleIndices { selectedHashes.insert(loadedBatch.groups[i].group.hash) }
+        recomputeSelectionStats()
+    }
+
+    private func deselectAllVisible() {
+        guard let loadedBatch else { return }
+        for i in visibleIndices { selectedHashes.remove(loadedBatch.groups[i].group.hash) }
+        recomputeSelectionStats()
+    }
+
+    /// Ricalcola i totali della selezione **solo sull'insieme selezionato**, mai filtrando
+    /// di nuovo tutti i gruppi (Regola 9): `entryByHash` da' l'`Entry` di ogni hash selezionato
+    /// in O(1), quindi il costo e' proporzionale a quanto e' selezionato, non alla libreria.
+    private func recomputeSelectionStats() {
+        var files = 0
+        var bytes: Int64 = 0
+        for hash in selectedHashes {
+            guard let entry = entryByHash[hash] else { continue }
+            files += entry.leaving.count
+            bytes += entry.reclaimableBytes
+        }
+        selectionStats = (files, bytes)
+    }
+
+    private func setFolder(_ folder: String?) {
+        filter.folder = folder
+        reapplyFilter()
+    }
+
+    private func setGroupKind(_ kind: GroupKindFilter) {
+        switch kind {
+        case .all: filter.internalOnly = nil
+        case .sameFolder: filter.internalOnly = true
+        case .crossFolder: filter.internalOnly = false
+        }
+        reapplyFilter()
+    }
+
+    private func setRuleFilterOnly(_ on: Bool) {
+        filter.rule = on ? folderRule : nil
+        reapplyFilter()
+    }
+
+    /// Ricalcola solo l'insieme filtrato (`rebuildBatch` senza toccare il blocco stesso): un
+    /// cambio di filtro non cambia mai la scelta di chi tenere, quindi non serve
+    /// ricostruire `DuplicateBatch` — solo `DuplicateFilter.apply(to:)` sul batch che c'e'
+    /// gia'. Usa comunque `Task.detached` con lo stato «sto applicando…» (Regola 9): alla
+    /// scala reale anche un solo `filter` su 27.798 gruppi non va fatto nel `body`.
+    private func reapplyFilter() {
+        guard let loadedBatch else { return }
+        isApplyingFilter = true
+        let currentFilter = filter
+        let groupsOnly = loadedBatch.groups.map(\.group)
+        Task.detached(priority: .utility) {
+            let indices = currentFilter.apply(to: groupsOnly)
+            await MainActor.run {
+                self.visibleIndices = indices
+                self.isApplyingFilter = false
+            }
+        }
+    }
+
+    /// Applica (o rimuove) la regola per cartella: persiste la scelta, **azzera la
+    /// selezione** (spec §2.6 — una selezione fatta su una proposta e confermata su
+    /// un'altra e' lo stesso difetto che questo pannello esiste per chiudere), e ricostruisce
+    /// il blocco una volta, fuori dal main.
+    private func applyRule(_ rule: DuplicateFolderRule?) {
+        folderRule = rule
+        saveDuplicateFolderRule(rule)
+        selectedHashes.removeAll()
+        selectionStats = (0, 0)
+        showRuleEditor = false
+        guard case .loaded(let groups) = loadState else { return }
+        rebuildBatch(from: groups, rule: rule)
     }
 
     /// Carica i gruppi **fuori dal main thread**: `duplicateGroups()` passa dalla coda
@@ -13129,22 +14386,80 @@ struct DuplicatesView: View {
             return
         }
         loadState = .loading
+        let rule = folderRule
         Task.detached(priority: .utility) {
             do {
                 let groups = try store.duplicateGroups()
-                // Ordinamento + scelta di chi tenere per OGNI gruppo: e' il lavoro pesante,
-                // e va fatto qui, fuori dal main thread, una volta sola (vedi doc-comment
-                // su `loadedBatch`), non dentro la view a ogni ridisegno.
-                let batch = DuplicateBatch(groups: groups)
                 await MainActor.run {
-                    loadState = .loaded(groups)
-                    loadedBatch = batch
+                    self.loadState = .loaded(groups)
+                    self.rebuildBatch(from: groups, rule: rule)
                 }
             } catch {
                 await MainActor.run {
-                    loadState = .failed("Non è stato possibile leggere l'elenco delle copie doppie: "
+                    self.loadState = .failed("Non è stato possibile leggere l'elenco delle copie doppie: "
                         + error.localizedDescription)
                 }
+            }
+        }
+    }
+
+    /// Ricostruisce `DuplicateBatch`, l'elenco delle cartelle, l'indice per hash, l'insieme
+    /// filtrato e — se una regola e' attiva — quanti gruppi copre, **sempre insieme, fuori
+    /// dal main**, con uno stato «sto applicando…» (Regola 9 della spec): filtro e regola
+    /// non toccano mai i 27.798 gruppi dentro il `body`. `duplicateKeepChoice` gira qui
+    /// dentro (via `DuplicateBatch(groups:rule:)`), **una volta sola**, esattamente come
+    /// prima — non e' un secondo posto che scelga fra i membri di un gruppo, e' l'unico
+    /// posto, chiamato di nuovo perche' la regola e' cambiata.
+    private func rebuildBatch(from rawGroups: [DuplicateGroup], rule: DuplicateFolderRule?) {
+        isApplyingFilter = true
+        let currentFilter = filter
+        Task.detached(priority: .utility) {
+            let batch = DuplicateBatch(groups: rawGroups, rule: rule)
+            let groupsOnly = batch.groups.map(\.group)
+            let folders = duplicateFolderList(groupsOnly)
+            var byHash: [String: DuplicateBatch.Entry] = [:]
+            var displayNames: [String: String] = [:]
+            for entry in batch.groups {
+                byHash[entry.group.hash] = entry
+                for member in entry.group.members {
+                    guard let key = topLevelFolderKey(of: member.path), displayNames[key] == nil else { continue }
+                    displayNames[key] = DuplicateBatch.folder(of: member)
+                }
+            }
+            let indices = currentFilter.apply(to: groupsOnly)
+            var coverage: (covered: Int, excludedByThirdFolder: Int)? = nil
+            if let rule {
+                let covered = groupsOnly.filter { rule.covers($0) }.count
+                let excluded = groupsOnly.filter { g in
+                    guard !rule.covers(g) else { return false }
+                    return g.members.contains(where: {
+                        guard let f = topLevelFolderKey(of: $0.path) else { return false }
+                        return f == rule.keepIn || rule.trashIn.contains(f)
+                    })
+                }.count
+                coverage = (covered, excluded)
+            }
+            // Snapshot immutabili prima del salto sul main: `byHash`/`displayNames`/`coverage`
+            // sono `var` mutate qui sopra, e Swift 6 non permette di catturarle cosi' come
+            // sono in una chiusura che esegue concorrentemente (`await MainActor.run`) — lo
+            // stesso fix di `startDuplicateTrashRun` nel runner (Task 10).
+            let finalByHash = byHash
+            let finalDisplayNames = displayNames
+            let finalCoverage = coverage
+            await MainActor.run {
+                self.loadedBatch = batch
+                self.folderList = folders
+                self.folderDisplayNames = finalDisplayNames
+                self.entryByHash = finalByHash
+                self.visibleIndices = indices
+                self.ruleCoverage = finalCoverage
+                self.isApplyingFilter = false
+                // Difesa, non l'azzeramento richiesto dalla spec (quello lo fa `applyRule`
+                // ESPLICITAMENTE, prima di arrivare qui): un hash selezionato che non esiste
+                // piu' nel batch appena ricostruito (rilettura dopo un annullamento, un
+                // gruppo scomparso) non deve restare a contare in `selectionStats`.
+                self.selectedHashes = self.selectedHashes.filter { finalByHash[$0] != nil }
+                self.recomputeSelectionStats()
             }
         }
     }
@@ -13152,21 +14467,39 @@ struct DuplicatesView: View {
     /// Congela il blocco selezionato e apre il riepilogo — la prima delle due conferme
     /// (decisione 4 di Enrico). Il blocco non viene piu' ricalcolato da qui in avanti: la
     /// stessa istanza arriva fino a `startTrashing(_:)`.
+    ///
+    /// **Filtra le `Entry` gia' congelate di `loadedBatch`, non ricostruisce dai gruppi
+    /// grezzi** (fix del difetto latente di ADR-0011, 2026-09-25): `DuplicateBatch(entries:)`
+    /// non richiama mai `duplicateKeepChoice` — quella e' gia' stata decisa una volta sola in
+    /// `loadGroups()`. Ricostruire da `DuplicateBatch(groups:rule:)` qui aprirebbe un secondo
+    /// posto in cui la scelta di quale copia tenere potrebbe, in futuro, divergere da quella
+    /// mostrata nella lista — la classe di errore che questo progetto ha gia' pagato tre
+    /// volte (`LibraryExclusions`, `realResolvedPath`, `makeThumbnail`).
+    ///
+    /// **Deviazione dichiarata dal piano (Task 11 Step 5, 2026-09-25)**: resta sincrona sul
+    /// main, non "fuori dal main se la selezione e' grande". E' un `filter` su un array di
+    /// `Entry` gia' calcolate (non un `init(groups:)`, che e' il costo che causo' l'incidente
+    /// del 2026-09-02) — costo non misurato sul caso peggiore (27.798 gruppi selezionati). Vedi
+    /// la nota nel piano prima di "correggerlo" senza prima misurarlo.
     private func beginConfirmation() {
-        guard case .loaded(let groups) = loadState else { return }
-        let selected = groups.filter { selectedHashes.contains($0.hash) }
+        guard let loadedBatch else { return }
+        let selected = loadedBatch.groups.filter { selectedHashes.contains($0.group.hash) }
         guard !selected.isEmpty else { return }
-        pendingBatch = DuplicateBatch(groups: selected)
+        let batch = DuplicateBatch(entries: selected)
+        pendingBatch = batch
+        pendingPlan = DuplicateRunPlan(entries: batch.groups)
         showSummarySheet = true
     }
 
     /// Avvia lo spostamento nel Cestino, dopo la doppia conferma: avvia
-    /// `BackupRunner.startDuplicateTrashing`, che gira fuori dal main tramite il runner
-    /// (ROADMAP #41). Barra, «Interrompi» ed esito arrivano da li' — la selezione e
+    /// `BackupRunner.startDuplicateTrashRun` (Task 10, ADR-0012) sul piano gia' calcolato in
+    /// `beginConfirmation()`, che gira fuori dal main tramite il runner e smaltisce la corsa
+    /// un blocco alla volta. Barra, «Interrompi» ed esito arrivano da li' — la selezione e
     /// l'elenco si ricaricano da `.onChange(of: runner.isTrashingDuplicates)` sopra, non da
     /// qui. Simmetrica a `startUndo()` sotto.
     private func startTrashing(_ batch: DuplicateBatch) {
-        runner.startDuplicateTrashing(batch, onAlert: { pendingAlert = $0 })
+        let plan = pendingPlan ?? DuplicateRunPlan(entries: batch.groups)
+        runner.startDuplicateTrashRun(plan, onAlert: { pendingAlert = $0 })
     }
 
     /// «Annulla l'ultimo spostamento», dopo la conferma non distruttiva: avvia
