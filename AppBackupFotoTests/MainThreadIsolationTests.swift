@@ -241,4 +241,18 @@ final class MainThreadIsolationTests: XCTestCase {
         XCTAssertEqual(done.wait(timeout: .now() + 10), .success,
                        "ContentHasher.digestFile ha avuto bisogno del main thread.")
     }
+
+    func testInventoryScan_runsWithoutTheMainThread() throws {
+        let root = tmp.appendingPathComponent("HDD")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data("uno".utf8).write(to: root.appendingPathComponent("a.jpg"))
+        let scanner = InventoryScanner(store: try makeStore(), cancelFlag: CancelFlag())
+        let done = DispatchSemaphore(value: 0)
+        Task.detached {
+            _ = try? scanner.scan(root: root, archive: .hdd, runId: 1)
+            done.signal()
+        }
+        XCTAssertEqual(done.wait(timeout: .now() + 10), .success,
+                       "InventoryScanner.scan ha avuto bisogno del main thread.")
+    }
 }

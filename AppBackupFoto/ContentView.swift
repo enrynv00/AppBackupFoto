@@ -5732,6 +5732,189 @@ nonisolated struct InventorySnapshot: Equatable, Sendable {
     func isComplete(_ archive: InventoryArchive) -> Bool { states[archive]?.complete == true }
 }
 
+/// Com'e' andata la lettura di SSD o HDD per l'inventario.
+nonisolated struct InventoryScanReport: Equatable, Sendable {
+    /// Foto e video visti (nel perimetro di `IndexableKind`).
+    var scanned = 0
+    /// Letti davvero in questo giro.
+    var reread = 0
+    /// Impronte riprese dal giro precedente: dimensione e data invariate.
+    var reused = 0
+    /// File che non si sono lasciati leggere per intero, o cambiati mentre li si leggeva.
+    var unreadableFiles = 0
+    /// Cartelle che non si sono lasciate aprire (contate dall'`errorHandler`).
+    var unreadableFolders = 0
+    /// File il cui percorso canonico non ricade sotto la radice (non raggiungibile oggi).
+    var outsideRoot = 0
+    var volumeVanished = false
+    var cancelled = false
+    /// Zero file visti, ma il giro precedente ne aveva: "non ho trovato niente" non e'
+    /// "non c'e' niente".
+    var sawNothing = false
+
+    var isComplete: Bool { incompleteReason == nil }
+
+    /// Il motivo principale per cui la lettura non vale come completa, `nil` se e' completa.
+    /// Precedenza: dal guasto piu' grave (il disco e' sparito) al piu' circoscritto.
+    var incompleteReason: InventoryIncompleteReason? {
+        if volumeVanished { return .volumeVanished }
+        if cancelled { return .interrupted }
+        if unreadableFolders > 0 { return .foldersUnreadable }
+        if unreadableFiles > 0 { return .filesUnreadable }
+        if sawNothing { return .sawNothing }
+        return nil
+    }
+}
+
+/// Legge SSD o HDD per l'inventario: stessa traversata di `LibraryIndexer.scan` (stesse
+/// esclusioni, stesso `.skipsHiddenFiles`, stesso filtro `IndexableKind`, stesso calcolo del
+/// percorso relativo per componenti, stesso `st_dev` inizio/fine, stesso `errorHandler` che
+/// conta), ma scrive nelle tabelle dell'inventario e calcola tre impronte per file in una
+/// lettura (`ContentHasher`). NON e' `LibraryIndexer` riusato: vedi ADR-0015 per il perche',
+/// e `InventoryScannerTests.testSeesExactlyTheFilesTheListSees` per la guardia contro le
+/// divergenze fra i due.
+///
+/// Sola lettura sul volume: non scrive, non sposta, non cancella niente.
+// `nonisolated`: `store`, `cancelFlag` e `fm` sono `let` (`LibraryIndexStore` serializza da
+// se' sulla propria coda, `CancelFlag` sta dietro il proprio lock, `FileManager.default` e'
+// thread-safe per queste operazioni); tutto lo stato di un giro e' LOCALE a `scan`. Vedi ADR-0006.
+nonisolated final class InventoryScanner: @unchecked Sendable {
+    private let store: LibraryIndexStore
+    private let cancelFlag: CancelFlag
+    private let fm = FileManager.default
+
+    /// Stessa scatola di `LibraryIndexer.TraversalFailures`: l'`errorHandler` e' `@escaping` e
+    /// viene chiamato in modo sincrono dal thread che chiama `nextObject()`, cioe' questo.
+    private final class TraversalFailures { var count = 0 }
+
+    init(store: LibraryIndexStore, cancelFlag: CancelFlag) {
+        self.store = store
+        self.cancelFlag = cancelFlag
+    }
+
+    @discardableResult
+    func scan(root: URL, archive: InventoryArchive, runId: Int64, batchSize: Int = 200,
+              progressIntervalNanos: UInt64 = ProgressThrottle.defaultMinimumIntervalNanos,
+              onProgress: @escaping (InventoryScanReport) -> Void = { _ in }) throws -> InventoryScanReport {
+        precondition(archive != .s3, "InventoryScanner legge solo SSD e HDD")
+        var report = InventoryScanReport()
+        var throttle = ProgressThrottle(minimumIntervalNanos: progressIntervalNanos)
+        var batch: [InventoryLocalFile] = []
+        let failures = TraversalFailures()
+        let previous = try store.inventoryLocalRows(archive)
+
+        let deviceAtStart = deviceIdentifier(of: root)
+        guard deviceAtStart != nil else {
+            // Disco assente prima di partire: un disco scollegato non e' mai un disco vuoto.
+            report.volumeVanished = true
+            onProgress(report)
+            return report
+        }
+        guard let enumerator = fm.enumerator(at: root,
+                                             includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey],
+                                             options: [.skipsHiddenFiles],
+                                             errorHandler: { _, _ in
+                                                 failures.count += 1
+                                                 return true
+                                             }) else {
+            report.unreadableFolders = 1
+            onProgress(report)
+            return report
+        }
+        let rootComponents = canonicalPathComponents(of: root)
+        var volumeVanished = false
+
+        func flush() throws {
+            guard !batch.isEmpty else { return }
+            try store.upsertInventoryLocal(batch, archive: archive, runId: runId)
+            batch.removeAll(keepingCapacity: true)
+            // Uscita anticipata opportunistica, come in `LibraryIndexer`: la garanzia vera e'
+            // il controllo dopo il ciclo.
+            if deviceIdentifier(of: root) != deviceAtStart { volumeVanished = true }
+        }
+
+        walk: while let url = enumerator.nextObject() as? URL {
+            if cancelFlag.isCancelled { break }
+            if LibraryExclusions.shouldExclude(url) { enumerator.skipDescendants(); continue }
+            let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey])
+            guard values?.isRegularFile == true else { continue }
+            guard IndexableKind.of(url: url) != .notIndexable else { continue }
+
+            let fileComponents = canonicalPathComponents(of: url)
+            guard fileComponents.count > rootComponents.count,
+                  Array(fileComponents.prefix(rootComponents.count)) == rootComponents else {
+                report.outsideRoot += 1
+                continue
+            }
+            let relative = fileComponents.dropFirst(rootComponents.count).joined(separator: "/")
+            report.scanned += 1
+            let key = normalizedIndexKey(relative)
+
+            // Senza dimensione o data non c'e' niente da confrontare: il file non entra, e
+            // l'archivio risulta incompleto (e' un file che c'e' e che non conosciamo).
+            guard let fileSize = values?.fileSize, let modified = values?.contentModificationDate else {
+                report.unreadableFiles += 1
+                continue
+            }
+            let size = Int64(fileSize)
+            // La data si legge PRIMA della lettura, come in `LibraryIndexer`: un file che cambia
+            // mentre lo si legge risulta cambiato al giro dopo, invece che invariato per sempre.
+            let mtime = modified.timeIntervalSince1970
+
+            if let old = previous[key], old.status == .ok, let digest = old.digest {
+                let verdict = indexEntryVerdict(storedSize: old.size, storedMTime: old.mtime,
+                                                storedHashedAt: old.hashedAt,
+                                                currentSize: size, currentMTime: mtime)
+                if verdict == .fresh || verdict == .timezoneShift {
+                    batch.append(InventoryLocalFile(key: key, displayPath: relative, size: size, mtime: mtime,
+                                                    status: .ok, digest: digest, hashedAt: old.hashedAt))
+                    report.reused += 1
+                    if batch.count >= batchSize { try flush(); if volumeVanished { break walk } }
+                    if throttle.shouldEmit(nowNanos: DispatchTime.now().uptimeNanoseconds, isFinal: false) {
+                        onProgress(report)
+                    }
+                    continue
+                }
+            }
+
+            let now = Date().timeIntervalSince1970
+            let row: InventoryLocalFile
+            switch ContentHasher.digestFile(at: url, isCancelled: { self.cancelFlag.isCancelled }) {
+            case .digest(let digest) where digest.size == size:
+                row = InventoryLocalFile(key: key, displayPath: relative, size: size, mtime: mtime,
+                                         status: .ok, digest: digest, hashedAt: now)
+                report.reread += 1
+            case .digest, .changedWhileReading:
+                // Letto per intero ma con una dimensione diversa da quella della cartella, o
+                // cambiato durante la lettura: le impronte non valgono niente.
+                row = InventoryLocalFile(key: key, displayPath: relative, size: size, mtime: mtime,
+                                         status: .changedWhileReading, digest: nil, hashedAt: now)
+                report.unreadableFiles += 1
+            case .unreadable:
+                row = InventoryLocalFile(key: key, displayPath: relative, size: size, mtime: mtime,
+                                         status: .unreadable, digest: nil, hashedAt: now)
+                report.unreadableFiles += 1
+            case .cancelled:
+                break walk
+            }
+            batch.append(row)
+            if batch.count >= batchSize { try flush(); if volumeVanished { break walk } }
+            if throttle.shouldEmit(nowNanos: DispatchTime.now().uptimeNanoseconds, isFinal: false) {
+                onProgress(report)
+            }
+        }
+
+        try flush()
+        if deviceIdentifier(of: root) != deviceAtStart { volumeVanished = true }
+        report.unreadableFolders = failures.count
+        report.volumeVanished = volumeVanished
+        report.cancelled = cancelFlag.isCancelled
+        report.sawNothing = report.scanned == 0 && !previous.isEmpty
+        onProgress(report)
+        return report
+    }
+}
+
 // MARK: - Testi e regole della card "Foto gia' salvate" (roadmap #31, Task 6)
 
 /// I nomi dei comandi della card, in un punto solo. Non e' pignoleria: due dei messaggi
