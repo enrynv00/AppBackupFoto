@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Stato: BOZZA — in attesa dell'approvazione esplicita di Enrico**, in particolare della sezione «Scostamenti dalla spec da far approvare» qui sotto. Nessuna riga di codice scritta nel repository. Spec: `Docs/superpowers/specs/2026-09-26-cross-store-inventory-design.md` (approvata). ADR: **0015** (scritto nel Task 0, dopo l'approvazione). ROADMAP: **#44**. ADR-0014 e #43 restano riservati al piano `2026-09-26-s3-upload-failures-visible`.
+**Stato: APPROVATO da Enrico il 2026-09-28** — scostamenti S1-S11 approvati; decisioni: categoria «⏳ Non si può ancora dire» sì, incompleto vale per l'archivio intero (D1), letture in sequenza SSD → HDD → Cubbit (D2), massimo 300 voci per categoria (D3), «Svuota l'elenco» svuota anche l'inventario e il testo di conferma lo dice (S8). Spec: `Docs/superpowers/specs/2026-09-26-cross-store-inventory-design.md` (approvata). ADR: **0015** (scritto nel Task 0, dopo l'approvazione). ROADMAP: **#44**. ADR-0014 e #43 restano riservati al piano `2026-09-26-s3-upload-failures-visible`.
 
 **Base:** `main` a `bf9fd99` (861 test), branch nuovo `feature/cross-store-inventory`.
 
