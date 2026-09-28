@@ -227,4 +227,18 @@ final class MainThreadIsolationTests: XCTestCase {
         XCTAssertEqual(done.wait(timeout: .now() + 10), .success,
                        "integritySampleLocalPair ha avuto bisogno del main thread.")
     }
+
+    // MARK: - Inventario (ROADMAP #44)
+
+    func testContentHasherDigestFile_runsWithoutTheMainThread() throws {
+        let url = tmp.appendingPathComponent("a.jpg")
+        try Data("uno".utf8).write(to: url)
+        let done = DispatchSemaphore(value: 0)
+        Task.detached {
+            _ = ContentHasher.digestFile(at: url)
+            done.signal()
+        }
+        XCTAssertEqual(done.wait(timeout: .now() + 10), .success,
+                       "ContentHasher.digestFile ha avuto bisogno del main thread.")
+    }
 }

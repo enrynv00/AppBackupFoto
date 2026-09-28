@@ -5904,6 +5904,140 @@ nonisolated func sha256(of url: URL) -> String? {
     sha256Measured(of: url)?.hash
 }
 
+// MARK: - ContentHasher: una lettura, tre impronte (ROADMAP #44, ADR-0015)
+
+/// Le tre impronte di un contenuto.
+// `nonisolated`: value type senza stato, prodotto e letto fuori dal main.
+nonisolated struct ContentDigest: Equatable, Sendable {
+    let size: Int64
+    /// Quella dell'elenco dei Doppioni (ADR-0001): e' l'identita' del contenuto.
+    let sha256: String
+    /// L'ETag che Cubbit da' a un file caricato in un colpo solo.
+    let md5: String
+    /// L'ETag che Cubbit da' a un file caricato a pezzi da 64 MiB:
+    /// `md5(md5(parte1) ‖ … ‖ md5(parteN))-N`. `nil` per i file fino a 64 MiB COMPRESI, perche'
+    /// `S3Syncer.upload` passa ai pezzi solo con `size > multipartChunkSize`: un file di
+    /// esattamente 64 MiB va su con un caricamento unico, e il suo ETag e' l'MD5.
+    let multipartETag: String?
+}
+
+/// Accumula SHA256, MD5 e l'MD5 di ogni parte da `partSize` byte mentre i byte arrivano, in
+/// UNA passata. Puro: non sa da dove vengono i byte (un file, un `Data` in un test). Le parti
+/// si contano sui byte, non sulle letture: un `read()` che restituisce meno byte di quanti
+/// chiesti non sposta i confini.
+// `nonisolated`: value type; ogni istanza vive sullo stack del thread che legge.
+nonisolated struct ContentHasher {
+    let partSize: Int
+    private var sha = SHA256()
+    private var whole = Insecure.MD5()
+    private var part = Insecure.MD5()
+    private var partFill = 0
+    private var partDigests = Data()
+    private var partCount = 0
+    private(set) var byteCount: Int64 = 0
+
+    /// `partSize` e' iniettabile solo per i test (confini visibili con pochi byte); in
+    /// produzione e' sempre la dimensione delle parti con cui l'app carica su Cubbit.
+    init(partSize: Int = S3Syncer.multipartChunkSize) {
+        precondition(partSize > 0, "partSize deve essere positivo")
+        self.partSize = partSize
+    }
+
+    mutating func update(_ bytes: UnsafeRawBufferPointer) {
+        guard bytes.count > 0 else { return }
+        sha.update(bufferPointer: bytes)
+        whole.update(bufferPointer: bytes)
+        byteCount += Int64(bytes.count)
+        var offset = 0
+        while offset < bytes.count {
+            let n = min(bytes.count - offset, partSize - partFill)
+            part.update(bufferPointer: UnsafeRawBufferPointer(rebasing: bytes[offset..<(offset + n)]))
+            partFill += n
+            offset += n
+            if partFill == partSize { closePart() }
+        }
+    }
+
+    mutating func update(_ data: Data) {
+        data.withUnsafeBytes { update($0) }
+    }
+
+    private mutating func closePart() {
+        partDigests.append(contentsOf: part.finalize())
+        partCount += 1
+        part = Insecure.MD5()
+        partFill = 0
+    }
+
+    func finalize() -> ContentDigest {
+        var copy = self
+        if copy.partFill > 0 { copy.closePart() }
+        let etag: String? = byteCount > Int64(partSize)
+            ? Self.hex(Insecure.MD5.hash(data: copy.partDigests)) + "-\(copy.partCount)"
+            : nil
+        return ContentDigest(size: byteCount, sha256: Self.hex(sha.finalize()),
+                             md5: Self.hex(whole.finalize()), multipartETag: etag)
+    }
+
+    static func hex<D: Sequence>(_ digest: D) -> String where D.Element == UInt8 {
+        digest.map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+/// Esito della lettura di un file per l'inventario.
+nonisolated enum ContentReadOutcome: Equatable, Sendable {
+    case digest(ContentDigest)
+    /// Non si apre, o `read()` fallisce (permessi, EIO, disco scollegato a meta').
+    case unreadable
+    /// `fstat` prima e dopo, o i byte letti, non coincidono: il file si e' mosso sotto di noi.
+    case changedWhileReading
+    case cancelled
+}
+
+extension ContentHasher {
+    /// 1 MiB, riusato per tutto il file: la memoria resta costante anche su un video da 40 GB.
+    nonisolated static let readBufferSize = 1 << 20
+
+    /// Legge `url` una volta sola e restituisce le tre impronte.
+    ///
+    /// Stesso schema di `sha256Measured`, e per le stesse ragioni: I/O POSIX a basso livello
+    /// (`open`/`read`/`close`, buffer riusato), MAI `FileHandle.readData` — e' il bug di memoria
+    /// da 41 GB (`.claude/rules/architecture.md`); dimensione misurata sullo stesso descrittore
+    /// prima e dopo, perche' `URL.resourceValues` serve valori in cache. NON usa
+    /// `S3Syncer.readFileInChunks`, che segue lo stesso principio ma e' un metodo `async` di un
+    /// tipo `@MainActor` (girerebbe sul main, ADR-0006) e copia ogni parte da 64 MiB in un
+    /// `Data` nuovo (vedi ADR-0015).
+    ///
+    /// `isCancelled` si chiede prima di ogni blocco da 1 MiB: «Interrompi» risponde anche a meta'
+    /// di un file grande.
+    nonisolated static func digestFile(at url: URL, partSize: Int = S3Syncer.multipartChunkSize,
+                                       isCancelled: () -> Bool = { false }) -> ContentReadOutcome {
+        let fd = open(url.path, O_RDONLY)
+        guard fd >= 0 else { return .unreadable }
+        defer { close(fd) }
+
+        var before = stat()
+        guard fstat(fd, &before) == 0 else { return .unreadable }
+
+        var hasher = ContentHasher(partSize: partSize)
+        var buffer = [UInt8](repeating: 0, count: readBufferSize)
+        while true {
+            if isCancelled() { return .cancelled }
+            let n = buffer.withUnsafeMutableBytes { read(fd, $0.baseAddress, readBufferSize) }
+            if n < 0 { return .unreadable }
+            if n == 0 { break }
+            buffer.withUnsafeBytes { hasher.update(UnsafeRawBufferPointer(rebasing: $0[0..<n])) }
+        }
+
+        var after = stat()
+        guard fstat(fd, &after) == 0 else { return .unreadable }
+        guard before.st_size == after.st_size, hasher.byteCount == Int64(after.st_size) else {
+            return .changedWhileReading
+        }
+        return .digest(hasher.finalize())
+    }
+}
+
 // MARK: - BookmarkManager
 final class BookmarkManager: ObservableObject {
     static let shared = BookmarkManager()
@@ -6751,7 +6885,8 @@ final class S3Syncer {
     // Costanti condivise: ogni unità di lavoro (file <64MB, o parte multipart) ha corpo
     // HTTP ≤ multipartChunkSize, quindi un tetto sul numero di slot è già equivalente a
     // un tetto sui byte in volo — nessuna contabilità separata necessaria.
-    static let multipartChunkSize = 64 * 1024 * 1024
+    // `nonisolated`: una costante; la legge anche `ContentHasher`, fuori dal main (ROADMAP #44).
+    nonisolated static let multipartChunkSize = 64 * 1024 * 1024
     private static let adaptiveMemoryCeilingBytes = 2 * 1024 * 1024 * 1024
     static let adaptiveConcurrencyCeiling = adaptiveMemoryCeilingBytes / multipartChunkSize
 
