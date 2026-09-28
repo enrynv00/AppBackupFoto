@@ -7846,6 +7846,118 @@ final class S3Syncer {
     }
 }
 
+// MARK: - ETag di Cubbit (ROADMAP #44, ADR-0015)
+
+/// La forma di un ETag di Cubbit. Tre casi, nient'altro: tutto quello che non e' riconosciuto
+/// con certezza e' `.unrecognized`, e un ETag non riconosciuto non certifica mai niente.
+// `nonisolated`: pura, chiamata dal confronto fuori dal main.
+nonisolated enum S3ETag: Equatable, Sendable {
+    /// Caricamento unico: l'ETag e' l'MD5 del contenuto.
+    case singlePart(md5: String)
+    /// Caricamento a pezzi: `md5(md5(parte1) ‖ … ‖ md5(parteN))-N`.
+    case multipart(digest: String, parts: Int)
+    case unrecognized
+
+    /// Accetta l'ETag con o senza virgolette (la lista le manda come `&quot;`, gia' decodificate
+    /// da `S3Syncer.xmlDecode`), in maiuscolo o minuscolo, con spazi ai bordi. Esadecimale solo
+    /// ASCII; `N` fra 1 e 10.000 (il massimo di S3), scritto senza zeri davanti.
+    static func parse(_ raw: String?) -> S3ETag {
+        guard var s = raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() else { return .unrecognized }
+        if s.count >= 2, s.hasPrefix("\""), s.hasSuffix("\"") { s = String(s.dropFirst().dropLast()) }
+        func isHex32(_ t: Substring) -> Bool { t.count == 32 && t.allSatisfy { $0.isASCII && $0.isHexDigit } }
+        let pieces = s.split(separator: "-", omittingEmptySubsequences: false)
+        if pieces.count == 1, isHex32(pieces[0]) { return .singlePart(md5: String(pieces[0])) }
+        if pieces.count == 2, isHex32(pieces[0]), let n = Int(pieces[1]), n >= 1, n <= 10_000, String(n) == pieces[1] {
+            return .multipart(digest: String(pieces[0]), parts: n)
+        }
+        return .unrecognized
+    }
+}
+
+/// Decisione 1 di Enrico: «certificato» su Cubbit vuol dire contenuto, confrontato con l'ETag
+/// senza scaricare. Un oggetto che non si riesce a confrontare cosi' e' NON CERTIFICABILE, mai
+/// «certificato» per ipotesi.
+// `nonisolated`: pura.
+nonisolated enum S3ETagMatcher {
+    /// Un file letto su SSD o HDD, con le sue impronte.
+    struct Candidate: Equatable, Sendable {
+        let size: Int64
+        let sha256: String
+        let md5: String
+        let multipartETag: String?
+    }
+
+    enum NotCertifiableReason: String, Equatable, Sendable {
+        case unrecognizedFormat
+        /// `-N` con un numero di parti che non torna con 64 MiB: caricato con un'altra
+        /// dimensione delle parti (per esempio da rclone). Ricalcolarlo vorrebbe dire scaricarlo.
+        case differentPartSize
+        /// Formato giusto, ma nessun file locale della stessa dimensione lo produce.
+        case noLocalFileProducesIt
+        /// Due contenuti locali diversi producono lo stesso ETag (una collisione MD5): non si
+        /// sceglie a caso.
+        case ambiguous
+    }
+
+    enum Verdict: Equatable, Sendable {
+        case certified(sha256: String)
+        /// ETag a parte unica che nessun file locale riproduce: e' l'MD5 vero di un contenuto
+        /// che c'e' solo su Cubbit. Si riconosce, ma non ha un SHA256.
+        case identifiedOnlyByMD5(md5: String)
+        case notCertifiable(NotCertifiableReason)
+    }
+
+    /// Quante parti da `partSize` produce `S3Syncer.upload` per un file di `size` byte (un
+    /// file vuoto o fino a `partSize` compresi e' una parte sola).
+    static func expectedParts(size: Int64, partSize: Int) -> Int {
+        guard size > 0 else { return 1 }
+        return Int((size + Int64(partSize) - 1) / Int64(partSize))
+    }
+
+    /// ETag di un caricamento a pezzi con UNA parte: l'MD5 dei 16 byte dell'MD5 del file. Non
+    /// dipende dalla dimensione delle parti, quindi si ricalcola da qualunque file locale.
+    static func md5OfMD5Hex(_ md5Hex: String) -> String? {
+        var bytes: [UInt8] = []
+        var i = md5Hex.startIndex
+        while i < md5Hex.endIndex {
+            let j = md5Hex.index(i, offsetBy: 2, limitedBy: md5Hex.endIndex) ?? md5Hex.endIndex
+            guard let b = UInt8(md5Hex[i..<j], radix: 16) else { return nil }
+            bytes.append(b)
+            i = j
+        }
+        guard bytes.count == 16 else { return nil }
+        return Insecure.MD5.hash(data: Data(bytes)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Solo i candidati della STESSA dimensione contano (spec: «di almeno un file letto su SSD
+    /// o HDD con la stessa dimensione»): il filtro e' qui, non affidato a chi chiama.
+    static func verdict(etag: String?, size: Int64, candidates: [Candidate],
+                        partSize: Int = S3Syncer.multipartChunkSize) -> Verdict {
+        let sameSize = candidates.filter { $0.size == size }
+        let matching: [Candidate]
+        switch S3ETag.parse(etag) {
+        case .unrecognized:
+            return .notCertifiable(.unrecognizedFormat)
+        case .singlePart(let md5):
+            matching = sameSize.filter { $0.md5 == md5 }
+            if matching.isEmpty { return .identifiedOnlyByMD5(md5: md5) }
+        case .multipart(let digest, 1):
+            matching = sameSize.filter { md5OfMD5Hex($0.md5) == digest }
+            if matching.isEmpty { return .notCertifiable(.noLocalFileProducesIt) }
+        case .multipart(let digest, let parts):
+            guard parts == expectedParts(size: size, partSize: partSize) else {
+                return .notCertifiable(.differentPartSize)
+            }
+            let wanted = "\(digest)-\(parts)"
+            matching = sameSize.filter { $0.multipartETag == wanted }
+            if matching.isEmpty { return .notCertifiable(.noLocalFileProducesIt) }
+        }
+        let shas = Set(matching.map(\.sha256))
+        guard shas.count == 1, let sha = shas.first else { return .notCertifiable(.ambiguous) }
+        return .certified(sha256: sha)
+    }
+}
+
 // MARK: - Spazio usato su Cubbit
 //
 // Persistenza e testo di "X usati · aggiornato...". Spec `Docs/superpowers/specs/2026-09-19-
