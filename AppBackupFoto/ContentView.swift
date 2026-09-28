@@ -4311,7 +4311,11 @@ private nonisolated func isPathInside(_ path: String, root: String) -> Bool {
 // L'annotazione rende verificabile dal compilatore un invariante gia' scritto sopra
 // (CONCORRENZA), non lo cambia. Vedi ADR-0006.
 nonisolated final class LibraryIndexStore: @unchecked Sendable {
-    static let schemaVersion = 1
+    /// 2 dal 2026-09-26 (ROADMAP #44): si aggiungono le tabelle dell'inventario.
+    static let schemaVersion = 2
+    /// L'unica versione diversa da `schemaVersion` da cui si sale SENZA buttare l'elenco:
+    /// la 1 ha `entries` identica a quella della 2 (vedi `createSchemaIfNeeded`, ADR-0015).
+    static let upgradableFromVersion: Int32 = 1
 
     enum StoreError: Error, LocalizedError {
         case cannotOpen(String)
@@ -4539,13 +4543,23 @@ nonisolated final class LibraryIndexStore: @unchecked Sendable {
         // un valore non numerico veniva letto come "database nuovo" e i dati vecchi
         // venivano adottati — il caso peggiore era irreversibile (schema futuro con colonne
         // diverse: ogni lettura falliva a ogni avvio, per sempre).
-        // Qualunque versione diversa da quella attesa — piu' vecchia, piu' nuova, o zero —
-        // significa "ricostruisci", mai "interpreta al meglio" (ADR-0002). Buttare l'indice
-        // non perde nulla di originale.
-        if try userVersionOnDisk() != Int32(Self.schemaVersion) {
+        //
+        // Tre casi, e solo tre (ADR-0002, ADR-0015):
+        // - versione attesa: niente da fare;
+        // - versione 1 (`upgradableFromVersion`): e' lo schema di prima dell'inventario, con
+        //   `entries` IDENTICA a quella di oggi. Si tiene l'elenco e si ricreano VUOTE le
+        //   tabelle dell'inventario: una build vecchia riaperta su un file nuovo le lascia
+        //   orfane, con dati di un giro che nessuno ha piu' controllato;
+        // - qualunque altra versione — piu' vecchia, piu' nuova, o zero — significa
+        //   "ricostruisci tutto", mai "interpreta al meglio". Buttare l'indice non perde
+        //   nulla di originale.
+        let onDisk = try userVersionOnDisk()
+        if onDisk == Self.upgradableFromVersion {
+            try exec(Self.dropInventoryTablesSQL)
+        } else if onDisk != Int32(Self.schemaVersion) {
             // `meta` non esiste piu' in questo schema: il DROP serve solo a ripulire i
             // database scritti dalla prima versione della store, che la creava.
-            try exec("DROP TABLE IF EXISTS entries; DROP TABLE IF EXISTS meta;")
+            try exec("DROP TABLE IF EXISTS entries; DROP TABLE IF EXISTS meta; " + Self.dropInventoryTablesSQL)
         }
         // NOT NULL esplicito sulle colonne TEXT: in una tabella rowid `TEXT PRIMARY KEY`
         // **non** implica NOT NULL e ammette perfino piu' righe NULL (verificato scrivendole
@@ -4562,8 +4576,64 @@ nonisolated final class LibraryIndexStore: @unchecked Sendable {
         CREATE INDEX IF NOT EXISTS idx_entries_hash ON entries(hash);
         CREATE INDEX IF NOT EXISTS idx_entries_size ON entries(size);
         """)
+        try exec(Self.createInventoryTablesSQL)
         try exec("PRAGMA user_version=\(Self.schemaVersion);")
     }
+
+    // MARK: Schema dell'inventario (ROADMAP #44, ADR-0015)
+
+    /// Le tre tabelle dell'inventario. Vivono nello STESSO file dell'elenco (decisione 4
+    /// della spec del 2026-09-26: si estende l'elenco, non un secondo database), quindi
+    /// "Svuota l'elenco" svuota anche l'inventario.
+    ///
+    /// - `inventory_local`: un file foto/video letto su SSD o HDD. `sha256`/`md5` sono NULL
+    ///   se la lettura non e' riuscita (`status` diverso da `ok`); `etag` e' NULL anche per
+    ///   i file fino a 64 MiB compresi, che Cubbit riceve con un caricamento unico.
+    /// - `inventory_s3`: un oggetto del bucket nel perimetro (foto e video). La chiave
+    ///   primaria e' la chiave VERA (`display_key`): su Cubbit maiuscole e minuscole
+    ///   contano, e due oggetti che differiscono solo per quello non devono sovrascriversi.
+    /// - `inventory_state`: com'e' andata l'ultima lettura di ciascun archivio.
+    ///
+    /// `run_id` dice in quale giro la riga e' stata vista l'ultima volta. Conta come
+    /// "presente" solo una riga del giro registrato in `inventory_state`: le altre sono solo
+    /// una memoria per non rileggere i file invariati (e dopo un giro completo si cancellano).
+    static let createInventoryTablesSQL = """
+    CREATE TABLE IF NOT EXISTS inventory_local (
+        archive      TEXT NOT NULL,
+        path         TEXT NOT NULL,
+        display_path TEXT NOT NULL,
+        size         INTEGER NOT NULL,
+        mtime        REAL NOT NULL,
+        status       TEXT NOT NULL,
+        sha256       TEXT,
+        md5          TEXT,
+        etag         TEXT,
+        hashed_at    REAL NOT NULL,
+        run_id       INTEGER NOT NULL,
+        PRIMARY KEY (archive, path)
+    );
+    CREATE INDEX IF NOT EXISTS idx_inventory_local_run ON inventory_local(archive, run_id);
+    CREATE TABLE IF NOT EXISTS inventory_s3 (
+        display_key  TEXT PRIMARY KEY NOT NULL,
+        path         TEXT NOT NULL,
+        size         INTEGER NOT NULL,
+        etag         TEXT,
+        run_id       INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_inventory_s3_run ON inventory_s3(run_id);
+    CREATE TABLE IF NOT EXISTS inventory_state (
+        archive      TEXT PRIMARY KEY NOT NULL,
+        run_id       INTEGER NOT NULL,
+        complete     INTEGER NOT NULL,
+        reason       TEXT,
+        unreadable   INTEGER NOT NULL,
+        started_at   REAL NOT NULL,
+        finished_at  REAL
+    );
+    """
+
+    static let dropInventoryTablesSQL =
+        "DROP TABLE IF EXISTS inventory_local; DROP TABLE IF EXISTS inventory_s3; DROP TABLE IF EXISTS inventory_state;"
 
     private func userVersionOnDisk() throws -> Int32 {
         let stmt = try prepare("PRAGMA user_version;")
@@ -4646,6 +4716,57 @@ nonisolated final class LibraryIndexStore: @unchecked Sendable {
     /// l'elenco PIU' vecchio di quanto e' — mai il contrario, mai un avviso taciuto.
     func newestHashedAt() throws -> Double? {
         try queue.sync { try newestHashedAtUnsynchronized() }
+    }
+
+    // MARK: Inventario (ROADMAP #44, ADR-0015) — API pubblica, serializzata sulla coda
+
+    /// Apre un giro: i tre archivi risultano "in corso", quindi INCOMPLETI, finche' ognuno
+    /// non viene chiuso da `finishInventoryArchive`. Se l'app si chiude a meta', resta
+    /// scritto che il giro non e' finito: mai un vecchio "completo" che sembra di oggi.
+    func beginInventoryRun(runId: Int64, startedAt: Double) throws {
+        try queue.sync { try beginInventoryRunUnsynchronized(runId: runId, startedAt: startedAt) }
+    }
+
+    /// Le righe di SSD o HDD rimaste dal giro precedente (qualunque `run_id`), per chiave.
+    /// Servono solo a non rileggere i file invariati.
+    func inventoryLocalRows(_ archive: InventoryArchive) throws -> [String: InventoryLocalFile] {
+        try queue.sync { try inventoryLocalRowsUnsynchronized(archive) }
+    }
+
+    /// Un lotto di righe di SSD o HDD, in una sola transazione (ADR-0002: un inventario
+    /// parziale e' valido in ogni istante).
+    func upsertInventoryLocal(_ rows: [InventoryLocalFile], archive: InventoryArchive, runId: Int64) throws {
+        try queue.sync { try upsertInventoryLocalUnsynchronized(rows, archive: archive, runId: runId) }
+    }
+
+    /// Una pagina di oggetti Cubbit, in una sola transazione.
+    func upsertInventoryS3(_ rows: [InventoryS3Object], runId: Int64) throws {
+        try queue.sync { try upsertInventoryS3Unsynchronized(rows, runId: runId) }
+    }
+
+    /// Chiude la lettura di un archivio. Solo se `complete`, cancella le righe di quel
+    /// archivio viste in un giro precedente e non in questo: e' l'unico momento in cui
+    /// "non l'ho visto" vuol dire "non c'e' piu'" (stessa regola di `LibraryIndexer`).
+    func finishInventoryArchive(_ archive: InventoryArchive, runId: Int64, complete: Bool,
+                                reason: InventoryIncompleteReason?, unreadable: Int,
+                                finishedAt: Double) throws {
+        try queue.sync {
+            try finishInventoryArchiveUnsynchronized(archive, runId: runId, complete: complete,
+                                                     reason: reason, unreadable: unreadable,
+                                                     finishedAt: finishedAt)
+        }
+    }
+
+    /// Lo stato dell'ultima lettura di ogni archivio. Un archivio mai letto non compare.
+    func inventoryStates() throws -> [InventoryArchive: InventoryArchiveState] {
+        try queue.sync { try inventoryStatesUnsynchronized() }
+    }
+
+    /// Tutto quello che serve a `InventoryClassifier`: per ogni archivio, SOLO le righe del
+    /// giro registrato nel suo stato. In ordine di percorso, cosi' il risultato non dipende
+    /// dall'ordine in cui SQLite restituisce le righe.
+    func inventorySnapshot() throws -> InventorySnapshot {
+        try queue.sync { try inventorySnapshotUnsynchronized() }
     }
 
     // MARK: Implementazioni (gia' sulla coda: non chiamarle dall'esterno)
@@ -4817,6 +4938,239 @@ nonisolated final class LibraryIndexStore: @unchecked Sendable {
         // (1 gennaio 1970).
         guard sqlite3_column_type(stmt, 0) != SQLITE_NULL else { return nil }
         return sqlite3_column_double(stmt, 0)
+    }
+
+    // MARK: Inventario — implementazioni (gia' sulla coda)
+
+    /// Come `bindText`, ma un valore assente diventa NULL di proposito (non per un bind fallito).
+    private func bindOptionalText(_ stmt: OpaquePointer?, _ index: Int32, _ value: String?) throws {
+        guard let value else {
+            guard sqlite3_bind_null(stmt, index) == SQLITE_OK else { throw sqlError() }
+            return
+        }
+        try bindText(stmt, index, value)
+    }
+
+    private func optionalText(_ stmt: OpaquePointer?, _ column: Int32) -> String? {
+        guard sqlite3_column_type(stmt, column) != SQLITE_NULL,
+              let p = sqlite3_column_text(stmt, column) else { return nil }
+        return String(cString: p)
+    }
+
+    private func beginInventoryRunUnsynchronized(runId: Int64, startedAt: Double) throws {
+        try exec("BEGIN TRANSACTION;")
+        do {
+            let stmt = try prepare("""
+            INSERT OR REPLACE INTO inventory_state(archive,run_id,complete,reason,unreadable,started_at,finished_at)
+            VALUES(?,?,0,?,0,?,NULL);
+            """)
+            defer { sqlite3_finalize(stmt) }
+            for archive in InventoryArchive.allCases {
+                sqlite3_reset(stmt)
+                try bindText(stmt, 1, archive.rawValue)
+                try bindInt64(stmt, 2, runId)
+                try bindText(stmt, 3, InventoryIncompleteReason.running.rawValue)
+                try bindDouble(stmt, 4, startedAt)
+                guard sqlite3_step(stmt) == SQLITE_DONE else { throw sqlError() }
+            }
+            try exec("COMMIT;")
+        } catch {
+            try? exec("ROLLBACK;")
+            throw error
+        }
+    }
+
+    private func readLocalRow(_ stmt: OpaquePointer?) -> InventoryLocalFile? {
+        // Stessa guardia nil di `readEntry`: una riga malformata si salta, non si interpreta.
+        guard let path = sqlite3_column_text(stmt, 0),
+              let display = sqlite3_column_text(stmt, 1),
+              let statusText = sqlite3_column_text(stmt, 4),
+              let status = InventoryReadStatus(rawValue: String(cString: statusText)) else { return nil }
+        let size = sqlite3_column_int64(stmt, 2)
+        var digest: ContentDigest? = nil
+        if status == .ok {
+            // Una riga "ok" senza impronte non e' una riga ok: si legge come illeggibile,
+            // cosi' il giro dopo la rilegge invece di fidarsi.
+            guard let sha = optionalText(stmt, 5), let md5 = optionalText(stmt, 6) else {
+                return InventoryLocalFile(key: String(cString: path), displayPath: String(cString: display),
+                                          size: size, mtime: sqlite3_column_double(stmt, 3),
+                                          status: .unreadable, digest: nil,
+                                          hashedAt: sqlite3_column_double(stmt, 8))
+            }
+            digest = ContentDigest(size: size, sha256: sha, md5: md5, multipartETag: optionalText(stmt, 7))
+        }
+        return InventoryLocalFile(key: String(cString: path), displayPath: String(cString: display),
+                                  size: size, mtime: sqlite3_column_double(stmt, 3),
+                                  status: status, digest: digest,
+                                  hashedAt: sqlite3_column_double(stmt, 8))
+    }
+
+    private static let localColumns = "path,display_path,size,mtime,status,sha256,md5,etag,hashed_at"
+
+    private func inventoryLocalRowsUnsynchronized(_ archive: InventoryArchive) throws -> [String: InventoryLocalFile] {
+        let stmt = try prepare("SELECT \(Self.localColumns) FROM inventory_local WHERE archive=?;")
+        defer { sqlite3_finalize(stmt) }
+        try bindText(stmt, 1, archive.rawValue)
+        var out: [String: InventoryLocalFile] = [:]
+        while try stepRow(stmt) {
+            if let row = readLocalRow(stmt) { out[row.key] = row }
+        }
+        return out
+    }
+
+    private func upsertInventoryLocalUnsynchronized(_ rows: [InventoryLocalFile], archive: InventoryArchive,
+                                                    runId: Int64) throws {
+        precondition(archive != .s3, "inventory_local contiene solo SSD e HDD")
+        guard !rows.isEmpty else { return }
+        try exec("BEGIN TRANSACTION;")
+        do {
+            let stmt = try prepare("""
+            INSERT OR REPLACE INTO inventory_local(archive,path,display_path,size,mtime,status,sha256,md5,etag,hashed_at,run_id)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?);
+            """)
+            defer { sqlite3_finalize(stmt) }
+            for r in rows {
+                sqlite3_reset(stmt)
+                try bindText(stmt, 1, archive.rawValue)
+                try bindText(stmt, 2, r.key)
+                try bindText(stmt, 3, r.displayPath)
+                try bindInt64(stmt, 4, r.size)
+                try bindDouble(stmt, 5, r.mtime)
+                try bindText(stmt, 6, r.status.rawValue)
+                try bindOptionalText(stmt, 7, r.digest?.sha256)
+                try bindOptionalText(stmt, 8, r.digest?.md5)
+                try bindOptionalText(stmt, 9, r.digest?.multipartETag)
+                try bindDouble(stmt, 10, r.hashedAt)
+                try bindInt64(stmt, 11, runId)
+                guard sqlite3_step(stmt) == SQLITE_DONE else { throw sqlError() }
+            }
+            try exec("COMMIT;")
+        } catch {
+            try? exec("ROLLBACK;")
+            throw error
+        }
+    }
+
+    private func upsertInventoryS3Unsynchronized(_ rows: [InventoryS3Object], runId: Int64) throws {
+        guard !rows.isEmpty else { return }
+        try exec("BEGIN TRANSACTION;")
+        do {
+            let stmt = try prepare("""
+            INSERT OR REPLACE INTO inventory_s3(display_key,path,size,etag,run_id) VALUES(?,?,?,?,?);
+            """)
+            defer { sqlite3_finalize(stmt) }
+            for r in rows {
+                sqlite3_reset(stmt)
+                try bindText(stmt, 1, r.displayKey)
+                try bindText(stmt, 2, r.key)
+                try bindInt64(stmt, 3, r.size)
+                try bindOptionalText(stmt, 4, r.etag)
+                try bindInt64(stmt, 5, runId)
+                guard sqlite3_step(stmt) == SQLITE_DONE else { throw sqlError() }
+            }
+            try exec("COMMIT;")
+        } catch {
+            try? exec("ROLLBACK;")
+            throw error
+        }
+    }
+
+    private func finishInventoryArchiveUnsynchronized(_ archive: InventoryArchive, runId: Int64, complete: Bool,
+                                                      reason: InventoryIncompleteReason?, unreadable: Int,
+                                                      finishedAt: Double) throws {
+        try exec("BEGIN TRANSACTION;")
+        do {
+            let stmt = try prepare("""
+            UPDATE inventory_state SET complete=?, reason=?, unreadable=?, finished_at=?
+            WHERE archive=? AND run_id=?;
+            """)
+            defer { sqlite3_finalize(stmt) }
+            try bindInt64(stmt, 1, complete ? 1 : 0)
+            try bindOptionalText(stmt, 2, complete ? nil : (reason ?? .interrupted).rawValue)
+            try bindInt64(stmt, 3, Int64(unreadable))
+            try bindDouble(stmt, 4, finishedAt)
+            try bindText(stmt, 5, archive.rawValue)
+            try bindInt64(stmt, 6, runId)
+            guard sqlite3_step(stmt) == SQLITE_DONE else { throw sqlError() }
+            // Nessuna riga aggiornata = non e' il giro aperto (un giro vecchio arrivato tardi):
+            // non si cancella niente, altrimenti sparirebbero le righe del giro vero.
+            if complete && sqlite3_changes(db) == 1 {
+                let sql = archive == .s3
+                    ? "DELETE FROM inventory_s3 WHERE run_id<>?;"
+                    : "DELETE FROM inventory_local WHERE archive=? AND run_id<>?;"
+                let del = try prepare(sql)
+                defer { sqlite3_finalize(del) }
+                if archive == .s3 {
+                    try bindInt64(del, 1, runId)
+                } else {
+                    try bindText(del, 1, archive.rawValue)
+                    try bindInt64(del, 2, runId)
+                }
+                guard sqlite3_step(del) == SQLITE_DONE else { throw sqlError() }
+            }
+            try exec("COMMIT;")
+        } catch {
+            try? exec("ROLLBACK;")
+            throw error
+        }
+    }
+
+    private func inventoryStatesUnsynchronized() throws -> [InventoryArchive: InventoryArchiveState] {
+        let stmt = try prepare("""
+        SELECT archive,run_id,complete,reason,unreadable,started_at,finished_at FROM inventory_state;
+        """)
+        defer { sqlite3_finalize(stmt) }
+        var out: [InventoryArchive: InventoryArchiveState] = [:]
+        while try stepRow(stmt) {
+            guard let a = sqlite3_column_text(stmt, 0),
+                  let archive = InventoryArchive(rawValue: String(cString: a)) else { continue }
+            let finished = sqlite3_column_type(stmt, 6) == SQLITE_NULL ? nil : sqlite3_column_double(stmt, 6)
+            // "Completo" vale solo con una data di fine: un giro mai chiuso non e' completo.
+            let complete = sqlite3_column_int64(stmt, 2) == 1 && finished != nil
+            // Un motivo che questa versione non conosce non rende l'archivio completo: resta
+            // incompleto, col motivo generico.
+            let reason = optionalText(stmt, 3).map { InventoryIncompleteReason(rawValue: $0) ?? .interrupted }
+            out[archive] = InventoryArchiveState(archive: archive, runId: sqlite3_column_int64(stmt, 1),
+                                                 complete: complete,
+                                                 reason: complete ? nil : (reason ?? .interrupted),
+                                                 unreadable: Int(sqlite3_column_int64(stmt, 4)),
+                                                 startedAt: sqlite3_column_double(stmt, 5),
+                                                 finishedAt: finished)
+        }
+        return out
+    }
+
+    private func inventorySnapshotUnsynchronized() throws -> InventorySnapshot {
+        let states = try inventoryStatesUnsynchronized()
+        var snap = InventorySnapshot(states: states)
+        for archive in [InventoryArchive.ssd, .hdd] {
+            guard let state = states[archive] else { continue }
+            let stmt = try prepare("""
+            SELECT \(Self.localColumns) FROM inventory_local WHERE archive=? AND run_id=? ORDER BY path;
+            """)
+            defer { sqlite3_finalize(stmt) }
+            try bindText(stmt, 1, archive.rawValue)
+            try bindInt64(stmt, 2, state.runId)
+            var rows: [InventoryLocalFile] = []
+            while try stepRow(stmt) {
+                if let row = readLocalRow(stmt) { rows.append(row) }
+            }
+            if archive == .ssd { snap.ssd = rows } else { snap.hdd = rows }
+        }
+        if let state = states[.s3] {
+            let stmt = try prepare("""
+            SELECT display_key,path,size,etag FROM inventory_s3 WHERE run_id=? ORDER BY display_key;
+            """)
+            defer { sqlite3_finalize(stmt) }
+            try bindInt64(stmt, 1, state.runId)
+            while try stepRow(stmt) {
+                guard let display = sqlite3_column_text(stmt, 0),
+                      let path = sqlite3_column_text(stmt, 1) else { continue }
+                snap.s3.append(InventoryS3Object(key: String(cString: path), displayKey: String(cString: display),
+                                                 size: sqlite3_column_int64(stmt, 2), etag: optionalText(stmt, 3)))
+            }
+        }
+        return snap
     }
 }
 
@@ -5275,6 +5629,107 @@ nonisolated final class LibraryIndexer: @unchecked Sendable {
         onProgress(progress)
         return progress
     }
+}
+
+// MARK: - Inventario certificato: il modello dei dati (ROADMAP #44, ADR-0015)
+//
+// Tutti value type senza stato condiviso: `nonisolated` perche' li producono e li leggono lo
+// scanner, il lettore di Cubbit e il confronto, fuori dal main (ADR-0006).
+
+/// I tre posti in cui stanno le foto. L'ordine (`rank`) e' quello in cui la finestra li nomina.
+nonisolated enum InventoryArchive: String, CaseIterable, Sendable, Comparable {
+    case ssd, hdd, s3
+
+    var rank: Int {
+        switch self {
+        case .ssd: return 0
+        case .hdd: return 1
+        case .s3: return 2
+        }
+    }
+
+    static func < (a: InventoryArchive, b: InventoryArchive) -> Bool { a.rank < b.rank }
+}
+
+/// Com'e' andata la lettura di un file su SSD o HDD.
+nonisolated enum InventoryReadStatus: String, Sendable {
+    case ok
+    /// Non si e' aperto o la lettura si e' interrotta (permessi, errore del disco, disco sparito).
+    case unreadable
+    /// Letto, ma e' cambiato mentre lo si leggeva: le impronte non valgono niente.
+    case changedWhileReading
+}
+
+/// Un file foto o video letto su SSD o HDD.
+nonisolated struct InventoryLocalFile: Equatable, Sendable {
+    /// `normalizedIndexKey` del percorso relativo alla radice del disco: la stessa chiave
+    /// dell'elenco dei Doppioni, cosi' "stesso percorso" vuol dire la stessa cosa ovunque.
+    let key: String
+    /// Il percorso com'e' sul disco, da mostrare.
+    let displayPath: String
+    let size: Int64
+    /// Data di modifica letta PRIMA della lettura del contenuto (vedi `InventoryScanner`).
+    let mtime: Double
+    let status: InventoryReadStatus
+    /// `nil` se `status != .ok`.
+    let digest: ContentDigest?
+    /// Quando le impronte sono state calcolate: serve alla regola anti-racy di `indexEntryVerdict`.
+    let hashedAt: Double
+}
+
+/// Un oggetto del bucket, nel perimetro (foto e video).
+nonisolated struct InventoryS3Object: Equatable, Sendable {
+    /// `normalizedIndexKey` della chiave: per il confronto dei percorsi con SSD e HDD.
+    let key: String
+    /// La chiave vera, con maiuscole e minuscole: su Cubbit contano.
+    let displayKey: String
+    let size: Int64
+    /// L'ETag come arriva dalla lista (virgolette comprese); `nil` se la lista non lo dava.
+    let etag: String?
+}
+
+/// Perche' la lettura di un archivio non vale come completa.
+nonisolated enum InventoryIncompleteReason: String, Sendable {
+    /// Scritto all'inizio di ogni giro: resta se l'app si chiude prima della fine.
+    case running
+    /// Il giro si e' fermato prima di arrivare a questo archivio.
+    case notReached
+    /// Fermato da «Interrompi» o dallo scollegamento di un disco qualsiasi.
+    case interrupted
+    case volumeVanished
+    case foldersUnreadable
+    case filesUnreadable
+    /// Zero foto viste dove la volta prima ce n'erano.
+    case sawNothing
+    case listingFailed
+    case listingMalformed
+    case couldNotSave
+}
+
+/// Com'e' andata l'ultima lettura di un archivio.
+nonisolated struct InventoryArchiveState: Equatable, Sendable {
+    let archive: InventoryArchive
+    let runId: Int64
+    /// Vero SOLO se la lettura e' arrivata in fondo senza nessun problema. Finche' e' falso,
+    /// da questo archivio non si dichiara assente niente (la regola «incompleto non e' assente»).
+    let complete: Bool
+    /// `nil` se completo.
+    let reason: InventoryIncompleteReason?
+    /// File che non si sono lasciati leggere per intero.
+    let unreadable: Int
+    let startedAt: Double
+    /// `nil` finche' la lettura di questo archivio non e' finita.
+    let finishedAt: Double?
+}
+
+/// Quello che il confronto riceve: per ogni archivio le righe dell'ultimo giro, e i tre stati.
+nonisolated struct InventorySnapshot: Equatable, Sendable {
+    var ssd: [InventoryLocalFile] = []
+    var hdd: [InventoryLocalFile] = []
+    var s3: [InventoryS3Object] = []
+    var states: [InventoryArchive: InventoryArchiveState] = [:]
+
+    func isComplete(_ archive: InventoryArchive) -> Bool { states[archive]?.complete == true }
 }
 
 // MARK: - Testi e regole della card "Foto gia' salvate" (roadmap #31, Task 6)
