@@ -4259,6 +4259,35 @@ nonisolated func isRunningUnderTests() -> Bool {
     ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
 }
 
+/// La radice dei file di persistenza che `BackupRunner` apre da solo, senza che nessun test
+/// li abbia scelti (BUG-10, 2026-09-28): `libraryIndexStore`/`trashManifestStore`/
+/// `trashHistoryStore` sono `lazy var`, valutate da `BackupRunner.init()` — che gira
+/// sempre, sia che `RootView` mostri `SetupView` sia `ContentView` — non da un percorso
+/// opzionale che un test possa evitare di toccare.
+///
+/// Quando Xcode avvia l'app come test host di `xcodebuild test`, e' questo stesso
+/// `BackupRunner()` reale a partire, e prima di questo fix puntava sempre a
+/// `~/Library/Application Support/AppBackupFoto/`, la cartella vera dell'utente — mai una
+/// posizione temporanea, a differenza di `storeAllowedRoots`/`isAllowedStoreLocation`, che
+/// gia' distinguono i due regimi da #31. Con lo schema 2 del Task 4 dell'inventario, questo
+/// ha migrato il `library-index.sqlite` reale di Enrico durante una corsa di test.
+///
+/// Pura e parametrizzata (default `isRunningUnderTests()`, mai chiamata da un test con
+/// l'argomento omesso): sotto test punta a una cartella nella directory temporanea del
+/// processo — la stessa gia' ammessa da `isAllowedStoreLocation(_:includingTemporary: true)`,
+/// nessuna seconda regola che possa divergere da quella. Non e' isolata per singolo test:
+/// tutti i test la condividono per la durata dell'intero test host, ma nessun test la usa
+/// direttamente (ognuno apre il proprio store usa-e-getta con un URL esplicito) — serve solo
+/// a tenere `BackupRunner`, mai visto da un test, lontano dai file veri.
+nonisolated func backupRunnerStoreRoot(isRunningUnderTests: Bool = isRunningUnderTests()) -> URL {
+    if isRunningUnderTests {
+        return URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("AppBackupFotoTestHost", isDirectory: true)
+    }
+    return FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("AppBackupFoto", isDirectory: true)
+}
+
 private nonisolated func storeAllowedRoots(includingTemporary: Bool) -> [String] {
     var roots = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
     if includingTemporary {
@@ -9584,6 +9613,13 @@ final class BackupRunner: ObservableObject {
     func loadS3ConfigIfNeeded() async {
         guard !s3ConfigLoaded else { return }
         s3ConfigLoaded = true
+        // BUG-10 (2026-09-28): sotto il test host di `xcodebuild test` questa funzione parte
+        // comunque, chiamata dalla `.task` di `ContentView` — nessun test la chiama a mano.
+        // Senza questa guardia leggerebbe il Keychain vero (`kSecAttrService: "AppBackupFoto"`)
+        // e, in fallback, `~/.config/rclone/rclone.conf` dell'utente a ogni corsa di test.
+        // Restare con `s3Config == nil` e' lo stato che l'app gestisce gia' (nessuna config
+        // trovata): nessun nuovo ramo per i chiamanti.
+        guard !isRunningUnderTests() else { return }
         // `BackupRunner` e' `@MainActor`, quindi questo corpo girerebbe TUTTO sul main thread —
         // inclusa `readConfigWithSource`, che legge il **Keychain** e, in fallback, un file di
         // configurazione. Un accesso al Keychain puo' costare centinaia di millisecondi, e
@@ -10012,16 +10048,14 @@ final class BackupRunner: ObservableObject {
     /// prerequisito per importare (ADR-0002). Nessun percorso di codice deve fallire
     /// per colpa sua, per questo `try?` e non `try`.
     private(set) lazy var libraryIndexStore: LibraryIndexStore? = {
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("AppBackupFoto")
+        let dir = backupRunnerStoreRoot()
         return try? LibraryIndexStore(url: dir.appendingPathComponent("library-index.sqlite"))
     }()
     /// Registro di ripristino del pannello Doppioni (Task 6, #31). Stesso pattern lazy di
     /// `libraryIndexStore`, stessa cartella: e' la rete di sicurezza dell'unica operazione
     /// distruttiva del progetto, quindi anche lei sul disco interno, mai sull'SSD.
     private(set) lazy var trashManifestStore: TrashManifestStore? = {
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("AppBackupFoto")
+        let dir = backupRunnerStoreRoot()
         return try? TrashManifestStore(url: dir.appendingPathComponent("trash-manifest.json"))
     }()
     /// La storia degli spostamenti (Task 8, ADR-0012 D13 punto 4). Stesso pattern lazy e
@@ -10030,8 +10064,7 @@ final class BackupRunner: ObservableObject {
     /// non c'e' un formato di file da poter corrompere come per SQLite/JSON, quindi nessun
     /// meccanismo di "riprova una volta" e' necessario qui.
     private(set) lazy var trashHistoryStore: TrashHistory? = {
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("AppBackupFoto")
+        let dir = backupRunnerStoreRoot()
         return try? TrashHistory(url: dir.appendingPathComponent("trash-history.jsonl"))
     }()
     private var syncTask: Task<Void, Never>?
@@ -12911,7 +12944,10 @@ struct ContentView: View {
             // backup): al collegamento dell'SSD non parte piu' nessuna lettura da sola.
             // L'elenco si aggiorna solo come ultimo passo di un backup/importazione, o a
             // mano da Diagnostica — mai piu' come attivita' separata al collegamento.
-            guard mounted, autoBackupEnabled, !runner.isRunning else { return }
+            // BUG-10 (2026-09-28): sotto il test host di `xcodebuild test` un backup vero
+            // scriverebbe file reali dell'utente sull'SSD/Libreria Foto veri se il volume
+            // venisse montato/smontato durante una corsa di test.
+            guard !isRunningUnderTests(), mounted, autoBackupEnabled, !runner.isRunning else { return }
             runner.runMacToSSD()
         }
         .sheet(isPresented: $showCompletion) {
