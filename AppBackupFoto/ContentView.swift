@@ -7261,7 +7261,12 @@ final class S3Syncer {
         return results
     }
 
-    private func listPage(config: S3Config, token: String?) async throws -> ([String: Int64], String?) {
+    /// Una pagina di `ListObjectsV2` cosi' com'e' arrivata, senza interpretarla. Estratta da
+    /// `listPage` il 2026-09-26 (ROADMAP #44): l'inventario ha bisogno anche dell'ETag, che
+    /// `listPage` non legge. La richiesta resta UNA — stessa URL, stessa firma, stesse
+    /// correzioni di BUG-8 (`encodePlusInQuery`, `xmlDecode`) — e i chiamanti di `listPage`
+    /// ricevono esattamente quello che ricevevano prima.
+    func fetchListPageXML(config: S3Config, token: String?) async throws -> String {
         guard var comps = URLComponents(string: "\(config.endpoint)/\(config.bucket)") else {
             throw NSError(domain: "S3", code: 8,
                 userInfo: [NSLocalizedDescriptionKey: "URL non valido per il bucket: \(config.bucket)"])
@@ -7284,7 +7289,11 @@ final class S3Syncer {
             throw NSError(domain: "S3", code: 3,
                 userInfo: [NSLocalizedDescriptionKey: "Errore lista S3: \(body.prefix(300))"])
         }
-        let xml = String(data: data, encoding: .utf8) ?? ""
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    private func listPage(config: S3Config, token: String?) async throws -> ([String: Int64], String?) {
+        let xml = try await fetchListPageXML(config: config, token: token)
         let keys = xmlAll(xml, tag: "Key")
         let sizes = xmlAll(xml, tag: "Size").compactMap { Int64($0) }
         var objs: [String: Int64] = [:]
@@ -7730,7 +7739,8 @@ final class S3Syncer {
     // Una sola passata, così `&amp;#39;` resta il testo `&#39;` e non diventa un apostrofo.
     // Cubbit scrive l'apostrofo come `&#39;`: senza i riferimenti numerici la chiave letta
     // era sbagliata, e il token ricavato da lei faceva fallire la lista con InvalidRequest.
-    static func xmlDecode(_ s: String) -> String {
+    // `nonisolated`: pura; la usa anche `parseListPage`, chiamata dall'inventario fuori dal main.
+    nonisolated static func xmlDecode(_ s: String) -> String {
         guard s.contains("&") else { return s }
         let named: [Substring: String] = ["amp": "&", "lt": "<", "gt": ">", "apos": "'", "quot": "\""]
         var out = ""
@@ -7769,6 +7779,70 @@ final class S3Syncer {
             search = String(search[e.upperBound...])
         }
         return results
+    }
+
+    // MARK: Lista con ETag, per l'inventario (ROADMAP #44, ADR-0015)
+
+    /// Un oggetto della lista, con l'ETag (`nil` se la voce non lo porta).
+    nonisolated struct S3ObjectInfo: Equatable, Sendable {
+        let key: String
+        let size: Int64
+        let etag: String?
+    }
+
+    /// Una pagina di `ListObjectsV2` letta oggetto per oggetto.
+    nonisolated struct S3ListPage: Equatable, Sendable {
+        let objects: [S3ObjectInfo]
+        let isTruncated: Bool
+        /// `nil` anche quando `isTruncated` e' vero ma la pagina non dice da dove ripartire:
+        /// chi legge deve trattarlo come lista incompleta, non come lista finita.
+        let nextToken: String?
+        /// Voci `<Contents>` senza chiave, senza dimensione leggibile o non chiuse.
+        let malformedEntries: Int
+    }
+
+    /// Legge una pagina blocco `<Contents>` per blocco `<Contents>`: chiave, dimensione ed ETag
+    /// di un oggetto vengono dallo STESSO blocco. `listPage` accoppia per posizione due liste
+    /// separate (chiavi e dimensioni): per l'ETag non basterebbe, perche' un oggetto senza ETag
+    /// sposterebbe tutti i successivi di un posto — l'ETag di un file finirebbe su un altro, e
+    /// un contenuto risulterebbe «certificato» su una chiave che non lo contiene.
+    ///
+    /// Scorre la stringa per intervalli, senza ricopiarne il resto a ogni voce. `nonisolated`
+    /// e statica: l'inventario la chiama fuori dal main, e non tocca niente dell'istanza.
+    nonisolated static func parseListPage(_ xml: String) -> S3ListPage {
+        func firstValue(_ tag: String, in range: Range<String.Index>) -> String? {
+            guard let open = xml.range(of: "<\(tag)>", range: range),
+                  let close = xml.range(of: "</\(tag)>", range: open.upperBound..<range.upperBound) else { return nil }
+            return xmlDecode(String(xml[open.upperBound..<close.lowerBound]))
+        }
+        var objects: [S3ObjectInfo] = []
+        // Una risposta senza l'involucro della lista (vuota, non UTF-8, un <Error>, un corpo
+        // troncato) non e' "una pagina senza oggetti": e' una pagina che non si e' letta.
+        // Senza questa riga, una risposta illeggibile chiuderebbe la lista come COMPLETA e
+        // VUOTA, e ogni foto risulterebbe mancante da Cubbit.
+        var malformed = (xml.contains("<ListBucketResult") && xml.contains("</ListBucketResult>")) ? 0 : 1
+        var cursor = xml.startIndex
+        while let open = xml.range(of: "<Contents>", range: cursor..<xml.endIndex) {
+            guard let close = xml.range(of: "</Contents>", range: open.upperBound..<xml.endIndex) else {
+                malformed += 1
+                break
+            }
+            let block = open.upperBound..<close.lowerBound
+            if let key = firstValue("Key", in: block),
+               let sizeText = firstValue("Size", in: block),
+               let size = Int64(sizeText), size >= 0 {
+                objects.append(S3ObjectInfo(key: key, size: size, etag: firstValue("ETag", in: block)))
+            } else {
+                malformed += 1
+            }
+            cursor = close.upperBound
+        }
+        // I tag di controllo si cercano in tutta la pagina: dentro una chiave non possono
+        // comparire, perche' la lista scrive `<` come `&lt;`.
+        let whole = xml.startIndex..<xml.endIndex
+        let isTruncated = firstValue("IsTruncated", in: whole) == "true"
+        let token = isTruncated ? firstValue("NextContinuationToken", in: whole) : nil
+        return S3ListPage(objects: objects, isTruncated: isTruncated, nextToken: token, malformedEntries: malformed)
     }
 }
 
