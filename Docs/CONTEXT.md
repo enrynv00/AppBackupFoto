@@ -84,6 +84,22 @@ Attenzione a una frase che questa pagina ha portato fino al 2026-08-27: «il pan
 
 ---
 
+## Inventario (roadmap #44)
+
+**Archivio** — SSD, HDD o Cubbit, visti come tre posti in cui una foto può stare. Termine nuovo: prima "le tre destinazioni" bastava perché si parlava solo del verso Mac→SSD→HDD/Cubbit; l'inventario guarda ai tre come posti da confrontare fra loro, non come tappe di un backup.
+
+**Inventario** — l'elenco del contenuto dei tre archivi, per contenuto e non per nome; è una cache come l'indice (ADR-0002), mai una fonte di verità. Vive nello stesso SQLite dell'indice.
+
+**Certificato** — su Cubbit, un oggetto è certificato solo se il suo ETag coincide con quello di un file letto sull'SSD o sull'HDD della stessa dimensione (parte unica → MD5, a pezzi → ETag a pezzi da 64 MiB). Mai per ipotesi, mai per nome o percorso uguale.
+
+**Non certificabile** — un oggetto Cubbit che non si può confrontare senza scaricarlo (parti di dimensione diversa da 64 MiB, o un ETag in un formato non riconosciuto). Finisce sempre in ❗, insieme alla foto allo stesso percorso sugli altri archivi.
+
+**Incompleto ≠ assente** — da un archivio non letto per intero (un file o una cartella illeggibile, un disco sparito a metà lettura, una lista di Cubbit non arrivata in fondo) non si dichiara mai assente niente. Un disco scollegato non è un disco vuoto: «manca da X» si dice solo se X è completo.
+
+**Giro** — un aggiornamento dell'inventario. «Presente» vuol dire «visto nell'ultimo giro», non «presente oggi»: un archivio scollegato durante un giro resta con lo stato del giro precedente, mai declassato a mancante.
+
+---
+
 ## Import da sorgenti locali (roadmap #27-A)
 
 **Sorgente di import** — una fotocamera, scheda SD, drone, vecchio disco o telefono da cui si importa una tantum. Diversa dalla **Sorgente** (la Libreria Foto), che è un flusso continuo.
