@@ -255,4 +255,16 @@ final class MainThreadIsolationTests: XCTestCase {
         XCTAssertEqual(done.wait(timeout: .now() + 10), .success,
                        "InventoryScanner.scan ha avuto bisogno del main thread.")
     }
+
+    func testCubbitRead_runsWithoutTheMainThread() throws {
+        let reader = InventoryCubbitReader(store: try makeStore(), cancelFlag: CancelFlag())
+        let page = "<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>"
+        let done = DispatchSemaphore(value: 0)
+        Task.detached {
+            _ = await reader.read(runId: 1, fetchPage: { _ in page })
+            done.signal()
+        }
+        XCTAssertEqual(done.wait(timeout: .now() + 10), .success,
+                       "InventoryCubbitReader.read ha avuto bisogno del main thread (manca @concurrent?).")
+    }
 }

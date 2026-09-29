@@ -44,6 +44,7 @@
 		496E00D79739E3114DC87822 /* S3ETagMatcherTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E23C952846EB4FAAB758CC44 /* S3ETagMatcherTests.swift */; };
 		8051CD87C86D4474EA31B719 /* InventoryStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B03981ED6C74915210F086AB /* InventoryStoreTests.swift */; };
 		EE37493DA8873EFB121F2062 /* InventoryScannerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 13740CD609C3CF49E0834FEE /* InventoryScannerTests.swift */; };
+		C83C8DBDEA1EFF04AD9B6E40 /* InventoryCubbitReaderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 580B6ADF04D6871266BBF239 /* InventoryCubbitReaderTests.swift */; };
 		01356B0C0557160EA896080A /* VolumeSpaceDisplayTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = EEFFE5652482E5E79478B13D /* VolumeSpaceDisplayTests.swift */; };
 		97D652B9C9945A6788253896 /* VolumeCapacityReaderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2B640C6771DB4DB8F6BDDDAE /* VolumeCapacityReaderTests.swift */; };
 		8BD1765B5781E1714175EAB5 /* S3ListingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0A347E62D03D7EAD225D2AFC /* S3ListingTests.swift */; };
@@ -125,6 +126,7 @@
 		E23C952846EB4FAAB758CC44 /* S3ETagMatcherTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = S3ETagMatcherTests.swift; sourceTree = "<group>"; };
 		B03981ED6C74915210F086AB /* InventoryStoreTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = InventoryStoreTests.swift; sourceTree = "<group>"; };
 		13740CD609C3CF49E0834FEE /* InventoryScannerTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = InventoryScannerTests.swift; sourceTree = "<group>"; };
+		580B6ADF04D6871266BBF239 /* InventoryCubbitReaderTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = InventoryCubbitReaderTests.swift; sourceTree = "<group>"; };
 		EEFFE5652482E5E79478B13D /* VolumeSpaceDisplayTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = VolumeSpaceDisplayTests.swift; sourceTree = "<group>"; };
 		2B640C6771DB4DB8F6BDDDAE /* VolumeCapacityReaderTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = VolumeCapacityReaderTests.swift; sourceTree = "<group>"; };
 		0A347E62D03D7EAD225D2AFC /* S3ListingTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = S3ListingTests.swift; sourceTree = "<group>"; };
@@ -233,6 +235,7 @@
 				E23C952846EB4FAAB758CC44 /* S3ETagMatcherTests.swift */,
 				B03981ED6C74915210F086AB /* InventoryStoreTests.swift */,
 				13740CD609C3CF49E0834FEE /* InventoryScannerTests.swift */,
+				580B6ADF04D6871266BBF239 /* InventoryCubbitReaderTests.swift */,
 				EEFFE5652482E5E79478B13D /* VolumeSpaceDisplayTests.swift */,
 				2B640C6771DB4DB8F6BDDDAE /* VolumeCapacityReaderTests.swift */,
 				0A347E62D03D7EAD225D2AFC /* S3ListingTests.swift */,
@@ -434,6 +437,7 @@
 				496E00D79739E3114DC87822 /* S3ETagMatcherTests.swift in Sources */,
 				8051CD87C86D4474EA31B719 /* InventoryStoreTests.swift in Sources */,
 				EE37493DA8873EFB121F2062 /* InventoryScannerTests.swift in Sources */,
+				C83C8DBDEA1EFF04AD9B6E40 /* InventoryCubbitReaderTests.swift in Sources */,
 				01356B0C0557160EA896080A /* VolumeSpaceDisplayTests.swift in Sources */,
 				97D652B9C9945A6788253896 /* VolumeCapacityReaderTests.swift in Sources */,
 				8BD1765B5781E1714175EAB5 /* S3ListingTests.swift in Sources */,

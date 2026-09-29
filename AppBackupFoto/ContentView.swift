@@ -5944,6 +5944,108 @@ nonisolated final class InventoryScanner: @unchecked Sendable {
     }
 }
 
+/// Com'e' andata la lettura dell'elenco di Cubbit per l'inventario.
+nonisolated struct CubbitReadReport: Equatable, Sendable {
+    var pages = 0
+    /// Oggetti elencati, di qualunque tipo.
+    var objectsListed = 0
+    /// Oggetti nel perimetro (foto e video), quelli salvati.
+    var objectsKept = 0
+    /// Voci della lista senza chiave o senza dimensione leggibile.
+    var malformedEntries = 0
+    /// La lista dice "ce n'e' ancora" ma non dice da dove ripartire.
+    var truncatedWithoutToken = false
+    /// L'ultima pagina e' arrivata: la lista e' finita davvero.
+    var reachedEnd = false
+    var cancelled = false
+    /// Testo dell'errore di rete o di salvataggio, per il registro. Mai mostrato cosi' com'e'.
+    var failure: String? = nil
+    var couldNotSave = false
+
+    var isComplete: Bool { incompleteReason == nil }
+
+    var incompleteReason: InventoryIncompleteReason? {
+        if couldNotSave { return .couldNotSave }
+        if cancelled { return .interrupted }
+        if failure != nil { return .listingFailed }
+        if malformedEntries > 0 || truncatedWithoutToken { return .listingMalformed }
+        if !reachedEnd { return .interrupted }
+        return nil
+    }
+}
+
+/// Foto e video: lo stesso perimetro dei dischi, applicato alle chiavi di Cubbit.
+// `nonisolated`: pura, chiamata dal lettore di Cubbit fuori dal main.
+nonisolated enum InventoryPerimeter {
+    /// Vero se un oggetto con questa chiave sarebbe stato letto dallo scanner dei dischi:
+    /// nessuna componente nascosta (`.skipsHiddenFiles`, e quindi anche i `._` AppleDouble),
+    /// nessuna componente fra `LibraryExclusions.names`, e `IndexableKind` foto o video.
+    static func includesS3Key(_ key: String) -> Bool {
+        let components = key.split(separator: "/", omittingEmptySubsequences: true)
+        guard !components.isEmpty, !key.hasSuffix("/") else { return false }
+        for c in components where c.hasPrefix(".") || LibraryExclusions.names.contains(String(c)) {
+            return false
+        }
+        return IndexableKind.of(url: URL(fileURLWithPath: key)) != .notIndexable
+    }
+}
+
+/// Legge l'elenco del bucket con l'ETag di ogni oggetto e lo salva a pagine. Nessun download,
+/// nessuna scrittura su Cubbit: solo `ListObjectsV2`, la stessa richiesta di `S3Syncer.listPage`.
+// `nonisolated`: `store` e `cancelFlag` sono `let`, custoditi rispettivamente dalla coda
+// seriale dello store e dal lock di `CancelFlag`; il resto e' locale a `read`. `read` e'
+// `@concurrent` (regola del progetto per le funzioni di fondo `async`, ADR-0006): senza, con
+// `NonisolatedNonsendingByDefault` girerebbe sul thread di chi la chiama.
+nonisolated final class InventoryCubbitReader: @unchecked Sendable {
+    private let store: LibraryIndexStore
+    private let cancelFlag: CancelFlag
+
+    init(store: LibraryIndexStore, cancelFlag: CancelFlag) {
+        self.store = store
+        self.cancelFlag = cancelFlag
+    }
+
+    @concurrent
+    func read(runId: Int64,
+              fetchPage: @escaping @Sendable (String?) async throws -> String,
+              onProgress: @escaping @Sendable (CubbitReadReport) -> Void = { _ in }) async -> CubbitReadReport {
+        var report = CubbitReadReport()
+        var token: String? = nil
+        while true {
+            if cancelFlag.isCancelled { report.cancelled = true; break }
+            let xml: String
+            do {
+                xml = try await fetchPage(token)
+            } catch {
+                report.failure = error.localizedDescription
+                break
+            }
+            let page = S3Syncer.parseListPage(xml)
+            report.pages += 1
+            report.objectsListed += page.objects.count
+            report.malformedEntries += page.malformedEntries
+            let rows = page.objects
+                .filter { InventoryPerimeter.includesS3Key($0.key) }
+                .map { InventoryS3Object(key: normalizedIndexKey($0.key), displayKey: $0.key,
+                                         size: $0.size, etag: $0.etag) }
+            do {
+                try store.upsertInventoryS3(rows, runId: runId)
+            } catch {
+                report.couldNotSave = true
+                report.failure = error.localizedDescription
+                break
+            }
+            report.objectsKept += rows.count
+            onProgress(report)
+            guard page.isTruncated else { report.reachedEnd = true; break }
+            guard let next = page.nextToken else { report.truncatedWithoutToken = true; break }
+            token = next
+        }
+        onProgress(report)
+        return report
+    }
+}
+
 // MARK: - Testi e regole della card "Foto gia' salvate" (roadmap #31, Task 6)
 
 /// I nomi dei comandi della card, in un punto solo. Non e' pignoleria: due dei messaggi
