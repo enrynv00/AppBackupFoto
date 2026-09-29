@@ -277,4 +277,19 @@ final class MainThreadIsolationTests: XCTestCase {
         XCTAssertEqual(done.wait(timeout: .now() + 10), .success,
                        "InventorySummary/InventoryClassifier hanno avuto bisogno del main thread.")
     }
+
+    func testInventoryRefresh_runsWithoutTheMainThread() throws {
+        let ssd = tmp.appendingPathComponent("SSD"), hdd = tmp.appendingPathComponent("HDD")
+        for d in [ssd, hdd] { try FileManager.default.createDirectory(at: d, withIntermediateDirectories: true) }
+        let store = try makeStore()
+        let page = "<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>"
+        let done = DispatchSemaphore(value: 0)
+        Task.detached {
+            _ = await InventoryRefresh.run(store: store, ssdRoot: ssd, hddRoot: hdd, runId: 1, cancelFlag: CancelFlag(),
+                                           fetchPage: { _ in page }, onProgress: { _ in })
+            done.signal()
+        }
+        XCTAssertEqual(done.wait(timeout: .now() + 10), .success,
+                       "InventoryRefresh.run ha avuto bisogno del main thread (manca @concurrent?).")
+    }
 }

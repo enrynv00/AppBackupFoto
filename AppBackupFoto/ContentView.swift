@@ -6266,6 +6266,127 @@ nonisolated struct InventorySummary: Equatable, Sendable {
     func bytes(_ c: InventoryCategory) -> Int64 { bytes[c] ?? 0 }
 }
 
+/// A che punto e' un aggiornamento dell'inventario, per la barra della finestra.
+nonisolated enum InventoryProgress: Equatable, Sendable {
+    case checkingCubbit
+    case local(InventoryArchive, InventoryScanReport)
+    case cubbit(CubbitReadReport)
+    case classifying
+}
+
+/// Com'e' finito un aggiornamento: il riepilogo nuovo, oppure il motivo per cui non c'e'.
+nonisolated struct InventoryRefreshOutcome: Sendable {
+    let summary: InventorySummary?
+    /// Testo per il registro, mai mostrato cosi' com'e'.
+    let failure: String?
+}
+
+/// L'aggiornamento completo: SSD, poi HDD, poi Cubbit, poi il confronto. Separato da
+/// `BackupRunner` perche' sia verificabile da un test con cartelle temporanee e un Cubbit
+/// finto; `BackupRunner` ci mette solo i bookmark, il cancello e la pubblicazione sul main.
+// `nonisolated`: nessuno stato, tutto e' nei parametri. `@concurrent`: e' una funzione di fondo
+// `async`, e senza girerebbe sul thread di chi la chiama (ADR-0006).
+nonisolated enum InventoryRefresh {
+    @concurrent
+    static func run(store: LibraryIndexStore, ssdRoot: URL, hddRoot: URL, runId: Int64,
+                    cancelFlag: CancelFlag,
+                    sampleLimit: Int = InventorySummary.defaultSampleLimit,
+                    now: @escaping @Sendable () -> Double = { Date().timeIntervalSince1970 },
+                    fetchPage: @escaping @Sendable (String?) async throws -> String,
+                    onProgress: @escaping @Sendable (InventoryProgress) -> Void) async -> InventoryRefreshOutcome {
+        do {
+            try store.beginInventoryRun(runId: runId, startedAt: now())
+        } catch {
+            return InventoryRefreshOutcome(summary: nil, failure: error.localizedDescription)
+        }
+        let scanner = InventoryScanner(store: store, cancelFlag: cancelFlag)
+        for (archive, root) in [(InventoryArchive.ssd, ssdRoot), (.hdd, hddRoot)] {
+            guard !cancelFlag.isCancelled else {
+                try? store.finishInventoryArchive(archive, runId: runId, complete: false, reason: .notReached,
+                                                  unreadable: 0, finishedAt: now())
+                continue
+            }
+            do {
+                let report = try scanner.scan(root: root, archive: archive, runId: runId) { r in
+                    onProgress(.local(archive, r))
+                }
+                try store.finishInventoryArchive(archive, runId: runId, complete: report.isComplete,
+                                                 reason: report.incompleteReason,
+                                                 unreadable: report.unreadableFiles, finishedAt: now())
+            } catch {
+                try? store.finishInventoryArchive(archive, runId: runId, complete: false, reason: .couldNotSave,
+                                                  unreadable: 0, finishedAt: now())
+            }
+        }
+        if cancelFlag.isCancelled {
+            try? store.finishInventoryArchive(.s3, runId: runId, complete: false, reason: .notReached,
+                                              unreadable: 0, finishedAt: now())
+        } else {
+            let reader = InventoryCubbitReader(store: store, cancelFlag: cancelFlag)
+            let report = await reader.read(runId: runId, fetchPage: fetchPage) { r in onProgress(.cubbit(r)) }
+            try? store.finishInventoryArchive(.s3, runId: runId, complete: report.isComplete,
+                                              reason: report.incompleteReason, unreadable: 0, finishedAt: now())
+        }
+        onProgress(.classifying)
+        do {
+            let snapshot = try store.inventorySnapshot()
+            return InventoryRefreshOutcome(summary: InventorySummary(snapshot, sampleLimit: sampleLimit), failure: nil)
+        } catch {
+            return InventoryRefreshOutcome(summary: nil, failure: error.localizedDescription)
+        }
+    }
+}
+
+/// Perche' «Aggiorna l'inventario» non puo' partire adesso, `nil` se puo'. Il verso opposto
+/// (niente backup, lettura dell'elenco, spostamento o annullamento durante l'inventario) sta
+/// nei cancelli di quelle operazioni, col parametro `isInventorying`.
+enum InventoryStartGate {
+    static func blockedReason(isRunning: Bool, isIndexing: Bool, isTrashingDuplicates: Bool,
+                              isRestoringFromTrash: Bool, isInventorying: Bool,
+                              ssdMounted: Bool, hddMounted: Bool, hasCubbitConfig: Bool) -> String? {
+        if isInventorying { return "L'inventario si sta già aggiornando." }
+        if isTrashingDuplicates {
+            return "L'app sta spostando nel Cestino delle copie doppie: aspetta che finisca, "
+                + "altrimenti l'inventario leggerebbe l'SSD mentre cambia."
+        }
+        if isRestoringFromTrash {
+            return "L'app sta rimettendo a posto delle foto dal Cestino: aspetta che finisca, "
+                + "altrimenti l'inventario leggerebbe l'SSD mentre cambia."
+        }
+        if isRunning {
+            return "C'è un backup in corso: aspetta che finisca, altrimenti l'inventario "
+                + "leggerebbe i dischi mentre cambiano."
+        }
+        if isIndexing {
+            return "L'app sta aggiornando l'elenco delle foto sull'SSD: aspetta che finisca."
+        }
+        if !ssdMounted {
+            return "L'SSD non è collegato: l'inventario ha bisogno di SSD, HDD e Cubbit insieme."
+        }
+        if !hddMounted {
+            return "L'HDD non è collegato: l'inventario ha bisogno di SSD, HDD e Cubbit insieme."
+        }
+        if !hasCubbitConfig {
+            return "L'app non ha letto le credenziali di Cubbit: controlla in Diagnostica, poi riprova."
+        }
+        return nil
+    }
+
+    static let cubbitUnreachable =
+        "Cubbit non risponde in questo momento: controlla la connessione a Internet e riprova."
+
+    /// Un disco si sta smontando durante l'inventario: ci si ferma solo se e' l'SSD o l'HDD
+    /// (o se macOS non dice quale, per prudenza). Diverso dalla lettura dell'elenco, che si
+    /// ferma a ogni smontaggio: li' costa poco, qui un giro dura decine di minuti, ed espellere
+    /// una chiavetta non deve buttarlo via. Il confronto e' per componenti, mai per prefisso
+    /// di stringa (`/Volumes/SSD` non e' `/Volumes/SSD 2`).
+    static func volumeChangeStopsInventory(unmounting volume: URL?, ssdRoot: URL?, hddRoot: URL?) -> Bool {
+        guard let volume else { return true }
+        let target = volume.standardizedFileURL.pathComponents
+        return [ssdRoot, hddRoot].compactMap { $0 }.contains { $0.standardizedFileURL.pathComponents == target }
+    }
+}
+
 // MARK: - Testi e regole della card "Foto gia' salvate" (roadmap #31, Task 6)
 
 /// I nomi dei comandi della card, in un punto solo. Non e' pignoleria: due dei messaggi
