@@ -3650,7 +3650,8 @@ enum DuplicatesStatus {
     /// da qui (restano comunque le due conferme). Stessa disciplina di `RestoreView`: un
     /// bottone disattivato dice sempre perche', non un semplice grigiore.
     static func trashDisabledReason(isRunning: Bool, isIndexing: Bool, ssdMounted: Bool,
-                                    isTrashingDuplicates: Bool, isRestoringFromTrash: Bool) -> String? {
+                                    isTrashingDuplicates: Bool, isRestoringFromTrash: Bool,
+                                    isInventorying: Bool) -> String? {
         guard ssdMounted else {
             return "L'SSD non è collegato in questo momento: senza, l'app non può né "
                 + "riverificare né spostare niente."
@@ -3675,6 +3676,10 @@ enum DuplicatesStatus {
             return "L'app sta rimettendo a posto le foto dell'ultimo spostamento: aspetta che "
                 + "finisca."
         }
+        guard !isInventorying else {
+            return "L'app sta facendo l'inventario di SSD, HDD e Cubbit: aspetta che finisca "
+                + "prima di spostare copie nel Cestino."
+        }
         return nil
     }
 
@@ -3685,7 +3690,8 @@ enum DuplicatesStatus {
     /// false`) o che l'ultimo blocco sia gia' stato rimesso a posto per intero.
     static func undoDisabledReason(ssdMounted: Bool, isRunning: Bool, isIndexing: Bool,
                                    isTrashingDuplicates: Bool, isRestoringFromTrash: Bool,
-                                   summary: RestorableBatchSummary?, hasEverTrashed: Bool) -> String? {
+                                   summary: RestorableBatchSummary?, hasEverTrashed: Bool,
+                                   isInventorying: Bool) -> String? {
         guard ssdMounted else {
             return "L'SSD non è collegato: le foto da rimettere a posto sono nel suo Cestino. "
                 + "Ricollegalo e riprova."
@@ -3703,6 +3709,10 @@ enum DuplicatesStatus {
         guard !isIndexing else {
             return "L'elenco delle foto già salvate si sta aggiornando in questo momento: "
                 + "aspetta che finisca."
+        }
+        guard !isInventorying else {
+            return "L'app sta facendo l'inventario: aspetta che finisca prima di annullare lo "
+                + "spostamento."
         }
         guard summary != nil else {
             return hasEverTrashed
@@ -6760,7 +6770,7 @@ enum JobStartGate {
     /// fra loro (si escludono a vicenda in `BackupRunner`), ma l'ordine qui fissa comunque
     /// quale frase l'utente legge se mai lo stato risultasse incoerente.
     static func blockedReason(isIndexing: Bool, isTrashingDuplicates: Bool,
-                              isRestoringFromTrash: Bool) -> String? {
+                              isRestoringFromTrash: Bool, isInventorying: Bool) -> String? {
         if isTrashingDuplicates {
             return "L'app sta spostando nel Cestino le copie doppie che hai confermato. "
                 + "Aspetta che finisca, oppure fermala con «Interrompi» nella finestra Doppioni."
@@ -6768,6 +6778,12 @@ enum JobStartGate {
         if isRestoringFromTrash {
             return "L'app sta rimettendo a posto le foto che avevi spostato nel Cestino. "
                 + "Aspetta che finisca, oppure fermala con «Interrompi» nella finestra Doppioni."
+        }
+        // ROADMAP #44: l'inventario legge SSD, HDD e Cubbit; un job che ci scrive sopra
+        // renderebbe falso quello che sta leggendo.
+        if isInventorying {
+            return "L'app sta facendo l'inventario di SSD, HDD e Cubbit. Aspetta che finisca, "
+                + "oppure fermalo con «\(InventoryStatus.stopButton)» nella finestra Inventario."
         }
         if isIndexing {
             return "L'app sta leggendo le foto sull'SSD per aggiornare l'elenco. Aspetta che "
@@ -6782,7 +6798,8 @@ enum LibraryIndexCommandGate {
     /// perche' e' la causa piu' vicina a quello che l'utente sta guardando: se sta scorrendo
     /// la barra di avanzamento, la frase sul backup lo confonderebbe.
     static func disabledReason(isIndexing: Bool, jobIsRunning: Bool,
-                               isTrashingDuplicates: Bool, isRestoringFromTrash: Bool) -> String? {
+                               isTrashingDuplicates: Bool, isRestoringFromTrash: Bool,
+                               isInventorying: Bool) -> String? {
         // Lo spostamento nel Cestino ha la precedenza sulle altre: da quando gira
         // davvero fuori dal main (2026-09-19, BUG-7) puo' essere in corso insieme a
         // un'altra causa, ed e' quella piu' vicina al danno se qualcuno lo ignorasse.
@@ -6793,6 +6810,10 @@ enum LibraryIndexCommandGate {
         if isRestoringFromTrash {
             return "L'app sta rimettendo a posto le foto spostate nel Cestino: leggere le foto "
                 + "adesso darebbe un elenco sbagliato. Riprova quando ha finito."
+        }
+        if isInventorying {
+            return "L'app sta facendo l'inventario e sta leggendo le stesse foto: aggiornare "
+                + "l'elenco adesso rallenterebbe entrambe le cose. Riprova quando ha finito."
         }
         if isIndexing {
             return "L'app sta già leggendo le foto sull'SSD. Aspetta che finisca, "
@@ -6811,10 +6832,14 @@ enum LibraryIndexCommandGate {
     /// all'elenco per non ricopiare foto che ci sono gia', e togliergielo sotto significa
     /// ricopiarle.
     static func resetDisabledReason(isIndexing: Bool, jobIsRunning: Bool,
-                                    isTrashingDuplicates: Bool) -> String? {
+                                    isTrashingDuplicates: Bool, isInventorying: Bool) -> String? {
         if isTrashingDuplicates {
             return "L'app sta spostando nel Cestino le copie doppie e intanto aggiorna "
                 + "l'elenco: svuotarlo adesso lo lascerebbe a metà. Riprova quando ha finito."
+        }
+        if isInventorying {
+            return "L'inventario sta scrivendo in questo stesso elenco: svuotarlo adesso lo "
+                + "lascerebbe a metà. Riprova quando ha finito."
         }
         if isIndexing {
             return "L'app sta leggendo le foto sull'SSD proprio ora. Fermala con "
@@ -10352,10 +10377,10 @@ final class BackupRunner: ObservableObject {
     /// altrimenti imposta il flag e restituisce `nil`. Controllo e impostazione sono
     /// atomici rispetto a ogni altro gate perche' girano entrambi sul MainActor.
     func beginDuplicateTrashing() -> SimpleAlert? {
-        guard !isTrashingDuplicates, !isRunning, !isIndexing, !isRestoringFromTrash else {
+        guard !isTrashingDuplicates, !isRunning, !isIndexing, !isRestoringFromTrash, !isInventorying else {
             return SimpleAlert(title: "Meglio non farlo adesso",
                 message: "C'è già un'altra operazione in corso (un backup, una lettura "
-                    + "dell'elenco, un altro spostamento nel Cestino o un annullamento). "
+                    + "dell'elenco, un inventario, un altro spostamento nel Cestino o un annullamento). "
                     + "Aspetta che finisca.")
         }
         isTrashingDuplicates = true
@@ -10379,10 +10404,10 @@ final class BackupRunner: ObservableObject {
     /// annullamento; altrimenti imposta il flag e restituisce `nil`. Controllo e
     /// impostazione sono atomici perche' girano entrambi sul MainActor.
     func beginTrashRestore() -> SimpleAlert? {
-        guard !isRestoringFromTrash, !isTrashingDuplicates, !isRunning, !isIndexing else {
+        guard !isRestoringFromTrash, !isTrashingDuplicates, !isRunning, !isIndexing, !isInventorying else {
             return SimpleAlert(title: "Meglio non farlo adesso",
                 message: "C'è già un'altra operazione in corso (un backup, una lettura "
-                    + "dell'elenco, uno spostamento nel Cestino o un altro annullamento). "
+                    + "dell'elenco, un inventario, uno spostamento nel Cestino o un altro annullamento). "
                     + "Aspetta che finisca.")
         }
         isRestoringFromTrash = true
@@ -10452,7 +10477,8 @@ final class BackupRunner: ObservableObject {
                                                              isRunning: isRunning, isIndexing: isIndexing,
                                                              isTrashingDuplicates: isTrashingDuplicates,
                                                              isRestoringFromTrash: isRestoringFromTrash,
-                                                             summary: restorableBatch, hasEverTrashed: (trashManifestStore?.totalRecorded ?? 0) > 0) {
+                                                             summary: restorableBatch, hasEverTrashed: (trashManifestStore?.totalRecorded ?? 0) > 0,
+                                                             isInventorying: isInventorying) {
             onAlert(SimpleAlert(title: "Meglio non farlo adesso", message: reason))
             return
         }
@@ -10556,7 +10582,8 @@ final class BackupRunner: ObservableObject {
                                                            isIndexing: isIndexing,
                                                            ssdMounted: VolumeMonitor.shared.ssdMounted,
                                                            isTrashingDuplicates: isTrashingDuplicates,
-                                                           isRestoringFromTrash: isRestoringFromTrash)
+                                                           isRestoringFromTrash: isRestoringFromTrash,
+                                                           isInventorying: isInventorying)
         if let reason {
             onAlert(SimpleAlert(title: "Meglio non farlo adesso", message: reason))
             return
@@ -10741,13 +10768,19 @@ final class BackupRunner: ObservableObject {
         // center, non su NotificationCenter.default. Registrarsi su quello sbagliato
         // compila, non produce errori a runtime, e semplicemente non scatta mai.
         unmountObserver = NSWorkspace.shared.notificationCenter.addObserver(
-            forName: NSWorkspace.willUnmountNotification, object: nil, queue: .main) { [weak self] _ in
-                // Non si filtra per volume: fermare una lettura in corso a ogni smontaggio e'
+            forName: NSWorkspace.willUnmountNotification, object: nil, queue: .main) { [weak self] note in
+                // Non si filtra per volume per la lettura dell'elenco: fermarla a ogni smontaggio e'
                 // innocuo (quello che e' stato letto resta valido e la volta dopo si riprende
                 // da li'), mentre continuare a leggere da un volume che sta sparendo produce
-                // hash calcolati su letture troncate.
+                // hash calcolati su letture troncate. L'inventario invece si ferma solo per
+                // l'SSD o l'HDD (ROADMAP #44, S10): un suo giro dura decine di minuti.
                 guard let self else { return }
-                Task { @MainActor in self.stopIndexingForVolumeChange() }
+                // L'URL si estrae qui: la notifica non attraversa il salto sul MainActor, l'URL si'.
+                let volume = note.userInfo?[NSWorkspace.volumeURLUserInfoKey] as? URL
+                Task { @MainActor in
+                    self.stopIndexingForVolumeChange()
+                    self.stopInventoryForVolumeChange(volume)
+                }
             }
         // NON qui in modo sincrono: `refreshIndexedFileCount` tocca `libraryIndexStore`, che
         // e' `lazy` — valutarla APRE il database SQLite, e con un WAL da recuperare quella
@@ -10897,7 +10930,8 @@ final class BackupRunner: ObservableObject {
         if let reason = LibraryIndexCommandGate.disabledReason(isIndexing: isIndexing,
                                                               jobIsRunning: isRunning,
                                                               isTrashingDuplicates: isTrashingDuplicates,
-                                                              isRestoringFromTrash: isRestoringFromTrash) {
+                                                              isRestoringFromTrash: isRestoringFromTrash,
+                                                              isInventorying: isInventorying) {
             onAlert?(SimpleAlert(title: "Meglio non farlo adesso", message: reason))
             return
         }
@@ -10951,7 +10985,8 @@ final class BackupRunner: ObservableObject {
         // sta appoggiando per non ricopiare foto gia' presenti.
         if let reason = LibraryIndexCommandGate.resetDisabledReason(isIndexing: isIndexing,
                                                                    jobIsRunning: isRunning,
-                                                                   isTrashingDuplicates: isTrashingDuplicates) {
+                                                                   isTrashingDuplicates: isTrashingDuplicates,
+                                                                   isInventorying: isInventorying) {
             onAlert?(SimpleAlert(title: "Meglio non farlo adesso", message: reason))
             return
         }
@@ -10961,6 +10996,9 @@ final class BackupRunner: ObservableObject {
             indexProgress = nil
             indexInterruptedByUser = false
             indexedFileCount = 0
+            // Lo stesso file conteneva l'inventario (S8): la finestra lo rilegge, e ora dira'
+            // «mai fatto».
+            inventorySummary = nil
             // L'elenco appena svuotato non e' "aggiornato ad oggi": e' vuoto, e la
             // prossima lettura (manuale, la ricostruzione non parte da sola) e' la prima
             // vera dopo lo svuotamento (Task 12, D15).
@@ -10980,6 +11018,132 @@ final class BackupRunner: ObservableObject {
     /// motivo (le due finestre sono due scene e presentano canali diversi).
     private func showIndexAlert(_ alert: SimpleAlert, via sink: AlertSink?) {
         if let sink { sink(alert) } else { pendingAlert = alert }
+    }
+
+    // MARK: Inventario certificato (ROADMAP #44, ADR-0015)
+
+    /// Vero mentre l'inventario legge SSD, HDD e Cubbit. Vive QUI e non in uno `@State` di
+    /// `InventoryView`, per la stessa ragione di `isTrashingDuplicates`: chiudere e riaprire la
+    /// finestra non deve far perdere ne' la mutua esclusione con job, letture, spostamenti e
+    /// annullamenti, ne' la barra e «Interrompi» (regola D3 di ROADMAP #41).
+    @Published private(set) var isInventorying = false
+    @Published private(set) var inventoryProgress: InventoryProgress? = nil
+    @Published private(set) var inventoryStopRequested = false
+    /// L'ultimo confronto calcolato. `nil` = non ancora letto in questa sessione, o elenco
+    /// appena svuotato: la finestra lo chiede con `loadInventoryIfNeeded()`.
+    @Published private(set) var inventorySummary: InventorySummary? = nil
+    @Published private(set) var isLoadingInventory = false
+    private var inventoryCancelFlag: CancelFlag? = nil
+
+    /// «Aggiorna l'inventario». Le precondizioni si rivalutano QUI, all'avvio vero (stessa
+    /// disciplina di `rebuildLibraryIndex`), e `isInventorying` si alza PRIMA della domanda a
+    /// Cubbit: da quel momento nessun backup, lettura, spostamento o annullamento puo' partire.
+    func startInventoryRefresh(onAlert: @escaping AlertSink) {
+        if let reason = InventoryStartGate.blockedReason(
+            isRunning: isRunning, isIndexing: isIndexing, isTrashingDuplicates: isTrashingDuplicates,
+            isRestoringFromTrash: isRestoringFromTrash, isInventorying: isInventorying,
+            ssdMounted: VolumeMonitor.shared.ssdMounted, hddMounted: VolumeMonitor.shared.hddMounted,
+            hasCubbitConfig: s3Config != nil) {
+            onAlert(SimpleAlert(title: "Meglio non farlo adesso", message: reason))
+            return
+        }
+        guard let store = libraryIndexStore, let config = s3Config else {
+            onAlert(SimpleAlert(title: "Inventario non disponibile",
+                                message: "Non è stato possibile aprire sul Mac l'elenco in cui l'inventario viene salvato."))
+            return
+        }
+        guard let ssdURL = bm.startAccessing(.ssd), isLikelyVolumeRoot(ssdURL) else {
+            bm.stopAccessing(.ssd)
+            onAlert(SimpleAlert(title: "SSD non valido",
+                                message: "Vai in Impostazioni e riseleziona l'SSD scegliendo '/Volumes/SSD - Enri' (la radice del disco, non una cartella)."))
+            return
+        }
+        guard let hddURL = bm.startAccessing(.hdd), isLikelyVolumeRoot(hddURL) else {
+            bm.stopAccessing(.ssd)
+            bm.stopAccessing(.hdd)
+            onAlert(SimpleAlert(title: "HDD non valido",
+                                message: "Vai in Impostazioni e riseleziona l'HDD scegliendo '/Volumes/BackupHDD' (la radice del disco, non una cartella)."))
+            return
+        }
+        let flag = CancelFlag()
+        isInventorying = true
+        inventoryStopRequested = false
+        inventoryCancelFlag = flag
+        inventoryProgress = .checkingCubbit
+        // Un `S3Syncer` DEDICATO, come il ricalcolo dello spazio di Cubbit: `s3Syncer` del
+        // runner condivide il proprio flag di interruzione con i job.
+        let syncer = S3Syncer()
+        Task { @MainActor in
+            let reachable = await syncer.checkReachable(config: config)
+            guard reachable, !flag.isCancelled else {
+                self.finishInventoryRefresh(summary: nil)
+                if !reachable {
+                    onAlert(SimpleAlert(title: "Cubbit non risponde", message: InventoryStartGate.cubbitUnreachable))
+                }
+                return
+            }
+            let runId = Int64(Date().timeIntervalSince1970 * 1000)
+            Task.detached(priority: .utility) {
+                let outcome = await InventoryRefresh.run(
+                    store: store, ssdRoot: ssdURL, hddRoot: hddURL, runId: runId, cancelFlag: flag,
+                    fetchPage: { token in try await syncer.fetchListPageXML(config: config, token: token) },
+                    onProgress: { p in Task { @MainActor in self.inventoryProgress = p } })
+                await MainActor.run {
+                    self.finishInventoryRefresh(summary: outcome.summary)
+                    if outcome.summary == nil {
+                        onAlert(SimpleAlert(title: "L'inventario si è fermato",
+                                            message: "Non è stato possibile salvare o rileggere l'inventario sul Mac. "
+                                                + "Le foto non sono state toccate: puoi riprovare più tardi."))
+                    }
+                }
+            }
+        }
+    }
+
+    /// L'UNICO punto in cui un aggiornamento finisce, su ogni percorso: accessi chiusi, flag
+    /// giu', esito pubblicato. Un esito `nil` lascia quello di prima (piu' vecchio, mai sbagliato).
+    private func finishInventoryRefresh(summary: InventorySummary?) {
+        bm.stopAccessing(.ssd)
+        bm.stopAccessing(.hdd)
+        isInventorying = false
+        inventoryCancelFlag = nil
+        inventoryProgress = nil
+        inventoryStopRequested = false
+        if let summary { inventorySummary = summary }
+    }
+
+    /// «Interrompi» (idempotente). Lo scanner si ferma fra un blocco da 1 MiB e l'altro, il
+    /// lettore di Cubbit fra una pagina e l'altra: quello che e' stato letto resta salvato.
+    func stopInventoryRefresh() {
+        guard isInventorying, !inventoryStopRequested else { return }
+        inventoryStopRequested = true
+        inventoryCancelFlag?.cancel()
+    }
+
+    /// Un volume si sta smontando: l'inventario si ferma solo se e' l'SSD o l'HDD (S10), senza
+    /// segnarlo come «fermato da te».
+    private func stopInventoryForVolumeChange(_ volume: URL?) {
+        guard isInventorying,
+              InventoryStartGate.volumeChangeStopsInventory(unmounting: volume, ssdRoot: bm.urls[.ssd],
+                                                            hddRoot: bm.urls[.hdd]) else { return }
+        inventoryCancelFlag?.cancel()
+    }
+
+    /// Legge l'ultimo inventario salvato e ne calcola il confronto, fuori dal main. Chiamata
+    /// all'apertura della finestra; non fa niente se c'e' gia' un risultato o se un
+    /// aggiornamento e' in corso (arrivera' da quello).
+    func loadInventoryIfNeeded() {
+        guard inventorySummary == nil, !isLoadingInventory, !isInventorying,
+              let store = libraryIndexStore else { return }
+        isLoadingInventory = true
+        Task.detached(priority: .userInitiated) {
+            let snapshot = (try? store.inventorySnapshot()) ?? InventorySnapshot()
+            let summary = InventorySummary(snapshot, sampleLimit: InventorySummary.defaultSampleLimit)
+            await MainActor.run {
+                self.isLoadingInventory = false
+                self.inventorySummary = summary
+            }
+        }
     }
 
     // `autoRefreshLibraryIndexIfEnabled()` e `LibraryIndexAutoRefresh.shouldRun` sono stati
@@ -11752,7 +11916,8 @@ final class BackupRunner: ObservableObject {
         guard !isRunning else { return }
         if let reason = JobStartGate.blockedReason(isIndexing: isIndexing,
                                                     isTrashingDuplicates: isTrashingDuplicates,
-                                                    isRestoringFromTrash: isRestoringFromTrash) {
+                                                    isRestoringFromTrash: isRestoringFromTrash,
+                                                    isInventorying: isInventorying) {
             pendingAlert = SimpleAlert(title: "Meglio non farlo adesso", message: reason)
             return
         }
@@ -15077,7 +15242,8 @@ struct LibraryIndexCard: View {
         LibraryIndexCommandGate.disabledReason(isIndexing: runner.isIndexing,
                                                jobIsRunning: runner.isRunning,
                                                isTrashingDuplicates: runner.isTrashingDuplicates,
-                                               isRestoringFromTrash: runner.isRestoringFromTrash)
+                                               isRestoringFromTrash: runner.isRestoringFromTrash,
+                                               isInventorying: runner.isInventorying)
     }
 
     private var commandsDisabled: Bool { commandsDisabledReason != nil }
@@ -15649,7 +15815,8 @@ struct DuplicatesView: View {
                                              isIndexing: runner.isIndexing,
                                              ssdMounted: volumes.ssdMounted,
                                              isTrashingDuplicates: runner.isTrashingDuplicates,
-                                             isRestoringFromTrash: runner.isRestoringFromTrash)
+                                             isRestoringFromTrash: runner.isRestoringFromTrash,
+                                             isInventorying: runner.isInventorying)
     }
 
     private var canRequestTrash: Bool {
@@ -15671,7 +15838,8 @@ struct DuplicatesView: View {
         DuplicatesStatus.undoDisabledReason(
             ssdMounted: volumes.ssdMounted, isRunning: runner.isRunning, isIndexing: runner.isIndexing,
             isTrashingDuplicates: runner.isTrashingDuplicates, isRestoringFromTrash: runner.isRestoringFromTrash,
-            summary: runner.restorableBatch, hasEverTrashed: (runner.trashManifestStore?.totalRecorded ?? 0) > 0)
+            summary: runner.restorableBatch, hasEverTrashed: (runner.trashManifestStore?.totalRecorded ?? 0) > 0,
+            isInventorying: runner.isInventorying)
     }
 
     private var undoConfirmationText: TrashRestoreStatus.Confirmation? {

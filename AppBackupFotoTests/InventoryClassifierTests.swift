@@ -289,4 +289,17 @@ final class InventoryClassifierTests: XCTestCase {
         XCTAssertEqual(summary.bytes(.missingSomewhere), 50)
         XCTAssertEqual(summary.count(.safe), 0)
     }
+
+    /// Decisione del 2026-09-29: ❗ «stesso percorso, contenuto diverso» vale fra DUE archivi
+    /// (spec, ADR-0015), non dentro un archivio solo. SSD e HDD non distinguono maiuscole e
+    /// minuscole, e su Cubbit il 2026-09-29 non c'era nessuna coppia di chiavi che collide dopo
+    /// la normalizzazione (219.877 chiavi controllate). Il progetto 4 deve ricontrollarlo
+    /// prima di cancellare qualunque cosa da Cubbit.
+    func testPathCollisionInsideASingleArchive_isNotAConflict() {
+        let items = classify(hdd: [file("Foto/IMG.JPG", "x"), file("Foto/img.jpg", "y")])
+        XCTAssertEqual(item(items, "sha-x")?.checkReasons, [])
+        XCTAssertEqual(item(items, "sha-y")?.checkReasons, [])
+        XCTAssertEqual(item(items, "sha-x")?.category, .onlyOutsideSSD)
+        XCTAssertEqual(item(items, "sha-y")?.category, .onlyOutsideSSD)
+    }
 }

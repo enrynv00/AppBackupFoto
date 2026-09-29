@@ -156,15 +156,15 @@ final class DuplicatesStatusTests: XCTestCase {
 
     /// Job in corso: motivo scritto, non un bottone grigio senza spiegazione.
     func testJobRunning_explainsWhyTrashDisabled() {
-        let reason = DuplicatesStatus.trashDisabledReason(isRunning: true, isIndexing: false, ssdMounted: true, isTrashingDuplicates: false, isRestoringFromTrash: false)
+        let reason = DuplicatesStatus.trashDisabledReason(isRunning: true, isIndexing: false, ssdMounted: true, isTrashingDuplicates: false, isRestoringFromTrash: false, isInventorying: false)
         XCTAssertNotNil(reason)
         XCTAssertTrue(reason!.lowercased().contains("backup"))
     }
 
     /// Scansione dell'indice in corso: stessa disciplina, motivo diverso da quello del job.
     func testIndexingRunning_explainsWhyTrashDisabled() {
-        let indexing = DuplicatesStatus.trashDisabledReason(isRunning: false, isIndexing: true, ssdMounted: true, isTrashingDuplicates: false, isRestoringFromTrash: false)
-        let running = DuplicatesStatus.trashDisabledReason(isRunning: true, isIndexing: false, ssdMounted: true, isTrashingDuplicates: false, isRestoringFromTrash: false)
+        let indexing = DuplicatesStatus.trashDisabledReason(isRunning: false, isIndexing: true, ssdMounted: true, isTrashingDuplicates: false, isRestoringFromTrash: false, isInventorying: false)
+        let running = DuplicatesStatus.trashDisabledReason(isRunning: true, isIndexing: false, ssdMounted: true, isTrashingDuplicates: false, isRestoringFromTrash: false, isInventorying: false)
         XCTAssertNotNil(indexing)
         XCTAssertNotEqual(indexing, running, "i due motivi non devono essere la stessa frase")
     }
@@ -172,7 +172,7 @@ final class DuplicatesStatusTests: XCTestCase {
     /// SSD scollegato: riga PROPRIA, diversa da "nessun doppione" — non sono la stessa cosa:
     /// uno è "non ho niente da segnalare", l'altro è "non posso controllare adesso".
     func testSSDDisconnected_ownReason_differsFromNoGroups() {
-        let reason = DuplicatesStatus.trashDisabledReason(isRunning: false, isIndexing: false, ssdMounted: false, isTrashingDuplicates: false, isRestoringFromTrash: false)
+        let reason = DuplicatesStatus.trashDisabledReason(isRunning: false, isIndexing: false, ssdMounted: false, isTrashingDuplicates: false, isRestoringFromTrash: false, isInventorying: false)
         let noGroupsLine = DuplicatesStatus.headerLine(indexBuilt: true, groupsKnown: true, groupCount: 0, reclaimableBytes: 0)
         XCTAssertNotNil(reason)
         XCTAssertNotEqual(reason!, noGroupsLine.text)
@@ -183,7 +183,7 @@ final class DuplicatesStatusTests: XCTestCase {
     /// comunque le due conferme). Una funzione che restituisse sempre un motivo non
     /// distinguerebbe "disattivato" da "attivo".
     func testNothingBlocksTrash_whenAllConditionsAreFine() {
-        XCTAssertNil(DuplicatesStatus.trashDisabledReason(isRunning: false, isIndexing: false, ssdMounted: true, isTrashingDuplicates: false, isRestoringFromTrash: false))
+        XCTAssertNil(DuplicatesStatus.trashDisabledReason(isRunning: false, isIndexing: false, ssdMounted: true, isTrashingDuplicates: false, isRestoringFromTrash: false, isInventorying: false))
     }
 
     /// Uno spostamento nel Cestino gia' in corso (Task 4, 2026-09-19): un secondo non puo'
@@ -191,7 +191,7 @@ final class DuplicatesStatusTests: XCTestCase {
     /// e' la garanzia che sostituisce il vecchio `@State isTrashing` che si azzerava riaprendo
     /// la finestra.
     func testTrashingAlreadyInProgress_explainsWhyTrashDisabled() {
-        let reason = DuplicatesStatus.trashDisabledReason(isRunning: false, isIndexing: false, ssdMounted: true, isTrashingDuplicates: true, isRestoringFromTrash: false)
+        let reason = DuplicatesStatus.trashDisabledReason(isRunning: false, isIndexing: false, ssdMounted: true, isTrashingDuplicates: true, isRestoringFromTrash: false, isInventorying: false)
         XCTAssertNotNil(reason)
         XCTAssertTrue(reason!.lowercased().contains("cestino"))
     }
@@ -273,10 +273,10 @@ final class DuplicatesStatusTests: XCTestCase {
         allTexts.append(DuplicatesStatus.headerLine(indexBuilt: false, groupsKnown: true, groupCount: 0, reclaimableBytes: 0).text)
         allTexts.append(DuplicatesStatus.headerLine(indexBuilt: true, groupsKnown: true, groupCount: 0, reclaimableBytes: 0).text)
         allTexts.append(DuplicatesStatus.headerLine(indexBuilt: true, groupsKnown: true, groupCount: 3, reclaimableBytes: 1_000).text)
-        allTexts.append(DuplicatesStatus.trashDisabledReason(isRunning: true, isIndexing: false, ssdMounted: true, isTrashingDuplicates: false, isRestoringFromTrash: false) ?? "")
-        allTexts.append(DuplicatesStatus.trashDisabledReason(isRunning: false, isIndexing: true, ssdMounted: true, isTrashingDuplicates: false, isRestoringFromTrash: false) ?? "")
-        allTexts.append(DuplicatesStatus.trashDisabledReason(isRunning: false, isIndexing: false, ssdMounted: false, isTrashingDuplicates: false, isRestoringFromTrash: false) ?? "")
-        allTexts.append(DuplicatesStatus.trashDisabledReason(isRunning: false, isIndexing: false, ssdMounted: true, isTrashingDuplicates: true, isRestoringFromTrash: false) ?? "")
+        allTexts.append(DuplicatesStatus.trashDisabledReason(isRunning: true, isIndexing: false, ssdMounted: true, isTrashingDuplicates: false, isRestoringFromTrash: false, isInventorying: false) ?? "")
+        allTexts.append(DuplicatesStatus.trashDisabledReason(isRunning: false, isIndexing: true, ssdMounted: true, isTrashingDuplicates: false, isRestoringFromTrash: false, isInventorying: false) ?? "")
+        allTexts.append(DuplicatesStatus.trashDisabledReason(isRunning: false, isIndexing: false, ssdMounted: false, isTrashingDuplicates: false, isRestoringFromTrash: false, isInventorying: false) ?? "")
+        allTexts.append(DuplicatesStatus.trashDisabledReason(isRunning: false, isIndexing: false, ssdMounted: true, isTrashingDuplicates: true, isRestoringFromTrash: false, isInventorying: false) ?? "")
 
         var skipped = DuplicateTrashOutcome()
         skipped.skippedGroups = [(DuplicateGroup(hash: "h", size: 1,
@@ -360,7 +360,7 @@ final class DuplicatesStatusTests: XCTestCase {
 
     func testTrashDisabled_whileRestoring() {
         let reason = DuplicatesStatus.trashDisabledReason(isRunning: false, isIndexing: false, ssdMounted: true,
-                                                           isTrashingDuplicates: false, isRestoringFromTrash: true)
+                                                           isTrashingDuplicates: false, isRestoringFromTrash: true, isInventorying: false)
         XCTAssertNotNil(reason)
         XCTAssertTrue(reason!.lowercased().contains("rimettendo"))
     }
@@ -374,7 +374,7 @@ final class DuplicatesStatusTests: XCTestCase {
     func testUndoDisabled_ssdNotMounted() {
         let reason = DuplicatesStatus.undoDisabledReason(ssdMounted: false, isRunning: false, isIndexing: false,
                                                           isTrashingDuplicates: false, isRestoringFromTrash: false,
-                                                          summary: summary(), hasEverTrashed: true)
+                                                          summary: summary(), hasEverTrashed: true, isInventorying: false)
         XCTAssertNotNil(reason)
         XCTAssertTrue(reason!.contains("SSD"))
     }
@@ -386,7 +386,7 @@ final class DuplicatesStatusTests: XCTestCase {
     func testUndoDisabled_ssdNotMounted_takesPrecedenceOverEverythingElse() {
         let reason = DuplicatesStatus.undoDisabledReason(ssdMounted: false, isRunning: true, isIndexing: true,
                                                           isTrashingDuplicates: true, isRestoringFromTrash: true,
-                                                          summary: summary(), hasEverTrashed: true)
+                                                          summary: summary(), hasEverTrashed: true, isInventorying: false)
         XCTAssertNotNil(reason)
         XCTAssertTrue(reason!.contains("SSD"))
     }
@@ -394,7 +394,7 @@ final class DuplicatesStatusTests: XCTestCase {
     func testUndoDisabled_trashingInProgress() {
         let reason = DuplicatesStatus.undoDisabledReason(ssdMounted: true, isRunning: false, isIndexing: false,
                                                           isTrashingDuplicates: true, isRestoringFromTrash: false,
-                                                          summary: summary(), hasEverTrashed: true)
+                                                          summary: summary(), hasEverTrashed: true, isInventorying: false)
         XCTAssertNotNil(reason)
         XCTAssertTrue(reason!.lowercased().contains("cestino"))
     }
@@ -402,14 +402,14 @@ final class DuplicatesStatusTests: XCTestCase {
     func testUndoDisabled_restoringAlreadyInProgress() {
         let reason = DuplicatesStatus.undoDisabledReason(ssdMounted: true, isRunning: false, isIndexing: false,
                                                           isTrashingDuplicates: false, isRestoringFromTrash: true,
-                                                          summary: summary(), hasEverTrashed: true)
+                                                          summary: summary(), hasEverTrashed: true, isInventorying: false)
         XCTAssertNotNil(reason)
     }
 
     func testUndoDisabled_jobRunning() {
         let reason = DuplicatesStatus.undoDisabledReason(ssdMounted: true, isRunning: true, isIndexing: false,
                                                           isTrashingDuplicates: false, isRestoringFromTrash: false,
-                                                          summary: summary(), hasEverTrashed: true)
+                                                          summary: summary(), hasEverTrashed: true, isInventorying: false)
         XCTAssertNotNil(reason)
         XCTAssertTrue(reason!.lowercased().contains("backup"))
     }
@@ -417,7 +417,7 @@ final class DuplicatesStatusTests: XCTestCase {
     func testUndoDisabled_indexing() {
         let reason = DuplicatesStatus.undoDisabledReason(ssdMounted: true, isRunning: false, isIndexing: true,
                                                           isTrashingDuplicates: false, isRestoringFromTrash: false,
-                                                          summary: summary(), hasEverTrashed: true)
+                                                          summary: summary(), hasEverTrashed: true, isInventorying: false)
         XCTAssertNotNil(reason)
     }
 
@@ -426,7 +426,7 @@ final class DuplicatesStatusTests: XCTestCase {
     func testUndoDisabled_neverTrashedAnything() {
         let reason = DuplicatesStatus.undoDisabledReason(ssdMounted: true, isRunning: false, isIndexing: false,
                                                           isTrashingDuplicates: false, isRestoringFromTrash: false,
-                                                          summary: nil, hasEverTrashed: false)
+                                                          summary: nil, hasEverTrashed: false, isInventorying: false)
         XCTAssertNotNil(reason)
         XCTAssertTrue(reason!.lowercased().contains("non hai ancora"))
     }
@@ -436,10 +436,10 @@ final class DuplicatesStatusTests: XCTestCase {
     func testUndoDisabled_alreadyRestored() {
         let neverTrashed = DuplicatesStatus.undoDisabledReason(ssdMounted: true, isRunning: false, isIndexing: false,
                                                                 isTrashingDuplicates: false, isRestoringFromTrash: false,
-                                                                summary: nil, hasEverTrashed: false)
+                                                                summary: nil, hasEverTrashed: false, isInventorying: false)
         let alreadyRestored = DuplicatesStatus.undoDisabledReason(ssdMounted: true, isRunning: false, isIndexing: false,
                                                                    isTrashingDuplicates: false, isRestoringFromTrash: false,
-                                                                   summary: nil, hasEverTrashed: true)
+                                                                   summary: nil, hasEverTrashed: true, isInventorying: false)
         XCTAssertNotNil(alreadyRestored)
         XCTAssertNotEqual(neverTrashed, alreadyRestored)
     }
@@ -448,7 +448,7 @@ final class DuplicatesStatusTests: XCTestCase {
     func testUndoDisabled_nilWhenSomethingIsPendingAndNothingBlocks() {
         XCTAssertNil(DuplicatesStatus.undoDisabledReason(ssdMounted: true, isRunning: false, isIndexing: false,
                                                           isTrashingDuplicates: false, isRestoringFromTrash: false,
-                                                          summary: summary(), hasEverTrashed: true))
+                                                          summary: summary(), hasEverTrashed: true, isInventorying: false))
     }
 
     /// Ogni ramo di `undoDisabledReason` e' davvero raggiunto dal proprio caso — stile
@@ -456,19 +456,19 @@ final class DuplicatesStatusTests: XCTestCase {
     func testUndoDisabled_everyBranchIsReachedByItsCase() {
         let cases: [(String, String?)] = [
             ("ssd", DuplicatesStatus.undoDisabledReason(ssdMounted: false, isRunning: false, isIndexing: false,
-                isTrashingDuplicates: false, isRestoringFromTrash: false, summary: summary(), hasEverTrashed: true)),
+                isTrashingDuplicates: false, isRestoringFromTrash: false, summary: summary(), hasEverTrashed: true, isInventorying: false)),
             ("trashing", DuplicatesStatus.undoDisabledReason(ssdMounted: true, isRunning: false, isIndexing: false,
-                isTrashingDuplicates: true, isRestoringFromTrash: false, summary: summary(), hasEverTrashed: true)),
+                isTrashingDuplicates: true, isRestoringFromTrash: false, summary: summary(), hasEverTrashed: true, isInventorying: false)),
             ("restoring", DuplicatesStatus.undoDisabledReason(ssdMounted: true, isRunning: false, isIndexing: false,
-                isTrashingDuplicates: false, isRestoringFromTrash: true, summary: summary(), hasEverTrashed: true)),
+                isTrashingDuplicates: false, isRestoringFromTrash: true, summary: summary(), hasEverTrashed: true, isInventorying: false)),
             ("running", DuplicatesStatus.undoDisabledReason(ssdMounted: true, isRunning: true, isIndexing: false,
-                isTrashingDuplicates: false, isRestoringFromTrash: false, summary: summary(), hasEverTrashed: true)),
+                isTrashingDuplicates: false, isRestoringFromTrash: false, summary: summary(), hasEverTrashed: true, isInventorying: false)),
             ("indexing", DuplicatesStatus.undoDisabledReason(ssdMounted: true, isRunning: false, isIndexing: true,
-                isTrashingDuplicates: false, isRestoringFromTrash: false, summary: summary(), hasEverTrashed: true)),
+                isTrashingDuplicates: false, isRestoringFromTrash: false, summary: summary(), hasEverTrashed: true, isInventorying: false)),
             ("never-trashed", DuplicatesStatus.undoDisabledReason(ssdMounted: true, isRunning: false, isIndexing: false,
-                isTrashingDuplicates: false, isRestoringFromTrash: false, summary: nil, hasEverTrashed: false)),
+                isTrashingDuplicates: false, isRestoringFromTrash: false, summary: nil, hasEverTrashed: false, isInventorying: false)),
             ("already-restored", DuplicatesStatus.undoDisabledReason(ssdMounted: true, isRunning: false, isIndexing: false,
-                isTrashingDuplicates: false, isRestoringFromTrash: false, summary: nil, hasEverTrashed: true)),
+                isTrashingDuplicates: false, isRestoringFromTrash: false, summary: nil, hasEverTrashed: true, isInventorying: false)),
         ]
         for (name, reason) in cases {
             XCTAssertNotNil(reason, "il caso '\(name)' non ha prodotto un motivo")
@@ -672,5 +672,23 @@ final class DuplicatesStatusTests: XCTestCase {
                 XCTAssertFalse(lower.contains(word), "'\(word)' non deve comparire in: \(text)")
             }
         }
+    }
+
+    // MARK: - Inventario in corso (ROADMAP #44)
+
+    func testTrashDisabled_duringTheInventory() {
+        let reason = DuplicatesStatus.trashDisabledReason(isRunning: false, isIndexing: false, ssdMounted: true,
+                                                          isTrashingDuplicates: false, isRestoringFromTrash: false,
+                                                          isInventorying: true)
+        XCTAssertNotNil(reason)
+        XCTAssertTrue(reason!.contains("inventario"))
+    }
+
+    func testUndoDisabled_duringTheInventory() {
+        let reason = DuplicatesStatus.undoDisabledReason(ssdMounted: true, isRunning: false, isIndexing: false,
+                                                         isTrashingDuplicates: false, isRestoringFromTrash: false,
+                                                         summary: nil, hasEverTrashed: true, isInventorying: true)
+        XCTAssertNotNil(reason)
+        XCTAssertTrue(reason!.contains("inventario"))
     }
 }
