@@ -198,6 +198,16 @@ struct BackupFotoEnricoApp: App {
         // nel Cestino. Il gate vero e' dentro DuplicatesView.
         .restorationBehavior(.disabled)
 
+        Window("Inventario", id: "inventory") {
+            InventoryView()
+                .environmentObject(runner)
+        }
+        .defaultSize(width: 720, height: 680)
+        // Stessa regola di #30: ogni Window scene di primo livello va gated (il gate vero e'
+        // dentro InventoryView: elenca percorsi e nomi di tutte le foto) e non deve essere
+        // riaperta dal ripristino automatico di macOS prima dello sblocco.
+        .restorationBehavior(.disabled)
+
         MenuBarExtra {
             MenuBarContent()
                 .environmentObject(runner)
@@ -14493,6 +14503,9 @@ struct HamburgerPanel: View {
                         HamburgerRow(icon: "photo.stack", label: "Foto", iconColor: .pink) {
                             openWindow(id: "immich")
                         }
+                        HamburgerRow(icon: "checklist", label: "Inventario", iconColor: .indigo) {
+                            openWindow(id: "inventory")
+                        }
                         HamburgerRow(icon: "arrow.triangle.2.circlepath", label: "Controlla aggiornamenti", iconColor: .cyan) {
                             updater.controller.checkForUpdates(nil)
                         }
@@ -15437,7 +15450,7 @@ struct LibraryIndexCard: View {
     private func confirmReset() {
         pendingAlert = SimpleAlert(
             title: "Svuotare l'elenco delle foto già salvate?",
-            message: "Viene cancellato solo l'elenco che l'app tiene sul Mac. Le tue foto e i tuoi video sull'SSD non vengono toccati: non ne viene cancellato nemmeno uno.\n\nDopo, l'elenco va rifatto da zero (\(durata)) e finché non lo rifai un'importazione può ricopiare foto che hai già.",
+            message: "Viene cancellato solo l'elenco che l'app tiene sul Mac. Le tue foto e i tuoi video sull'SSD non vengono toccati: non ne viene cancellato nemmeno uno.\n\nDopo, l'elenco va rifatto da zero (\(durata)) e finché non lo rifai un'importazione può ricopiare foto che hai già.\n\nInsieme all'elenco si svuota anche l'inventario (finestra Inventario), che andrà aggiornato di nuovo.",
             isDestructive: true,
             confirmTitle: "Svuota l'elenco",
             cancelTitle: "Annulla",
@@ -16608,5 +16621,162 @@ private struct DuplicateGroupRow: View {
         guard loadToken == token else { return }
         if let image { cache.insert(image, for: key) }
         thumbnail = image
+    }
+}
+
+// MARK: - Pannello Inventario
+
+// MARK: - Pannello Inventario (ROADMAP #44, ADR-0015)
+
+/// La finestra "Inventario": per ogni contenuto foto/video, in quale dei tre posti (SSD, HDD,
+/// Cubbit) c'e' davvero, e cosa non torna. SOLA LETTURA: nessun bottone copia, sposta o
+/// cancella (spec, «Il pannello e' solo lettura»).
+///
+/// **NON coperta da test** (stessa dichiarazione di `DuplicatesView` e `LibraryIndexCard`):
+/// questa view, il gate Touch ID, l'apertura della finestra. E' testato tutto cio' che sta ai
+/// due capi del cablaggio: `InventoryStatus` (testi), `InventoryStartGate`, `InventorySummary`/
+/// `InventoryClassifier`, `InventoryRefresh`.
+struct InventoryView: View {
+    @ObservedObject private var gate = AuthGateManager.shared
+    @EnvironmentObject private var runner: BackupRunner
+    @ObservedObject private var volumes = VolumeMonitor.shared
+
+    /// Avvisi LOCALI della finestra (vedi `AlertSink`): `runner.pendingAlert` ha un solo
+    /// presentatore, nella finestra principale.
+    @State private var alert: SimpleAlert? = nil
+    @State private var expanded: Set<InventoryCategory> = []
+
+    var body: some View {
+        if gate.touchIDEnabled && !gate.unlocked {
+            LockScreenView()
+        } else {
+            content
+        }
+    }
+
+    private var startDisabledReason: String? {
+        InventoryStartGate.blockedReason(
+            isRunning: runner.isRunning, isIndexing: runner.isIndexing,
+            isTrashingDuplicates: runner.isTrashingDuplicates, isRestoringFromTrash: runner.isRestoringFromTrash,
+            isInventorying: runner.isInventorying, ssdMounted: volumes.ssdMounted, hddMounted: volumes.hddMounted,
+            hasCubbitConfig: runner.s3Config != nil)
+    }
+
+    private var content: some View {
+        VStack(alignment: .leading, spacing: AppSpacing.md) {
+            Text("Inventario").font(AppFont.title)
+            Label(InventoryStatus.readOnlyNote, systemImage: "eye")
+                .font(AppFont.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if let summary = runner.inventorySummary {
+                lineView(InventoryStatus.freshnessLine(states: summary.states, now: Date()))
+                ForEach(InventoryArchive.allCases, id: \.self) { archive in
+                    VStack(alignment: .leading, spacing: AppSpacing.xs) {
+                        Text(InventoryStatus.archiveLine(archive, stats: summary.stats[archive] ?? InventoryArchiveStats()))
+                            .font(AppFont.body)
+                        if let line = InventoryStatus.completenessLine(archive, state: summary.states[archive]) {
+                            lineView(line)
+                        }
+                    }
+                }
+                Divider()
+                ScrollView {
+                    VStack(alignment: .leading, spacing: AppSpacing.sm) {
+                        ForEach(InventoryStatus.displayOrder, id: \.self) { category in
+                            categoryRow(category, summary: summary)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            } else {
+                HStack(spacing: AppSpacing.sm) {
+                    ProgressView().controlSize(.small)
+                    Text(InventoryStatus.loadingLine).font(AppFont.caption).foregroundStyle(.secondary)
+                }
+            }
+
+            Spacer(minLength: 0)
+            footer
+        }
+        .padding(AppSpacing.lg)
+        .frame(minWidth: 560, minHeight: 480, alignment: .topLeading)
+        .task { runner.loadInventoryIfNeeded() }
+        .alert(alert?.title ?? "", isPresented: Binding(
+            get: { alert != nil },
+            set: { if !$0 { alert = nil } }
+        ), presenting: alert) { a in
+            Button(a.confirmTitle, role: a.isDestructive ? .destructive : nil) { a.onConfirm?() }
+            if let cancelTitle = a.cancelTitle { Button(cancelTitle, role: .cancel) {} }
+        } message: { a in
+            Text(a.message)
+        }
+    }
+
+    @ViewBuilder
+    private func categoryRow(_ category: InventoryCategory, summary: InventorySummary) -> some View {
+        let count = summary.count(category)
+        // «Non si puo' ancora dire» compare solo se c'e' qualcosa: non e' una categoria della
+        // spec, e' il posto dei contenuti su cui il giudizio e' sospeso.
+        if category != .undetermined || count > 0 {
+            DisclosureGroup(isExpanded: Binding(
+                get: { expanded.contains(category) },
+                set: { if $0 { expanded.insert(category) } else { expanded.remove(category) } }
+            )) {
+                VStack(alignment: .leading, spacing: AppSpacing.xs) {
+                    Text(InventoryStatus.explanation(category))
+                        .font(AppFont.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    let items = summary.samples[category] ?? []
+                    ForEach(items) { item in
+                        Text(InventoryStatus.itemLine(item))
+                            .font(AppFont.caption)
+                            .lineLimit(1).truncationMode(.middle)
+                            .textSelection(.enabled)
+                    }
+                    if let more = InventoryStatus.sampleLimitLine(shown: items.count, total: count) {
+                        Text(more).font(AppFont.caption).foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.leading, AppSpacing.md)
+            } label: {
+                Text(InventoryStatus.categoryLine(category, count: count, bytes: summary.bytes(category)))
+                    .font(AppFont.body)
+            }
+        }
+    }
+
+    private var footer: some View {
+        VStack(alignment: .leading, spacing: AppSpacing.sm) {
+            if runner.isInventorying {
+                HStack(spacing: AppSpacing.sm) {
+                    ProgressView().controlSize(.small)
+                    Text(runner.inventoryStopRequested
+                         ? InventoryStatus.stoppingLine
+                         : runner.inventoryProgress.map { InventoryStatus.progressLine($0) } ?? InventoryStatus.progressLine(.checkingCubbit))
+                        .font(AppFont.caption)
+                }
+                Button(InventoryStatus.stopButton) { runner.stopInventoryRefresh() }
+                    .disabled(runner.inventoryStopRequested)
+            } else {
+                Button(InventoryStatus.refreshButton) {
+                    runner.startInventoryRefresh(onAlert: { alert = $0 })
+                }
+                .disabled(startDisabledReason != nil)
+                if let reason = startDisabledReason {
+                    Label(reason, systemImage: "info.circle")
+                        .font(AppFont.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+
+    private func lineView(_ line: InventoryStatus.Line) -> some View {
+        Label(line.text, systemImage: line.tone == .ok ? "checkmark.circle.fill"
+              : line.tone == .warning ? "exclamationmark.triangle.fill" : "info.circle.fill")
+            .font(AppFont.caption)
+            .foregroundStyle(line.tone == .ok ? AppColor.success : line.tone == .warning ? AppColor.warning : .secondary)
+            .fixedSize(horizontal: false, vertical: true)
     }
 }
