@@ -108,7 +108,7 @@ final class UpdaterViewModel: ObservableObject {
     let controller: SPUStandardUpdaterController
     init() {
         controller = SPUStandardUpdaterController(
-            startingUpdater: true,
+            startingUpdater: appTouchesUserStateAtLaunch(),
             updaterDelegate: nil,
             userDriverDelegate: nil
         )
@@ -4288,6 +4288,13 @@ nonisolated func backupRunnerStoreRoot(isRunningUnderTests: Bool = isRunningUnde
         .appendingPathComponent("AppBackupFoto", isDirectory: true)
 }
 
+/// BUG-10, seconda parte (2026-09-29): il test host ha lo stesso bundle id dell'app, quindi
+/// le stesse preferenze vere. Sotto test l'app non avvia Sparkle (rete + scritture nelle
+/// preferenze) e non riscrive l'UUID dei volumi dei bookmark all'avvio.
+nonisolated func appTouchesUserStateAtLaunch(isRunningUnderTests: Bool = isRunningUnderTests()) -> Bool {
+    !isRunningUnderTests
+}
+
 private nonisolated func storeAllowedRoots(includingTemporary: Bool) -> [String] {
     var roots = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
     if includingTemporary {
@@ -6840,8 +6847,9 @@ final class BookmarkManager: ObservableObject {
                 // Backfill dell'UUID di volume per i bookmark salvati prima che esistesse
                 // (roadmap #28): finché il volume è montato è l'unico momento in cui si può
                 // ricavare. Best-effort e silenzioso, stesso criterio dell'adozione Keychain
-                // di `S3Syncer.readConfig()`.
-                persistVolumeUUID(for: loc, url: url)
+                // di `S3Syncer.readConfig()`. Mai sotto test (BUG-10): scriverebbe le
+                // preferenze vere dell'utente.
+                if appTouchesUserStateAtLaunch() { persistVolumeUUID(for: loc, url: url) }
             }
         }
     }

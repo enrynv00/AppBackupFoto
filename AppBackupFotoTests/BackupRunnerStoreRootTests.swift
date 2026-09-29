@@ -44,4 +44,10 @@ final class BackupRunnerStoreRootTests: XCTestCase {
         let file = root.appendingPathComponent("library-index.sqlite")
         XCTAssertTrue(isAllowedStoreLocation(file, includingTemporary: true))
     }
+
+    /// BUG-10, seconda parte: sotto test niente Sparkle e niente scritture nelle preferenze.
+    func testUserStateAtLaunch_isTouchedOnlyOutsideTests() {
+        XCTAssertFalse(appTouchesUserStateAtLaunch(isRunningUnderTests: true))
+        XCTAssertTrue(appTouchesUserStateAtLaunch(isRunningUnderTests: false))
+    }
 }
