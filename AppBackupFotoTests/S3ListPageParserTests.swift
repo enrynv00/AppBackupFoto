@@ -110,4 +110,13 @@ final class S3ListPageParserTests: XCTestCase {
     func testXmlDecode_isTheSameFunctionUsedByTheList() {
         XCTAssertEqual(S3Syncer.xmlDecode("&quot;abc&quot;"), "\"abc\"")
     }
+
+    /// Un token vuoto non e' un token: la pagina e' troncata senza un modo di proseguire, e chi
+    /// legge deve trattarla come lista incompleta, non richiedere di nuovo la stessa pagina.
+    func testTruncatedWithAnEmptyToken_hasNoNextToken() {
+        XCTAssertNil(S3Syncer.parseListPage(page(object("a.jpg", size: "1", etag: nil),
+                                                 truncated: true, token: "")).nextToken)
+        XCTAssertNil(S3Syncer.parseListPage(page(object("a.jpg", size: "1", etag: nil),
+                                                 truncated: true, token: "  ")).nextToken)
+    }
 }

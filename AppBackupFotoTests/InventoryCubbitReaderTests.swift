@@ -82,6 +82,21 @@ final class InventoryCubbitReaderTests: XCTestCase {
         XCTAssertEqual(r.incompleteReason, .listingMalformed)
     }
 
+    /// Token vuoto su una pagina troncata: incompleto, e nessuna seconda richiesta (con `""`
+    /// si richiederebbe di nuovo la prima pagina, all'infinito).
+    func testTruncatedWithAnEmptyToken_isIncomplete_andAsksOnlyOnce() async {
+        let page = "<ListBucketResult><IsTruncated>true</IsTruncated>"
+            + Self.object("a.jpg", 1, "e722bbb0c3185d08f1a31567e66a825b")
+            + "<NextContinuationToken></NextContinuationToken></ListBucketResult>"
+        let r = await reader.read(runId: 1, fetchPage: { token in
+            XCTAssertNil(token, "dopo una pagina con token vuoto non si chiede altro")
+            return page
+        })
+        XCTAssertEqual(r.pages, 1)
+        XCTAssertTrue(r.truncatedWithoutToken)
+        XCTAssertFalse(r.isComplete)
+    }
+
     func testMalformedEntry_isIncomplete() async {
         let page = "<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>a.jpg</Key></Contents></ListBucketResult>"
         let r = await reader.read(runId: 1, fetchPage: { _ in page })

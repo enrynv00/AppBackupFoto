@@ -8618,7 +8618,10 @@ final class S3Syncer {
         // comparire, perche' la lista scrive `<` come `&lt;`.
         let whole = xml.startIndex..<xml.endIndex
         let isTruncated = firstValue("IsTruncated", in: whole) == "true"
-        let token = isTruncated ? firstValue("NextContinuationToken", in: whole) : nil
+        // Un token vuoto non permette di proseguire: con `""` si richiederebbe di nuovo la
+        // prima pagina, all'infinito. Vale come assente, cioe' lista troncata senza token.
+        let rawToken = isTruncated ? firstValue("NextContinuationToken", in: whole) : nil
+        let token = rawToken.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
         return S3ListPage(objects: objects, isTruncated: isTruncated, nextToken: token, malformedEntries: malformed)
     }
 }
