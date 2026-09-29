@@ -205,4 +205,24 @@ final class InventoryScannerTests: XCTestCase {
         XCTAssertEqual(r.scanned, 5)
         XCTAssertGreaterThanOrEqual(savedDuringTheRead, 2)
     }
+
+    /// La radice sparisce DOPO che l'ultimo lotto e' gia' stato scritto (lotto vuoto): il
+    /// controllo dentro `flush()` non ha piu' niente da controllare (la sua guardia esce
+    /// subito su un lotto vuoto), e l'unico rilevatore rimasto e' il controllo st_dev dopo
+    /// il ciclo. Isola quel controllo da quello di `flush()`, gia' coperto da
+    /// `testRootVanishingDuringTheRead_isAVanishedDisk` (batchSize 1, sparizione a META' lotto).
+    func testRootVanishingRightAfterTheLastFlush_isCaughtByThePostLoopCheck() throws {
+        for i in 0..<5 { try makeFile("Foto/f\(i).jpg", "c\(i)") }
+        let moved = tempDir.appendingPathComponent("HDD-scollegato")
+        let original = root!
+        var renamed = false
+        let r = try run(1, batchSize: 5) { report in
+            guard !renamed, report.scanned == 5 else { return }
+            renamed = true
+            try? FileManager.default.moveItem(at: original, to: moved)
+        }
+        XCTAssertTrue(renamed)
+        XCTAssertTrue(r.volumeVanished)
+        XCTAssertFalse(r.isComplete)
+    }
 }
