@@ -267,4 +267,14 @@ final class MainThreadIsolationTests: XCTestCase {
         XCTAssertEqual(done.wait(timeout: .now() + 10), .success,
                        "InventoryCubbitReader.read ha avuto bisogno del main thread (manca @concurrent?).")
     }
+
+    func testInventorySummary_runsWithoutTheMainThread() {
+        let done = DispatchSemaphore(value: 0)
+        Task.detached {
+            _ = InventorySummary(InventorySnapshot(), sampleLimit: 10)
+            done.signal()
+        }
+        XCTAssertEqual(done.wait(timeout: .now() + 10), .success,
+                       "InventorySummary/InventoryClassifier hanno avuto bisogno del main thread.")
+    }
 }

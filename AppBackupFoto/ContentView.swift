@@ -6053,6 +6053,219 @@ nonisolated final class InventoryCubbitReader: @unchecked Sendable {
     }
 }
 
+/// In quale categoria cade un contenuto. L'ordine dei casi e' la PRECEDENZA della spec
+/// (❗ > 🔎 > ⚠️ > ✅), con «non si puo' ancora dire» per ultimo: non e' un esito, e' il posto
+/// dei contenuti su cui la regola «incompleto non e' assente» sospende il giudizio.
+nonisolated enum InventoryCategory: String, CaseIterable, Sendable {
+    case toCheck
+    case onlyOutsideSSD
+    case missingSomewhere
+    case safe
+    case undetermined
+}
+
+nonisolated enum InventoryCheckReason: String, Hashable, Sendable {
+    /// Stesso percorso relativo, contenuto diverso, fra due archivi.
+    case samePathDifferentContent
+    /// Un oggetto Cubbit che non si riesce a confrontare senza scaricarlo — lui, e la foto
+    /// che sta allo stesso percorso su SSD o HDD.
+    case cubbitNotCertifiable
+}
+
+/// Un contenuto (non un file): tutte le copie con la stessa impronta, nei tre archivi.
+nonisolated struct InventoryItem: Equatable, Sendable, Identifiable {
+    /// L'SHA256; `md5:<md5>` per un contenuto che c'e' solo su Cubbit, riconosciuto dal suo
+    /// MD5; `s3:<chiave>` per un oggetto Cubbit non certificabile (contenuto sconosciuto).
+    let id: String
+    let category: InventoryCategory
+    let size: Int64
+    let presentOn: Set<InventoryArchive>
+    /// Archivi COMPLETI da cui manca: solo qui si puo' dire «manca».
+    let missingFrom: Set<InventoryArchive>
+    /// Archivi incompleti da cui non risulta: «non si sa ancora».
+    let unknownOn: Set<InventoryArchive>
+    let checkReasons: Set<InventoryCheckReason>
+    /// Un percorso da mostrare: quello dell'SSD se c'e', poi HDD, poi Cubbit; a parita', il
+    /// primo in ordine alfabetico. Cosi' il risultato non dipende dall'ordine delle righe.
+    let exampleArchive: InventoryArchive
+    let examplePath: String
+}
+
+/// I numeri in testa alla finestra, per archivio.
+nonisolated struct InventoryArchiveStats: Equatable, Sendable {
+    /// File foto e video letti (anche quelli illeggibili: ci sono, anche se non si sa cosa
+    /// contengono) o oggetti Cubbit nel perimetro.
+    var files = 0
+    /// Copie in piu' dello stesso contenuto nello stesso archivio.
+    var extraCopies = 0
+    /// Spazio che si libererebbe tenendone una sola per contenuto.
+    var reclaimableBytes: Int64 = 0
+}
+
+/// Dai tre elenchi alle categorie. Logica PURA: nessun disco, nessuna rete, nessun database.
+/// E' il pezzo su cui i progetti 2-4 decideranno copie e cancellazioni (sempre rileggendo i
+/// file prima, ADR-0005), quindi e' il piu' testato (`InventoryClassifierTests`).
+///
+/// Due confronti, come nella spec:
+/// 1. **per contenuto** — SHA256 fra SSD e HDD; verso Cubbit con l'ETag (`S3ETagMatcher`),
+///    solo contro file letti della stessa dimensione;
+/// 2. **per percorso** — stesso percorso relativo (chiave normalizzata) su due archivi con
+///    contenuto diverso: ❗ per entrambi i contenuti.
+///
+/// La regola che conta di piu': si dice «manca da X» solo se X e' stato letto per intero.
+nonisolated enum InventoryClassifier {
+    private struct Content {
+        var size: Int64
+        var present: Set<InventoryArchive> = []
+        var reasons: Set<InventoryCheckReason> = []
+        var example: (archive: InventoryArchive, path: String)
+    }
+
+    static func classify(_ s: InventorySnapshot) -> (items: [InventoryItem], stats: [InventoryArchive: InventoryArchiveStats]) {
+        var contents: [String: Content] = [:]
+        var stats: [InventoryArchive: InventoryArchiveStats] = [.ssd: .init(), .hdd: .init(), .s3: .init()]
+        var copies: [InventoryArchive: [String: Int]] = [.ssd: [:], .hdd: [:], .s3: [:]]
+        var byPath: [String: [InventoryArchive: Set<String>]] = [:]
+        var uncertainS3Paths = Set<String>()
+
+        func record(id: String, size: Int64, archive: InventoryArchive, key: String, displayPath: String) {
+            if var c = contents[id] {
+                c.present.insert(archive)
+                if (archive, displayPath) < (c.example.archive, c.example.path) { c.example = (archive, displayPath) }
+                contents[id] = c
+            } else {
+                contents[id] = Content(size: size, present: [archive], example: (archive, displayPath))
+            }
+            copies[archive]![id, default: 0] += 1
+            byPath[key, default: [:]][archive, default: []].insert(id)
+        }
+
+        // 1. SSD e HDD: un contenuto per SHA256. Un file illeggibile conta come file, non come
+        //    contenuto, e non puo' certificare niente su Cubbit.
+        var candidatesBySize: [Int64: [S3ETagMatcher.Candidate]] = [:]
+        var knownSha = Set<String>()
+        for (archive, files) in [(InventoryArchive.ssd, s.ssd), (.hdd, s.hdd)] {
+            for f in files {
+                stats[archive]!.files += 1
+                guard f.status == .ok, let d = f.digest else { continue }
+                record(id: d.sha256, size: f.size, archive: archive, key: f.key, displayPath: f.displayPath)
+                if knownSha.insert(d.sha256).inserted {
+                    candidatesBySize[f.size, default: []].append(
+                        .init(size: f.size, sha256: d.sha256, md5: d.md5, multipartETag: d.multipartETag))
+                }
+            }
+        }
+
+        // 2. Cubbit: certificato, riconosciuto dal solo MD5, o non certificabile.
+        for o in s.s3 {
+            stats[.s3]!.files += 1
+            switch S3ETagMatcher.verdict(etag: o.etag, size: o.size, candidates: candidatesBySize[o.size] ?? []) {
+            case .certified(let sha):
+                record(id: sha, size: o.size, archive: .s3, key: o.key, displayPath: o.displayKey)
+            case .identifiedOnlyByMD5(let md5):
+                record(id: "md5:" + md5, size: o.size, archive: .s3, key: o.key, displayPath: o.displayKey)
+            case .notCertifiable:
+                contents["s3:" + o.displayKey] = Content(size: o.size, present: [.s3], reasons: [.cubbitNotCertifiable],
+                                                         example: (.s3, o.displayKey))
+                uncertainS3Paths.insert(o.key)
+            }
+        }
+
+        // 3. Per percorso: stesso percorso su almeno due archivi, piu' di un contenuto.
+        for (_, perArchive) in byPath where perArchive.count >= 2 {
+            let ids = perArchive.values.reduce(into: Set<String>()) { $0.formUnion($1) }
+            guard ids.count > 1 else { continue }
+            for id in ids { contents[id]!.reasons.insert(.samePathDifferentContent) }
+        }
+        // Un oggetto Cubbit non certificabile rende incerta anche la foto allo stesso percorso:
+        // su Cubbit potrebbe esserci come no.
+        for key in uncertainS3Paths {
+            for (archive, ids) in byPath[key] ?? [:] where archive != .s3 {
+                for id in ids { contents[id]!.reasons.insert(.cubbitNotCertifiable) }
+            }
+        }
+
+        // 4. Copie in piu' per archivio. I file vuoti hanno tutti la stessa impronta e non sono
+        //    copie l'uno dell'altro (stessa regola di `LibraryIndexStore.duplicateGroups`).
+        for archive in InventoryArchive.allCases {
+            for (id, n) in copies[archive]! where n > 1 {
+                let size = contents[id]!.size
+                guard size > 0 else { continue }
+                stats[archive]!.extraCopies += n - 1
+                stats[archive]!.reclaimableBytes += Int64(n - 1) * size
+            }
+        }
+
+        // 5. Categorie, con la precedenza della spec.
+        var items: [InventoryItem] = []
+        items.reserveCapacity(contents.count)
+        for (id, c) in contents {
+            let missing = Set(InventoryArchive.allCases).subtracting(c.present)
+            let missingKnown = missing.filter { s.isComplete($0) }
+            let unknown = missing.subtracting(missingKnown)
+            let category: InventoryCategory
+            if !c.reasons.isEmpty {
+                category = .toCheck
+            } else if !c.present.contains(.ssd) && s.isComplete(.ssd) {
+                category = .onlyOutsideSSD
+            } else if !missingKnown.isEmpty {
+                category = .missingSomewhere
+            } else if missing.isEmpty {
+                category = .safe
+            } else {
+                category = .undetermined
+            }
+            items.append(InventoryItem(id: id, category: category, size: c.size, presentOn: c.present,
+                                       missingFrom: missingKnown, unknownOn: unknown, checkReasons: c.reasons,
+                                       exampleArchive: c.example.archive, examplePath: c.example.path))
+        }
+        let order = Dictionary(uniqueKeysWithValues: InventoryCategory.allCases.enumerated().map { ($1, $0) })
+        items.sort { a, b in
+            if a.category != b.category { return order[a.category]! < order[b.category]! }
+            if a.examplePath != b.examplePath { return a.examplePath < b.examplePath }
+            return a.id < b.id
+        }
+        return (items, stats)
+    }
+}
+
+/// Quello che la finestra Inventario mostra, calcolato una volta fuori dal main: numeri per
+/// categoria e per archivio, e un campione limitato di voci per categoria. L'elenco completo
+/// (centinaia di migliaia di contenuti) non viaggia verso la UI.
+nonisolated struct InventorySummary: Equatable, Sendable {
+    /// Quante voci per categoria si mostrano al massimo. La finestra dice sempre quante sono
+    /// in tutto (`InventoryStatus.sampleLimitLine`): mai un elenco tagliato in silenzio.
+    static let defaultSampleLimit = 300
+
+    let states: [InventoryArchive: InventoryArchiveState]
+    let stats: [InventoryArchive: InventoryArchiveStats]
+    let counts: [InventoryCategory: Int]
+    let bytes: [InventoryCategory: Int64]
+    let samples: [InventoryCategory: [InventoryItem]]
+
+    init(_ snapshot: InventorySnapshot, sampleLimit: Int) {
+        let (items, stats) = InventoryClassifier.classify(snapshot)
+        var counts: [InventoryCategory: Int] = [:]
+        var bytes: [InventoryCategory: Int64] = [:]
+        var samples: [InventoryCategory: [InventoryItem]] = [:]
+        for item in items {
+            counts[item.category, default: 0] += 1
+            bytes[item.category, default: 0] += item.size
+            if samples[item.category, default: []].count < sampleLimit {
+                samples[item.category, default: []].append(item)
+            }
+        }
+        self.states = snapshot.states
+        self.stats = stats
+        self.counts = counts
+        self.bytes = bytes
+        self.samples = samples
+    }
+
+    func count(_ c: InventoryCategory) -> Int { counts[c] ?? 0 }
+    func bytes(_ c: InventoryCategory) -> Int64 { bytes[c] ?? 0 }
+}
+
 // MARK: - Testi e regole della card "Foto gia' salvate" (roadmap #31, Task 6)
 
 /// I nomi dei comandi della card, in un punto solo. Non e' pignoleria: due dei messaggi
