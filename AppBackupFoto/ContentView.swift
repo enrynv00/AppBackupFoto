@@ -16624,8 +16624,6 @@ private struct DuplicateGroupRow: View {
     }
 }
 
-// MARK: - Pannello Inventario
-
 // MARK: - Pannello Inventario (ROADMAP #44, ADR-0015)
 
 /// La finestra "Inventario": per ogni contenuto foto/video, in quale dei tre posti (SSD, HDD,
