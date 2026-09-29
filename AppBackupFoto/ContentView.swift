@@ -6387,6 +6387,207 @@ enum InventoryStartGate {
     }
 }
 
+/// I testi della finestra Inventario. Logica pura, come `DuplicatesStatus`: nessuna stringa
+/// nasce dentro la View. Registro: niente gergo («hash», «impronta», «ETag», «MD5», «indice»,
+/// «scansione», «bucket», «cache»): Enrico legge SSD, HDD, Cubbit, foto e video.
+enum InventoryStatus {
+    enum Tone: Equatable { case ok, info, warning }
+
+    struct Line: Identifiable, Equatable {
+        let id: String
+        let tone: Tone
+        let text: String
+    }
+
+    /// Ordine in cui la finestra mostra le categorie: quello della tabella della spec, con
+    /// «non si può ancora dire» in fondo.
+    static let displayOrder: [InventoryCategory] = [.safe, .missingSomewhere, .onlyOutsideSSD, .toCheck, .undetermined]
+
+    static let readOnlyNote = "Questa finestra guarda soltanto: non copia, non sposta e non cancella "
+        + "niente, né sull'SSD né sull'HDD né su Cubbit."
+    static let refreshButton = "Aggiorna l'inventario"
+    static let stopButton = "Interrompi"
+    static let stoppingLine = "Mi fermo appena finisco il file o la pagina dell'elenco che sto leggendo…"
+    static let loadingLine = "Leggo l'ultimo inventario salvato…"
+
+    static func archiveName(_ a: InventoryArchive) -> String {
+        switch a {
+        case .ssd: return "SSD"
+        case .hdd: return "HDD"
+        case .s3: return "Cubbit"
+        }
+    }
+
+    static func title(_ c: InventoryCategory) -> String {
+        switch c {
+        case .safe: return "✅ Al sicuro"
+        case .missingSomewhere: return "⚠️ Manca da qualche parte"
+        case .onlyOutsideSSD: return "🔎 Solo fuori dall'SSD"
+        case .toCheck: return "❗ Da controllare"
+        case .undetermined: return "⏳ Non si può ancora dire"
+        }
+    }
+
+    static func explanation(_ c: InventoryCategory) -> String {
+        switch c {
+        case .safe:
+            return "Ci sono sull'SSD, sull'HDD e su Cubbit, e l'app ha verificato che sono identiche in tutti e tre i posti."
+        case .missingSomewhere:
+            return "Ci sono in uno o due posti ma mancano dagli altri: per ognuna l'app dice da dove manca."
+        case .onlyOutsideSSD:
+            return "Ci sono sull'HDD o su Cubbit, ma sull'SSD non ci sono più."
+        case .toCheck:
+            return "Con lo stesso nome c'è un contenuto diverso in due posti, oppure la copia su Cubbit "
+                + "non si può confrontare senza scaricarla. Queste non verranno mai toccate in automatico."
+        case .undetermined:
+            return "Mancano da un posto che l'app non è riuscita a leggere per intero: finché non lo "
+                + "legge tutto, non dice che mancano."
+        }
+    }
+
+    static func categoryLine(_ c: InventoryCategory, count: Int, bytes: Int64) -> String {
+        "\(title(c)): \(photos(count)) (\(size(bytes)))"
+    }
+
+    static func archiveLine(_ a: InventoryArchive, stats: InventoryArchiveStats) -> String {
+        guard stats.extraCopies > 0 else {
+            return "\(archiveName(a)): \(photos(stats.files)) · nessuna copia in più"
+        }
+        let copies = stats.extraCopies == 1 ? "1 copia in più" : "\(number(stats.extraCopies)) copie in più"
+        return "\(archiveName(a)): \(photos(stats.files)) · \(copies) · \(size(stats.reclaimableBytes)) "
+            + "si possono recuperare tenendone una sola"
+    }
+
+    /// `nil` se l'archivio e' stato letto per intero nell'ultimo aggiornamento.
+    static func completenessLine(_ a: InventoryArchive, state: InventoryArchiveState?) -> Line? {
+        let name = archiveName(a)
+        guard let state else {
+            return Line(id: "never-\(a.rawValue)", tone: .info, text: "\(name): non ancora letto.")
+        }
+        guard !state.complete else { return nil }
+        let why: String
+        switch state.reason ?? .interrupted {
+        case .running:
+            why = "l'ultimo aggiornamento non è arrivato in fondo (l'app si è chiusa a metà)."
+        case .notReached:
+            why = "non è stato letto, perché l'aggiornamento si è fermato prima di arrivarci."
+        case .interrupted:
+            why = "la lettura è stata fermata prima della fine."
+        case .volumeVanished:
+            why = "il disco è stato scollegato mentre l'app lo leggeva."
+        case .foldersUnreadable:
+            why = "alcune cartelle non si sono lasciate aprire (permessi o errori di lettura)."
+        case .filesUnreadable:
+            why = state.unreadable == 1
+                ? "1 file non si è lasciato leggere per intero."
+                : "\(number(state.unreadable)) file non si sono lasciati leggere per intero."
+        case .sawNothing:
+            why = "l'app non ha trovato nessuna foto, mentre la volta prima ce n'erano."
+        case .listingFailed:
+            why = "l'elenco si è interrotto per un problema di rete."
+        case .listingMalformed:
+            why = "l'elenco è arrivato con delle voci che l'app non ha saputo leggere."
+        case .couldNotSave:
+            why = "l'app non è riuscita a salvare quello che leggeva."
+        }
+        return Line(id: "incomplete-\(a.rawValue)", tone: .warning, text:
+            "\(name): \(why) Finché non viene letto per intero, l'app non dice mai che una foto manca da lì.")
+    }
+
+    static func freshnessLine(states: [InventoryArchive: InventoryArchiveState], now: Date,
+                              calendar: Calendar = .current) -> Line {
+        guard !states.isEmpty else {
+            return Line(id: "never", tone: .info, text:
+                "L'inventario non è mai stato fatto. La prima volta l'app rilegge per intero l'SSD e "
+                + "l'HDD, e ci vogliono decine di minuti.")
+        }
+        let runIds = Set(states.values.map(\.runId))
+        let allComplete = InventoryArchive.allCases.allSatisfy { states[$0]?.complete == true }
+        let started = states.values.map(\.startedAt).max() ?? 0
+        let finished = states.values.compactMap(\.finishedAt).max() ?? started
+        if allComplete && runIds.count == 1 {
+            return Line(id: "complete", tone: .ok, text:
+                "Inventario completo, aggiornato \(when(finished, now: now, calendar: calendar)).")
+        }
+        return Line(id: "incomplete", tone: .warning, text:
+            "L'ultimo aggiornamento (\(when(started, now: now, calendar: calendar))) non è completo: "
+            + "qui sotto trovi quali posti non sono stati letti per intero.")
+    }
+
+    static func itemLine(_ item: InventoryItem) -> String {
+        let place = "«\(item.examplePath)» (\(archiveName(item.exampleArchive)))"
+        switch item.category {
+        case .safe:
+            return "\(place) — su SSD, HDD e Cubbit"
+        case .missingSomewhere:
+            var text = "\(place) — manca da: \(names(item.missingFrom))"
+            if !item.unknownOn.isEmpty { text += "; su \(names(item.unknownOn)) non si sa ancora" }
+            return text
+        case .onlyOutsideSSD:
+            return "\(place) — c'è solo su \(names(item.presentOn))"
+        case .toCheck:
+            if item.checkReasons.contains(.samePathDifferentContent) {
+                return "\(place) — con lo stesso nome, altrove c'è un contenuto diverso"
+            }
+            return "\(place) — la copia su Cubbit non si può confrontare senza scaricarla"
+        case .undetermined:
+            return "\(place) — c'è su \(names(item.presentOn)); su \(names(item.unknownOn)) non si sa ancora"
+        }
+    }
+
+    static func progressLine(_ p: InventoryProgress) -> String {
+        switch p {
+        case .checkingCubbit:
+            return "Controllo che Cubbit risponda…"
+        case .local(let archive, let r):
+            let step = archive == .ssd ? "1 di 3" : "2 di 3"
+            return "\(step) · Leggo le foto sull'\(archiveName(archive)): \(number(r.scanned)) viste, "
+                + "\(number(r.reread)) lette da capo"
+        case .cubbit(let r):
+            return "3 di 3 · Chiedo a Cubbit l'elenco delle foto: \(number(r.objectsKept)) finora"
+        case .classifying:
+            return "Metto a confronto SSD, HDD e Cubbit…"
+        }
+    }
+
+    /// `nil` quando si vedono tutte.
+    static func sampleLimitLine(shown: Int, total: Int) -> String? {
+        guard total > shown else { return nil }
+        return "Qui ne vedi \(number(shown)) su \(number(total)), in ordine di nome."
+    }
+
+    // MARK: - Aiuti
+
+    private static func photos(_ n: Int) -> String { n == 1 ? "1 foto o video" : "\(number(n)) foto e video" }
+    private static func number(_ n: Int) -> String { n.formatted() }
+    private static func size(_ b: Int64) -> String { ByteCountFormatter.string(fromByteCount: b, countStyle: .file) }
+
+    private static func names(_ set: Set<InventoryArchive>) -> String {
+        let list = set.sorted().map { archiveName($0) }
+        guard list.count > 1 else { return list.first ?? "" }
+        return list.dropLast().joined(separator: ", ") + " e " + list.last!
+    }
+
+    private static func when(_ t: Double, now: Date, calendar: Calendar) -> String {
+        let date = Date(timeIntervalSince1970: t)
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "it_IT")
+        f.calendar = calendar
+        f.timeZone = calendar.timeZone
+        f.dateStyle = .long
+        f.timeStyle = .none
+        let days = calendar.dateComponents([.day], from: calendar.startOfDay(for: date),
+                                           to: calendar.startOfDay(for: now)).day ?? 0
+        let ago: String
+        switch days {
+        case ..<1: ago = "oggi"
+        case 1: ago = "ieri"
+        default: ago = "\(days) giorni fa"
+        }
+        return "\(ago), il \(f.string(from: date))"
+    }
+}
+
 // MARK: - Testi e regole della card "Foto gia' salvate" (roadmap #31, Task 6)
 
 /// I nomi dei comandi della card, in un punto solo. Non e' pignoleria: due dei messaggi
