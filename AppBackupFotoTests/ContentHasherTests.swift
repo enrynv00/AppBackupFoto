@@ -1,4 +1,5 @@
 import XCTest
+import CryptoKit
 @testable import AppBackupFoto
 
 /// `ContentHasher` (ROADMAP #44, ADR-0015): una lettura, tre impronte — SHA256, MD5 e l'ETag
@@ -176,5 +177,72 @@ final class ContentHasherTests: XCTestCase {
         let url = tmp.appendingPathComponent("fermo.jpg")
         try Self.pattern(1000).write(to: url)
         XCTAssertEqual(ContentHasher.digestFile(at: url, isCancelled: { true }), .cancelled)
+    }
+
+
+    // MARK: - Forme alternative dell'ETag (2026-09-30, oggetti reali caricati a pezzi da 128 MiB)
+
+    /// Riferimento indipendente: le parti si tagliano a mano sul `Data`, senza `ContentHasher`.
+    private func referenceETags(_ data: Data, partSize: Int) -> (binary: String, text: String) {
+        var digests = Data(); var hexes = ""; var count = 0
+        var start = 0
+        while start < data.count {
+            let end = min(start + partSize, data.count)
+            let d = Insecure.MD5.hash(data: data.subdata(in: start..<end))
+            digests.append(contentsOf: d)
+            hexes += d.map { String(format: "%02x", $0) }.joined()
+            count += 1
+            start = end
+        }
+        let hex = { (x: Insecure.MD5.Digest) in x.map { String(format: "%02x", $0) }.joined() }
+        return (hex(Insecure.MD5.hash(data: digests)) + "-\(count)",
+                hex(Insecure.MD5.hash(data: Data(hexes.utf8))) + "-\(count)")
+    }
+
+    func testAlternativeETags_standardPartsTextFormula_andLegacyPartsBothFormulas() {
+        let data = Data((0..<21).map { UInt8($0 * 7 & 0xff) })
+        var h = ContentHasher(partSize: 4, legacyPartSize: 8)
+        h.update(data)
+        let d = h.finalize()
+        let std = referenceETags(data, partSize: 4), legacy = referenceETags(data, partSize: 8)
+        XCTAssertEqual(d.multipartETag, std.binary)
+        XCTAssertEqual(d.alternativeMultipartETags, [std.text, legacy.binary, legacy.text])
+    }
+
+    /// Fra le due dimensioni di parte: solo la formula «in testo» delle parti piccole. Con parti
+    /// da 128 MiB un file cosi' e' una parte sola, e quella la riconosce il confronto dall'MD5.
+    func testAlternativeETags_betweenTheTwoPartSizes_onlyTheTextFormula() {
+        let data = Data((0..<6).map { UInt8($0) })
+        var h = ContentHasher(partSize: 4, legacyPartSize: 8)
+        h.update(data)
+        XCTAssertEqual(h.finalize().alternativeMultipartETags, [referenceETags(data, partSize: 4).text])
+    }
+
+    func testAlternativeETags_emptyUpToThePartSize() {
+        var h = ContentHasher(partSize: 4, legacyPartSize: 8)
+        h.update(Data([1, 2, 3, 4]))
+        let d = h.finalize()
+        XCTAssertNil(d.multipartETag)
+        XCTAssertEqual(d.alternativeMultipartETags, [])
+        XCTAssertFalse(d.needsAlternativeETags)
+    }
+
+    /// Un'impronta salvata prima delle forme alternative va riletta, solo se il file e' grande.
+    func testNeedsAlternativeETags_onlyForBigFilesWithoutThem() {
+        let big = Int64(S3Syncer.multipartChunkSize) + 1
+        XCTAssertTrue(ContentDigest(size: big, sha256: "s", md5: "m", multipartETag: "x-2").needsAlternativeETags)
+        XCTAssertFalse(ContentDigest(size: big, sha256: "s", md5: "m", multipartETag: "x-2",
+                                     alternativeMultipartETags: ["y-2"]).needsAlternativeETags)
+        XCTAssertFalse(ContentDigest(size: 10, sha256: "s", md5: "m", multipartETag: nil).needsAlternativeETags)
+    }
+
+    func testStoredETagColumn_roundTrips() {
+        let d = ContentDigest(size: 1, sha256: "s", md5: "m", multipartETag: "a-2", alternativeMultipartETags: ["b-2", "c-1"])
+        XCTAssertEqual(d.storedETagColumn, "a-2 b-2 c-1")
+        let back = ContentDigest.splitStoredETagColumn(d.storedETagColumn)
+        XCTAssertEqual(back.primary, "a-2")
+        XCTAssertEqual(back.alternatives, ["b-2", "c-1"])
+        XCTAssertNil(ContentDigest.splitStoredETagColumn(nil).primary)
+        XCTAssertEqual(ContentDigest.splitStoredETagColumn("solo-3").alternatives, [])
     }
 }

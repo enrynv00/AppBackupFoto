@@ -45,3 +45,14 @@ Approvato integralmente il 2026-09-28 (vedi intestazione del piano `Docs/superpo
 - **D2** — Ordine delle letture: **in sequenza SSD → HDD → Cubbit** (raccomandazione accolta).
 - **D3** — La finestra mostra al **massimo 300 voci per categoria**, con «Qui ne vedi 300 su N».
 - **S8** (ribadito esplicitamente): «Svuota l'elenco» svuota anche l'inventario, e il testo di conferma in Diagnostica lo dice.
+
+## Aggiornamento del 2026-09-30: le forme dell'ETag trovate sul bucket reale
+
+Il primo inventario completo (SSD, HDD, Cubbit, 0 file illeggibili) ha messo 496 contenuti in ❗, per 79,6 GB: 318 oggetti caricati a pezzi il cui ETag non coincideva con quello a pezzi da 64 MiB. Verificato ricalcolandoli dai file sull'SSD (in sola lettura):
+
+- **205 oggetti `-1`** hanno l'ETag scritto con la formula «in testo»: `md5` dei 32 caratteri esadecimali dell'MD5, non dei 16 byte. Tutti e 205 coincidono.
+- **Gli oggetti `-N` con N che non torna con 64 MiB** sono stati caricati a pezzi da **128 MiB** (da un vecchio programma di caricamento), a volte con la formula standard, a volte con quella «in testo». 6 su 6 verificati.
+
+Quindi l'inventario riconosce anche queste forme: `ContentHasher` calcola, nella stessa lettura, l'ETag a pezzi da 64 MiB con le due formule e quello a pezzi da 128 MiB con le due formule (`ContentDigest.alternativeMultipartETags`); il confronto con un `-1` prova anche la formula «in testo». Nessuna richiesta nuova a Cubbit, nessun download. Le forme in piu' si salvano nella stessa colonna `etag`, separate da uno spazio (nessun cambio di schema); un'impronta salvata prima, di un file sopra i 64 MiB, si rilegge al giro dopo (`needsAlternativeETags`).
+
+Resta vero il principio: un oggetto che non coincide con nessuna di queste forme resta **non certificabile**, mai «certificato» per ipotesi.

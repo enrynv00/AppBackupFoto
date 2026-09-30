@@ -136,4 +136,30 @@ final class S3ETagMatcherTests: XCTestCase {
         XCTAssertEqual(S3ETagMatcher.expectedParts(size: Int64(p) + 1, partSize: p), 2)
         XCTAssertEqual(S3ETagMatcher.expectedParts(size: 4 * Int64(p), partSize: p), 4)
     }
+
+
+    // MARK: - Forme alternative (verificate sul bucket reale il 2026-09-30)
+
+    /// Una parte sola con la formula «in testo»: MD5 dei 32 caratteri dell'MD5.
+    func testSinglePartMultipart_textFormula_isCertified() {
+        let md5 = "e697ff061778079bb6821fda7e42b778"
+        let c = S3ETagMatcher.Candidate(size: 71_122_630, sha256: "S", md5: md5, multipartETag: nil)
+        // Valore reale: foto google drive/google foto 10/file0044.mov.
+        XCTAssertEqual(S3ETagMatcher.verdict(etag: "\"079badd7040c2c141066a87932cba3ba-1\"", size: 71_122_630, candidates: [c]),
+                       .certified(sha256: "S"))
+    }
+
+    func testMultipart_legacyPartSize_isCertifiedThroughTheAlternatives() {
+        let c = S3ETagMatcher.Candidate(size: 178_879_272, sha256: "S", md5: "m", multipartETag: "aaaa-3",
+                                        alternativeETags: ["bbbb-3", "cccccccccccccccccccccccccccccccc-2", "dddd-2"])
+        XCTAssertEqual(S3ETagMatcher.verdict(etag: "cccccccccccccccccccccccccccccccc-2", size: 178_879_272, candidates: [c]),
+                       .certified(sha256: "S"))
+    }
+
+    /// Senza le forme alternative (impronta vecchia) resta non certificabile, col motivo giusto.
+    func testMultipart_legacyPartSize_withoutAlternatives_staysDifferentPartSize() {
+        let c = S3ETagMatcher.Candidate(size: 178_879_272, sha256: "S", md5: "m", multipartETag: "aaaa-3")
+        XCTAssertEqual(S3ETagMatcher.verdict(etag: "cccccccccccccccccccccccccccccccc-2", size: 178_879_272, candidates: [c]),
+                       .notCertifiable(.differentPartSize))
+    }
 }

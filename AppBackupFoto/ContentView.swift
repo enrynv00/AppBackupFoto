@@ -5053,7 +5053,9 @@ nonisolated final class LibraryIndexStore: @unchecked Sendable {
                                           status: .unreadable, digest: nil,
                                           hashedAt: sqlite3_column_double(stmt, 8))
             }
-            digest = ContentDigest(size: size, sha256: sha, md5: md5, multipartETag: optionalText(stmt, 7))
+            let etags = ContentDigest.splitStoredETagColumn(optionalText(stmt, 7))
+            digest = ContentDigest(size: size, sha256: sha, md5: md5, multipartETag: etags.primary,
+                                   alternativeMultipartETags: etags.alternatives)
         }
         return InventoryLocalFile(key: String(cString: path), displayPath: String(cString: display),
                                   size: size, mtime: sqlite3_column_double(stmt, 3),
@@ -5095,7 +5097,7 @@ nonisolated final class LibraryIndexStore: @unchecked Sendable {
                 try bindText(stmt, 6, r.status.rawValue)
                 try bindOptionalText(stmt, 7, r.digest?.sha256)
                 try bindOptionalText(stmt, 8, r.digest?.md5)
-                try bindOptionalText(stmt, 9, r.digest?.multipartETag)
+                try bindOptionalText(stmt, 9, r.digest?.storedETagColumn)
                 try bindDouble(stmt, 10, r.hashedAt)
                 try bindInt64(stmt, 11, runId)
                 guard sqlite3_step(stmt) == SQLITE_DONE else { throw sqlError() }
@@ -5917,7 +5919,7 @@ nonisolated final class InventoryScanner: @unchecked Sendable {
             // mentre lo si legge risulta cambiato al giro dopo, invece che invariato per sempre.
             let mtime = modified.timeIntervalSince1970
 
-            if let old = previous[key], old.status == .ok, let digest = old.digest {
+            if let old = previous[key], old.status == .ok, let digest = old.digest, !digest.needsAlternativeETags {
                 let verdict = indexEntryVerdict(storedSize: old.size, storedMTime: old.mtime,
                                                 storedHashedAt: old.hashedAt,
                                                 currentSize: size, currentMTime: mtime)
@@ -6171,7 +6173,8 @@ nonisolated enum InventoryClassifier {
                 record(id: d.sha256, size: f.size, archive: archive, key: f.key, displayPath: f.displayPath)
                 if knownSha.insert(d.sha256).inserted {
                     candidatesBySize[f.size, default: []].append(
-                        .init(size: f.size, sha256: d.sha256, md5: d.md5, multipartETag: d.multipartETag))
+                        .init(size: f.size, sha256: d.sha256, md5: d.md5, multipartETag: d.multipartETag,
+                              alternativeETags: d.alternativeMultipartETags))
                 }
             }
         }
@@ -7265,6 +7268,31 @@ nonisolated struct ContentDigest: Equatable, Sendable {
     /// `S3Syncer.upload` passa ai pezzi solo con `size > multipartChunkSize`: un file di
     /// esattamente 64 MiB va su con un caricamento unico, e il suo ETag e' l'MD5.
     let multipartETag: String?
+    /// Le altre forme con cui Cubbit puo' aver scritto l'ETag di un file caricato a pezzi
+    /// (misurato il 2026-09-30 sul bucket reale): parti da 64 MiB con la formula «in testo»
+    /// (`md5` della concatenazione degli MD5 esadecimali delle parti), e parti da 128 MiB con
+    /// entrambe le formule. Vuota per i file fino a 64 MiB compresi.
+    var alternativeMultipartETags: [String] = []
+
+    /// Vero per un'impronta salvata prima che le forme alternative esistessero: il file va
+    /// riletto, altrimenti un oggetto caricato a pezzi da 128 MiB resterebbe non certificabile.
+    var needsAlternativeETags: Bool {
+        size > Int64(S3Syncer.multipartChunkSize) && alternativeMultipartETags.isEmpty
+    }
+
+    /// Come si salvano nella colonna `etag` di `inventory_local`: la prima e' `multipartETag`,
+    /// le altre seguono separate da uno spazio. Nessuna nuova colonna, nessun cambio di schema.
+    var storedETagColumn: String? {
+        guard let multipartETag else { return nil }
+        return ([multipartETag] + alternativeMultipartETags).joined(separator: " ")
+    }
+
+    static func splitStoredETagColumn(_ column: String?) -> (primary: String?, alternatives: [String]) {
+        guard let parts = column?.split(separator: " ").map(String.init), let first = parts.first else {
+            return (nil, [])
+        }
+        return (first, Array(parts.dropFirst()))
+    }
 }
 
 /// Accumula SHA256, MD5 e l'MD5 di ogni parte da `partSize` byte mentre i byte arrivano, in
@@ -7280,13 +7308,20 @@ nonisolated struct ContentHasher {
     private var partFill = 0
     private var partDigests = Data()
     private var partCount = 0
+    let legacyPartSize: Int
+    private var legacyPart = Insecure.MD5()
+    private var legacyFill = 0
+    private var legacyDigests = Data()
+    private var legacyCount = 0
     private(set) var byteCount: Int64 = 0
 
-    /// `partSize` e' iniettabile solo per i test (confini visibili con pochi byte); in
-    /// produzione e' sempre la dimensione delle parti con cui l'app carica su Cubbit.
-    init(partSize: Int = S3Syncer.multipartChunkSize) {
-        precondition(partSize > 0, "partSize deve essere positivo")
+    /// `partSize` e `legacyPartSize` sono iniettabili solo per i test (confini visibili con
+    /// pochi byte); in produzione sono le dimensioni delle parti viste su Cubbit.
+    init(partSize: Int = S3Syncer.multipartChunkSize,
+         legacyPartSize: Int = S3Syncer.legacyMultipartChunkSize) {
+        precondition(partSize > 0 && legacyPartSize > 0, "le dimensioni delle parti devono essere positive")
         self.partSize = partSize
+        self.legacyPartSize = legacyPartSize
     }
 
     mutating func update(_ bytes: UnsafeRawBufferPointer) {
@@ -7302,6 +7337,14 @@ nonisolated struct ContentHasher {
             offset += n
             if partFill == partSize { closePart() }
         }
+        offset = 0
+        while offset < bytes.count {
+            let n = min(bytes.count - offset, legacyPartSize - legacyFill)
+            legacyPart.update(bufferPointer: UnsafeRawBufferPointer(rebasing: bytes[offset..<(offset + n)]))
+            legacyFill += n
+            offset += n
+            if legacyFill == legacyPartSize { closeLegacyPart() }
+        }
     }
 
     mutating func update(_ data: Data) {
@@ -7315,14 +7358,41 @@ nonisolated struct ContentHasher {
         partFill = 0
     }
 
+    private mutating func closeLegacyPart() {
+        legacyDigests.append(contentsOf: legacyPart.finalize())
+        legacyCount += 1
+        legacyPart = Insecure.MD5()
+        legacyFill = 0
+    }
+
+    /// Le due formule dell'ETag a pezzi: quella standard (MD5 dei 16 byte di ogni parte) e
+    /// quella «in testo» (MD5 della concatenazione degli MD5 esadecimali), trovata sul bucket.
+    private static func multipartETags(_ digests: Data, parts: Int) -> (binary: String, text: String) {
+        let text = stride(from: 0, to: digests.count, by: 16)
+            .map { hex(digests[digests.index(digests.startIndex, offsetBy: $0)..<digests.index(digests.startIndex, offsetBy: $0 + 16)]) }
+            .joined()
+        return (hex(Insecure.MD5.hash(data: digests)) + "-\(parts)",
+                hex(Insecure.MD5.hash(data: Data(text.utf8))) + "-\(parts)")
+    }
+
     func finalize() -> ContentDigest {
         var copy = self
         if copy.partFill > 0 { copy.closePart() }
-        let etag: String? = byteCount > Int64(partSize)
-            ? Self.hex(Insecure.MD5.hash(data: copy.partDigests)) + "-\(copy.partCount)"
-            : nil
+        if copy.legacyFill > 0 { copy.closeLegacyPart() }
+        var etag: String? = nil
+        var alternatives: [String] = []
+        if byteCount > Int64(partSize) {
+            let standard = Self.multipartETags(copy.partDigests, parts: copy.partCount)
+            etag = standard.binary
+            alternatives.append(standard.text)
+            if byteCount > Int64(legacyPartSize) {
+                let legacy = Self.multipartETags(copy.legacyDigests, parts: copy.legacyCount)
+                alternatives += [legacy.binary, legacy.text]
+            }
+        }
         return ContentDigest(size: byteCount, sha256: Self.hex(sha.finalize()),
-                             md5: Self.hex(whole.finalize()), multipartETag: etag)
+                             md5: Self.hex(whole.finalize()), multipartETag: etag,
+                             alternativeMultipartETags: alternatives)
     }
 
     static func hex<D: Sequence>(_ digest: D) -> String where D.Element == UInt8 {
@@ -8234,6 +8304,10 @@ final class S3Syncer {
     // un tetto sui byte in volo — nessuna contabilità separata necessaria.
     // `nonisolated`: una costante; la legge anche `ContentHasher`, fuori dal main (ROADMAP #44).
     nonisolated static let multipartChunkSize = 64 * 1024 * 1024
+    /// Dimensione delle parti usata da un vecchio programma di caricamento: il 2026-09-30 81
+    /// oggetti del bucket risultavano caricati a pezzi da 128 MiB (verificato ricalcolandoli
+    /// dai file sull'SSD). Serve solo all'inventario per certificarli (ADR-0015).
+    nonisolated static let legacyMultipartChunkSize = 128 * 1024 * 1024
     private static let adaptiveMemoryCeilingBytes = 2 * 1024 * 1024 * 1024
     static let adaptiveConcurrencyCeiling = adaptiveMemoryCeilingBytes / multipartChunkSize
 
@@ -9235,6 +9309,8 @@ nonisolated enum S3ETagMatcher {
         let sha256: String
         let md5: String
         let multipartETag: String?
+        /// `ContentDigest.alternativeMultipartETags`: parti da 128 MiB e formula «in testo».
+        var alternativeETags: [String] = []
     }
 
     enum NotCertifiableReason: String, Equatable, Sendable {
@@ -9279,6 +9355,11 @@ nonisolated enum S3ETagMatcher {
         return Insecure.MD5.hash(data: Data(bytes)).map { String(format: "%02x", $0) }.joined()
     }
 
+    /// La formula «in testo» per una parte sola: l'MD5 dei 32 caratteri esadecimali.
+    static func md5OfMD5Text(_ md5Hex: String) -> String {
+        Insecure.MD5.hash(data: Data(md5Hex.lowercased().utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
     /// Solo i candidati della STESSA dimensione contano (spec: «di almeno un file letto su SSD
     /// o HDD con la stessa dimensione»): il filtro e' qui, non affidato a chi chiama.
     static func verdict(etag: String?, size: Int64, candidates: [Candidate],
@@ -9292,15 +9373,18 @@ nonisolated enum S3ETagMatcher {
             matching = sameSize.filter { $0.md5 == md5 }
             if matching.isEmpty { return .identifiedOnlyByMD5(md5: md5) }
         case .multipart(let digest, 1):
-            matching = sameSize.filter { md5OfMD5Hex($0.md5) == digest }
+            // Una parte sola: non dipende dalla dimensione delle parti. Due formule, quella
+            // standard e quella «in testo» (MD5 dell'MD5 esadecimale), entrambe trovate sul
+            // bucket reale il 2026-09-30.
+            matching = sameSize.filter { md5OfMD5Hex($0.md5) == digest || md5OfMD5Text($0.md5) == digest }
             if matching.isEmpty { return .notCertifiable(.noLocalFileProducesIt) }
         case .multipart(let digest, let parts):
-            guard parts == expectedParts(size: size, partSize: partSize) else {
-                return .notCertifiable(.differentPartSize)
-            }
             let wanted = "\(digest)-\(parts)"
-            matching = sameSize.filter { $0.multipartETag == wanted }
-            if matching.isEmpty { return .notCertifiable(.noLocalFileProducesIt) }
+            matching = sameSize.filter { $0.multipartETag == wanted || $0.alternativeETags.contains(wanted) }
+            if matching.isEmpty {
+                return .notCertifiable(parts == expectedParts(size: size, partSize: partSize)
+                                       ? .noLocalFileProducesIt : .differentPartSize)
+            }
         }
         let shas = Set(matching.map(\.sha256))
         guard shas.count == 1, let sha = shas.first else { return .notCertifiable(.ambiguous) }

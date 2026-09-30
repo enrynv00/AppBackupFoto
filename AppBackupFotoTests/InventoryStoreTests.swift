@@ -292,4 +292,18 @@ final class InventoryStoreTests: XCTestCase {
         XCTAssertEqual(states[.ssd]?.reason, .interrupted)
         XCTAssertEqual(states[.hdd]?.complete, false)
     }
+
+
+    /// Le forme alternative stanno nella stessa colonna `etag` e tornano identiche.
+    func testAlternativeETags_roundTripThroughTheStore() throws {
+        try store.beginInventoryRun(runId: 1, startedAt: 0)
+        let big = InventoryLocalFile(key: "foto/v.mov", displayPath: "Foto/v.mov", size: 178_879_272, mtime: 1,
+                                     status: .ok,
+                                     digest: ContentDigest(size: 178_879_272, sha256: "S", md5: "M", multipartETag: "a-3",
+                                                           alternativeMultipartETags: ["b-3", "c-2", "d-2"]),
+                                     hashedAt: 2)
+        try store.upsertInventoryLocal([big], archive: .ssd, runId: 1)
+        try finish(.ssd, 1, complete: true)
+        XCTAssertEqual(try store.inventorySnapshot().ssd, [big])
+    }
 }
