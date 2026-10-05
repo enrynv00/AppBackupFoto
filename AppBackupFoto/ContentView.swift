@@ -18183,8 +18183,9 @@ private struct DuplicateGroupRow: View {
 // MARK: - Pannello Inventario (ROADMAP #44, ADR-0015)
 
 /// La finestra "Inventario": per ogni contenuto foto/video, in quale dei tre posti (SSD, HDD,
-/// Cubbit) c'e' davvero, e cosa non torna. SOLA LETTURA: nessun bottone copia, sposta o
-/// cancella (spec, «Il pannello e' solo lettura»).
+/// Cubbit) c'e' davvero, e cosa non torna. L'inventario e' SOLA LETTURA; l'unico bottone che
+/// scrive e' «Ripara…» sulle voci riparabili in ❗ (ROADMAP #45, ADR-0016): una foto alla volta,
+/// dopo un riepilogo e una conferma.
 ///
 /// **NON coperta da test** (stessa dichiarazione di `DuplicatesView` e `LibraryIndexCard`):
 /// questa view, il gate Touch ID, l'apertura della finestra. E' testato tutto cio' che sta ai
@@ -18199,6 +18200,11 @@ struct InventoryView: View {
     /// presentatore, nella finestra principale.
     @State private var alert: SimpleAlert? = nil
     @State private var expanded: Set<InventoryCategory> = []
+    /// La voce di cui si sta leggendo il riepilogo (stato della conversazione: resta nella view,
+    /// regola D3 di ROADMAP #41). `confirmRepair` passa la voce all'alert dopo la chiusura del
+    /// foglio, perche' un alert non si presenta mentre un foglio si sta chiudendo.
+    @State private var pendingRepair: RepairCandidate? = nil
+    @State private var confirmRepair: RepairCandidate? = nil
 
     var body: some View {
         if gate.touchIDEnabled && !gate.unlocked {
@@ -18215,6 +18221,14 @@ struct InventoryView: View {
             isInventorying: runner.isInventorying, isRepairing: runner.isRepairing,
             ssdMounted: volumes.ssdMounted, hddMounted: volumes.hddMounted,
             hasCubbitConfig: runner.s3Config != nil)
+    }
+
+    private var repairDisabledReason: String? {
+        RepairStartGate.blockedReason(
+            isRunning: runner.isRunning, isIndexing: runner.isIndexing,
+            isTrashingDuplicates: runner.isTrashingDuplicates, isRestoringFromTrash: runner.isRestoringFromTrash,
+            isInventorying: runner.isInventorying, isRepairing: runner.isRepairing,
+            ssdMounted: volumes.ssdMounted, hddMounted: volumes.hddMounted, hasCubbitConfig: runner.s3Config != nil)
     }
 
     private var content: some View {
@@ -18256,7 +18270,20 @@ struct InventoryView: View {
         }
         .padding(AppSpacing.lg)
         .frame(minWidth: 560, minHeight: 480, alignment: .topLeading)
-        .task { runner.loadInventoryIfNeeded() }
+        .task {
+            runner.loadInventoryIfNeeded()
+            runner.refreshRepairRecords()
+        }
+        .sheet(item: $pendingRepair, onDismiss: {
+            guard let c = confirmRepair else { return }
+            confirmRepair = nil
+            alert = SimpleAlert(title: RepairStatus.confirmTitle, message: RepairStatus.confirmMessage(c),
+                                isDestructive: true, confirmTitle: RepairStatus.confirmButton,
+                                cancelTitle: RepairStatus.cancelButton,
+                                onConfirm: { runner.startRepair(c, dryRun: false, onAlert: { alert = $0 }) })
+        }) { c in
+            repairSummarySheet(c)
+        }
         .alert(alert?.title ?? "", isPresented: Binding(
             get: { alert != nil },
             set: { if !$0 { alert = nil } }
@@ -18282,6 +18309,9 @@ struct InventoryView: View {
                     Text(InventoryStatus.explanation(category))
                         .font(AppFont.caption).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
+                    if category == .toCheck && !summary.repairCandidates.isEmpty {
+                        repairSection(summary)
+                    }
                     let items = summary.samples[category] ?? []
                     ForEach(items) { item in
                         Text(InventoryStatus.itemLine(item))
@@ -18299,6 +18329,79 @@ struct InventoryView: View {
                     .font(AppFont.body)
             }
         }
+    }
+
+    /// Le voci riparabili, in testa a ❗: tutte (sono poche), ognuna con «Ripara…», con la riga
+    /// del passo in corso, o con «riparata il …» finche' un nuovo inventario non la conferma.
+    @ViewBuilder
+    private func repairSection(_ summary: InventorySummary) -> some View {
+        VStack(alignment: .leading, spacing: AppSpacing.xs) {
+            Text(RepairStatus.sectionTitle(count: summary.repairCandidates.count)).font(AppFont.body)
+            Text(RepairStatus.sectionExplanation)
+                .font(AppFont.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            ForEach(summary.repairCandidates) { c in
+                HStack(alignment: .firstTextBaseline, spacing: AppSpacing.sm) {
+                    Text(RepairStatus.candidateLine(c))
+                        .font(AppFont.caption)
+                        .lineLimit(2).truncationMode(.middle)
+                        .textSelection(.enabled)
+                    Spacer(minLength: AppSpacing.sm)
+                    if let done = RepairStatus.awaitingConfirmation(c, records: runner.repairRecords, states: summary.states) {
+                        Label(RepairStatus.repairedLine(done), systemImage: "checkmark.circle.fill")
+                            .font(AppFont.caption).foregroundStyle(AppColor.success)
+                    } else if runner.repairingKey == c.key {
+                        HStack(spacing: AppSpacing.xs) {
+                            ProgressView().controlSize(.small)
+                            Text(RepairStatus.progressLine(runner.repairStep)).font(AppFont.caption)
+                        }
+                    } else {
+                        Button(RepairStatus.buttonTitle) { pendingRepair = c }
+                            .disabled(repairDisabledReason != nil)
+                    }
+                }
+            }
+            if let reason = repairDisabledReason, !runner.isRepairing {
+                Label(reason, systemImage: "info.circle")
+                    .font(AppFont.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let outcome = runner.lastRepairOutcome {
+                ForEach(RepairStatus.outcomeLines(outcome)) { lineView($0) }
+            }
+        }
+        .padding(.vertical, AppSpacing.xs)
+    }
+
+    /// Il riepilogo prima della conferma (decisione 3 di Enrico): «Continua…» chiude il foglio e
+    /// apre la conferma vera, con il bottone distruttivo; «Controlla senza riparare» fa solo il
+    /// ricontrollo (S11).
+    private func repairSummarySheet(_ c: RepairCandidate) -> some View {
+        VStack(alignment: .leading, spacing: AppSpacing.md) {
+            Text(RepairStatus.summaryTitle).font(AppFont.title)
+            ForEach(Array(RepairStatus.summaryLines(c, date: Date(), calendar: RepairPaths.defaultCalendar).enumerated()),
+                    id: \.offset) { _, line in
+                Text(line).font(AppFont.body).fixedSize(horizontal: false, vertical: true)
+            }
+            HStack {
+                Spacer()
+                Button(RepairStatus.cancelButton, role: .cancel) { pendingRepair = nil }
+                    .keyboardShortcut(.cancelAction)
+                // Regola 4 di `Docs/CLAUDE.md` (S11): lo stesso ricontrollo, senza scrivere niente.
+                Button(RepairStatus.dryRunButton) {
+                    pendingRepair = nil
+                    runner.startRepair(c, dryRun: true, onAlert: { alert = $0 })
+                }
+                .disabled(repairDisabledReason != nil)
+                Button(RepairStatus.continueButton) {
+                    confirmRepair = c
+                    pendingRepair = nil
+                }
+                .disabled(repairDisabledReason != nil)
+            }
+        }
+        .padding(AppSpacing.lg)
+        .frame(width: 520)
     }
 
     private var footer: some View {
