@@ -100,6 +100,20 @@ Attenzione a una frase che questa pagina ha portato fino al 2026-08-27: «il pan
 
 ---
 
+## Riparazione (roadmap #45)
+
+**Copia rovinata** — la copia di una foto, in UN archivio, con un contenuto diverso da quello identico negli altri due. «Diverso» va dimostrato: su un disco un SHA256 diverso, su Cubbit un ETag a parte unica (che è l'MD5) diverso. Un ETag a pezzi che non torna non dimostra niente.
+
+**Regola «2 su 3»** — si scrive su un archivio solo se gli altri due hanno la stessa copia certificata. Senza una maggioranza (tre contenuti diversi, un archivio letto a metà, il percorso che manca da un archivio) non si ripara niente.
+
+**Sorgente e testimone** — la sorgente è il file locale da cui si copia (SSD per riparare HDD o Cubbit, HDD per riparare l'SSD); il testimone è la seconda copia buona (HDD per Cubbit, Cubbit per i dischi). Entrambi si ricontrollano dal vivo prima di toccare qualunque cosa: l'inventario è una cache.
+
+**Quarantena** — la cartella `_quarantena/<AAAA-MM-GG>/<percorso originale>` sullo stesso archivio, dove la riparazione mette da parte la copia che sostituisce, invece di cancellarla. Non rientra mai in backup, elenco, inventario, Doppioni, ripristino. Su Cubbit è idempotente: una copia già messa da parte, in qualunque giorno, con la stessa dimensione e lo stesso ETag della rovinata, vale come fatta. La svuota solo l'utente, dal Finder o da Cubbit.
+
+**Registro delle riparazioni** — `repair-log.json` sul disco interno del Mac, mai su un archivio: una voce scritta «in corso» prima di toccare qualunque archivio, aggiornata con l'esito, con percorsi, impronte prima e dopo e posizione della quarantena.
+
+---
+
 ## Import da sorgenti locali (roadmap #27-A)
 
 **Sorgente di import** — una fotocamera, scheda SD, drone, vecchio disco o telefono da cui si importa una tantum. Diversa dalla **Sorgente** (la Libreria Foto), che è un flusso continuo.
