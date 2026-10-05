@@ -513,6 +513,18 @@ Stesso schema di sopra, applicato allo spostamento invece che all'annullamento (
 
 **`Docs/superpowers/plans/2026-09-24-duplicates-at-real-scale.md` è chiuso solo in parte**: Task 13 (mutation testing) resta da eseguire — vedi il piano per l'elenco dei mutanti dichiarati dai task precedenti che nessuno ha ancora verificato.
 
+#### Doppioni con la garanzia dell'inventario (2026-10-05, ROADMAP #46, ADR-0017)
+
+Piano `Docs/superpowers/plans/2026-10-05-certified-duplicates-ssd.md`, spec `Docs/superpowers/specs/2026-10-05-certified-duplicates-ssd-design.md`. **Implementato, verifica dal vivo del Task 7 ancora da fare.**
+
+- **`ArchiveWriteClock`** (enum sul MainActor: legge `JobHistoryStore`) — l'ora dell'ultima scrittura sugli archivi: la più recente fra la data dell'ultimo `JobSummary` (fine del job, anche interrotto o fallito) e `lastArchiveWriteJobStartedAt`, scritta da `run(label:)` dopo il cancello e prima di ogni scrittura (copre un job interrotto da una chiusura forzata). Contano tutti e soli i job di `run(label:)`.
+- **`DuplicateInventoryFreshness`/`DuplicateCertificationBlock`/`DuplicateCertificationBasis`/`DuplicateCertification`** (`nonisolated`, value type puri) — freschezza (tre stati completi dello stesso giro, ultima scrittura non dopo l'**inizio** del giro), contenuti ✅ presi da `InventoryClassifier.classify` (una regola sola), mappa chiave → SHA256 dell'SSD; verdetto per gruppo (non ✅ > copia non vista nell'inventario dell'SSD, la tenuta compresa). Un hash che la certificazione non conosce non è spuntabile. `load(store:reusing:)` legge prima gli stati e riusa la base se sono uguali; con un giro incompleto non legge altro.
+- **`BackupRunner`** — `duplicateCertificationBasisCache` (non `@Published`); `startDuplicateTrashRun(_:certification:onAlert:)` rifiuta una corsa non coperta e prima di ogni blocco, insieme a `ssdMounted`, rifà `DuplicateCertification.runBlock` (stesso giro, ancora fresco); se no, `DuplicateRunStopReason.inventoryNoLongerValid`.
+- **`DuplicatesView`** — `refreshCertification()` in `Task.detached` dopo ogni lettura dell'elenco e a fine backup/inventario (token contro i risultati superati); per riga una lettura O(1); `recountBlocked()` sul main su indici già calcolati; selezione (a mano e in massa) solo di gruppi certificati; `pendingCertification` congelata con il blocco in `beginConfirmation()`.
+- **Registro** — `TrashedItem.keptPath` e `TrashHistoryEntry.keptPaths` (relativi alla radice dell'SSD, `decodeIfPresent`/opzionale): il progetto 4 terrà lo stesso percorso su HDD e Cubbit. La storia c'è perché il registro di ripristino pota a 2.000 voci.
+
+**Non coperto da test, dichiarato:** il cablaggio in `BackupRunner` e `DuplicatesView`. Coperto ai due capi: `DuplicateCertificationTests`, `ArchiveWriteClockTests`, `DuplicateCertificationStatusTests`, e le aggiunte a `TrashManifestTests`/`TrashHistoryTests`/`DuplicateTrasherTests`/`MainThreadIsolationTests`.
+
 ---
 
 ### Inventario certificato (2026-09-29, roadmap #44, ADR-0015)

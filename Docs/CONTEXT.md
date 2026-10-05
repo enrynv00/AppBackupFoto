@@ -70,6 +70,12 @@ Attenzione a una frase che questa pagina ha portato fino al 2026-08-27: «il pan
 
 **Copia tenuta** — il membro del gruppo che l'app propone di **non** cestinare. La proposta segue una gerarchia (libreria principale → cartella organizzata invece che import → la più vecchia → tie-break deterministico sul percorso), ed è **spiegata a parole**, mai solo evidenziata: una proposta evidenziata e non spiegata si conferma senza sapere cosa si sta confermando. Resta una proposta: l'utente può cambiarla gruppo per gruppo prima di confermare.
 
+**Gruppo certificato** (termine nuovo, 2026-10-05, ADR-0017) — un gruppo di doppioni che si può spuntare: l'ultimo inventario è completo su SSD, HDD e Cubbit, nessun backup o import ha scritto dopo l'inizio di quel giro, il contenuto è ✅ «Al sicuro», e ogni copia del gruppo — la tenuta e quelle che escono — è nell'inventario dell'SSD di quel giro con lo stesso contenuto. Un gruppo non certificato resta visibile, con la casella spenta e il motivo. La certificazione si aggiunge alla rilettura dal disco al momento dello spostamento, non la sostituisce.
+
+**Inventario fresco** — completo su tutti e tre gli archivi e più recente dell'ultimo job che scrive sugli archivi (Mac → SSD, SSD → HDD, SSD → Cubbit, import). Lo invecchia anche un job che non ha copiato niente; non lo invecchiano spostamenti nel Cestino, annullamenti, riparazioni, inventario, lettura dell'elenco.
+
+**Percorso tenuto** — nel registro del Cestino e nella storia degli spostamenti, per ogni foto spostata, il percorso della copia rimasta, relativo alla radice dell'SSD: è lo stesso percorso sull'HDD e la stessa chiave su Cubbit, e il progetto 4 terrà quella.
+
 **Membri a pari merito** — le copie che valgono quanto quella tenuta, e fra cui ha deciso solo il tie-break. Vanno **marcate nella lista**, non solo contate: sapere che «un'altra copia va bene quanto questa» senza sapere *quale* è un'informazione vera e non azionabile.
 
 **Blocco** — l'unità di lavoro della cancellazione: un sottoinsieme dei gruppi spuntati dall'utente, smaltito tutto insieme, senza mai spezzare un gruppo fra due blocchi. **Tetto: 2.000 file o 50 GB** (aggiornato il 2026-09-25, ADR-0012 — prima era 500 file o 50 GB), il primo che scatta; 2.000 non è un numero scelto a parte, è la stessa granularità del registro di ripristino (`TrashManifestStore.maxItems`), un invariante protetto da un test dedicato. Il tetto resta scelto sul **raggio del danno**, non sulla durata — un guasto a metà blocco è uno stato reale e misurato.
