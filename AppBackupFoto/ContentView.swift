@@ -12225,6 +12225,18 @@ final class BackupRunner: ObservableObject {
         isTrashingDuplicates = false
     }
 
+    /// L'ultima base della certificazione dei Doppioni (ROADMAP #46, ADR-0017), tenuta qui e non
+    /// nella finestra: riaprire la finestra, o ricaricare l'elenco dopo uno spostamento, la
+    /// riusa senza rileggere e riclassificare tutto l'inventario (secondi, e centinaia di MB di
+    /// passaggio). Si sostituisce da sola quando gli stati dei tre archivi cambiano
+    /// (`DuplicateCertificationBasis.load(store:reusing:)`). Non `@Published`: nessuna view la
+    /// osserva, la finestra la legge e la riscrive solo dentro le proprie funzioni.
+    private(set) var duplicateCertificationBasisCache: DuplicateCertificationBasis? = nil
+
+    func rememberDuplicateCertificationBasis(_ basis: DuplicateCertificationBasis) {
+        duplicateCertificationBasisCache = basis
+    }
+
     /// Vero mentre `TrashRestorer.run` sta rimettendo a posto l'ultimo blocco spostato nel
     /// Cestino (ADR-0009). Stesso motivo di `isTrashingDuplicates`: vive nel runner, non in
     /// uno `@State` di `DuplicatesView` — riaprire la finestra non deve far perdere la
@@ -12433,8 +12445,21 @@ final class BackupRunner: ObservableObject {
     /// saltati dalla verifica (`DuplicateTrashSkipReason`), che su questa libreria sono la
     /// normalita' (ADR-0002): fermarsi li' vorrebbe dire non arrivare mai in fondo a una
     /// corsa vera.
-    func startDuplicateTrashRun(_ plan: DuplicateRunPlan, onAlert: @escaping (SimpleAlert) -> Void) {
+    ///
+    /// **La garanzia dell'inventario (ROADMAP #46, ADR-0017).** `certification` e' quella con cui
+    /// la finestra ha lasciato spuntare i gruppi: ogni gruppo della corsa deve esserne coperto,
+    /// altrimenti non parte niente. Subito prima di OGNI blocco la freschezza si ricontrolla
+    /// (`DuplicateCertification.runBlock`): stesso giro, ancora completo, nessun backup dopo
+    /// l'inizio. Un backup non puo' partire durante la corsa (`isTrashingDuplicates` lo ferma
+    /// alla fonte), ma la regola si ricontrolla lo stesso (spec).
+    func startDuplicateTrashRun(_ plan: DuplicateRunPlan, certification: DuplicateCertification,
+                                onAlert: @escaping (SimpleAlert) -> Void) {
         guard !plan.blocks.isEmpty else { return }
+        guard let certifiedRunId = certification.certifiedRunId,
+              certification.uncoveredGroupCount(in: plan) == 0 else {
+            onAlert(SimpleAlert(title: "Meglio non farlo adesso", message: DuplicatesStatus.notCertifiedRunMessage))
+            return
+        }
 
         let reason = DuplicatesStatus.trashDisabledReason(isRunning: isRunning,
                                                            isIndexing: isIndexing,
@@ -12485,8 +12510,18 @@ final class BackupRunner: ObservableObject {
                     runOutcome.stopReason = .interrupted
                     break
                 }
-                guard await MainActor.run(body: { VolumeMonitor.shared.ssdMounted }) else {
+                let (ssdMounted, lastWrite) = await MainActor.run {
+                    (VolumeMonitor.shared.ssdMounted, ArchiveWriteClock.lastWriteAt())
+                }
+                guard ssdMounted else {
                     runOutcome.stopReason = .volumeVanished
+                    break
+                }
+                // Il ricontrollo della spec, fuori dal main (una query piccola sullo store).
+                if let block = DuplicateCertification.runBlock(states: try? store.inventoryStates(),
+                                                              lastArchiveWriteAt: lastWrite,
+                                                              certifiedRunId: certifiedRunId) {
+                    runOutcome.stopReason = .inventoryNoLongerValid(block)
                     break
                 }
 
@@ -13883,6 +13918,10 @@ final class BackupRunner: ObservableObject {
             pendingAlert = SimpleAlert(title: "Meglio non farlo adesso", message: reason)
             return
         }
+        // Da qui il job puo' scrivere su SSD, HDD o Cubbit: l'inventario non vale piu' per i
+        // Doppioni (ROADMAP #46, ADR-0017). Prima di qualunque scrittura, cosi' anche un job che
+        // non arriva mai a salvare il suo `JobSummary` (app chiusa a forza) lascia la traccia.
+        ArchiveWriteClock.markStarted()
         output = ""; stats = JobStats(); currentStatus = ""; currentThumbnail = nil
         wasStopped = false
         let now = Date()
@@ -18284,7 +18323,8 @@ struct DuplicatesView: View {
     /// qui. Simmetrica a `startUndo()` sotto.
     private func startTrashing(_ batch: DuplicateBatch) {
         let plan = pendingPlan ?? DuplicateRunPlan(entries: batch.groups)
-        runner.startDuplicateTrashRun(plan, onAlert: { pendingAlert = $0 })
+        runner.startDuplicateTrashRun(plan, certification: DuplicateCertification(basis: .unreadable, lastArchiveWriteAt: nil, groups: []),
+                                      onAlert: { pendingAlert = $0 })
     }
 
     /// «Annulla l'ultimo spostamento», dopo la conferma non distruttiva: avvia
