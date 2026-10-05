@@ -6833,6 +6833,176 @@ nonisolated enum RepairRules {
     }
 }
 
+// MARK: - Riparazione: il registro sul Mac (ROADMAP #45, ADR-0016)
+
+/// I passi della riparazione, nell'ordine in cui avvengono (spec, «Cosa succede quando si
+/// ripara»). Su SSD e HDD la copia buona si PREPARA prima di mettere da parte quella rovinata
+/// (scostamento S4 del piano): il passo `write` compare quindi due volte, prima e dopo
+/// `quarantine`.
+nonisolated enum RepairStep: String, Codable, Sendable {
+    case liveCheck
+    case quarantine
+    case write
+    case finalCheck
+    case log
+}
+
+/// Com'e' finita una riparazione, per il registro.
+nonisolated enum RepairOutcomeKind: String, Codable, Sendable {
+    /// Scritto PRIMA di toccare qualunque archivio: se l'app si chiude a meta', il registro
+    /// dice che una riparazione era cominciata e dove stava la copia messa da parte.
+    case inProgress
+    case repaired
+    /// Fermata a un passo, con il motivo. Se il passo e' `liveCheck` non e' stato toccato niente.
+    case failed
+    /// Scritta, ma la verifica finale non torna: la copia rovinata resta in quarantena e non si
+    /// ritenta da soli.
+    case verificationFailed
+}
+
+/// Una riparazione nel registro. Tutti i campi che servono a ricostruire cosa e' successo
+/// senza l'inventario: percorso, archivio riparato, sorgente, impronte prima e dopo, dove e'
+/// finita la copia rovinata, quando, com'e' andata.
+// `nonisolated`: value type, scritto dal motore fuori dal main e letto dalla finestra.
+nonisolated struct RepairRecord: Codable, Equatable, Sendable {
+    var repairId: String
+    var key: String
+    /// Il percorso nell'archivio riparato (su Cubbit, la chiave vera).
+    var displayPath: String
+    var target: String
+    var source: String
+    var witness: String
+    var goodSHA256: String
+    var goodSize: Int64
+    var badSize: Int64
+    var badSHA256: String? = nil
+    var badETag: String? = nil
+    var afterSHA256: String? = nil
+    var afterETag: String? = nil
+    /// Dove sta la copia rovinata messa da parte (relativo alla radice, o chiave di Cubbit).
+    var quarantinePath: String? = nil
+    /// Vero se su Cubbit la copia rovinata era gia' in quarantena (anche con un'altra data).
+    var reusedQuarantineCopy: Bool = false
+    var startedAt: Date
+    var finishedAt: Date? = nil
+    var outcome: RepairOutcomeKind
+    var failedStep: RepairStep? = nil
+    /// Testo per chi legge il registro a mano; mai mostrato cosi' com'e' nella finestra.
+    var detail: String? = nil
+}
+
+nonisolated extension RepairRecord {
+    private enum CodingKeys: String, CodingKey {
+        case repairId, key, displayPath, target, source, witness, goodSHA256, goodSize, badSize, badSHA256, badETag,
+             afterSHA256, afterETag, quarantinePath, reusedQuarantineCopy, startedAt, finishedAt, outcome, failedStep, detail
+    }
+
+    /// `init(from:)` esplicita con `decodeIfPresent` (regola del progetto per i tipi
+    /// persistiti, fatto misurato n. 5 di #31). Severa sui campi portanti — senza identita',
+    /// percorso, archivio, data o esito la voce non racconta niente — tollerante sugli altri.
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        repairId = try c.decode(String.self, forKey: .repairId)
+        key = try c.decode(String.self, forKey: .key)
+        displayPath = try c.decodeIfPresent(String.self, forKey: .displayPath) ?? ""
+        target = try c.decode(String.self, forKey: .target)
+        source = try c.decodeIfPresent(String.self, forKey: .source) ?? ""
+        witness = try c.decodeIfPresent(String.self, forKey: .witness) ?? ""
+        goodSHA256 = try c.decodeIfPresent(String.self, forKey: .goodSHA256) ?? ""
+        goodSize = try c.decodeIfPresent(Int64.self, forKey: .goodSize) ?? 0
+        badSize = try c.decodeIfPresent(Int64.self, forKey: .badSize) ?? 0
+        badSHA256 = try c.decodeIfPresent(String.self, forKey: .badSHA256)
+        badETag = try c.decodeIfPresent(String.self, forKey: .badETag)
+        afterSHA256 = try c.decodeIfPresent(String.self, forKey: .afterSHA256)
+        afterETag = try c.decodeIfPresent(String.self, forKey: .afterETag)
+        quarantinePath = try c.decodeIfPresent(String.self, forKey: .quarantinePath)
+        reusedQuarantineCopy = try c.decodeIfPresent(Bool.self, forKey: .reusedQuarantineCopy) ?? false
+        startedAt = try c.decode(Date.self, forKey: .startedAt)
+        finishedAt = try c.decodeIfPresent(Date.self, forKey: .finishedAt)
+        outcome = try c.decode(RepairOutcomeKind.self, forKey: .outcome)
+        failedStep = try c.decodeIfPresent(RepairStep.self, forKey: .failedStep)
+        detail = try c.decodeIfPresent(String.self, forKey: .detail)
+    }
+}
+
+/// Il contenuto di `repair-log.json`: stesso schema di `TrashManifest` (`totalRecorded` +
+/// `items`), per la stessa ragione — il numero vero resta anche quando la lista e' potata.
+// `nonisolated`: value type, letto e scritto da `RepairLogStore` sempre dietro `lock`.
+nonisolated struct RepairLog: Codable {
+    var totalRecorded: Int = 0
+    var items: [RepairRecord] = []
+}
+
+nonisolated extension RepairLog {
+    private enum CodingKeys: String, CodingKey { case totalRecorded, items }
+
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        totalRecorded = try c.decodeIfPresent(Int.self, forKey: .totalRecorded) ?? 0
+        items = try c.decodeIfPresent([RepairRecord].self, forKey: .items) ?? []
+    }
+}
+
+/// Il registro delle riparazioni, sul disco interno (`Application Support/AppBackupFoto/
+/// repair-log.json`), mai su un archivio. Stessa disciplina di `TrashManifestStore`: allow-list
+/// della posizione, ogni scrittura su disco PRIMA di tornare, `0600`, un file illeggibile
+/// riparte da vuoto senza bloccare niente.
+// `nonisolated`: `record` arriva dal motore della riparazione fuori dal main, `records` dal
+// main. Ogni accesso a `log` avviene dentro `lock.withLock`, scrittura su disco compresa;
+// `url` e' `let`. Vedi ADR-0006.
+nonisolated final class RepairLogStore: @unchecked Sendable {
+    enum StoreError: Error, LocalizedError {
+        case invalidLocation(String)
+        var errorDescription: String? {
+            switch self {
+            case .invalidLocation(let p): return "Posizione non consentita per il registro delle riparazioni: \(p)"
+            }
+        }
+    }
+
+    /// Le riparazioni sono una alla volta e con conferma: 2.000 voci sono anni di storia.
+    static let defaultMaxItems = 2000
+
+    private let url: URL
+    private let maxItems: Int
+    private var log: RepairLog
+    private let lock = NSLock()
+
+    /// `maxItems` e' iniettato solo dai test (la potatura si prova con poche voci).
+    init(url: URL, maxItems: Int = RepairLogStore.defaultMaxItems) throws {
+        guard isAllowedStoreLocation(url) else { throw StoreError.invalidLocation(url.path) }
+        self.url = url
+        self.maxItems = max(1, maxItems)
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if let data = try? Data(contentsOf: url), let decoded = try? JSONDecoder().decode(RepairLog.self, from: data) {
+            log = decoded
+        } else {
+            log = RepairLog()
+        }
+    }
+
+    var totalRecorded: Int { lock.withLock { log.totalRecorded } }
+
+    /// Aggiunge la voce, o aggiorna quella con lo stesso `repairId` (la stessa riparazione che
+    /// passa da «in corso» al suo esito), e **scrive su disco prima di tornare**.
+    func record(_ r: RepairRecord) throws {
+        try lock.withLock {
+            if let i = log.items.firstIndex(where: { $0.repairId == r.repairId }) {
+                log.items[i] = r
+            } else {
+                log.items.append(r)
+                log.totalRecorded += 1
+                if log.items.count > maxItems { log.items = Array(log.items.suffix(maxItems)) }
+            }
+            try JSONEncoder().encode(log).write(to: url, options: .atomic)
+            // Best-effort, come il registro dei Doppioni: contiene i percorsi delle foto.
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        }
+    }
+
+    func records() -> [RepairRecord] { lock.withLock { log.items } }
+}
+
 // MARK: - Testi e regole della card "Foto gia' salvate" (roadmap #31, Task 6)
 
 /// I nomi dei comandi della card, in un punto solo. Non e' pignoleria: due dei messaggi
