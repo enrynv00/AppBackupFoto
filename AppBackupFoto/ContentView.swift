@@ -7707,6 +7707,41 @@ enum RepairStatus {
     }
 }
 
+// MARK: - Riparazione: il Cubbit vero (ROADMAP #45, ADR-0016)
+
+/// `RepairCloud` sopra un `S3Syncer` DEDICATO alla riparazione — mai `BackupRunner.s3Syncer`,
+/// che condivide il flag di interruzione con i job (stessa regola dell'inventario e del
+/// ricalcolo dello spazio di Cubbit).
+// `nonisolated`: solo proprieta' `let`. `S3Syncer` e' isolato al MainActor (quindi `Sendable`):
+// ogni chiamata salta sul main per il tempo di costruire e firmare la richiesta, l'attesa di
+// rete no. `replaceObjectForRepair` legge il file come il backup (`Data(contentsOf:)` fino a
+// 64 MiB, a pezzi sopra): per una foto sono millisecondi.
+nonisolated final class S3RepairCloud: RepairCloud, @unchecked Sendable {
+    private let syncer: S3Syncer
+    private let config: S3Syncer.S3Config
+
+    init(syncer: S3Syncer, config: S3Syncer.S3Config) {
+        self.syncer = syncer
+        self.config = config
+    }
+
+    func head(key: String) async throws -> S3Syncer.S3ObjectHead? {
+        try await syncer.headObject(config: config, key: key)
+    }
+
+    func list(prefix: String) async throws -> [S3Syncer.S3ObjectInfo] {
+        try await syncer.listObjects(config: config, prefix: prefix)
+    }
+
+    func copy(from sourceKey: String, to destinationKey: String) async throws {
+        try await syncer.copyObject(config: config, from: sourceKey, to: destinationKey)
+    }
+
+    func replace(key: String, withFileAt url: URL) async throws {
+        try await syncer.replaceObjectForRepair(config: config, key: key, withFileAt: url)
+    }
+}
+
 // MARK: - Testi e regole della card "Foto gia' salvate" (roadmap #31, Task 6)
 
 /// I nomi dei comandi della card, in un punto solo. Non e' pignoleria: due dei messaggi
@@ -12564,6 +12599,107 @@ final class BackupRunner: ObservableObject {
                 self.inventorySummary = summary
             }
         }
+    }
+
+    // MARK: Riparazione con la regola «2 su 3» (ROADMAP #45, ADR-0016)
+
+    /// Il registro delle riparazioni, sul disco interno come gli altri file dell'app (BUG-10:
+    /// sotto test in una cartella temporanea). Lazy e `try?`: senza registro la riparazione non
+    /// parte, ma niente altro ne dipende.
+    private(set) lazy var repairLogStore: RepairLogStore? = {
+        try? RepairLogStore(url: backupRunnerStoreRoot().appendingPathComponent("repair-log.json"))
+    }()
+    /// Il passo in corso, per la riga sotto la voce. `nil` mentre si controlla che Cubbit risponda.
+    @Published private(set) var repairStep: RepairStep? = nil
+    /// La voce in riparazione (`RepairCandidate.key`).
+    @Published private(set) var repairingKey: String? = nil
+    @Published private(set) var lastRepairOutcome: RepairOutcome? = nil
+    /// Le voci del registro, lette fuori dal main: la finestra ci trova «riparata il …».
+    @Published private(set) var repairRecords: [RepairRecord] = []
+
+    /// Rilegge il registro fuori dal main e pubblica solo se e' cambiato.
+    func refreshRepairRecords() {
+        guard let log = repairLogStore else { return }
+        Task.detached(priority: .utility) { [weak self] in
+            guard let self else { return }
+            let records = log.records()
+            await MainActor.run {
+                guard self.repairRecords != records else { return }
+                self.repairRecords = records
+            }
+        }
+    }
+
+    /// «Ripara» confermato, o «Controlla senza riparare» (`dryRun`, S11: stesso ricontrollo,
+    /// nessuna scrittura). Le precondizioni si rivalutano QUI, all'avvio vero (fra «Ripara…» e
+    /// la conferma l'utente puo' aver lasciato aperto il riepilogo per minuti), poi
+    /// `isRepairing` si alza PRIMA della domanda a Cubbit. `onAlert` e' il canale della finestra
+    /// Inventario (regola `AlertSink`).
+    func startRepair(_ candidate: RepairCandidate, dryRun: Bool, onAlert: @escaping AlertSink) {
+        if let reason = RepairStartGate.blockedReason(
+            isRunning: isRunning, isIndexing: isIndexing, isTrashingDuplicates: isTrashingDuplicates,
+            isRestoringFromTrash: isRestoringFromTrash, isInventorying: isInventorying, isRepairing: isRepairing,
+            ssdMounted: VolumeMonitor.shared.ssdMounted, hddMounted: VolumeMonitor.shared.hddMounted,
+            hasCubbitConfig: s3Config != nil) {
+            onAlert(SimpleAlert(title: "Meglio non farlo adesso", message: reason))
+            return
+        }
+        guard let log = repairLogStore, let config = s3Config else {
+            onAlert(SimpleAlert(title: "Riparazione non disponibile",
+                                message: "Non è stato possibile aprire sul Mac il registro delle riparazioni."))
+            return
+        }
+        guard let ssdURL = bm.startAccessing(.ssd), isLikelyVolumeRoot(ssdURL) else {
+            bm.stopAccessing(.ssd)
+            onAlert(SimpleAlert(title: "SSD non valido",
+                                message: "Vai in Impostazioni e riseleziona l'SSD scegliendo '/Volumes/SSD - Enri' (la radice del disco, non una cartella)."))
+            return
+        }
+        guard let hddURL = bm.startAccessing(.hdd), isLikelyVolumeRoot(hddURL) else {
+            bm.stopAccessing(.ssd)
+            bm.stopAccessing(.hdd)
+            onAlert(SimpleAlert(title: "HDD non valido",
+                                message: "Vai in Impostazioni e riseleziona l'HDD scegliendo '/Volumes/BackupHDD' (la radice del disco, non una cartella)."))
+            return
+        }
+        if let alert = beginRepair() {
+            bm.stopAccessing(.ssd)
+            bm.stopAccessing(.hdd)
+            onAlert(alert)
+            return
+        }
+        repairingKey = candidate.key
+        repairStep = nil
+        lastRepairOutcome = nil
+        let syncer = S3Syncer()
+        Task { @MainActor in
+            guard await syncer.checkReachable(config: config) else {
+                self.finishRepair(nil)
+                onAlert(SimpleAlert(title: "Cubbit non risponde", message: RepairStartGate.cubbitUnreachable))
+                return
+            }
+            let cloud = S3RepairCloud(syncer: syncer, config: config)
+            Task.detached(priority: .userInitiated) {
+                let engine = RepairEngine(ssdRoot: ssdURL, hddRoot: hddURL, cloud: cloud,
+                                          record: { try log.record($0) })
+                let outcome = await engine.run(candidate, dryRun: dryRun, onStep: { step in
+                    Task { @MainActor in if self.isRepairing { self.repairStep = step } }
+                })
+                await MainActor.run { self.finishRepair(outcome) }
+            }
+        }
+    }
+
+    /// L'UNICO punto in cui una riparazione finisce, su ogni percorso: accessi chiusi, flag giu',
+    /// esito pubblicato, registro riletto.
+    private func finishRepair(_ outcome: RepairOutcome?) {
+        bm.stopAccessing(.ssd)
+        bm.stopAccessing(.hdd)
+        endRepair()
+        repairStep = nil
+        repairingKey = nil
+        if let outcome { lastRepairOutcome = outcome }
+        refreshRepairRecords()
     }
 
     // `autoRefreshLibraryIndexIfEnabled()` e `LibraryIndexAutoRefresh.shouldRun` sono stati
