@@ -1417,7 +1417,12 @@ func importFolderSlug(_ label: String) -> String {
         cleaned = cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
     } while cleaned != previous
 
-    if cleaned.isEmpty || cleaned.allSatisfy({ $0 == "." }) { return "Import" }
+    // Un'etichetta uguale a un nome escluso (`_quarantena`, `lost+found`, ...) farebbe
+    // atterrare l'importazione in una cartella che backup, elenco e inventario saltano: le
+    // foto resterebbero sull'SSD senza mai arrivare su HDD e Cubbit (ROADMAP #45).
+    if cleaned.isEmpty || cleaned.allSatisfy({ $0 == "." }) || LibraryExclusions.isExcludedName(cleaned) {
+        return "Import"
+    }
     return cleaned
 }
 
@@ -1629,18 +1634,47 @@ enum ImportPreviewStatus {
 // la isolerebbe e ogni chiamata da un contesto non isolato sarebbe un warning (un salto sul
 // main thread a runtime).
 nonisolated enum LibraryExclusions {
+    /// La cartella in cui la riparazione (ROADMAP #45, ADR-0016) mette da parte la copia
+    /// rovinata che sostituisce, alla radice di SSD, HDD e Cubbit. NON e' contenuto
+    /// dell'utente: se rientrasse nel backup, il backup ricaricherebbe su Cubbit (o copierebbe
+    /// sull'HDD) proprio la copia rovinata, e i Doppioni la vedrebbero come una copia in piu'.
+    /// Il nome vive QUI e in nessun altro posto: anche `RepairPaths` lo legge da qui.
+    static let quarantineFolderName = "_quarantena"
+
     static let names: Set<String> = [
         ".DS_Store", ".Spotlight-V100", ".TemporaryItems", ".Trashes",
-        ".fseventsd", ".DocumentRevisions-V100", "lost+found", "Backups.backupdb"
+        ".fseventsd", ".DocumentRevisions-V100", "lost+found", "Backups.backupdb",
+        quarantineFolderName
     ]
+
+    /// Vero per la cartella di quarantena, senza distinguere maiuscole e minuscole: l'SSD e'
+    /// exFAT e non le distingue, quindi `_Quarantena` creata a mano e' la stessa cartella in
+    /// cui la riparazione scriverebbe. Verificato il 2026-10-04 sull'elenco e sull'inventario
+    /// salvati: nessun percorso di SSD, HDD o Cubbit contiene oggi `quarantena`.
+    static func isQuarantineName(_ name: String) -> Bool {
+        name.compare(quarantineFolderName, options: [.caseInsensitive, .literal]) == .orderedSame
+    }
+
+    /// Il confronto su UNA componente di percorso, condiviso da `shouldExclude` (dischi) e da
+    /// `InventoryPerimeter` (chiavi di Cubbit): i nomi della lista, i sidecar `._` e la
+    /// cartella di quarantena.
+    static func isExcludedName(_ name: String) -> Bool {
+        names.contains(name) || name.hasPrefix("._") || isQuarantineName(name)
+    }
 
     /// Confronto sull'ultima componente del path, mai sul path intero: una cartella
     /// di passaggio dal nome simile non deve escludere i file che contiene.
     /// `._*` sono i sidecar AppleDouble che macOS crea sui filesystem non-HFS —
     /// l'SSD è ExFAT, quindi ce ne sono ovunque.
     static func shouldExclude(_ url: URL) -> Bool {
-        let name = url.lastPathComponent
-        return names.contains(name) || name.hasPrefix("._")
+        isExcludedName(url.lastPathComponent)
+    }
+
+    /// Per i percorsi che non si scorrono con `shouldExclude` (le chiavi di Cubbit nel
+    /// campione d'integrita'): vero se UNA componente del percorso relativo e' la cartella di
+    /// quarantena.
+    static func isInsideQuarantine(relativePath: String) -> Bool {
+        relativePath.split(separator: "/").contains { isQuarantineName(String($0)) }
     }
 }
 
@@ -6008,11 +6042,12 @@ nonisolated struct CubbitReadReport: Equatable, Sendable {
 nonisolated enum InventoryPerimeter {
     /// Vero se un oggetto con questa chiave sarebbe stato letto dallo scanner dei dischi:
     /// nessuna componente nascosta (`.skipsHiddenFiles`, e quindi anche i `._` AppleDouble),
-    /// nessuna componente fra `LibraryExclusions.names`, e `IndexableKind` foto o video.
+    /// nessuna componente esclusa da `LibraryExclusions.isExcludedName` (quindi nemmeno la
+    /// cartella di quarantena della riparazione, ADR-0016), e `IndexableKind` foto o video.
     static func includesS3Key(_ key: String) -> Bool {
         let components = key.split(separator: "/", omittingEmptySubsequences: true)
         guard !components.isEmpty, !key.hasSuffix("/") else { return false }
-        for c in components where c.hasPrefix(".") || LibraryExclusions.names.contains(String(c)) {
+        for c in components where c.hasPrefix(".") || LibraryExclusions.isExcludedName(String(c)) {
             return false
         }
         return IndexableKind.of(url: URL(fileURLWithPath: key)) != .notIndexable
@@ -8487,25 +8522,42 @@ final class S3Syncer {
     func previewUpload(from localURL: URL, config: S3Config) async throws -> (toUpload: Int, toSkip: Int, bytes: Int64) {
         beginNewOperation()
         let existingKeys = Set(try await listAll(config: config).keys)
+        guard let files = Self.localUploadFiles(root: localURL) else {
+            throw NSError(domain: "S3", code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "Impossibile enumerare i file locali"])
+        }
+        return Self.previewCount(files: files.map { (key: $0.key, size: $0.size) }, existingKeys: existingKeys)
+    }
+
+    /// I file dell'SSD che il backup SSD → Cubbit considera, con la chiave che avrebbero su
+    /// Cubbit. UNA sola traversata per `sync` e `previewUpload` (prima erano due copie dello
+    /// stesso ciclo). Stesse regole di prima — `.skipsHiddenFiles`, niente `._*` e
+    /// `.DS_Store` — piu' la cartella di quarantena della riparazione (ADR-0016), saltata con
+    /// tutto il suo contenuto: senza, il backup ricaricherebbe su Cubbit la copia rovinata messa
+    /// da parte sull'SSD. NON usa `LibraryExclusions.shouldExclude` per intero: allineare anche
+    /// `lost+found`/`Backups.backupdb` e' un cambio di comportamento ancora da decidere (vedi il
+    /// commento di `LibraryExclusions`). `nil` se la radice non si lascia scorrere.
+    // `nonisolated`: nessuno stato dell'istanza; il flag di interruzione arriva come closure.
+    nonisolated static func localUploadFiles(root localURL: URL, isCancelled: () -> Bool = { false })
+        -> [(url: URL, key: String, size: Int64)]? {
         let fm = FileManager.default
-        var files: [(key: String, size: Int64)] = []
+        var files: [(url: URL, key: String, size: Int64)] = []
         let base = localURL.path
         guard let enumerator = fm.enumerator(
             at: localURL,
             includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
-            options: [.skipsHiddenFiles]) else {
-            throw NSError(domain: "S3", code: 2,
-                userInfo: [NSLocalizedDescriptionKey: "Impossibile enumerare i file locali"])
-        }
+            options: [.skipsHiddenFiles]) else { return nil }
         while let f = enumerator.nextObject() as? URL {
+            if isCancelled() { break }
+            let name = f.lastPathComponent
+            if LibraryExclusions.isQuarantineName(name) { enumerator.skipDescendants(); continue }
             let v = try? f.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
             guard v?.isRegularFile == true else { continue }
-            let name = f.lastPathComponent
             if name.hasPrefix("._") || name == ".DS_Store" { continue }
             let rel = String(f.path.dropFirst(base.count).drop(while: { $0 == "/" }))
-            files.append((rel, Int64(v?.fileSize ?? 0)))
+            files.append((url: f, key: rel, size: Int64(v?.fileSize ?? 0)))
         }
-        return Self.previewCount(files: files, existingKeys: existingKeys)
+        return files
     }
 
     func sync(from localURL: URL, config: S3Config,
@@ -8524,24 +8576,9 @@ final class S3Syncer {
         let existingCount = existing.count
         DispatchQueue.main.async { onStatus("Trovati \(existingCount) oggetti su S3 — scansione file locali...") }
 
-        let fm = FileManager.default
-        var files: [(url: URL, key: String, size: Int64)] = []
-        let base = localURL.path
-        guard let enumerator = fm.enumerator(
-            at: localURL,
-            includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
-            options: [.skipsHiddenFiles]) else {
+        guard let files = Self.localUploadFiles(root: localURL, isCancelled: { self.cancelled }) else {
             throw NSError(domain: "S3", code: 2,
                 userInfo: [NSLocalizedDescriptionKey: "Impossibile enumerare i file locali"])
-        }
-        while let f = enumerator.nextObject() as? URL {
-            if cancelled { break }
-            let v = try? f.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
-            guard v?.isRegularFile == true else { continue }
-            let name = f.lastPathComponent
-            if name.hasPrefix("._") || name == ".DS_Store" { continue }
-            let rel = String(f.path.dropFirst(base.count).drop(while: { $0 == "/" }))
-            files.append((url: f, key: rel, size: Int64(v?.fileSize ?? 0)))
         }
 
         let existingKeys = Set(existing.keys)
@@ -8993,6 +9030,8 @@ final class S3Syncer {
         for key in keys {
             guard key.contains("/"), let first = key.split(separator: "/", maxSplits: 1).first else { continue }
             let name = String(first)
+            // La quarantena della riparazione (ADR-0016) non e' una cartella da ripristinare.
+            if LibraryExclusions.isQuarantineName(name) { continue }
             if !seen.contains(name) { seen.insert(name); ordered.append(name) }
         }
         return ordered.sorted()
@@ -12499,9 +12538,11 @@ nonisolated func integritySampleLocalPair(srcRoot: URL, dstRoot: URL, pairName: 
     var relPaths: [String] = []
     let base = resolvedDstRoot.path
     while let f = enumerator.nextObject() as? URL {
+        let name = f.lastPathComponent
+        // La quarantena della riparazione (ADR-0016) non e' una copia di backup da campionare.
+        if LibraryExclusions.isQuarantineName(name) { enumerator.skipDescendants(); continue }
         let vals = try? f.resourceValues(forKeys: [.isRegularFileKey])
         guard vals?.isRegularFile == true else { continue }
-        let name = f.lastPathComponent
         if name.hasPrefix("._") || name == ".DS_Store" { continue }
         relPaths.append(String(f.path.dropFirst(base.count).drop(while: { $0 == "/" })))
     }
@@ -12593,7 +12634,11 @@ final class ReviewEngine {
         var result = IntegrityCheckResult(pairName: "SSD ↔ S3")
         let config = try S3Syncer.readConfig()
         let remoteKeys = try await s3Syncer.listAll(config: config)
-        let candidates = remoteKeys.keys.filter { fm.fileExists(atPath: ssdRoot.appendingPathComponent($0).path) }
+        let candidates = remoteKeys.keys.filter {
+            // La quarantena della riparazione (ADR-0016) non e' una copia di backup da campionare.
+            !LibraryExclusions.isInsideQuarantine(relativePath: $0)
+                && fm.fileExists(atPath: ssdRoot.appendingPathComponent($0).path)
+        }
         guard !candidates.isEmpty else { return result }
 
         let sample = candidates.shuffled().prefix(sampleSize)
@@ -12808,7 +12853,8 @@ final class RestoreEngine: ObservableObject {
             let vals = try? url.resourceValues(forKeys: [.isDirectoryKey])
             guard vals?.isDirectory == true else { return nil }
             let name = url.lastPathComponent
-            return name.hasPrefix(".") ? nil : name
+            // La quarantena della riparazione (ADR-0016) non e' una cartella da ripristinare.
+            return name.hasPrefix(".") || LibraryExclusions.isQuarantineName(name) ? nil : name
         }.sorted()
     }
 
