@@ -48,6 +48,8 @@
 		571CCCE2BF5254CBC5C95301 /* InventoryClassifierTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1EB0DF8A234B0B8A0802230 /* InventoryClassifierTests.swift */; };
 		D32A3EFFFFA66AAE2C29C8E6 /* InventoryRefreshTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C08CBD0B92948BEFEE0428F4 /* InventoryRefreshTests.swift */; };
 		51437C0FB531B995488AA29D /* InventoryStatusTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 410F77B6DAC6CC5324775DA3 /* InventoryStatusTests.swift */; };
+		737DA6D834924A1DF98041E7 /* RepairPathsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 309AE9683F23DFEF253FB1FA /* RepairPathsTests.swift */; };
+		300DA1BAF6ECCD2BD27DCBCD /* RepairRulesTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E3C9EBC30E095C631289A569 /* RepairRulesTests.swift */; };
 		4FEC1A21A21E1363C8AC16A1 /* S3RepairRequestsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 83F99398053EFEE0718BE507 /* S3RepairRequestsTests.swift */; };
 		81C34F19C0E11548D23E19B0 /* S3SignatureTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1922A6BF150035D742D1CE8A /* S3SignatureTests.swift */; };
 		4617E005A1169953A4B9116B /* QuarantineExclusionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B63D84C9B5F6DFE611C89286 /* QuarantineExclusionTests.swift */; };
@@ -136,6 +138,8 @@
 		E1EB0DF8A234B0B8A0802230 /* InventoryClassifierTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = InventoryClassifierTests.swift; sourceTree = "<group>"; };
 		C08CBD0B92948BEFEE0428F4 /* InventoryRefreshTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = InventoryRefreshTests.swift; sourceTree = "<group>"; };
 		410F77B6DAC6CC5324775DA3 /* InventoryStatusTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = InventoryStatusTests.swift; sourceTree = "<group>"; };
+		309AE9683F23DFEF253FB1FA /* RepairPathsTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = RepairPathsTests.swift; sourceTree = "<group>"; };
+		E3C9EBC30E095C631289A569 /* RepairRulesTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = RepairRulesTests.swift; sourceTree = "<group>"; };
 		83F99398053EFEE0718BE507 /* S3RepairRequestsTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = S3RepairRequestsTests.swift; sourceTree = "<group>"; };
 		1922A6BF150035D742D1CE8A /* S3SignatureTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = S3SignatureTests.swift; sourceTree = "<group>"; };
 		B63D84C9B5F6DFE611C89286 /* QuarantineExclusionTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = QuarantineExclusionTests.swift; sourceTree = "<group>"; };
@@ -251,6 +255,8 @@
 				E1EB0DF8A234B0B8A0802230 /* InventoryClassifierTests.swift */,
 				C08CBD0B92948BEFEE0428F4 /* InventoryRefreshTests.swift */,
 				410F77B6DAC6CC5324775DA3 /* InventoryStatusTests.swift */,
+				309AE9683F23DFEF253FB1FA /* RepairPathsTests.swift */,
+				E3C9EBC30E095C631289A569 /* RepairRulesTests.swift */,
 				83F99398053EFEE0718BE507 /* S3RepairRequestsTests.swift */,
 				1922A6BF150035D742D1CE8A /* S3SignatureTests.swift */,
 				B63D84C9B5F6DFE611C89286 /* QuarantineExclusionTests.swift */,
@@ -459,6 +465,8 @@
 				571CCCE2BF5254CBC5C95301 /* InventoryClassifierTests.swift in Sources */,
 				D32A3EFFFFA66AAE2C29C8E6 /* InventoryRefreshTests.swift in Sources */,
 				51437C0FB531B995488AA29D /* InventoryStatusTests.swift in Sources */,
+				737DA6D834924A1DF98041E7 /* RepairPathsTests.swift in Sources */,
+				300DA1BAF6ECCD2BD27DCBCD /* RepairRulesTests.swift in Sources */,
 				4FEC1A21A21E1363C8AC16A1 /* S3RepairRequestsTests.swift in Sources */,
 				81C34F19C0E11548D23E19B0 /* S3SignatureTests.swift in Sources */,
 				4617E005A1169953A4B9116B /* QuarantineExclusionTests.swift in Sources */,

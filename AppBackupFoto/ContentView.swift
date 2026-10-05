@@ -6646,6 +6646,193 @@ enum InventoryStatus {
     }
 }
 
+// MARK: - Riparazione con la regola «2 su 3»: le regole pure (ROADMAP #45, ADR-0016)
+
+/// Dove la riparazione mette le copie, come percorsi RELATIVI alla radice di un archivio (SSD,
+/// HDD) o come chiavi di Cubbit. Logica pura: nessun disco, nessuna rete.
+// `nonisolated`: pura, chiamata dal motore della riparazione fuori dal main.
+nonisolated enum RepairPaths {
+    /// Lo stesso nome che backup, elenco, inventario e ripristino escludono (una fonte sola).
+    static var quarantineFolder: String { LibraryExclusions.quarantineFolderName }
+
+    /// Il calendario dei nomi delle cartelle per giorno: gregoriano, nel fuso del Mac.
+    static var defaultCalendar: Calendar {
+        var c = Calendar(identifier: .gregorian)
+        c.timeZone = .current
+        return c
+    }
+
+    /// `AAAA-MM-GG` del giorno di `date` nel calendario dato.
+    static func dayFolder(for date: Date, calendar: Calendar) -> String {
+        let d = calendar.dateComponents([.year, .month, .day], from: date)
+        return String(format: "%04d-%02d-%02d", d.year ?? 0, d.month ?? 0, d.day ?? 0)
+    }
+
+    /// Le componenti di un percorso relativo, o `nil` se non e' sicuro da usare: vuoto,
+    /// assoluto, con componenti vuote, `.` o `..` (uscirebbe dalla cartella), oppure gia'
+    /// dentro la quarantena (non si mette in quarantena una quarantena).
+    static func safeComponents(_ relative: String) -> [String]? {
+        let parts = relative.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+        guard !parts.isEmpty,
+              !parts.contains(where: { $0.isEmpty || $0 == "." || $0 == ".." }),
+              !LibraryExclusions.isQuarantineName(parts[0]) else { return nil }
+        return parts
+    }
+
+    /// `_quarantena/<AAAA-MM-GG>/<percorso originale>`: stessa chiave relativa, caratteri
+    /// speciali compresi, sullo stesso archivio. `nil` se il percorso non e' sicuro.
+    static func quarantinePath(for relative: String, date: Date, calendar: Calendar) -> String? {
+        guard safeComponents(relative) != nil else { return nil }
+        return quarantineFolder + "/" + dayFolder(for: date, calendar: calendar) + "/" + relative
+    }
+
+    /// Dove si prepara la copia buona prima di metterla al suo posto (solo SSD e HDD): accanto
+    /// alla copia in quarantena, con un suffisso unico. Se la riparazione si ferma prima della
+    /// fine, quello che resta sta dentro la quarantena (che nessuno legge) e non va cancellato.
+    static func stagingPath(for relative: String, date: Date, calendar: Calendar, token: String) -> String? {
+        guard !token.isEmpty, token.allSatisfy({ $0.isLetter || $0.isNumber }),
+              let q = quarantinePath(for: relative, date: date, calendar: calendar) else { return nil }
+        return q + ".in-arrivo-" + token
+    }
+
+    /// Vero se `key` e' `_quarantena/<un giorno qualsiasi>/<relative>`: serve alla quarantena
+    /// IDEMPOTENTE su Cubbit (una copia messa da parte un altro giorno, per esempio dalla prova
+    /// con `rclone` del 2026-10-04, vale come gia' fatta).
+    static func isQuarantineCopy(_ key: String, of relative: String) -> Bool {
+        let prefix = quarantineFolder + "/"
+        guard key.hasPrefix(prefix) else { return false }
+        let rest = key.dropFirst(prefix.count)
+        guard let slash = rest.firstIndex(of: "/") else { return false }
+        return isDayFolder(rest[..<slash]) && rest[rest.index(after: slash)...] == relative[...]
+    }
+
+    private static func isDayFolder(_ s: Substring) -> Bool {
+        let parts = s.split(separator: "-", omittingEmptySubsequences: false)
+        guard parts.count == 3, parts[0].count == 4, parts[1].count == 2, parts[2].count == 2 else { return false }
+        return parts.allSatisfy { $0.allSatisfy { $0.isASCII && $0.isNumber } }
+    }
+}
+
+/// Una foto rovinata in UN archivio, integra e identica negli altri due: si puo' riparare.
+/// Viene dall'inventario, che e' una cache (ADR-0002): il motore ricontrolla tutto dal vivo.
+nonisolated struct RepairCandidate: Equatable, Sendable, Identifiable {
+    /// `normalizedIndexKey` del percorso: lo stesso nei tre archivi.
+    let key: String
+    /// La minoranza: l'archivio con la copia diversa.
+    let target: InventoryArchive
+    /// Da dove si copia: sempre un file locale — l'SSD per riparare HDD o Cubbit, l'HDD per
+    /// riparare l'SSD.
+    let source: InventoryArchive
+    /// La seconda copia buona, che deve coincidere anche lei al ricontrollo.
+    let witness: InventoryArchive
+    /// Il percorso com'e' scritto in ciascun archivio (su Cubbit con le maiuscole vere).
+    let paths: [InventoryArchive: String]
+    /// Le impronte della copia buona, lette per intero nell'ultimo inventario.
+    let good: ContentDigest
+    /// Cosa l'inventario ha visto nella copia rovinata.
+    let badSize: Int64
+    /// Su SSD o HDD.
+    let badSHA256: String?
+    /// Su Cubbit, cosi' come arriva dalla lista.
+    let badETag: String?
+
+    var id: String { key }
+}
+
+/// Quando una voce dell'inventario si puo' riparare. Logica PURA sul `InventorySnapshot`.
+// `nonisolated`: pura, calcolata insieme al riepilogo dell'inventario fuori dal main.
+nonisolated enum RepairRules {
+    /// L'archivio da cui si copia per riparare `target`.
+    static func source(forTarget target: InventoryArchive) -> InventoryArchive {
+        target == .ssd ? .hdd : .ssd
+    }
+
+    /// La seconda copia buona per riparare `target`.
+    static func witness(forTarget target: InventoryArchive) -> InventoryArchive {
+        target == .s3 ? .hdd : .s3
+    }
+
+    /// L'ETag che Cubbit dara' alla copia buona dopo `S3Syncer.upload`: l'MD5 fino a 64 MiB
+    /// compresi, l'ETag a pezzi da 64 MiB sopra (stessa soglia di `upload`).
+    static func expectedCubbitETag(for good: ContentDigest) -> String {
+        good.multipartETag ?? good.md5
+    }
+
+    /// Un ETag senza virgolette, spazi e maiuscole, per confrontarne due.
+    static func normalizedETag(_ raw: String?) -> String? {
+        guard var s = raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(), !s.isEmpty else { return nil }
+        if s.count >= 2, s.hasPrefix("\""), s.hasSuffix("\"") { s = String(s.dropFirst().dropLast()) }
+        return s.isEmpty ? nil : s
+    }
+
+    /// Una chiave di Cubbit si puo' riparare solo se il caricamento (che usa la codifica di
+    /// sempre del backup, `.urlPathAllowed`) e le richieste nuove (HEAD e copia, con
+    /// `encodeKeyStrict`) mandano lo STESSO percorso. Vale per lettere (accentate comprese:
+    /// fuori dall'ASCII le due codifiche coincidono), cifre, spazi e `-_.~/` — la foto del
+    /// 2026-10-01 compresa. Con `+`, apostrofo e gli altri segni che `.urlPathAllowed` lascia
+    /// passare (`!$&'()*+,;=:@`) divergono, e la sovrascrittura potrebbe finire su una chiave
+    /// diversa da quella controllata: quelle voci restano in ❗ finche' una prova dal vivo non
+    /// le copre.
+    static func cubbitKeyIsRepairable(_ key: String) -> Bool {
+        key.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) == S3Syncer.encodeKeyStrict(key)
+    }
+
+    /// Le voci riparabili, in ordine di percorso. Le condizioni (spec, «Quando una foto e'
+    /// riparabile»), tutte necessarie:
+    /// - tutti e tre gli archivi COMPLETI nell'ultimo giro (incompleto non e' assente, ADR-0015);
+    /// - lo stesso percorso, una sola volta, in ciascuno dei tre (una collisione di maiuscole
+    ///   dentro un archivio non si ripara);
+    /// - SSD e HDD letti per intero;
+    /// - due archivi con lo stesso contenuto certificato e la stessa dimensione, il terzo con un
+    ///   contenuto DIMOSTRATO diverso.
+    ///
+    /// «Dimostrato» su Cubbit vuol dire: un ETag a parte unica (e' l'MD5 del contenuto) diverso
+    /// dall'MD5 della copia buona. Un ETag a pezzi che non torna non dimostra niente (potrebbe
+    /// essere lo stesso contenuto caricato con parti di altra dimensione): la voce resta in ❗.
+    static func candidates(in s: InventorySnapshot) -> [RepairCandidate] {
+        guard InventoryArchive.allCases.allSatisfy({ s.isComplete($0) }) else { return [] }
+        let ssd = Dictionary(grouping: s.ssd, by: \.key)
+        let hdd = Dictionary(grouping: s.hdd, by: \.key)
+        let s3 = Dictionary(grouping: s.s3, by: \.key)
+        var out: [RepairCandidate] = []
+        for (key, ssdRows) in ssd {
+            guard !LibraryExclusions.isInsideQuarantine(relativePath: key),
+                  ssdRows.count == 1, let hddRows = hdd[key], hddRows.count == 1,
+                  let s3Rows = s3[key], s3Rows.count == 1 else { continue }
+            let a = ssdRows[0], b = hddRows[0], o = s3Rows[0]
+            guard a.status == .ok, b.status == .ok, let da = a.digest, let db = b.digest,
+                  da.size == a.size, db.size == b.size else { continue }
+            let paths: [InventoryArchive: String] = [.ssd: a.displayPath, .hdd: b.displayPath, .s3: o.displayKey]
+
+            if da.sha256 == db.sha256 {
+                // SSD e HDD d'accordo: Cubbit e' la minoranza solo se dimostrato diverso.
+                guard case .singlePart(let md5) = S3ETag.parse(o.etag), md5 != da.md5,
+                      cubbitKeyIsRepairable(o.displayKey) else { continue }
+                out.append(RepairCandidate(key: key, target: .s3, source: .ssd, witness: .hdd, paths: paths,
+                                           good: da, badSize: o.size, badSHA256: nil, badETag: o.etag))
+                continue
+            }
+            // SSD e HDD diversi: decide Cubbit, solo se certifica uno dei due (stesso
+            // confronto dell'inventario, `S3ETagMatcher`, fra i due contenuti in gioco).
+            let both = [da, db].map {
+                S3ETagMatcher.Candidate(size: $0.size, sha256: $0.sha256, md5: $0.md5,
+                                        multipartETag: $0.multipartETag, alternativeETags: $0.alternativeMultipartETags)
+            }
+            guard case .certified(let sha) = S3ETagMatcher.verdict(etag: o.etag, size: o.size, candidates: both) else {
+                continue
+            }
+            if sha == da.sha256 && o.size == da.size {
+                out.append(RepairCandidate(key: key, target: .hdd, source: .ssd, witness: .s3, paths: paths,
+                                           good: da, badSize: b.size, badSHA256: db.sha256, badETag: nil))
+            } else if sha == db.sha256 && o.size == db.size {
+                out.append(RepairCandidate(key: key, target: .ssd, source: .hdd, witness: .s3, paths: paths,
+                                           good: db, badSize: a.size, badSHA256: da.sha256, badETag: nil))
+            }
+        }
+        return out.sorted { $0.key < $1.key }
+    }
+}
+
 // MARK: - Testi e regole della card "Foto gia' salvate" (roadmap #31, Task 6)
 
 /// I nomi dei comandi della card, in un punto solo. Non e' pignoleria: due dei messaggi
