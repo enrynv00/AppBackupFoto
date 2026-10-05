@@ -7003,6 +7003,438 @@ nonisolated final class RepairLogStore: @unchecked Sendable {
     func records() -> [RepairRecord] { lock.withLock { log.items } }
 }
 
+// MARK: - Riparazione: il motore (ROADMAP #45, ADR-0016)
+
+/// Quello che la riparazione chiede a Cubbit. In produzione `S3RepairCloud` (sopra
+/// `S3Syncer`); nei test un Cubbit finto in memoria.
+nonisolated protocol RepairCloud: Sendable {
+    /// `nil` = l'oggetto non c'e'.
+    func head(key: String) async throws -> S3Syncer.S3ObjectHead?
+    /// Tutti gli oggetti sotto `prefix`; lancia se la lista non arriva in fondo.
+    func list(prefix: String) async throws -> [S3Syncer.S3ObjectInfo]
+    /// Copia lato server; la sorgente non viene toccata.
+    func copy(from sourceKey: String, to destinationKey: String) async throws
+    /// La sola sovrascrittura: la copia buona al posto di quella rovinata.
+    func replace(key: String, withFileAt url: URL) async throws
+}
+
+/// Perche' una riparazione si e' fermata. Ogni caso ha la sua frase in `RepairStatus`.
+nonisolated enum RepairFailure: Equatable, Sendable {
+    case volumeMissing(InventoryArchive)
+    case unsafePath
+    case sourceChanged
+    case witnessChanged
+    case badCopyMissing
+    case badCopyChanged
+    case cubbitError(String)
+    case logNotWritten(String)
+    case quarantineOccupied
+    case quarantineFailed(String)
+    case quarantineCopyMismatch
+    case stagingFailed(String)
+    case stagingMismatch
+    case writeFailed(String)
+    case finalCheckFailed
+}
+
+/// Com'e' andata una riparazione, per la finestra.
+nonisolated struct RepairOutcome: Equatable, Sendable {
+    let key: String
+    let target: InventoryArchive
+    /// Il percorso nell'archivio riparato.
+    let displayPath: String
+    /// Controllo senza riparare (S11): il ricontrollo e' stato fatto, niente e' stato scritto
+    /// (nemmeno nel registro); `quarantinePath` dice dove andrebbe la copia diversa.
+    var wasDryRun = false
+    var succeeded = false
+    var failedStep: RepairStep? = nil
+    var failure: RepairFailure? = nil
+    /// Dove sta la copia rovinata messa da parte; `nil` se non e' stata spostata (o e' stata
+    /// rimessa al suo posto).
+    var quarantinePath: String? = nil
+    var reusedQuarantineCopy = false
+    /// Su SSD/HDD: la scrittura e' fallita dopo la quarantena, e la copia rovinata e' stata
+    /// rimessa dov'era — tutto com'era prima.
+    var restoredOriginal = false
+    /// Su SSD/HDD: la copia buona preparata e rimasta dentro la quarantena (non si cancella).
+    var leftoverStagingPath: String? = nil
+    var afterSHA256: String? = nil
+    var afterETag: String? = nil
+    var finishedAt: Date
+    /// Il registro non si e' potuto aggiornare alla fine: la riparazione e' andata come dice
+    /// `succeeded`, ma il registro dice ancora «in corso».
+    var logError: String? = nil
+}
+
+/// La riparazione di UNA foto, nei passi della spec: ricontrollo dal vivo, quarantena,
+/// scrittura, verifica finale, registro. Il primo passo che fallisce ferma tutto e dice cosa
+/// e' successo.
+///
+/// - Su **Cubbit**: quarantena = copia lato server in `_quarantena/<giorno>/<chiave>`,
+///   IDEMPOTENTE (una copia gia' messa da parte, anche un altro giorno, con la stessa
+///   dimensione e lo stesso ETag della rovinata, vale come fatta); poi HEAD della copia;
+///   scrittura = `S3Syncer.upload` (la sola sovrascrittura); verifica = HEAD con l'ETag atteso.
+/// - Su **SSD/HDD**: la copia buona si PREPARA prima (copia + rilettura dentro la quarantena,
+///   scostamento S4), poi la rovinata si sposta in quarantena con `rename(2)` sullo stesso
+///   volume, poi la preparata va al suo posto con un altro `rename(2)`. Se quest'ultimo
+///   fallisce la rovinata torna dov'era. Mai `removeItem`, mai `FileManager.moveItem` (fra due
+///   volumi copierebbe e poi cancellerebbe).
+///
+/// Le funzioni di disco, di hash e il Cubbit sono iniettati: i fallimenti da coprire (un
+/// `rename` che fallisce, un disco che cambia, una copia che non torna) non si producono su
+/// file veri senza una corsa. In produzione sono quelle vere (default), stesso schema di
+/// `TrashRestorer`.
+// `nonisolated`: `run` gira fuori dal main (rilegge file interi). Solo proprieta' `let`
+// (closure `@Sendable`, URL, `Calendar`); lo stato di una riparazione e' tutto locale a `run`.
+// Una alla volta: lo garantisce `BackupRunner.isRepairing`. `run` e' `@concurrent` (ADR-0006).
+nonisolated final class RepairEngine: @unchecked Sendable {
+    enum FileError: Error, LocalizedError {
+        case destinationExists(String)
+        var errorDescription: String? {
+            switch self {
+            case .destinationExists(let p): return "Esiste gia' un file in \(p)"
+            }
+        }
+    }
+
+    private let ssdRoot: URL
+    private let hddRoot: URL
+    private let cloud: any RepairCloud
+    private let record: @Sendable (RepairRecord) throws -> Void
+    private let now: @Sendable () -> Date
+    private let calendar: Calendar
+    private let hashFile: @Sendable (URL) -> ContentReadOutcome
+    private let copyFile: @Sendable (URL, URL) throws -> Void
+    private let renameFile: @Sendable (URL, URL) throws -> Void
+    private let volumeIdentity: @Sendable (URL) -> dev_t?
+    private let makeToken: @Sendable () -> String
+
+    init(ssdRoot: URL, hddRoot: URL, cloud: any RepairCloud,
+         record: @escaping @Sendable (RepairRecord) throws -> Void,
+         now: @escaping @Sendable () -> Date = { Date() },
+         calendar: Calendar = RepairPaths.defaultCalendar,
+         hashFile: @escaping @Sendable (URL) -> ContentReadOutcome = { ContentHasher.digestFile(at: $0) },
+         copyFile: @escaping @Sendable (URL, URL) throws -> Void = { try FileManager.default.copyItem(at: $0, to: $1) },
+         renameFile: @escaping @Sendable (URL, URL) throws -> Void = { try RepairEngine.renameWithoutOverwriting(from: $0, to: $1) },
+         volumeIdentity: @escaping @Sendable (URL) -> dev_t? = { deviceIdentifier(of: $0) },
+         makeToken: @escaping @Sendable () -> String = {
+             String(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(8)).lowercased()
+         }) {
+        self.ssdRoot = ssdRoot
+        self.hddRoot = hddRoot
+        self.cloud = cloud
+        self.record = record
+        self.now = now
+        self.calendar = calendar
+        self.hashFile = hashFile
+        self.copyFile = copyFile
+        self.renameFile = renameFile
+        self.volumeIdentity = volumeIdentity
+        self.makeToken = makeToken
+    }
+
+    /// `rename(2)` senza mai sovrascrivere: se la destinazione esiste ci si ferma (zero-overwrite
+    /// anche dentro la quarantena). Non `FileManager.moveItem`: fra due volumi diversi copia e
+    /// poi CANCELLA l'originale, mentre `rename(2)` fallisce con `EXDEV` e non tocca niente. Il
+    /// controllo e lo spostamento non sono atomici fra loro: la finestra e' di microsecondi, e
+    /// nessun'altra operazione dell'app scrive mentre una riparazione e' in corso (`isRepairing`).
+    nonisolated static func renameWithoutOverwriting(from: URL, to: URL) throws {
+        guard !itemExists(to) else { throw FileError.destinationExists(to.path) }
+        guard rename(from.path, to.path) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+    }
+
+    /// `lstat`: vero anche per un link rotto (che `fileExists` darebbe come assente).
+    nonisolated static func itemExists(_ url: URL) -> Bool {
+        var st = stat()
+        return lstat(url.path, &st) == 0
+    }
+
+    /// `root/relative`, solo se il percorso e' sicuro e la sua cartella, risolta dal
+    /// filesystem, sta davvero sotto la radice (per componenti, mai per prefisso di stringa).
+    nonisolated static func confined(_ root: URL, _ relative: String) -> URL? {
+        guard RepairPaths.safeComponents(relative) != nil else { return nil }
+        let url = root.appendingPathComponent(relative)
+        return isInside(url.deletingLastPathComponent(), root: root) ? url : nil
+    }
+
+    nonisolated static func isInside(_ dir: URL, root: URL) -> Bool {
+        let r = canonicalPathComponents(of: root)
+        let d = canonicalPathComponents(of: dir)
+        return !r.isEmpty && d.count >= r.count && Array(d.prefix(r.count)) == r
+    }
+
+    private func root(_ a: InventoryArchive) -> URL? {
+        switch a {
+        case .ssd: return ssdRoot
+        case .hdd: return hddRoot
+        case .s3: return nil
+        }
+    }
+
+    private static func isGood(_ r: ContentReadOutcome, _ good: ContentDigest) -> Bool {
+        if case .digest(let d) = r { return d.sha256 == good.sha256 && d.size == good.size }
+        return false
+    }
+
+    /// Una copia della rovinata gia' in quarantena su Cubbit, in un giorno qualsiasi, con la
+    /// stessa dimensione e lo stesso ETag: la quarantena IDEMPOTENTE. `nil` se non c'e'.
+    private func existingQuarantineCopy(of relative: String, size: Int64, etag: String?) async throws -> String? {
+        try await cloud.list(prefix: RepairPaths.quarantineFolder + "/")
+            .filter { RepairPaths.isQuarantineCopy($0.key, of: relative) && $0.size == size
+                      && RepairRules.normalizedETag($0.etag) == etag }
+            .map(\.key).sorted().first
+    }
+
+    /// `dryRun` (S11, regola 4 di `Docs/CLAUDE.md`): fa il ricontrollo dal vivo, dice dove
+    /// andrebbe la copia diversa e si ferma. Nessuna scrittura su nessun archivio, nessuna voce
+    /// nel registro.
+    @concurrent
+    func run(_ c: RepairCandidate, dryRun: Bool = false,
+             onStep: @escaping @Sendable (RepairStep) -> Void = { _ in }) async -> RepairOutcome {
+        let started = now()
+        var out = RepairOutcome(key: c.key, target: c.target, displayPath: c.paths[c.target] ?? "", finishedAt: started)
+        out.wasDryRun = dryRun
+        var rec = RepairRecord(repairId: UUID().uuidString, key: c.key, displayPath: out.displayPath,
+                               target: c.target.rawValue, source: c.source.rawValue, witness: c.witness.rawValue,
+                               goodSHA256: c.good.sha256, goodSize: c.good.size, badSize: c.badSize,
+                               badSHA256: c.badSHA256, badETag: c.badETag, startedAt: started, outcome: .inProgress)
+
+        func finish(_ kind: RepairOutcomeKind, step: RepairStep? = nil, _ failure: RepairFailure? = nil) -> RepairOutcome {
+            out.succeeded = kind == .repaired
+            out.failedStep = step
+            out.failure = failure
+            out.finishedAt = now()
+            rec.outcome = kind
+            rec.failedStep = step
+            rec.detail = failure.map { "\($0)" }
+            rec.finishedAt = out.finishedAt
+            rec.quarantinePath = out.quarantinePath
+            rec.reusedQuarantineCopy = out.reusedQuarantineCopy
+            rec.afterSHA256 = out.afterSHA256
+            rec.afterETag = out.afterETag
+            if case .logNotWritten = failure { return out }
+            if out.wasDryRun { return out }
+            do { try record(rec) } catch { out.logError = error.localizedDescription }
+            return out
+        }
+
+        // 1. RICONTROLLO DAL VIVO. Niente e' ancora stato toccato.
+        onStep(.liveCheck)
+        guard c.source == RepairRules.source(forTarget: c.target), c.witness == RepairRules.witness(forTarget: c.target),
+              let srcRel = c.paths[c.source], let tgtRel = c.paths[c.target], let witRel = c.paths[c.witness],
+              RepairPaths.safeComponents(tgtRel) != nil, RepairPaths.safeComponents(witRel) != nil,
+              c.target != .s3 || RepairRules.cubbitKeyIsRepairable(tgtRel),
+              let srcRoot = root(c.source) else {
+            return finish(.failed, step: .liveCheck, .unsafePath)
+        }
+        guard volumeIdentity(srcRoot) != nil else { return finish(.failed, step: .liveCheck, .volumeMissing(c.source)) }
+        guard let srcURL = Self.confined(srcRoot, srcRel) else { return finish(.failed, step: .liveCheck, .unsafePath) }
+        guard Self.isGood(hashFile(srcURL), c.good) else { return finish(.failed, step: .liveCheck, .sourceChanged) }
+
+        if c.witness == .s3 {
+            let candidate = S3ETagMatcher.Candidate(size: c.good.size, sha256: c.good.sha256, md5: c.good.md5,
+                                                    multipartETag: c.good.multipartETag,
+                                                    alternativeETags: c.good.alternativeMultipartETags)
+            do {
+                guard let h = try await cloud.head(key: witRel), h.size == c.good.size,
+                      S3ETagMatcher.verdict(etag: h.etag, size: h.size, candidates: [candidate]) == .certified(sha256: c.good.sha256)
+                else { return finish(.failed, step: .liveCheck, .witnessChanged) }
+            } catch {
+                return finish(.failed, step: .liveCheck, .cubbitError(error.localizedDescription))
+            }
+        } else if let witRoot = root(c.witness) {
+            guard volumeIdentity(witRoot) != nil else { return finish(.failed, step: .liveCheck, .volumeMissing(c.witness)) }
+            guard let witURL = Self.confined(witRoot, witRel), Self.isGood(hashFile(witURL), c.good) else {
+                return finish(.failed, step: .liveCheck, .witnessChanged)
+            }
+        }
+
+        let badETag = RepairRules.normalizedETag(c.badETag)
+        var target: (root: URL, device: dev_t, url: URL)? = nil
+        if c.target == .s3 {
+            do {
+                guard let h = try await cloud.head(key: tgtRel) else { return finish(.failed, step: .liveCheck, .badCopyMissing) }
+                guard badETag != nil, h.size == c.badSize, RepairRules.normalizedETag(h.etag) == badETag else {
+                    return finish(.failed, step: .liveCheck, .badCopyChanged)
+                }
+            } catch {
+                return finish(.failed, step: .liveCheck, .cubbitError(error.localizedDescription))
+            }
+        } else if let tgtRoot = root(c.target) {
+            guard let device = volumeIdentity(tgtRoot) else { return finish(.failed, step: .liveCheck, .volumeMissing(c.target)) }
+            guard let url = Self.confined(tgtRoot, tgtRel) else { return finish(.failed, step: .liveCheck, .unsafePath) }
+            guard Self.itemExists(url) else { return finish(.failed, step: .liveCheck, .badCopyMissing) }
+            guard case .digest(let d) = hashFile(url), d.size == c.badSize, d.sha256 == c.badSHA256 else {
+                return finish(.failed, step: .liveCheck, .badCopyChanged)
+            }
+            target = (tgtRoot, device, url)
+        }
+
+        // CONTROLLO SENZA RIPARARE: il ricontrollo e' fatto; si dice dove andrebbe la copia diversa
+        // e ci si ferma, senza scrivere niente.
+        if dryRun {
+            if c.target == .s3 {
+                do {
+                    if let existing = try await existingQuarantineCopy(of: tgtRel, size: c.badSize, etag: badETag) {
+                        out.quarantinePath = existing
+                        out.reusedQuarantineCopy = true
+                    } else {
+                        guard let fresh = RepairPaths.quarantinePath(for: tgtRel, date: started, calendar: calendar) else {
+                            return finish(.failed, step: .quarantine, .unsafePath)
+                        }
+                        if let h = try await cloud.head(key: fresh),
+                           !(h.size == c.badSize && RepairRules.normalizedETag(h.etag) == badETag) {
+                            return finish(.failed, step: .quarantine, .quarantineOccupied)
+                        }
+                        out.quarantinePath = fresh
+                    }
+                } catch {
+                    return finish(.failed, step: .quarantine, .quarantineFailed(error.localizedDescription))
+                }
+            } else if let t = target {
+                guard let qRel = RepairPaths.quarantinePath(for: tgtRel, date: started, calendar: calendar) else {
+                    return finish(.failed, step: .quarantine, .unsafePath)
+                }
+                guard !Self.itemExists(t.root.appendingPathComponent(qRel)) else {
+                    return finish(.failed, step: .quarantine, .quarantineOccupied)
+                }
+                out.quarantinePath = qRel
+            }
+            return finish(.repaired)
+        }
+
+        // Il registro PRIMA di toccare qualunque archivio.
+        do {
+            try record(rec)
+        } catch {
+            return finish(.failed, step: .log, .logNotWritten(error.localizedDescription))
+        }
+
+        if c.target == .s3 {
+            // 2. QUARANTENA su Cubbit: copia lato server, idempotente.
+            onStep(.quarantine)
+            do {
+                let qKey: String
+                if let existing = try await existingQuarantineCopy(of: tgtRel, size: c.badSize, etag: badETag) {
+                    qKey = existing
+                    out.reusedQuarantineCopy = true
+                } else {
+                    guard let fresh = RepairPaths.quarantinePath(for: tgtRel, date: started, calendar: calendar) else {
+                        return finish(.failed, step: .quarantine, .unsafePath)
+                    }
+                    if let h = try await cloud.head(key: fresh) {
+                        // Zero-overwrite anche in quarantena: si riusa solo se e' proprio lei.
+                        guard h.size == c.badSize, RepairRules.normalizedETag(h.etag) == badETag else {
+                            return finish(.failed, step: .quarantine, .quarantineOccupied)
+                        }
+                        out.reusedQuarantineCopy = true
+                    } else {
+                        try await cloud.copy(from: tgtRel, to: fresh)
+                    }
+                    qKey = fresh
+                }
+                out.quarantinePath = qKey
+                guard let h = try await cloud.head(key: qKey), h.size == c.badSize,
+                      RepairRules.normalizedETag(h.etag) == badETag else {
+                    return finish(.failed, step: .quarantine, .quarantineCopyMismatch)
+                }
+            } catch {
+                return finish(.failed, step: .quarantine, .quarantineFailed(error.localizedDescription))
+            }
+
+            // 3. SCRITTURA: la sola sovrascrittura del progetto.
+            onStep(.write)
+            do {
+                try await cloud.replace(key: tgtRel, withFileAt: srcURL)
+            } catch {
+                return finish(.failed, step: .write, .writeFailed(error.localizedDescription))
+            }
+
+            // 4. VERIFICA FINALE: l'ETag deve essere quello della copia buona.
+            onStep(.finalCheck)
+            do {
+                let h = try await cloud.head(key: tgtRel)
+                out.afterETag = h?.etag
+                guard let h, h.size == c.good.size,
+                      RepairRules.normalizedETag(h.etag) == RepairRules.expectedCubbitETag(for: c.good) else {
+                    return finish(.verificationFailed, step: .finalCheck, .finalCheckFailed)
+                }
+            } catch {
+                return finish(.verificationFailed, step: .finalCheck, .cubbitError(error.localizedDescription))
+            }
+        } else if let t = target {
+            let token = makeToken()
+            guard let qRel = RepairPaths.quarantinePath(for: tgtRel, date: started, calendar: calendar),
+                  let stRel = RepairPaths.stagingPath(for: tgtRel, date: started, calendar: calendar, token: token) else {
+                return finish(.failed, step: .write, .unsafePath)
+            }
+            let qURL = t.root.appendingPathComponent(qRel)
+            let stURL = t.root.appendingPathComponent(stRel)
+            let qDir = qURL.deletingLastPathComponent()
+
+            // 2a. PREPARAZIONE della copia buona, dentro la quarantena: la foto non e' ancora toccata.
+            onStep(.write)
+            guard volumeIdentity(t.root) == t.device else { return finish(.failed, step: .write, .volumeMissing(c.target)) }
+            guard !Self.itemExists(qURL) else { return finish(.failed, step: .write, .quarantineOccupied) }
+            do {
+                try FileManager.default.createDirectory(at: qDir, withIntermediateDirectories: true)
+            } catch {
+                return finish(.failed, step: .write, .stagingFailed(error.localizedDescription))
+            }
+            // `createDirectory` su un disco appena sparito creerebbe la cartella sul disco del
+            // Mac: dopo averla creata, deve stare sullo stesso disco e sotto la radice.
+            guard volumeIdentity(qDir) == t.device, Self.isInside(qDir, root: t.root) else {
+                return finish(.failed, step: .write, .unsafePath)
+            }
+            do {
+                try copyFile(srcURL, stURL)
+            } catch {
+                if Self.itemExists(stURL) { out.leftoverStagingPath = stRel }
+                return finish(.failed, step: .write, .stagingFailed(error.localizedDescription))
+            }
+            out.leftoverStagingPath = stRel
+            guard Self.isGood(hashFile(stURL), c.good) else { return finish(.failed, step: .write, .stagingMismatch) }
+
+            // 2b. QUARANTENA: la copia rovinata si sposta, sullo stesso volume.
+            onStep(.quarantine)
+            guard volumeIdentity(t.root) == t.device else { return finish(.failed, step: .quarantine, .volumeMissing(c.target)) }
+            do {
+                try renameFile(t.url, qURL)
+            } catch {
+                return finish(.failed, step: .quarantine, .quarantineFailed(error.localizedDescription))
+            }
+            out.quarantinePath = qRel
+
+            // 3. SCRITTURA: la copia preparata al suo posto. Se fallisce, la rovinata torna dov'era.
+            onStep(.write)
+            do {
+                try renameFile(stURL, t.url)
+                out.leftoverStagingPath = nil
+            } catch {
+                if (try? renameFile(qURL, t.url)) != nil {
+                    out.restoredOriginal = true
+                    out.quarantinePath = nil
+                }
+                return finish(.failed, step: .write, .writeFailed(error.localizedDescription))
+            }
+
+            // 4. VERIFICA FINALE: rilettura della foto al suo posto.
+            onStep(.finalCheck)
+            let after = hashFile(t.url)
+            if case .digest(let d) = after { out.afterSHA256 = d.sha256 }
+            guard Self.isGood(after, c.good) else { return finish(.verificationFailed, step: .finalCheck, .finalCheckFailed) }
+        } else {
+            return finish(.failed, step: .liveCheck, .unsafePath)
+        }
+
+        // 5. REGISTRO.
+        onStep(.log)
+        return finish(.repaired)
+    }
+}
+
 // MARK: - Testi e regole della card "Foto gia' salvate" (roadmap #31, Task 6)
 
 /// I nomi dei comandi della card, in un punto solo. Non e' pignoleria: due dei messaggi

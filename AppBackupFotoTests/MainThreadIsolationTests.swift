@@ -292,4 +292,38 @@ final class MainThreadIsolationTests: XCTestCase {
         XCTAssertEqual(done.wait(timeout: .now() + 10), .success,
                        "InventoryRefresh.run ha avuto bisogno del main thread (manca @concurrent?).")
     }
+
+    // MARK: - Riparazione (ROADMAP #45)
+
+    func testRepairEngineRun_runsWithoutTheMainThread() throws {
+        let ssd = tmp.appendingPathComponent("SSD"), hdd = tmp.appendingPathComponent("HDD")
+        for d in [ssd, hdd] { try FileManager.default.createDirectory(at: d, withIntermediateDirectories: true) }
+        try Data("buona".utf8).write(to: ssd.appendingPathComponent("a.jpg"))
+        try Data("buona".utf8).write(to: hdd.appendingPathComponent("a.jpg"))
+        let cloud = FakeRepairCloud()
+        cloud.put("a.jpg", "rovinata")
+        var h = ContentHasher(); h.update(Data("buona".utf8))
+        let c = RepairCandidate(key: "a.jpg", target: .s3, source: .ssd, witness: .hdd,
+                                paths: [.ssd: "a.jpg", .hdd: "a.jpg", .s3: "a.jpg"], good: h.finalize(),
+                                badSize: 8, badSHA256: nil, badETag: FakeRepairCloud.md5(Data("rovinata".utf8)))
+        let log = try RepairLogStore(url: tmp.appendingPathComponent("repair-log.json"))
+        let done = DispatchSemaphore(value: 0)
+        Task.detached {
+            let engine = RepairEngine(ssdRoot: ssd, hddRoot: hdd, cloud: cloud, record: { try log.record($0) })
+            _ = await engine.run(c)
+            done.signal()
+        }
+        XCTAssertEqual(done.wait(timeout: .now() + 10), .success,
+                       "RepairEngine.run ha avuto bisogno del main thread (manca @concurrent o nonisolated?).")
+    }
+
+    func testRepairLogStore_runsWithoutTheMainThread() throws {
+        let log = try RepairLogStore(url: tmp.appendingPathComponent("repair-log.json"))
+        let done = DispatchSemaphore(value: 0)
+        Task.detached {
+            _ = log.records()
+            done.signal()
+        }
+        XCTAssertEqual(done.wait(timeout: .now() + 10), .success, "RepairLogStore ha avuto bisogno del main thread.")
+    }
 }
