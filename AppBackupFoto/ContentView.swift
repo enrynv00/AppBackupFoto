@@ -8724,7 +8724,9 @@ final class S3Syncer {
     /// `listPage` non legge. La richiesta resta UNA — stessa URL, stessa firma, stesse
     /// correzioni di BUG-8 (`encodePlusInQuery`, `xmlDecode`) — e i chiamanti di `listPage`
     /// ricevono esattamente quello che ricevevano prima.
-    func fetchListPageXML(config: S3Config, token: String?) async throws -> String {
+    /// `prefix` (ROADMAP #45, default `nil` = la richiesta di sempre): la riparazione elenca
+    /// solo `_quarantena/` per sapere se una copia rovinata e' gia' stata messa da parte.
+    func fetchListPageXML(config: S3Config, token: String?, prefix: String? = nil) async throws -> String {
         guard var comps = URLComponents(string: "\(config.endpoint)/\(config.bucket)") else {
             throw NSError(domain: "S3", code: 8,
                 userInfo: [NSLocalizedDescriptionKey: "URL non valido per il bucket: \(config.bucket)"])
@@ -8732,6 +8734,7 @@ final class S3Syncer {
         var qi = [URLQueryItem(name: "list-type", value: "2"),
                   URLQueryItem(name: "max-keys", value: "1000")]
         if let t = token { qi.append(URLQueryItem(name: "continuation-token", value: t)) }
+        if let prefix { qi.append(URLQueryItem(name: "prefix", value: prefix)) }
         comps.queryItems = qi
         comps.percentEncodedQuery = Self.encodePlusInQuery(comps.percentEncodedQuery)
         guard let url = comps.url else {
@@ -9113,8 +9116,160 @@ final class S3Syncer {
         return (resp as? HTTPURLResponse)?.statusCode == 200
     }
 
+    // MARK: - Richieste della riparazione (ROADMAP #45, ADR-0016)
+    //
+    // HEAD (sola lettura), copia lato server (in quarantena) e la sola sovrascrittura del
+    // progetto. Le chiavi viaggiano codificate con `encodeKeyStrict` e la firma riceve lo
+    // stesso identico percorso (`canonicalURI`): niente doppie codifiche diverse fra cio' che
+    // si manda e cio' che si firma, la classe di errore di BUG-8.
+
+    /// Codifica di una chiave (o del nome del bucket) per il percorso di una richiesta e per
+    /// `x-amz-copy-source`: tutto tranne `A-Z a-z 0-9 - _ . ~` e `/`, byte per byte in UTF-8.
+    /// `+` diventa `%2B` (in un percorso Cubbit potrebbe leggerlo come spazio), l'apostrofo
+    /// `%27`, `è` `%C3%A8`. E' la codifica che SigV4 si aspetta per il percorso canonico.
+    // `nonisolated`: pura.
+    nonisolated static func encodeKeyStrict(_ key: String) -> String {
+        var out = ""
+        for byte in key.utf8 {
+            switch byte {
+            case 0x41...0x5A, 0x61...0x7A, 0x30...0x39, 0x2D, 0x5F, 0x2E, 0x7E, 0x2F:
+                out.unicodeScalars.append(Unicode.Scalar(byte))
+            default:
+                out += String(format: "%%%02X", byte)
+            }
+        }
+        return out
+    }
+
+    /// Il percorso di un oggetto, `/<bucket>/<chiave>`, codificato con `encodeKeyStrict`: lo
+    /// stesso testo va nella richiesta e nella firma.
+    nonisolated static func objectRequestPath(bucket: String, key: String) -> String {
+        "/" + encodeKeyStrict(bucket) + "/" + encodeKeyStrict(key)
+    }
+
+    /// Il valore di `x-amz-copy-source`: `<bucket>/<chiave>` codificati, senza la barra
+    /// iniziale — la forma che `rclone copyto` ha usato nella prova su Cubbit del 2026-10-04.
+    nonisolated static func copySourceHeader(bucket: String, key: String) -> String {
+        encodeKeyStrict(bucket) + "/" + encodeKeyStrict(key)
+    }
+
+    /// Come leggere la risposta a una HEAD: 404 = l'oggetto non c'e' (`nil`), 200 con una
+    /// dimensione leggibile = l'oggetto, ogni altra cosa = errore (mai «non c'e'» per
+    /// sbaglio: un 403 o un 500 non dicono niente sull'oggetto).
+    nonisolated static func parseHead(statusCode: Int, contentLength: String?, etag: String?,
+                                      key: String) throws -> S3ObjectHead? {
+        if statusCode == 404 { return nil }
+        guard statusCode == 200 else {
+            throw S3HTTPError(statusCode: statusCode, message: "Errore HEAD \(key)")
+        }
+        guard let text = contentLength?.trimmingCharacters(in: .whitespaces),
+              let size = Int64(text), size >= 0 else {
+            throw S3HTTPError(statusCode: statusCode, message: "HEAD \(key) senza una dimensione leggibile")
+        }
+        return S3ObjectHead(size: size, etag: etag)
+    }
+
+    /// Una copia lato server e' riuscita solo se la risposta e' 2xx E il corpo e' un
+    /// `<CopyObjectResult>`: S3 puo' rispondere 200 e mettere l'errore nel corpo.
+    nonisolated static func copyObjectSucceeded(statusCode: Int, body: String) -> Bool {
+        (200...299).contains(statusCode) && body.contains("<CopyObjectResult") && !body.contains("<Error>")
+    }
+
+    /// HEAD di un oggetto: dimensione ed ETag letti ADESSO da Cubbit (l'inventario e' una
+    /// cache, ADR-0002). `nil` se l'oggetto non c'e'. Sola lettura.
+    func headObject(config: S3Config, key: String) async throws -> S3ObjectHead? {
+        let path = Self.objectRequestPath(bucket: config.bucket, key: key)
+        guard let url = URL(string: config.endpoint + path) else {
+            throw NSError(domain: "S3", code: 12,
+                userInfo: [NSLocalizedDescriptionKey: "URL non valido per il file: \(key)"])
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "HEAD"
+        sign(&req, config: config, body: Data(), date: Date(), canonicalURI: path)
+        let (_, resp) = try await session.data(for: req)
+        guard let http = resp as? HTTPURLResponse else {
+            throw S3HTTPError(statusCode: -1, message: "HEAD \(key): risposta non HTTP")
+        }
+        return try Self.parseHead(statusCode: http.statusCode,
+                                  contentLength: http.value(forHTTPHeaderField: "Content-Length"),
+                                  etag: http.value(forHTTPHeaderField: "ETag"), key: key)
+    }
+
+    /// Copia lato server (`CopyObject`) di `sourceKey` in `destinationKey`, nello stesso
+    /// bucket: la sorgente non viene toccata. La usa SOLO la riparazione, per mettere in
+    /// quarantena la copia rovinata (ADR-0016); chi chiama ha gia' controllato con
+    /// `headObject` che `destinationKey` non esista (zero-overwrite anche in quarantena).
+    /// Provata su Cubbit il 2026-10-04 con `rclone copyto`: copia lato server, ETag identico.
+    func copyObject(config: S3Config, from sourceKey: String, to destinationKey: String) async throws {
+        let path = Self.objectRequestPath(bucket: config.bucket, key: destinationKey)
+        guard let url = URL(string: config.endpoint + path) else {
+            throw NSError(domain: "S3", code: 12,
+                userInfo: [NSLocalizedDescriptionKey: "URL non valido per il file: \(destinationKey)"])
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "PUT"
+        sign(&req, config: config, body: Data(), date: Date(), canonicalURI: path,
+             extraSignedHeaders: ["x-amz-copy-source": Self.copySourceHeader(bucket: config.bucket, key: sourceKey)])
+        let (data, resp) = try await session.data(for: req)
+        let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
+        let body = String(data: data, encoding: .utf8) ?? ""
+        guard Self.copyObjectSucceeded(statusCode: code, body: body) else {
+            throw S3HTTPError(statusCode: code, message: "Errore copia \(sourceKey): \(body.prefix(200))")
+        }
+    }
+
+    /// Tutti gli oggetti sotto `prefix`, pagina dopo pagina. Lancia se la lista non arriva in
+    /// fondo pulita: chi decide in base a cosa c'e' gia' in quarantena non deve leggere una
+    /// lista a meta'.
+    func listObjects(config: S3Config, prefix: String) async throws -> [S3ObjectInfo] {
+        var out: [S3ObjectInfo] = []
+        var token: String? = nil
+        repeat {
+            let page = Self.parseListPage(try await fetchListPageXML(config: config, token: token, prefix: prefix))
+            guard page.malformedEntries == 0 else {
+                throw S3HTTPError(statusCode: 200, message: "Lista di \(prefix) illeggibile")
+            }
+            out += page.objects
+            if page.isTruncated {
+                guard let next = page.nextToken else {
+                    throw S3HTTPError(statusCode: 200, message: "Lista di \(prefix) troncata senza seguito")
+                }
+                token = next
+            } else {
+                token = nil
+            }
+        } while token != nil
+        return out
+    }
+
+    /// LA SOLA SOVRASCRITTURA SU CUBBIT DEL PROGETTO (ADR-0016): rimette al suo posto la copia
+    /// buona di una foto la cui copia rovinata e' gia' in quarantena, verificata. Usa la stessa
+    /// `upload` del backup (PUT unico fino a 64 MiB compresi, a pezzi sopra) con un gate tutto
+    /// suo da uno slot. NON va chiamata da nessun'altra parte: il backup resta zero-overwrite
+    /// (`shouldUpload`, BUG-3). Un'istanza dedicata di `S3Syncer`, mai quella dei job.
+    func replaceObjectForRepair(config: S3Config, key: String, withFileAt url: URL) async throws {
+        beginNewOperation()
+        let gate = AdaptiveUploadGate(startingLimit: 1, ceiling: 1)
+        try await upload(url: url, key: key, config: config, gate: gate, onStart: {}, onStatus: { _ in })
+    }
+
     // MARK: - AWS Signature V4
-    private func sign(_ request: inout URLRequest, config: S3Config, body: Data, date: Date) {
+
+    /// Firma una richiesta. `internal` e non piu' `private` (ROADMAP #45) solo perche'
+    /// `S3SignatureTests` possa bloccare la firma di una richiesta di lista con un valore
+    /// calcolato a parte; nessun chiamante nuovo fuori da questa classe.
+    ///
+    /// Due parametri nuovi, entrambi con un default che lascia la firma di oggi IDENTICA per
+    /// tutte le richieste esistenti:
+    /// - `canonicalURI`: il percorso esattamente come viaggia nella richiesta. Le richieste
+    ///   della riparazione (HEAD, copia) costruiscono il percorso con `encodeKeyStrict`; senza
+    ///   questo parametro la firma ricalcolerebbe il percorso da `url.path` con una codifica
+    ///   diversa per `+`, apostrofo e lettere accentate (la stessa famiglia di BUG-8).
+    /// - `extraSignedHeaders`: intestazioni `x-amz-*` in piu', impostate sulla richiesta E
+    ///   firmate. `x-amz-copy-source` della copia lato server va firmata: S3 rifiuta le
+    ///   intestazioni `x-amz-*` presenti ma non firmate.
+    func sign(_ request: inout URLRequest, config: S3Config, body: Data, date: Date,
+              canonicalURI: String? = nil, extraSignedHeaders: [String: String] = [:]) {
         let fmt = DateFormatter()
         fmt.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
         fmt.timeZone = TimeZone(identifier: "UTC")!
@@ -9127,18 +9282,24 @@ final class S3Syncer {
         let payHash = SHA256.hash(data: body).map { String(format: "%02x", $0) }.joined()
         request.setValue(payHash, forHTTPHeaderField: "x-amz-content-sha256")
 
-        let headerVals: [String: String] = [
+        var headerVals: [String: String] = [
             "host": host,
             "x-amz-content-sha256": payHash,
             "x-amz-date": datetime
         ]
-        let signedNames = headerVals.keys.sorted()
-        let canonH = signedNames.map { "\($0):\(headerVals[$0]!)" }.joined(separator: "\n") + "\n"
-        let signedH = signedNames.joined(separator: ";")
+        for (name, value) in extraSignedHeaders {
+            request.setValue(value, forHTTPHeaderField: name)
+            headerVals[name.lowercased()] = value.trimmingCharacters(in: .whitespaces)
+        }
 
-        let rawPath = request.url?.path ?? "/"
-        let s3PathAllowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_.~/"))
-        let uri = rawPath.addingPercentEncoding(withAllowedCharacters: s3PathAllowed) ?? rawPath
+        let uri: String
+        if let canonicalURI {
+            uri = canonicalURI
+        } else {
+            let rawPath = request.url?.path ?? "/"
+            let s3PathAllowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_.~/"))
+            uri = rawPath.addingPercentEncoding(withAllowedCharacters: s3PathAllowed) ?? rawPath
+        }
 
         func sigv4Encode(_ s: String) -> String {
             let decoded = s.removingPercentEncoding ?? s
@@ -9168,25 +9329,43 @@ final class S3Syncer {
         let sortedQuery = queryParams.sorted { $0.0 < $1.0 }
             .map { "\($0.0)=\($0.1)" }.joined(separator: "&")
 
-        let canonReq = [request.httpMethod ?? "GET", uri, sortedQuery, canonH, signedH, payHash]
-            .joined(separator: "\n")
+        let signed = Self.sigV4Signature(method: request.httpMethod ?? "GET", canonicalURI: uri,
+                                         canonicalQuery: sortedQuery, headers: headerVals,
+                                         payloadHash: payHash, amzDate: datetime,
+                                         secretAccessKey: config.secretAccessKey, region: region)
+        request.setValue(
+            "AWS4-HMAC-SHA256 Credential=\(config.accessKeyId)/\(dateOnly)/\(region)/s3/aws4_request, " +
+            "SignedHeaders=\(signed.signedHeaders), Signature=\(signed.signature)",
+            forHTTPHeaderField: "Authorization")
+    }
 
+    /// Il cuore di SigV4, PURO: dalla richiesta canonica alla firma. Estratto da `sign` il
+    /// 2026-10 (ROADMAP #45) con le stesse identiche operazioni, per poterlo provare con i
+    /// valori pubblicati da AWS (`S3SignatureTests`) prima di mandare a Cubbit la prima copia
+    /// lato server. `headers`: nomi gia' in minuscolo, valori gia' ripuliti.
+    // `nonisolated`: pura.
+    nonisolated static func sigV4Signature(method: String, canonicalURI: String, canonicalQuery: String,
+                                           headers: [String: String], payloadHash: String, amzDate: String,
+                                           secretAccessKey: String, region: String)
+        -> (signedHeaders: String, signature: String) {
+        let signedNames = headers.keys.sorted()
+        let canonH = signedNames.map { "\($0):\(headers[$0]!)" }.joined(separator: "\n") + "\n"
+        let signedH = signedNames.joined(separator: ";")
+        let canonReq = [method, canonicalURI, canonicalQuery, canonH, signedH, payloadHash]
+            .joined(separator: "\n")
+        let dateOnly = String(amzDate.prefix(8))
         let credScope = "\(dateOnly)/\(region)/s3/aws4_request"
         let reqHash = SHA256.hash(data: Data(canonReq.utf8)).map { String(format: "%02x", $0) }.joined()
-        let s2s = "AWS4-HMAC-SHA256\n\(datetime)\n\(credScope)\n\(reqHash)"
+        let s2s = "AWS4-HMAC-SHA256\n\(amzDate)\n\(credScope)\n\(reqHash)"
 
         func hmac(_ key: Data, _ msg: String) -> Data {
             Data(HMAC<SHA256>.authenticationCode(for: Data(msg.utf8), using: SymmetricKey(data: key)))
         }
-        let sigKey = hmac(hmac(hmac(hmac(Data(("AWS4" + config.secretAccessKey).utf8),
+        let sigKey = hmac(hmac(hmac(hmac(Data(("AWS4" + secretAccessKey).utf8),
             dateOnly), region), "s3"), "aws4_request")
         let sig = Data(HMAC<SHA256>.authenticationCode(for: Data(s2s.utf8),
             using: SymmetricKey(data: sigKey))).map { String(format: "%02x", $0) }.joined()
-
-        request.setValue(
-            "AWS4-HMAC-SHA256 Credential=\(config.accessKeyId)/\(credScope), " +
-            "SignedHeaders=\(signedH), Signature=\(sig)",
-            forHTTPHeaderField: "Authorization")
+        return (signedH, sig)
     }
 
     // Cubbit usa come continuation-token la chiave stessa. URLComponents lascia il `+` nella
@@ -9247,6 +9426,13 @@ final class S3Syncer {
     nonisolated struct S3ObjectInfo: Equatable, Sendable {
         let key: String
         let size: Int64
+        let etag: String?
+    }
+
+    /// Dimensione ed ETag di un oggetto, letti con una HEAD (ROADMAP #45).
+    nonisolated struct S3ObjectHead: Equatable, Sendable {
+        let size: Int64
+        /// Cosi' come arriva nell'intestazione (virgolette comprese); `nil` se manca.
         let etag: String?
     }
 
