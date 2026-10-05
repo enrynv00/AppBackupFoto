@@ -3629,6 +3629,262 @@ nonisolated struct DuplicateRunOutcome {
     var stopReason: DuplicateRunStopReason? = nil
 }
 
+// MARK: - Doppioni sull'SSD con la garanzia dell'inventario (ROADMAP #46, ADR-0017)
+
+/// Quando un backup o un import ha scritto per l'ultima volta su SSD, HDD o Cubbit: il
+/// riferimento con cui si decide se l'inventario vale ancora per i Doppioni (decisione 1 di
+/// Enrico: un inventario piu' vecchio dell'ultimo backup non certifica niente).
+///
+/// Contano SOLO i job che passano da `BackupRunner.run(label:...)`: Mac → SSD, SSD → HDD,
+/// SSD → Cubbit e gli import, cioe' gli unici che scrivono sugli archivi. Non passano da li', e
+/// quindi non contano, gli spostamenti nel Cestino, gli annullamenti, le riparazioni,
+/// l'inventario e la lettura dell'elenco.
+///
+/// Due fonti, vale la piu' recente:
+/// - la data dell'ultimo `JobSummary` (`JobHistoryStore`): la FINE dell'ultimo job, anche
+///   interrotto o fallito (puo' aver scritto lo stesso);
+/// - `startedKey`, scritta all'INIZIO di ogni job da `run(label:...)`: copre il job che non
+///   arriva mai a salvare il suo `JobSummary` (l'app chiusa a forza a meta' copia).
+/// Un job e un inventario non si sovrappongono mai (mutua esclusione nei due versi): per un job
+/// arrivato in fondo, «iniziato dopo l'inizio del giro» e «finito dopo l'inizio del giro»
+/// sono la stessa cosa.
+///
+/// NON `nonisolated`: legge `JobHistoryStore`, che vive sul MainActor. Si chiama dal main
+/// (la finestra Doppioni, `run(label:)`, il ricontrollo della corsa via `MainActor.run`).
+enum ArchiveWriteClock {
+    static let startedKey = "lastArchiveWriteJobStartedAt"
+
+    static func markStarted(at date: Date = Date(), defaults: UserDefaults = .standard) {
+        defaults.set(date, forKey: startedKey)
+    }
+
+    /// `nil` = nessun job registrato.
+    static func lastWriteAt(defaults: UserDefaults = .standard) -> Date? {
+        let ended = JobHistoryStore.load(defaults: defaults)?.date
+        let started = defaults.object(forKey: startedKey) as? Date
+        return [ended, started].compactMap { $0 }.max()
+    }
+}
+
+/// Se l'ultimo inventario vale per i Doppioni (spec, «Regole»: completo su tutti e tre gli
+/// archivi, e nessun backup o import finito dopo l'inizio di quel giro). Vale per tutti i gruppi
+/// insieme. Logica pura.
+// `nonisolated`: value type puro, calcolato fuori dal main con il resto della certificazione.
+nonisolated enum DuplicateInventoryFreshness: Equatable, Sendable {
+    /// Nessun inventario salvato.
+    case neverRun
+    /// Un archivio non e' stato letto per intero, o i tre stati non sono dello stesso giro, o
+    /// un giro e' ancora in corso (ADR-0015: incompleto non e' assente).
+    case incomplete
+    /// L'inventario salvato non si e' lasciato leggere.
+    case unreadable
+    /// Un backup o un import ha scritto dopo l'inizio del giro.
+    case olderThanLastBackup(backupAt: Date, startedAt: Double, finishedAt: Double)
+    case fresh(runId: Int64, startedAt: Double, finishedAt: Double)
+
+    /// Precedenza: mai fatto > incompleto > piu' vecchio dell'ultimo backup.
+    static func evaluate(states: [InventoryArchive: InventoryArchiveState],
+                         lastArchiveWriteAt: Date?) -> DuplicateInventoryFreshness {
+        guard !states.isEmpty else { return .neverRun }
+        let all = InventoryArchive.allCases.compactMap { states[$0] }
+        guard all.count == InventoryArchive.allCases.count,
+              all.allSatisfy(\.complete),
+              Set(all.map(\.runId)).count == 1 else { return .incomplete }
+        // L'inizio piu' vecchio dei tre (oggi coincidono: `beginInventoryRun` li scrive insieme).
+        let startedAt = all.map(\.startedAt).min() ?? 0
+        let finishedAt = all.compactMap(\.finishedAt).max() ?? startedAt
+        // Confronto con l'INIZIO del giro, non con la fine: un archivio letto prima del backup
+        // non ha visto quello che il backup ha scritto.
+        if let written = lastArchiveWriteAt, written.timeIntervalSince1970 > startedAt {
+            return .olderThanLastBackup(backupAt: written, startedAt: startedAt, finishedAt: finishedAt)
+        }
+        return .fresh(runId: all[0].runId, startedAt: startedAt, finishedAt: finishedAt)
+    }
+}
+
+/// Perche' un gruppo di doppioni non si puo' spuntare. Ogni caso ha la sua frase in
+/// `DuplicatesStatus.certificationReason`.
+// `nonisolated`: value type puro.
+nonisolated enum DuplicateCertificationBlock: Equatable, Sendable {
+    case inventoryNeverRun
+    case inventoryIncomplete
+    case inventoryUnreadable
+    case inventoryOlderThanLastBackup(backupAt: Date)
+    /// Il contenuto del gruppo non e' nella categoria ✅ «Al sicuro» dell'ultimo giro.
+    case notSafeOnAllThree
+    /// Una copia del gruppo (la tenuta o una che esce) non e' nell'inventario dell'SSD di quel
+    /// giro con lo stesso contenuto: letta dopo, cambiata, o illeggibile allora.
+    case changedAfterInventory
+    /// Solo al ricontrollo prima dello spostamento: l'inventario e' stato rifatto dopo che la
+    /// finestra aveva calcolato quali gruppi sono certificati.
+    case inventoryChangedSinceOpening
+
+    /// Il motivo che vale per tutti i gruppi, o `nil` se l'inventario e' fresco.
+    init?(freshness: DuplicateInventoryFreshness) {
+        switch freshness {
+        case .neverRun: self = .inventoryNeverRun
+        case .incomplete: self = .inventoryIncomplete
+        case .unreadable: self = .inventoryUnreadable
+        case .olderThanLastBackup(let backupAt, _, _): self = .inventoryOlderThanLastBackup(backupAt: backupAt)
+        case .fresh: return nil
+        }
+    }
+}
+
+/// Quello che serve dall'ultimo inventario per certificare i gruppi, calcolato UNA volta fuori
+/// dal main (la classificazione di tutto l'inventario costa secondi: mai nel `body`, mai a ogni
+/// ridisegno). `BackupRunner` ne tiene l'ultima copia e la riusa finche' gli stati dei tre
+/// archivi non cambiano (`load(store:reusing:)`).
+// `nonisolated`: value type senza stato condiviso, costruito in un `Task.detached`.
+nonisolated struct DuplicateCertificationBasis: Sendable {
+    let states: [InventoryArchive: InventoryArchiveState]
+    /// Vero se l'inventario salvato non si e' lasciato leggere.
+    let readFailed: Bool
+    /// I contenuti (SHA256) nella categoria ✅ dell'ultimo giro. Vuoto se il giro non e' completo.
+    let safeHashes: Set<String>
+    /// Chiave normalizzata → SHA256 dei file dell'SSD letti bene nell'ultimo giro. Vuoto se il
+    /// giro non e' completo.
+    let ssdHashByKey: [String: String]
+
+    private init(states: [InventoryArchive: InventoryArchiveState], readFailed: Bool,
+                 safeHashes: Set<String>, ssdHashByKey: [String: String]) {
+        self.states = states
+        self.readFailed = readFailed
+        self.safeHashes = safeHashes
+        self.ssdHashByKey = ssdHashByKey
+    }
+
+    static let unreadable = DuplicateCertificationBasis(states: [:], readFailed: true, safeHashes: [], ssdHashByKey: [:])
+
+    /// Tre archivi, tutti completi, dello stesso giro.
+    static func isCompleteRun(_ states: [InventoryArchive: InventoryArchiveState]) -> Bool {
+        let all = InventoryArchive.allCases.compactMap { states[$0] }
+        return all.count == InventoryArchive.allCases.count && all.allSatisfy(\.complete)
+            && Set(all.map(\.runId)).count == 1
+    }
+
+    /// Dalla fotografia dell'inventario. La categoria ✅ e' quella di `InventoryClassifier`, la
+    /// stessa che mostra la finestra Inventario: una regola sola, mai una seconda.
+    init(snapshot: InventorySnapshot) {
+        self.states = snapshot.states
+        self.readFailed = false
+        guard Self.isCompleteRun(snapshot.states) else {
+            self.safeHashes = []
+            self.ssdHashByKey = [:]
+            return
+        }
+        let (items, _) = InventoryClassifier.classify(snapshot)
+        self.safeHashes = Set(items.lazy.filter { $0.category == .safe }.map(\.id))
+        var byKey: [String: String] = [:]
+        byKey.reserveCapacity(snapshot.ssd.count)
+        for file in snapshot.ssd where file.status == .ok {
+            guard let digest = file.digest else { continue }
+            byKey[file.key] = digest.sha256
+        }
+        self.ssdHashByKey = byKey
+    }
+
+    /// Legge l'inventario salvato. Gli stati per primi (una query piccola): se sono gli stessi
+    /// di `cached`, si riusa quella; se il giro non e' completo non si legge altro (non
+    /// certificherebbe niente). Non lancia: un errore di lettura e' `.unreadable`, che blocca
+    /// tutto.
+    static func load(store: LibraryIndexStore, reusing cached: DuplicateCertificationBasis?) -> DuplicateCertificationBasis {
+        guard let states = try? store.inventoryStates() else { return .unreadable }
+        if let cached, !cached.readFailed, cached.states == states { return cached }
+        guard isCompleteRun(states) else {
+            return DuplicateCertificationBasis(states: states, readFailed: false, safeHashes: [], ssdHashByKey: [:])
+        }
+        guard let snapshot = try? store.inventorySnapshot() else { return .unreadable }
+        return DuplicateCertificationBasis(snapshot: snapshot)
+    }
+}
+
+/// Quali gruppi di doppioni si possono spuntare (spec, «Regole»), calcolato una volta fuori dal
+/// main per tutti i gruppi caricati e letto dalla finestra in O(1) per riga. Un gruppo e'
+/// spuntabile solo se l'inventario e' fresco, il suo contenuto e' ✅ e TUTTE le sue copie
+/// (la tenuta e quelle che escono) sono nell'inventario dell'SSD di quel giro con lo stesso
+/// contenuto. Un hash che non era fra i gruppi certificati non e' mai spuntabile.
+///
+/// Non sostituisce niente di ADR-0005: allo spostamento ogni copia si rilegge e si rihasha
+/// comunque dal disco. Questa e' una condizione IN PIU'.
+// `nonisolated`: value type puro, costruito in un `Task.detached` e passato al runner.
+nonisolated struct DuplicateCertification: Sendable {
+    let freshness: DuplicateInventoryFreshness
+    private let certifiedHashes: Set<String>
+    private let blockedByHash: [String: DuplicateCertificationBlock]
+
+    init(basis: DuplicateCertificationBasis, lastArchiveWriteAt: Date?, groups: [DuplicateGroup]) {
+        let freshness = basis.readFailed
+            ? .unreadable
+            : DuplicateInventoryFreshness.evaluate(states: basis.states, lastArchiveWriteAt: lastArchiveWriteAt)
+        self.freshness = freshness
+        guard case .fresh = freshness else {
+            self.certifiedHashes = []
+            self.blockedByHash = [:]
+            return
+        }
+        var certified = Set<String>()
+        var blocked: [String: DuplicateCertificationBlock] = [:]
+        for group in groups {
+            if let block = Self.groupBlock(group, basis: basis) {
+                blocked[group.hash] = block
+            } else {
+                certified.insert(group.hash)
+            }
+        }
+        self.certifiedHashes = certified
+        self.blockedByHash = blocked
+    }
+
+    /// La regola per un gruppo, con l'inventario gia' fresco. Precedenza della spec: foto non
+    /// al sicuro su tutti e tre > copia cambiata dopo l'inventario.
+    static func groupBlock(_ group: DuplicateGroup, basis: DuplicateCertificationBasis) -> DuplicateCertificationBlock? {
+        guard basis.safeHashes.contains(group.hash) else { return .notSafeOnAllThree }
+        // OGNI membro, la copia tenuta compresa: la regola della spec vale per entrambe.
+        for member in group.members where basis.ssdHashByKey[member.path] != group.hash {
+            return .changedAfterInventory
+        }
+        return nil
+    }
+
+    /// Il motivo per cui il gruppo non si puo' spuntare, `nil` se si puo'.
+    func block(for hash: String) -> DuplicateCertificationBlock? {
+        if let global = DuplicateCertificationBlock(freshness: freshness) { return global }
+        if certifiedHashes.contains(hash) { return nil }
+        return blockedByHash[hash] ?? .changedAfterInventory
+    }
+
+    func isSelectable(_ hash: String) -> Bool { block(for: hash) == nil }
+
+    /// Il giro che ha certificato i gruppi: il ricontrollo prima dello spostamento pretende lo stesso.
+    var certifiedRunId: Int64? {
+        if case .fresh(let runId, _, _) = freshness { return runId }
+        return nil
+    }
+
+    /// Quando e' finito il giro che certifica, per il riepilogo.
+    var inventoryFinishedAt: Date? {
+        if case .fresh(_, _, let finishedAt) = freshness { return Date(timeIntervalSince1970: finishedAt) }
+        return nil
+    }
+
+    /// Quanti gruppi della corsa questa certificazione NON copre (deve essere 0 per partire).
+    func uncoveredGroupCount(in plan: DuplicateRunPlan) -> Int {
+        plan.blocks.reduce(0) { total, block in total + block.filter { !isSelectable($0.group.hash) }.count }
+    }
+
+    /// Il ricontrollo subito prima di ogni blocco di uno spostamento (spec: «il controllo di
+    /// freschezza si rifa'»). `states == nil` = l'inventario non si e' lasciato leggere.
+    static func runBlock(states: [InventoryArchive: InventoryArchiveState]?, lastArchiveWriteAt: Date?,
+                         certifiedRunId: Int64) -> DuplicateCertificationBlock? {
+        guard let states else { return .inventoryUnreadable }
+        let freshness = DuplicateInventoryFreshness.evaluate(states: states, lastArchiveWriteAt: lastArchiveWriteAt)
+        if let block = DuplicateCertificationBlock(freshness: freshness) { return block }
+        if case .fresh(let runId, _, _) = freshness, runId != certifiedRunId { return .inventoryChangedSinceOpening }
+        return nil
+    }
+}
+
 // MARK: - Righe di stato del pannello Doppioni (Task 6, 2026-08-31)
 
 /// Cosa dire in cima al pannello Doppioni, perche' la cancellazione e' disattivata in questo

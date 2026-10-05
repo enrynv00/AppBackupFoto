@@ -326,4 +326,20 @@ final class MainThreadIsolationTests: XCTestCase {
         }
         XCTAssertEqual(done.wait(timeout: .now() + 10), .success, "RepairLogStore ha avuto bisogno del main thread.")
     }
+
+    // MARK: - Doppioni con la garanzia dell'inventario (ROADMAP #46)
+
+    /// La lettura e la classificazione dell'inventario per i Doppioni costano secondi: devono
+    /// girare fuori dal main come in `DuplicatesView.refreshCertification()`.
+    func testDuplicateCertificationLoad_runsWithoutTheMainThread() throws {
+        let store = try makeStore()
+        let done = DispatchSemaphore(value: 0)
+        Task.detached {
+            let basis = DuplicateCertificationBasis.load(store: store, reusing: nil)
+            _ = DuplicateCertification(basis: basis, lastArchiveWriteAt: nil, groups: [])
+            done.signal()
+        }
+        XCTAssertEqual(done.wait(timeout: .now() + 10), .success,
+                       "DuplicateCertificationBasis.load ha avuto bisogno del main thread: manca un nonisolated?")
+    }
 }
