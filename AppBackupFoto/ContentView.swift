@@ -17635,6 +17635,27 @@ struct DuplicatesView: View {
 
     @State private var thumbnailCache = DuplicateThumbnailCache()
 
+    // MARK: - La garanzia dell'inventario (ROADMAP #46, ADR-0017)
+
+    /// Quali gruppi si possono spuntare, calcolato fuori dal main da `refreshCertification()`,
+    /// mai nel `body`. `nil` finche' non e' pronto: nessuna casella si accende.
+    @State private var certification: DuplicateCertification? = nil
+    /// Scarta un calcolo arrivato dopo uno piu' recente (stesso meccanismo di `loadToken` delle
+    /// miniature): un backup finito mentre si calcolava non deve essere coperto da un risultato
+    /// vecchio.
+    @State private var certificationToken = UUID()
+    /// La certificazione congelata insieme a `pendingBatch` in `beginConfirmation()`: viaggia
+    /// invariata fino al runner, che ricontrolla la freschezza prima di ogni blocco.
+    @State private var pendingCertification: DuplicateCertification? = nil
+    /// Quanti gruppi visibili non si possono spuntare (`DuplicatesStatus.bulkSkipLine`),
+    /// ricalcolato da `recountBlocked()` quando cambiano l'insieme visibile o la certificazione.
+    @State private var visibleBlockedCount = 0
+    /// I gruppi coperti dalla regola per cartella attiva (vuoto senza regola), calcolati in
+    /// `rebuildBatch` insieme a `ruleCoverage`.
+    @State private var ruleCoveredHashes: [String] = []
+    @State private var ruleCoveredBlockedCount = 0
+    @Environment(\.openWindow) private var openWindow
+
     var body: some View {
         if gate.touchIDEnabled && !gate.unlocked {
             LockScreenView()
@@ -17648,6 +17669,8 @@ struct DuplicatesView: View {
             Text("Doppioni").font(AppFont.title)
 
             headerLine
+
+            certificationBanner
 
             Label(DuplicatesStatus.mirrorsUntouchedNote(), systemImage: "externaldrive.badge.checkmark")
                 .font(AppFont.caption).foregroundStyle(.secondary)
@@ -17683,6 +17706,12 @@ struct DuplicatesView: View {
             }
 
             selectionStatusLine
+
+            if let skipped = DuplicatesStatus.bulkSkipLine(blockedVisible: visibleBlockedCount,
+                                                            visible: visibleIndices.count) {
+                Text(skipped).font(AppFont.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
             if runner.isTrashingDuplicates, let progress = runner.duplicateRunProgress {
                 duplicateRunProgressBar(progress)
@@ -17754,11 +17783,20 @@ struct DuplicatesView: View {
         // prima stava nel blocco finale del `Task.detached` di `startTrashing`: le chiavi dei
         // file davvero cestinati sono gia' state tolte dall'elenco dentro `run(...)`, quindi
         // si rilegge per mostrare i gruppi rimasti.
+        // La garanzia si ricalcola quando finisce un backup (puo' aver invecchiato l'inventario)
+        // o un inventario (puo' averlo rinnovato): il pannello lo dice senza essere riaperto.
+        .onChange(of: runner.isRunning) { _, running in
+            if !running { refreshCertification() }
+        }
+        .onChange(of: runner.isInventorying) { _, inventorying in
+            if !inventorying { refreshCertification() }
+        }
         .onChange(of: runner.isTrashingDuplicates) { _, isTrashing in
             if !isTrashing {
                 selectedHashes.removeAll()
                 pendingBatch = nil
                 pendingPlan = nil
+                pendingCertification = nil
                 loadGroups()
             }
         }
@@ -17965,6 +18003,10 @@ struct DuplicatesView: View {
                                                        excludedByThirdFolder: coverage.excludedByThirdFolder))
                     .font(AppFont.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
+                if let blocked = DuplicatesStatus.ruleBlockedLine(blockedCovered: ruleCoveredBlockedCount) {
+                    Text(blocked).font(AppFont.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
 
             HStack {
@@ -18013,6 +18055,7 @@ struct DuplicatesView: View {
                             let entry = batch.groups[i]
                             DuplicateGroupRow(entry: entry,
                                               isSelected: selectedHashes.contains(entry.group.hash),
+                                              blockedReason: blockedRowLine(for: entry.group.hash),
                                               libraryRootPath: BookmarkManager.shared.urls[.ssd]?.path,
                                               cache: thumbnailCache) {
                                 toggleSelection(entry.group.hash)
@@ -18086,6 +18129,13 @@ struct DuplicatesView: View {
             // scoprirlo dopo un guasto a meta' corsa. `pendingPlan` e' gia' calcolato,
             // congelato insieme a `batch` in `beginConfirmation()` — mai ricalcolato qui,
             // che SwiftUI puo' richiamare a ogni ridisegno (regola 9).
+            if let finishedAt = pendingCertification?.inventoryFinishedAt {
+                Label(DuplicatesStatus.certifiedSummaryLine(inventoryFinishedAt: finishedAt),
+                      systemImage: "checkmark.shield")
+                    .font(AppFont.body)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             if let plan = pendingPlan {
                 Text(DuplicatesStatus.runPlanLine(blockCount: plan.blocks.count, files: batch.fileCount,
                                                   estimatedSeconds: plan.estimatedSeconds))
@@ -18115,6 +18165,9 @@ struct DuplicatesView: View {
     // MARK: - Azioni
 
     private func toggleSelection(_ hash: String) {
+        // Seconda difesa (la casella e' gia' spenta): un gruppo non certificato non entra mai
+        // nella selezione; toglierlo invece si puo' sempre.
+        guard selectedHashes.contains(hash) || certification?.isSelectable(hash) == true else { return }
         if selectedHashes.contains(hash) { selectedHashes.remove(hash) } else { selectedHashes.insert(hash) }
         recomputeSelectionStats()
     }
@@ -18124,7 +18177,10 @@ struct DuplicatesView: View {
     /// si aggiunge soltanto, non si sostituisce l'insieme selezionato.
     private func selectAllVisible() {
         guard let loadedBatch else { return }
-        for i in visibleIndices { selectedHashes.insert(loadedBatch.groups[i].group.hash) }
+        for i in visibleIndices {
+            let hash = loadedBatch.groups[i].group.hash
+            if certification?.isSelectable(hash) == true { selectedHashes.insert(hash) }
+        }
         recomputeSelectionStats()
     }
 
@@ -18182,6 +18238,7 @@ struct DuplicatesView: View {
             await MainActor.run {
                 self.visibleIndices = indices
                 self.isApplyingFilter = false
+                self.recountBlocked()
             }
         }
     }
@@ -18217,6 +18274,7 @@ struct DuplicatesView: View {
                 await MainActor.run {
                     self.loadState = .loaded(groups)
                     self.rebuildBatch(from: groups, rule: rule)
+                    self.refreshCertification()
                 }
             } catch {
                 await MainActor.run {
@@ -18252,8 +18310,10 @@ struct DuplicatesView: View {
             }
             let indices = currentFilter.apply(to: groupsOnly)
             var coverage: (covered: Int, excludedByThirdFolder: Int)? = nil
+            var coveredHashes: [String] = []
             if let rule {
-                let covered = groupsOnly.filter { rule.covers($0) }.count
+                coveredHashes = groupsOnly.filter { rule.covers($0) }.map(\.hash)
+                let covered = coveredHashes.count
                 let excluded = groupsOnly.filter { g in
                     guard !rule.covers(g) else { return false }
                     return g.members.contains(where: {
@@ -18270,6 +18330,7 @@ struct DuplicatesView: View {
             let finalByHash = byHash
             let finalDisplayNames = displayNames
             let finalCoverage = coverage
+            let finalCoveredHashes = coveredHashes
             await MainActor.run {
                 self.loadedBatch = batch
                 self.folderList = folders
@@ -18277,12 +18338,16 @@ struct DuplicatesView: View {
                 self.entryByHash = finalByHash
                 self.visibleIndices = indices
                 self.ruleCoverage = finalCoverage
+                self.ruleCoveredHashes = finalCoveredHashes
                 self.isApplyingFilter = false
                 // Difesa, non l'azzeramento richiesto dalla spec (quello lo fa `applyRule`
                 // ESPLICITAMENTE, prima di arrivare qui): un hash selezionato che non esiste
                 // piu' nel batch appena ricostruito (rilettura dopo un annullamento, un
                 // gruppo scomparso) non deve restare a contare in `selectionStats`.
-                self.selectedHashes = self.selectedHashes.filter { finalByHash[$0] != nil }
+                self.selectedHashes = self.selectedHashes.filter {
+                    finalByHash[$0] != nil && self.certification?.isSelectable($0) == true
+                }
+                self.recountBlocked()
                 self.recomputeSelectionStats()
             }
         }
@@ -18307,11 +18372,17 @@ struct DuplicatesView: View {
     /// la nota nel piano prima di "correggerlo" senza prima misurarlo.
     private func beginConfirmation() {
         guard let loadedBatch else { return }
-        let selected = loadedBatch.groups.filter { selectedHashes.contains($0.group.hash) }
+        // Secondo filtro (la selezione contiene gia' solo gruppi certificati): sulla
+        // certificazione che da qui viaggia col blocco fino al runner.
+        guard let certification else { return }
+        let selected = loadedBatch.groups.filter {
+            selectedHashes.contains($0.group.hash) && certification.isSelectable($0.group.hash)
+        }
         guard !selected.isEmpty else { return }
         let batch = DuplicateBatch(entries: selected)
         pendingBatch = batch
         pendingPlan = DuplicateRunPlan(entries: batch.groups)
+        pendingCertification = certification
         showSummarySheet = true
     }
 
@@ -18323,8 +18394,8 @@ struct DuplicatesView: View {
     /// qui. Simmetrica a `startUndo()` sotto.
     private func startTrashing(_ batch: DuplicateBatch) {
         let plan = pendingPlan ?? DuplicateRunPlan(entries: batch.groups)
-        runner.startDuplicateTrashRun(plan, certification: DuplicateCertification(basis: .unreadable, lastArchiveWriteAt: nil, groups: []),
-                                      onAlert: { pendingAlert = $0 })
+        guard let certification = pendingCertification else { return }
+        runner.startDuplicateTrashRun(plan, certification: certification, onAlert: { pendingAlert = $0 })
     }
 
     /// «Annulla l'ultimo spostamento», dopo la conferma non distruttiva: avvia
@@ -18332,6 +18403,78 @@ struct DuplicatesView: View {
     /// ed esito arrivano da li' — questa funzione fa solo partire.
     private func startUndo() {
         runner.startTrashRestore(onAlert: { pendingAlert = $0 })
+    }
+}
+
+// MARK: - La garanzia dell'inventario nella finestra Doppioni (ROADMAP #46, ADR-0017)
+
+extension DuplicatesView {
+    /// La riga in testa: se e su quale inventario si puo' spostare. Con l'inventario non
+    /// valido, il bottone che apre la finestra Inventario (dove lo si aggiorna).
+    @ViewBuilder
+    private var certificationBanner: some View {
+        if case .loaded = loadState {
+            let line = DuplicatesStatus.certificationLine(certification?.freshness)
+            HStack(alignment: .firstTextBaseline, spacing: AppSpacing.sm) {
+                Label(line.text, systemImage: line.tone == .ok ? "checkmark.shield" : "exclamationmark.shield")
+                    .font(AppFont.caption)
+                    .foregroundStyle(line.tone == .warning ? AppColor.warning : Color.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if line.tone == .warning {
+                    Spacer()
+                    Button("Apri l'inventario…") { openWindow(id: "inventory") }
+                        .buttonStyle(.bordered).controlSize(.small)
+                }
+            }
+        }
+    }
+
+    /// La riga sotto un gruppo che non si puo' spuntare, `nil` se si puo'. Una lettura O(1)
+    /// nella certificazione gia' calcolata.
+    private func blockedRowLine(for hash: String) -> String? {
+        guard let certification else { return DuplicatesStatus.certificationPendingRowLine }
+        return certification.block(for: hash).map { DuplicatesStatus.blockedRowLine($0) }
+    }
+
+    /// Ricalcola quali gruppi si possono spuntare, fuori dal main. La base dell'inventario si
+    /// riusa dal runner finche' gli stati dei tre archivi non cambiano; l'ora dell'ultimo
+    /// backup si legge qui sul main (`JobHistoryStore` e' del MainActor). Chiamata dopo ogni
+    /// lettura dell'elenco e quando finisce un backup o un inventario. Toglie dalla selezione
+    /// i gruppi che non si possono piu' spuntare.
+    private func refreshCertification() {
+        guard let store = runner.libraryIndexStore, case .loaded(let groups) = loadState else { return }
+        let cached = runner.duplicateCertificationBasisCache
+        let lastWrite = ArchiveWriteClock.lastWriteAt()
+        let token = UUID()
+        certificationToken = token
+        Task.detached(priority: .utility) {
+            let basis = DuplicateCertificationBasis.load(store: store, reusing: cached)
+            let result = DuplicateCertification(basis: basis, lastArchiveWriteAt: lastWrite, groups: groups)
+            await MainActor.run {
+                self.runner.rememberDuplicateCertificationBasis(basis)
+                guard self.certificationToken == token else { return }
+                self.certification = result
+                self.selectedHashes = self.selectedHashes.filter { result.isSelectable($0) }
+                self.recomputeSelectionStats()
+                self.recountBlocked()
+            }
+        }
+    }
+
+    /// Quanti gruppi visibili, e quanti coperti dalla regola, non si possono spuntare. Sul main:
+    /// letture O(1) sugli insiemi gia' calcolati (al massimo tanti quanti i gruppi caricati),
+    /// mai un ricalcolo dei gruppi — lo stesso costo di «Seleziona tutti quelli visibili».
+    private func recountBlocked() {
+        guard let certification, let loadedBatch else {
+            visibleBlockedCount = 0
+            ruleCoveredBlockedCount = 0
+            return
+        }
+        visibleBlockedCount = visibleIndices.reduce(0) { total, i in
+            guard loadedBatch.groups.indices.contains(i) else { return total }
+            return total + (certification.isSelectable(loadedBatch.groups[i].group.hash) ? 0 : 1)
+        }
+        ruleCoveredBlockedCount = ruleCoveredHashes.reduce(0) { $0 + (certification.isSelectable($1) ? 0 : 1) }
     }
 }
 
@@ -18477,6 +18620,8 @@ private struct DuplicateFileDetail: View {
 private struct DuplicateGroupRow: View {
     let entry: DuplicateBatch.Entry
     let isSelected: Bool
+    /// Perche' la casella e' spenta (ROADMAP #46, ADR-0017), `nil` se il gruppo si puo' spuntare.
+    let blockedReason: String?
     let libraryRootPath: String?
     let cache: DuplicateThumbnailCache
     let toggle: () -> Void
@@ -18502,6 +18647,8 @@ private struct DuplicateGroupRow: View {
             Toggle("", isOn: Binding(get: { isSelected }, set: { _ in toggle() }))
                 .toggleStyle(.checkbox)
                 .labelsHidden()
+                // Spenta se il gruppo non e' certificato; un gruppo gia' spuntato si puo' sempre togliere.
+                .disabled(blockedReason != nil && !isSelected)
 
             thumbnailView
 
@@ -18531,6 +18678,12 @@ private struct DuplicateGroupRow: View {
                 Text(duplicateKeepExplanation(entry.choice, in: entry.group))
                     .font(AppFont.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
+
+                if let blockedReason {
+                    Label(blockedReason, systemImage: "lock")
+                        .font(AppFont.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
 
                 ForEach(entry.leaving, id: \.path) { leaving in
                     VStack(alignment: .leading, spacing: 2) {
