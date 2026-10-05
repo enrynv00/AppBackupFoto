@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Stato: BOZZA, da approvare.** Nessuna riga di codice scritta nel repository. Spec: `Docs/superpowers/specs/2026-10-01-repair-from-majority-design.md` (approvata a voce da Enrico il 2026-10-01). **Prima di partire servono le risposte di Enrico agli scostamenti S1-S11 e alle decisioni D1-D4 qui sotto**: il piano implementa la colonna «Proposta»; se Enrico sceglie un'alternativa, l'Implementer si ferma e rimanda all'Architect. ADR: **0016** (scritto nel Task 0, dopo l'approvazione). ROADMAP: **#45**. ADR-0014 e #43 restano riservati al piano `2026-09-26-s3-upload-failures-visible`.
+**Stato: APPROVATO da Enrico il 2026-10-05** — scostamenti S1-S11 approvati, D1 (testo della «Regola assoluta» del Task 10) approvato così com'è, D2-D4 come raccomandato.
 
 **Base:** `main` a `c296732` (1.023 test: conteggio delle `func test` nei 69 file, ed eseguiti tutti, 0 fallimenti, nel prototipo descritto sotto), branch nuovo `feature/repair-from-majority`.
 
