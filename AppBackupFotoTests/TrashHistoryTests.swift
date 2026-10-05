@@ -143,4 +143,31 @@ final class TrashHistoryTests: XCTestCase {
                              "riga non decodificabile: una scrittura interfogliata l'avrebbe spezzata")
         }
     }
+
+    // MARK: - Il percorso tenuto (ROADMAP #46, ADR-0017)
+
+    /// Una riga per blocco, e per ogni foto spostata il percorso della copia tenuta, nello
+    /// stesso ordine dei percorsi originali (due gruppi diversi nello stesso blocco: l'ordine
+    /// conta, un mutante che li scambiasse direbbe a ogni foto la tenuta sbagliata).
+    func testKeptPaths_followTheOrderOfTheOriginals() throws {
+        let history = try TrashHistory(url: historyURL)
+        var a = item(path: "/Volumes/SSD - Enri/Takeout/a.jpg")
+        a.keptPath = "Foto iPhone/a.jpg"
+        var b = item(path: "/Volumes/SSD - Enri/Takeout 2/b.jpg")
+        b.keptPath = "Foto Google Drive/b.jpg"
+        let senza = item(path: "/Volumes/SSD - Enri/Other/c.jpg")
+        history.append(blockId: "b1", trashed: [a, b, senza])
+
+        let decoded = try JSONDecoder().decode(TrashHistoryEntry.self, from: Data(try linesOfFile(historyURL)[0].utf8))
+        XCTAssertEqual(decoded.originalPaths, [a.originalDisplayPath, b.originalDisplayPath, senza.originalDisplayPath])
+        XCTAssertEqual(decoded.keptPaths, ["Foto iPhone/a.jpg", "Foto Google Drive/b.jpg", ""])
+    }
+
+    /// Le righe gia' scritte prima di questo campo restano leggibili.
+    func testOldLineWithoutKeptPaths_stillDecodes() throws {
+        let vecchia = #"{"blockId":"b0","trashedAt":770000000,"originalPaths":["/x/a.jpg"]}"#
+        let decoded = try JSONDecoder().decode(TrashHistoryEntry.self, from: Data(vecchia.utf8))
+        XCTAssertEqual(decoded.originalPaths, ["/x/a.jpg"])
+        XCTAssertNil(decoded.keptPaths)
+    }
 }

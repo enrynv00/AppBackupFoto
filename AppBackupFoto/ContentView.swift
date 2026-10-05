@@ -2869,6 +2869,14 @@ nonisolated struct TrashedItem: Codable, Equatable {
     /// invece sono al loro posto. Campo accessorio: un registro scritto da una versione senza
     /// questo campo si decodifica con `restoredAt == nil`, comportamento di oggi.
     var restoredAt: Date? = nil
+    /// Il percorso della copia TENUTA del gruppo (ROADMAP #46, ADR-0017), relativo alla radice
+    /// dell'SSD e scritto com'e' sul disco (`LibraryIndexEntry.displayPath` del tenuto): e' lo
+    /// stesso percorso relativo che quella foto ha sull'HDD e la stessa chiave che ha su Cubbit,
+    /// ed e' quello che il progetto 4 terra' su HDD e Cubbit. Relativo e non assoluto (come
+    /// invece `originalDisplayPath`) apposta: la radice dell'SSD cambia nome se macOS lo monta
+    /// come «SSD - Enri 1». `nil` nelle voci scritte prima di questo campo: «non si sa», mai
+    /// un percorso inventato.
+    var keptPath: String? = nil
 }
 
 /// Perche' una voce non e' stata rimessa al suo posto. Ogni caso ha una frase propria:
@@ -2975,6 +2983,7 @@ nonisolated extension TrashManifest {
 nonisolated extension TrashedItem {
     private enum CodingKeys: String, CodingKey {
         case batchId, originalDisplayPath, originalKey, trashedPath, size, hash, trashedAt, restoredAt
+        case keptPath
     }
 
     /// Stessa ragione del tipo contenitore. Qui la decodifica e' **tollerante sui campi
@@ -2994,6 +3003,8 @@ nonisolated extension TrashedItem {
         hash = try c.decode(String.self, forKey: .hash)
         trashedAt = try c.decodeIfPresent(Date.self, forKey: .trashedAt) ?? Date(timeIntervalSince1970: 0)
         restoredAt = try c.decodeIfPresent(Date.self, forKey: .restoredAt)
+        // Campo accessorio (ROADMAP #46): le voci scritte prima non l'hanno, e restano valide.
+        keptPath = try c.decodeIfPresent(String.self, forKey: .keptPath)
     }
 }
 
@@ -3149,6 +3160,13 @@ nonisolated struct TrashHistoryEntry: Codable {
     /// Percorsi **assoluti**, come `TrashedItem.originalDisplayPath`: e' li' che la foto
     /// stava prima di finire nel Cestino.
     let originalPaths: [String]
+    /// Per ogni voce di `originalPaths`, nello stesso ordine, il percorso della copia TENUTA
+    /// del suo gruppo (`TrashedItem.keptPath`, relativo alla radice dell'SSD; stringa vuota se
+    /// non si sa). Serve al progetto 4: il registro di ripristino ricorda solo le ultime
+    /// `TrashManifestStore.maxItems` voci, questa storia le ricorda tutte. Opzionale: le righe
+    /// scritte prima di questo campo non ce l'hanno (la decodifica sintetizzata di un
+    /// opzionale usa `decodeIfPresent`).
+    let keptPaths: [String]?
 }
 
 /// La storia degli spostamenti (ADR-0012, D13 punto 4): un file append-only sul disco
@@ -3204,7 +3222,8 @@ nonisolated final class TrashHistory: @unchecked Sendable {
     func append(blockId: String, trashed: [TrashedItem], at date: Date = Date()) {
         guard !trashed.isEmpty else { return }
         let entry = TrashHistoryEntry(blockId: blockId, trashedAt: date,
-                                      originalPaths: trashed.map(\.originalDisplayPath))
+                                      originalPaths: trashed.map(\.originalDisplayPath),
+                                      keptPaths: trashed.map { $0.keptPath ?? "" })
         guard let data = try? JSONEncoder().encode(entry) else { return }
         lock.withLock {
             appendLineUnsynchronized(data)
@@ -4169,7 +4188,8 @@ nonisolated final class DuplicateTrasher: @unchecked Sendable {
                                            trashedPath: resultingURL?.path ?? "",
                                            size: entry.size,
                                            hash: group.hash,
-                                           trashedAt: Date())
+                                           trashedAt: Date(),
+                                           keptPath: decision.keeper.displayPath)
                     // Registrato SUBITO, prima di passare al file successivo. Un registro
                     // scritto a fine blocco si perderebbe proprio nel caso in cui serve — un
                     // guasto a meta' — che e' il difetto misurato del record del Finder.

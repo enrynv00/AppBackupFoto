@@ -455,4 +455,49 @@ final class TrashManifestTests: XCTestCase {
         _ = restore([itNuova], via: store)
         XCTAssertEqual(try TrashManifestStore(url: manifestURL).itemCount, 2)
     }
+
+    // MARK: - Il percorso tenuto (ROADMAP #46, ADR-0017)
+
+    /// Il registro annota quale copia del gruppo e' rimasta: il progetto 4 terra' lo stesso
+    /// percorso su HDD e Cubbit. Il test riapre lo store da zero: conta quello che c'e' su disco.
+    func testKeptPath_isWrittenToDisk() throws {
+        let store = try TrashManifestStore(url: manifestURL)
+        let trashed = try makeTrashedFile("a.jpg", contents: "foto")
+        var it = try item(trashed: trashed, originalAt: root.appendingPathComponent("Takeout/a.jpg"))
+        it.keptPath = "Foto iPhone/a.jpg"
+        try store.record(it)
+
+        XCTAssertEqual(try TrashManifestStore(url: manifestURL).lastBatch().first?.keptPath, "Foto iPhone/a.jpg")
+    }
+
+    /// Una voce scritta prima di questo campo (la forma di oggi, con `restoredAt`, JSON
+    /// letterale) resta valida: `keptPath` vale `nil` («non si sa»), il resto e' intatto.
+    func testRecordWithoutKeptPath_stillDecodes() throws {
+        let vecchio = """
+        {"totalRecorded":1,"items":[{"batchId":"b1","originalDisplayPath":"/x/a.jpg",\
+        "originalKey":"a.jpg","trashedPath":"/x/.Trashes/a.jpg","size":4,"hash":"abc",\
+        "trashedAt":770000000,"restoredAt":770000100}]}
+        """
+        try vecchio.write(to: manifestURL, atomically: true, encoding: .utf8)
+
+        let items = try TrashManifestStore(url: manifestURL).lastBatch()
+        XCTAssertEqual(items.count, 1, "una voce senza il campo nuovo ha fatto sparire il registro")
+        XCTAssertNil(items.first?.keptPath)
+        XCTAssertEqual(items.first?.hash, "abc")
+        XCTAssertNotNil(items.first?.restoredAt)
+    }
+
+    /// «Annulla» riscrive la voce marcandola tornata: il percorso tenuto non deve andare perso.
+    func testMarkRestored_keepsTheKeptPath() throws {
+        let store = try TrashManifestStore(url: manifestURL)
+        let trashed = try makeTrashedFile("a.jpg", contents: "foto")
+        var it = try item(trashed: trashed, originalAt: root.appendingPathComponent("a.jpg"))
+        it.keptPath = "Other/tenuta.jpg"
+        try store.record(it)
+        try store.markRestored(it, at: Date())
+
+        let riletta = try TrashManifestStore(url: manifestURL).lastBatch().first
+        XCTAssertNotNil(riletta?.restoredAt)
+        XCTAssertEqual(riletta?.keptPath, "Other/tenuta.jpg")
+    }
 }

@@ -587,4 +587,27 @@ final class DuplicateTrasherTests: XCTestCase {
         XCTAssertEqual(Set(frasi).count, motivi.count, "due motivi non devono dire la stessa cosa")
         XCTAssertFalse(frasi.contains { $0.isEmpty })
     }
+
+    // MARK: - Il percorso tenuto (ROADMAP #46, ADR-0017)
+
+    /// Ogni voce del registro dice quale copia e' rimasta, sia nell'esito sia su disco.
+    func testTrashedItems_recordTheKeptPath() throws {
+        let (decision, _) = try healthyTrio()
+        let outcome = makeTrasher().run([decision])
+
+        XCTAssertEqual(outcome.trashedFiles.count, 2)
+        XCTAssertEqual(outcome.trashedFiles.map(\.keptPath), ["Foto iPhone/a.jpg", "Foto iPhone/a.jpg"])
+        XCTAssertEqual(manifest.lastBatch().map(\.keptPath), ["Foto iPhone/a.jpg", "Foto iPhone/a.jpg"])
+    }
+
+    /// La tenuta e' quella decisa (`Decision.keeper`), non il primo membro del gruppo: qui si
+    /// tiene il TERZO, e un mutante che scrivesse `group.members[0]` direbbe il falso.
+    func testKeptPath_isTheChosenKeeper_notTheFirstMember() throws {
+        let (decision, entries) = try healthyTrio()
+        let other = DuplicateTrasher.Decision(group: decision.group, keeper: entries[2])
+        let outcome = makeTrasher().run([other])
+
+        XCTAssertEqual(Set(outcome.trashedFiles.map(\.originalKey)), [entries[0].path, entries[1].path])
+        XCTAssertEqual(Set(outcome.trashedFiles.compactMap(\.keptPath)), ["Import/c.jpg"])
+    }
 }
