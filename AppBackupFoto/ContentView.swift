@@ -6306,6 +6306,9 @@ nonisolated struct InventorySummary: Equatable, Sendable {
     let counts: [InventoryCategory: Int]
     let bytes: [InventoryCategory: Int64]
     let samples: [InventoryCategory: [InventoryItem]]
+    /// Le voci in ❗ che si possono riparare con la regola «2 su 3» (ROADMAP #45). Tutte, non
+    /// un campione: sono poche (oggi una), e ognuna ha il suo «Ripara…».
+    let repairCandidates: [RepairCandidate]
 
     init(_ snapshot: InventorySnapshot, sampleLimit: Int) {
         let (items, stats) = InventoryClassifier.classify(snapshot)
@@ -6324,6 +6327,7 @@ nonisolated struct InventorySummary: Equatable, Sendable {
         self.counts = counts
         self.bytes = bytes
         self.samples = samples
+        self.repairCandidates = RepairRules.candidates(in: snapshot)
     }
 
     func count(_ c: InventoryCategory) -> Int { counts[c] ?? 0 }
@@ -6513,8 +6517,9 @@ enum InventoryStatus {
     /// «non si può ancora dire» in fondo.
     static let displayOrder: [InventoryCategory] = [.safe, .missingSomewhere, .onlyOutsideSSD, .toCheck, .undetermined]
 
-    static let readOnlyNote = "Questa finestra guarda soltanto: non copia, non sposta e non cancella "
-        + "niente, né sull'SSD né sull'HDD né su Cubbit."
+    static let readOnlyNote = "L'inventario guarda soltanto: non copia, non sposta e non cancella "
+        + "niente, né sull'SSD né sull'HDD né su Cubbit. L'unica cosa che da qui può scrivere è "
+        + "«Ripara…», una foto alla volta e solo dopo la tua conferma."
     static let refreshButton = "Aggiorna l'inventario"
     static let stopButton = "Interrompi"
     static let stoppingLine = "Mi fermo appena finisco il file o la pagina dell'elenco che sto leggendo…"
@@ -7484,6 +7489,221 @@ nonisolated final class RepairEngine: @unchecked Sendable {
         // 5. REGISTRO.
         onStep(.log)
         return finish(.repaired)
+    }
+}
+
+// MARK: - Riparazione: i testi (ROADMAP #45, ADR-0016)
+
+/// I testi della riparazione nella finestra Inventario. Logica pura, come `InventoryStatus`:
+/// nessuna stringa nasce dentro la View. Registro: niente gergo («hash», «impronta», «ETag»,
+/// «MD5», «bucket»...). La cartella «_quarantena» si nomina, tra virgolette: e' quella che
+/// Enrico vedra' nel Finder e svuotera' lui (decisione 4 della spec).
+enum RepairStatus {
+    static let buttonTitle = "Ripara…"
+    static let continueButton = "Continua…"
+    static let cancelButton = "Annulla"
+    static let confirmTitle = "Riparare questa foto?"
+    static let confirmButton = "Ripara"
+    static let summaryTitle = "Riparazione di una foto"
+    /// Il controllo senza riparare (S11): rilegge e ricontrolla, non scrive niente.
+    static let dryRunButton = "Controlla senza riparare"
+
+    static func sectionTitle(count: Int) -> String {
+        count == 1 ? "1 foto si può riparare" : "\(count.formatted()) foto si possono riparare"
+    }
+
+    static let sectionExplanation = "Per ognuna, due posti su tre hanno la stessa copia integra e il terzo una "
+        + "copia diversa. L'app può rimettere a posto la copia diversa, una foto alla volta: prima ricontrolla "
+        + "tutto, poi mette da parte la copia diversa senza cancellarla."
+
+    static func candidateLine(_ c: RepairCandidate) -> String {
+        "«\(c.paths[c.target] ?? c.key)» — diversa \(on(c.target)); uguale \(on(c.source)) e \(on(c.witness))"
+    }
+
+    /// Il riepilogo prima della conferma: cosa e' diverso, cosa l'app ricontrolla, dove va la
+    /// copia diversa, cosa scrive al suo posto, cosa non tocca.
+    static func summaryLines(_ c: RepairCandidate, date: Date, calendar: Calendar) -> [String] {
+        let path = c.paths[c.target] ?? c.key
+        let q = RepairPaths.quarantinePath(for: path, date: date, calendar: calendar) ?? "«\(RepairPaths.quarantineFolder)»"
+        var lines = ["Foto: «\(path)»."]
+        lines.append("\(capitalized(on(c.target))) la copia è diversa da quella \(on(c.source)) e da quella "
+                     + "\(on(c.witness)), che sono identiche fra loro.")
+        lines.append("Prima di toccare qualcosa l'app rilegge per intero la copia \(on(c.source)), ricontrolla "
+                     + "quella \(on(c.witness)) e quella \(on(c.target)): se anche una sola non è più com'era "
+                     + "nell'ultimo inventario, si ferma senza toccare niente.")
+        if c.target == .s3 {
+            lines.append("La copia diversa non viene cancellata: viene messa da parte su Cubbit, in «\(q)». Se "
+                         + "era già stata messa da parte un altro giorno, l'app usa quella.")
+            lines.append("Al suo posto l'app carica la copia \(on(c.source)), poi controlla che Cubbit abbia "
+                         + "proprio quella.")
+        } else {
+            lines.append("La copia diversa non viene cancellata: viene spostata \(on(c.target)) stesso, in «\(q)».")
+            lines.append("Al suo posto l'app copia quella \(on(c.source)), la rilegge e controlla che sia identica.")
+        }
+        lines.append("Non viene toccato nient'altro. La cartella «\(RepairPaths.quarantineFolder)» la svuoti tu, "
+                     + "quando vuoi.")
+        return lines
+    }
+
+    static func confirmMessage(_ c: RepairCandidate) -> String {
+        "La copia \(on(c.target)) di «\(c.paths[c.target] ?? c.key)» verrà sostituita da quella "
+            + "\(on(c.source)). La copia diversa resta da parte in «\(RepairPaths.quarantineFolder)»."
+    }
+
+    static func progressLine(_ step: RepairStep?) -> String {
+        switch step {
+        case nil: return "Controllo che Cubbit risponda…"
+        case .liveCheck: return "Ricontrollo le tre copie…"
+        case .quarantine: return "Metto da parte la copia diversa…"
+        case .write: return "Scrivo la copia buona…"
+        case .finalCheck: return "Controllo la foto riparata…"
+        case .log: return "Annoto la riparazione sul Mac…"
+        }
+    }
+
+    /// La riparazione riuscita di questa voce, se e' piu' recente dell'ultimo inventario: la voce
+    /// resta in ❗ fino al giro successivo, con «riparata il …» al posto di «Ripara…».
+    static func awaitingConfirmation(_ c: RepairCandidate, records: [RepairRecord],
+                                     states: [InventoryArchive: InventoryArchiveState]) -> RepairRecord? {
+        let lastInventory = Date(timeIntervalSince1970: states.values.map(\.startedAt).max() ?? 0)
+        return records
+            .filter { $0.key == c.key && $0.target == c.target.rawValue && $0.outcome == .repaired
+                      && ($0.finishedAt ?? $0.startedAt) > lastInventory }
+            .max { ($0.finishedAt ?? $0.startedAt) < ($1.finishedAt ?? $1.startedAt) }
+    }
+
+    static func repairedLine(_ r: RepairRecord, calendar: Calendar = .current) -> String {
+        "Riparata il \(day(r.finishedAt ?? r.startedAt, calendar: calendar)): aggiorna l'inventario per confermarlo."
+    }
+
+    static func failureText(_ f: RepairFailure) -> String {
+        switch f {
+        case .volumeMissing(let a):
+            return "\(name(a)) non è collegato, o è stato scollegato proprio mentre l'app lavorava."
+        case .unsafePath:
+            return "Il percorso di questa foto non è sicuro da usare: l'app non scrive fuori dalla sua cartella."
+        case .sourceChanged:
+            return "La copia da cui l'app avrebbe copiato non è più quella vista nell'ultimo inventario, "
+                + "oppure non si lascia leggere."
+        case .witnessChanged:
+            return "La seconda copia buona non è più identica alla prima: senza due copie d'accordo l'app non ripara."
+        case .badCopyMissing:
+            return "La copia diversa non c'è più dove l'inventario l'aveva vista."
+        case .badCopyChanged:
+            return "La copia diversa è cambiata dall'ultimo inventario."
+        case .cubbitError:
+            return "Cubbit non ha risposto come doveva."
+        case .logNotWritten:
+            return "L'app non è riuscita a scrivere sul Mac il registro delle riparazioni, quindi non ha cominciato."
+        case .quarantineOccupied:
+            return "In «\(RepairPaths.quarantineFolder)» c'è già un file con lo stesso nome ma diverso: l'app non "
+                + "lo sovrascrive."
+        case .quarantineFailed:
+            return "Non è stato possibile mettere da parte la copia diversa."
+        case .quarantineCopyMismatch:
+            return "La copia messa da parte non è risultata identica a quella diversa: l'app si è fermata prima di scrivere."
+        case .stagingFailed:
+            return "Non è stato possibile preparare la copia buona (spazio o permessi sul disco)."
+        case .stagingMismatch:
+            return "La copia buona preparata non è risultata identica all'originale."
+        case .writeFailed:
+            return "Non è stato possibile mettere la copia buona al suo posto."
+        case .finalCheckFailed:
+            return "Dopo la scrittura la foto non è risultata identica alla copia buona."
+        }
+    }
+
+    /// Com'e' andata, sempre con un numero onesto di cosa e' cambiato e dove sta ogni copia.
+    static func outcomeLines(_ o: RepairOutcome) -> [InventoryStatus.Line] {
+        typealias Line = InventoryStatus.Line
+        var out: [Line] = []
+        let path = "«\(o.displayPath)»"
+        if o.wasDryRun {
+            if o.succeeded {
+                out.append(Line(id: "dry-ok", tone: .ok, text:
+                    "\(path): controllo riuscito, non è stato toccato niente. Le tre copie sono come "
+                    + "nell'ultimo inventario."))
+                if let q = o.quarantinePath {
+                    out.append(Line(id: "dry-where", tone: .info, text: o.reusedQuarantineCopy
+                        ? "La copia diversa è già da parte in «\(q)»: riparando, l'app userebbe quella."
+                        : "Riparando, la copia diversa andrebbe in «\(q)» \(on(o.target))."))
+                }
+            } else {
+                out.append(Line(id: "dry-failed", tone: .warning, text:
+                    "\(path): il controllo si è fermato, non è stato toccato niente."))
+                if let f = o.failure { out.append(Line(id: "repair-why", tone: .warning, text: failureText(f))) }
+            }
+            return out
+        }
+        if o.succeeded {
+            var text = "\(path) riparata \(on(o.target))."
+            if let q = o.quarantinePath {
+                text += o.reusedQuarantineCopy
+                    ? " La copia diversa era già da parte in «\(q)»."
+                    : " La copia diversa è da parte in «\(q)»."
+            }
+            out.append(Line(id: "repair-done", tone: .ok, text: text))
+            out.append(Line(id: "repair-confirm", tone: .info, text: "Aggiorna l'inventario per confermarlo."))
+        } else {
+            out.append(Line(id: "repair-failed", tone: .warning, text: "\(path): riparazione non fatta."))
+            if let f = o.failure { out.append(Line(id: "repair-why", tone: .warning, text: failureText(f))) }
+            out.append(Line(id: "repair-state", tone: .info, text: stateLine(o)))
+            if let st = o.leftoverStagingPath {
+                out.append(Line(id: "repair-staging", tone: .info, text:
+                    "La copia buona preparata è rimasta in «\(st)»: puoi lasciarla lì, se ne va quando svuoti "
+                    + "«\(RepairPaths.quarantineFolder)»."))
+            }
+        }
+        if o.logError != nil {
+            out.append(Line(id: "repair-log", tone: .warning, text:
+                "L'app non è riuscita ad annotare sul Mac come è finita: il registro dice ancora «in corso»."))
+        }
+        return out
+    }
+
+    private static func stateLine(_ o: RepairOutcome) -> String {
+        if o.failedStep == .finalCheck {
+            let q = o.quarantinePath.map { " resta in «\($0)»" } ?? " resta da parte"
+            return "La copia diversa\(q). L'app non riprova da sola: aggiorna l'inventario e guarda di nuovo "
+                + "questa foto."
+        }
+        if o.failedStep == .liveCheck || o.failedStep == .log || (o.quarantinePath == nil && o.target != .s3) {
+            return o.restoredOriginal
+                ? "La copia diversa è tornata al suo posto: tutto è com'era prima."
+                : "Non è stato toccato niente."
+        }
+        if o.target == .s3 {
+            if let q = o.quarantinePath {
+                return "Su Cubbit la copia diversa è ancora al suo posto, e una copia è anche in «\(q)»."
+            }
+            return "Su Cubbit la copia diversa è ancora al suo posto."
+        }
+        return "La copia diversa è da parte in «\(o.quarantinePath ?? RepairPaths.quarantineFolder)» "
+            + "\(on(o.target)) e non è andata persa, ma al suo posto per ora non c'è niente."
+    }
+
+    // MARK: - Aiuti
+
+    private static func name(_ a: InventoryArchive) -> String { InventoryStatus.archiveName(a) }
+
+    private static func on(_ a: InventoryArchive) -> String {
+        switch a {
+        case .ssd: return "sull'SSD"
+        case .hdd: return "sull'HDD"
+        case .s3: return "su Cubbit"
+        }
+    }
+
+    private static func capitalized(_ s: String) -> String { s.prefix(1).uppercased() + s.dropFirst() }
+
+    private static func day(_ d: Date, calendar: Calendar) -> String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "it_IT")
+        f.calendar = calendar
+        f.timeZone = calendar.timeZone
+        f.dateStyle = .long
+        f.timeStyle = .none
+        return f.string(from: d)
     }
 }
 
