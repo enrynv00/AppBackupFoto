@@ -3610,6 +3610,9 @@ nonisolated enum DuplicateRunStopReason: Equatable {
     case volumeVanished
     case trashFailed(displayPath: String, detail: String)
     case interrupted
+    /// Il ricontrollo prima di un blocco (ROADMAP #46, ADR-0017) ha trovato che l'inventario non
+    /// vale piu': la corsa si ferma prima di spostare altro.
+    case inventoryNoLongerValid(DuplicateCertificationBlock)
 }
 
 /// L'esito di un'intera corsa: l'aggregazione di tutti i blocchi smaltiti prima che la
@@ -3883,6 +3886,127 @@ nonisolated struct DuplicateCertification: Sendable {
         if case .fresh(let runId, _, _) = freshness, runId != certifiedRunId { return .inventoryChangedSinceOpening }
         return nil
     }
+}
+
+// MARK: - Testi della garanzia dell'inventario nel pannello Doppioni (ROADMAP #46, ADR-0017)
+
+/// Tutte le frasi nuove del pannello Doppioni sulla garanzia dell'inventario. Stessa disciplina
+/// di `DuplicatesStatus`: logica pura, italiano semplice, niente gergo («hash», «indice»,
+/// «SHA256», «scansione», «ETag»).
+extension DuplicatesStatus {
+    /// «5 ottobre 2026 alle 14:07». Scritta a mano, con i nomi dei mesi fissi, e non con un
+    /// `DateFormatter`: la frase deve essere la stessa su ogni Mac e verificabile da un test.
+    static func dayAndTime(_ date: Date, calendar: Calendar = .current) -> String {
+        let months = ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio",
+                      "agosto", "settembre", "ottobre", "novembre", "dicembre"]
+        let c = calendar.dateComponents([.year, .month, .day, .hour, .minute], from: date)
+        let month = months[max(0, min(11, (c.month ?? 1) - 1))]
+        return "\(c.day ?? 0) \(month) \(c.year ?? 0) alle \(c.hour ?? 0):" + String(format: "%02d", c.minute ?? 0)
+    }
+
+    /// Una durata a parole, arrotondata al minuto: «circa 1 ora e 15 minuti».
+    static func approxDuration(seconds: Double) -> String {
+        guard seconds >= 60 else { return "meno di un minuto" }
+        let minutes = max(1, Int((seconds / 60).rounded()))
+        guard minutes >= 60 else { return "circa \(count(minutes, "minuto", "minuti"))" }
+        let hours = minutes / 60, rest = minutes % 60
+        let hoursText = count(hours, "ora", "ore")
+        return rest == 0 ? "circa \(hoursText)" : "circa \(hoursText) e \(count(rest, "minuto", "minuti"))"
+    }
+
+    /// Il motivo, come pezzo di frase (minuscola, senza punto): lo usano la riga del gruppo e
+    /// l'esito di una corsa fermata.
+    static func certificationReason(_ block: DuplicateCertificationBlock, calendar: Calendar = .current) -> String {
+        switch block {
+        case .inventoryNeverRun:
+            return "l'inventario di SSD, HDD e Cubbit non è mai stato fatto"
+        case .inventoryIncomplete:
+            return "l'ultimo inventario non è completo"
+        case .inventoryUnreadable:
+            return "l'app non è riuscita a leggere l'inventario salvato"
+        case .inventoryOlderThanLastBackup(let backupAt):
+            return "l'inventario è più vecchio dell'ultimo backup (\(dayAndTime(backupAt, calendar: calendar)))"
+        case .notSafeOnAllThree:
+            return "secondo l'inventario questa foto non è al sicuro su SSD, HDD e Cubbit insieme"
+        case .changedAfterInventory:
+            return "una delle sue copie è cambiata, o è comparsa, dopo l'ultimo inventario"
+        case .inventoryChangedSinceOpening:
+            return "l'inventario è stato aggiornato dopo che hai aperto questo elenco"
+        }
+    }
+
+    /// La riga sotto un gruppo che non si puo' spuntare (spec: «visibili ma non spuntabili, con
+    /// una riga che dice perché»).
+    static func blockedRowLine(_ block: DuplicateCertificationBlock, calendar: Calendar = .current) -> String {
+        "Non si può spuntare: \(certificationReason(block, calendar: calendar))."
+    }
+
+    /// La riga sotto i gruppi finche' la certificazione non e' pronta (la casella resta spenta).
+    static let certificationPendingRowLine = "Sto controllando l'inventario…"
+
+    /// La riga in testa al pannello: vale per tutti i gruppi. `nil` = non ancora calcolata.
+    static func certificationLine(_ freshness: DuplicateInventoryFreshness?, calendar: Calendar = .current) -> Line {
+        guard let freshness else {
+            return Line(id: "cert-loading", tone: .info, text: "Sto controllando l'inventario di SSD, HDD e Cubbit…")
+        }
+        switch freshness {
+        case .fresh(_, _, let finishedAt):
+            return Line(id: "cert-fresh", tone: .ok, text:
+                "Inventario completo del \(dayAndTime(Date(timeIntervalSince1970: finishedAt), calendar: calendar)), "
+                + "più recente dell'ultimo backup: puoi spostare nel Cestino solo le copie di foto che "
+                + "risultano al sicuro anche sull'HDD e su Cubbit.")
+        case .neverRun:
+            return Line(id: "cert-never", tone: .warning, text:
+                "Non c'è ancora un inventario di SSD, HDD e Cubbit: finché non ce n'è uno completo, "
+                + "nessuna copia si può spostare. Apri l'inventario e premi «Aggiorna l'inventario».")
+        case .incomplete:
+            return Line(id: "cert-incomplete", tone: .warning, text:
+                "L'ultimo inventario non è completo (o è ancora in corso): finché non ne finisce uno "
+                + "completo, nessuna copia si può spostare.")
+        case .unreadable:
+            return Line(id: "cert-unreadable", tone: .warning, text:
+                "L'app non è riuscita a leggere l'inventario salvato, quindi nessuna copia si può "
+                + "spostare. Riapri questa finestra; se succede ancora, aggiorna l'inventario.")
+        case .olderThanLastBackup(let backupAt, let startedAt, let finishedAt):
+            return Line(id: "cert-older", tone: .warning, text:
+                "L'inventario è più vecchio dell'ultimo backup (\(dayAndTime(backupAt, calendar: calendar))): "
+                + "aggiornalo, poi torna qui. L'ultimo aggiornamento è durato "
+                + "\(approxDuration(seconds: finishedAt - startedAt)).")
+        }
+    }
+
+    /// Sotto «Seleziona tutti quelli visibili»: quanti gruppi visibili la selezione in massa
+    /// salta (spec: «lo dicono nel conteggio»). `nil` se non ne salta nessuno.
+    static func bulkSkipLine(blockedVisible: Int, visible: Int) -> String? {
+        guard blockedVisible > 0 else { return nil }
+        guard blockedVisible < visible else {
+            return "Nessuno dei gruppi visibili si può spuntare adesso: il motivo è scritto sotto ciascuno."
+        }
+        return "«Seleziona tutti quelli visibili» salta \(count(blockedVisible, "gruppo", "gruppi")) che non si "
+            + "\(blockedVisible == 1 ? "può" : "possono") ancora spostare: il motivo è scritto sotto ciascuno."
+    }
+
+    /// Sotto la copertura della regola per cartella: quanti dei gruppi coperti non si possono
+    /// ancora spostare. `nil` se nessuno.
+    static func ruleBlockedLine(blockedCovered: Int) -> String? {
+        guard blockedCovered > 0 else { return nil }
+        return "Di questi, \(count(blockedCovered, "gruppo", "gruppi")) non si "
+            + "\(blockedCovered == 1 ? "può" : "possono") ancora spostare: la selezione "
+            + "\(blockedCovered == 1 ? "lo" : "li") salta."
+    }
+
+    /// Nel riepilogo, prima della conferma: su quale inventario poggia la garanzia.
+    static func certifiedSummaryLine(inventoryFinishedAt: Date, calendar: Calendar = .current) -> String {
+        "Ogni foto di questo riepilogo risulta al sicuro anche sull'HDD e su Cubbit nell'inventario del "
+            + "\(dayAndTime(inventoryFinishedAt, calendar: calendar)). Subito prima di spostare, l'app "
+            + "ricontrolla che l'inventario valga ancora."
+    }
+
+    /// L'avviso se il runner riceve una corsa con un gruppo che la certificazione non copre
+    /// (non dovrebbe succedere: la finestra non lo lascia spuntare).
+    static let notCertifiedRunMessage =
+        "Alcuni gruppi scelti non risultano al sicuro su SSD, HDD e Cubbit secondo l'inventario, "
+        + "quindi non ho spostato niente. Chiudi e riapri la finestra Doppioni e scegli di nuovo."
 }
 
 // MARK: - Righe di stato del pannello Doppioni (Task 6, 2026-08-31)
@@ -4184,6 +4308,11 @@ enum DuplicatesStatus {
         case .trashFailed(let path, let detail):
             out.append(Line(id: "run-trash-failed", tone: .warning, text:
                 "Non è stato possibile spostare \(path) nel Cestino (\(detail)): mi sono fermato qui. "
+                + "\(count(outcome.blocksCompleted, "blocco è stato completato", "blocchi sono stati completati")) "
+                + "su \(count(outcome.totalBlocks, "previsto", "previsti"))."))
+        case .inventoryNoLongerValid(let block):
+            out.append(Line(id: "run-inventory-invalid", tone: .warning, text:
+                "Mi sono fermato prima di spostare altro: \(certificationReason(block)). "
                 + "\(count(outcome.blocksCompleted, "blocco è stato completato", "blocchi sono stati completati")) "
                 + "su \(count(outcome.totalBlocks, "previsto", "previsti"))."))
         case .interrupted:
