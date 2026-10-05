@@ -48,6 +48,7 @@
 		571CCCE2BF5254CBC5C95301 /* InventoryClassifierTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1EB0DF8A234B0B8A0802230 /* InventoryClassifierTests.swift */; };
 		D32A3EFFFFA66AAE2C29C8E6 /* InventoryRefreshTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C08CBD0B92948BEFEE0428F4 /* InventoryRefreshTests.swift */; };
 		51437C0FB531B995488AA29D /* InventoryStatusTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 410F77B6DAC6CC5324775DA3 /* InventoryStatusTests.swift */; };
+		926C7CE294F0C7B407DC2164 /* RepairGatesTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC1ACC7BA2F23A603E66A74E /* RepairGatesTests.swift */; };
 		66E8612C3A08039111319C1E /* RepairEngineTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C17486BE67CFB854FE2CAE08 /* RepairEngineTests.swift */; };
 		C02DAB72CD063550BF921394 /* RepairLogTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3D7BDF69D092B120D96219AA /* RepairLogTests.swift */; };
 		737DA6D834924A1DF98041E7 /* RepairPathsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 309AE9683F23DFEF253FB1FA /* RepairPathsTests.swift */; };
@@ -140,6 +141,7 @@
 		E1EB0DF8A234B0B8A0802230 /* InventoryClassifierTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = InventoryClassifierTests.swift; sourceTree = "<group>"; };
 		C08CBD0B92948BEFEE0428F4 /* InventoryRefreshTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = InventoryRefreshTests.swift; sourceTree = "<group>"; };
 		410F77B6DAC6CC5324775DA3 /* InventoryStatusTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = InventoryStatusTests.swift; sourceTree = "<group>"; };
+		FC1ACC7BA2F23A603E66A74E /* RepairGatesTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = RepairGatesTests.swift; sourceTree = "<group>"; };
 		C17486BE67CFB854FE2CAE08 /* RepairEngineTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = RepairEngineTests.swift; sourceTree = "<group>"; };
 		3D7BDF69D092B120D96219AA /* RepairLogTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = RepairLogTests.swift; sourceTree = "<group>"; };
 		309AE9683F23DFEF253FB1FA /* RepairPathsTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = RepairPathsTests.swift; sourceTree = "<group>"; };
@@ -259,6 +261,7 @@
 				E1EB0DF8A234B0B8A0802230 /* InventoryClassifierTests.swift */,
 				C08CBD0B92948BEFEE0428F4 /* InventoryRefreshTests.swift */,
 				410F77B6DAC6CC5324775DA3 /* InventoryStatusTests.swift */,
+				FC1ACC7BA2F23A603E66A74E /* RepairGatesTests.swift */,
 				C17486BE67CFB854FE2CAE08 /* RepairEngineTests.swift */,
 				3D7BDF69D092B120D96219AA /* RepairLogTests.swift */,
 				309AE9683F23DFEF253FB1FA /* RepairPathsTests.swift */,
@@ -471,6 +474,7 @@
 				571CCCE2BF5254CBC5C95301 /* InventoryClassifierTests.swift in Sources */,
 				D32A3EFFFFA66AAE2C29C8E6 /* InventoryRefreshTests.swift in Sources */,
 				51437C0FB531B995488AA29D /* InventoryStatusTests.swift in Sources */,
+				926C7CE294F0C7B407DC2164 /* RepairGatesTests.swift in Sources */,
 				66E8612C3A08039111319C1E /* RepairEngineTests.swift in Sources */,
 				C02DAB72CD063550BF921394 /* RepairLogTests.swift in Sources */,
 				737DA6D834924A1DF98041E7 /* RepairPathsTests.swift in Sources */,
