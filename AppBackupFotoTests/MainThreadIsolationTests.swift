@@ -97,7 +97,7 @@ final class MainThreadIsolationTests: XCTestCase {
         let store = try makeStore()
         let manifest = try TrashManifestStore(url: tmp.appendingPathComponent("manifest.json"))
         // Funzioni iniettate che non toccano niente: nessun Cestino vero, mai, in questo test.
-        let trasher = DuplicateTrasher(libraryRoot: root, store: store, manifest: manifest,
+        let trasher = DuplicateTrasher(libraryRoot: root, store: store, manifest: manifest, photosLibraryRoot: nil,
                                        trashFunction: { _ in nil }, hashFunction: { _ in nil })
         let done = DispatchSemaphore(value: 0)
         Task.detached {

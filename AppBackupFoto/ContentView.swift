@@ -3735,6 +3735,14 @@ nonisolated enum DuplicateTrashSkipReason: Equatable {
     /// La copia da tenere e' sparita a cestinamento gia' iniziato: quanto era stato
     /// spostato e' stato rimesso a posto.
     case keeperVanished(displayPath: String)
+    /// Una copia che stava per uscire e' in «Foto iPhone» e la libreria Foto del Mac ha ancora
+    /// il suo originale, ricontrollato subito prima di spostare (ADR-0018): il backup la
+    /// ricopierebbe. Il gruppo non e' stato toccato.
+    case stillInPhotosLibrary(displayPath: String)
+    /// Una copia che stava per uscire e' in «Foto iPhone» e la libreria Foto del Mac non si e'
+    /// lasciata controllare (non configurata, non trovata, vuota): nel verso sicuro non si
+    /// sposta (ADR-0018). Il gruppo non e' stato toccato.
+    case photosLibraryUnreadable(displayPath: String)
 
     var explanation: String {
         switch self {
@@ -3762,6 +3770,12 @@ nonisolated enum DuplicateTrashSkipReason: Equatable {
             return "La copia da tenere (\(p)) è sparita mentre il gruppo veniva smaltito. "
                 + "Le copie appena spostate sono state rimesse al loro posto: non sei rimasto "
                 + "senza nessuna copia."
+        case .stillInPhotosLibrary(let p):
+            return "\(p) è ancora nella libreria Foto del Mac: se la spostassi nel Cestino, il prossimo "
+                + "backup dal Mac la ricopierebbe. Non ho spostato niente di questo gruppo."
+        case .photosLibraryUnreadable(let p):
+            return "Non sono riuscito a controllare se \(p) è ancora nella libreria Foto del Mac, quindi "
+                + "per sicurezza non ho spostato niente di questo gruppo."
         }
     }
 }
@@ -4447,6 +4461,8 @@ enum DuplicatesStatus {
         case .nothingToTrash: return "nothing-to-trash"
         case .trashFailed: return "trash-failed"
         case .keeperVanished: return "keeper-vanished"
+        case .stillInPhotosLibrary: return "still-in-photos-library"
+        case .photosLibraryUnreadable: return "photos-library-unreadable"
         }
     }
 
@@ -4468,6 +4484,10 @@ enum DuplicatesStatus {
             return "perché lo spostamento è fallito"
         case .keeperVanished:
             return "perché la copia da tenere è sparita a metà"
+        case .stillInPhotosLibrary:
+            return "perché una copia era ancora nella libreria Foto del Mac"
+        case .photosLibraryUnreadable:
+            return "perché non sono riuscito a controllare la libreria Foto del Mac"
         }
     }
 
@@ -4650,20 +4670,32 @@ nonisolated final class DuplicateTrasher: @unchecked Sendable {
     struct Decision {
         let group: DuplicateGroup
         let keeper: LibraryIndexEntry
+        /// Le altre copie che restano perche' la libreria Foto del Mac le ha ancora
+        /// (`DuplicateKeepChoice.keptByPhotosLibrary`, ADR-0018), congelate con la tenuta. Come
+        /// la tenuta: si rileggono e si rihashano (l'unanimita' vale per tutto il gruppo), ma
+        /// non si passano MAI a `trashItem`. Nessun default: chi costruisce una decisione deve
+        /// dire cosa resta.
+        let keptByPhotosLibrary: Set<String>
     }
 
     private let libraryRoot: URL
     private let store: LibraryIndexStore
     private let manifest: TrashManifestStore
+    /// La cartella `originals` della libreria Foto del Mac (bookmark `.photos`), o `nil` se non
+    /// si risolve: allora nessuna copia in «Foto iPhone» esce (ADR-0018). Solo letta, con
+    /// `fileExists`/`contentsOfDirectory`: nessun file della libreria Foto viene aperto.
+    private let photosLibraryRoot: URL?
     private let trashFunction: (URL) throws -> URL?
     private let hashFunction: (URL) -> MeasuredHash?
     /// Le due forme canoniche della root, calcolate una volta. Stessa coppia usata da
     /// `isAlreadyInLibrary`: la root puo' essere raggiunta per symlink.
     private let rootForms: [[String]]
 
+    /// `photosLibraryRoot` senza default (ADR-0018): un chiamante che lo dimentica non compila.
     init(libraryRoot: URL,
          store: LibraryIndexStore,
          manifest: TrashManifestStore,
+         photosLibraryRoot: URL?,
          trashFunction: @escaping (URL) throws -> URL? = { url in
              var resulting: NSURL?
              try FileManager.default.trashItem(at: url, resultingItemURL: &resulting)
@@ -4673,6 +4705,7 @@ nonisolated final class DuplicateTrasher: @unchecked Sendable {
         self.libraryRoot = libraryRoot
         self.store = store
         self.manifest = manifest
+        self.photosLibraryRoot = photosLibraryRoot
         self.trashFunction = trashFunction
         self.hashFunction = hashFunction
         self.rootForms = [libraryRoot.standardizedFileURL.path, realResolvedPath(libraryRoot)].map {
@@ -4697,6 +4730,10 @@ nonisolated final class DuplicateTrasher: @unchecked Sendable {
         // «il file non c'era» e «il volume e' sparito» restano indistinguibili: presentano
         // lo stesso `NSCocoaErrorDomain/4`.
         let deviceAtStart = deviceIdentifier(of: libraryRoot)
+        // La libreria Foto si lascia leggere? Una volta per blocco. Se no, nessuna copia in
+        // «Foto iPhone» esce (ADR-0018): un `fileExists` falso su una cartella illeggibile
+        // direbbe «non c'e' piu'» proprio dove non si sa.
+        let photosLibraryReadable = Self.isReadableLibraryRoot(photosLibraryRoot)
 
         for (index, decision) in decisions.enumerated() {
             // Un'interruzione lascia un blocco parziale: e' uno stato legittimo, e i gruppi
@@ -4712,7 +4749,7 @@ nonisolated final class DuplicateTrasher: @unchecked Sendable {
             defer { onProgress(index + 1, decisions.count) }
 
             let group = decision.group
-            guard group.members.contains(where: { $0.path != decision.keeper.path }) else {
+            guard group.members.contains(where: { leaves($0, decision) }) else {
                 outcome.skippedGroups.append((group, .nothingToTrash))
                 continue
             }
@@ -4736,11 +4773,26 @@ nonisolated final class DuplicateTrasher: @unchecked Sendable {
                 continue
             }
 
+            // ULTIMA LINEA DI DIFESA (ADR-0018), dopo la rilettura e prima di qualunque
+            // `trashItem` del gruppo: una copia in uscita che sta in «Foto iPhone» e che la
+            // libreria Foto del Mac ha ANCORA, adesso, non si sposta — il backup la
+            // ricopierebbe. Dal vivo e non dalla fotografia presa all'apertura del pannello: fra
+            // le due Enrico puo' aver reimportato una foto. Se una sola copia non passa, il gruppo
+            // intero resta intatto (mai «sposto quelle che posso»).
+            let photosRefusal: DuplicateTrashSkipReason? = resolved.lazy
+                .filter { self.leaves($0.entry, decision) }
+                .compactMap { self.photosLibraryRefusal(for: $0.entry, libraryReadable: photosLibraryReadable) }
+                .first
+            if let photosRefusal {
+                outcome.skippedGroups.append((group, photosRefusal))
+                continue
+            }
+
             var trashedInGroup: [TrashedItem] = []
             var groupFailure: DuplicateTrashSkipReason?
             var volumeVanished = false
 
-            for (entry, url) in resolved where entry.path != decision.keeper.path {
+            for (entry, url) in resolved where leaves(entry, decision) {
                 do {
                     let resultingURL = try trashFunction(url)
                     // Percorso **assoluto**: e' quello che `TrashManifestStore.restore`
@@ -4814,6 +4866,40 @@ nonisolated final class DuplicateTrasher: @unchecked Sendable {
         }
 
         return outcome
+    }
+
+    /// Vero se la copia esce: non e' la tenuta e non e' fra quelle che restano per la libreria
+    /// Foto. Un posto solo per la regola, usato dalla guardia «niente da spostare», dal
+    /// ricontrollo e dal ciclo di `trashItem`.
+    private func leaves(_ entry: LibraryIndexEntry, _ decision: Decision) -> Bool {
+        entry.path != decision.keeper.path && !decision.keptByPhotosLibrary.contains(entry.path)
+    }
+
+    /// Il ricontrollo dal vivo di una copia in uscita (ADR-0018). `nil` = puo' uscire. Le copie
+    /// fuori da «Foto iPhone» non dipendono mai dalla libreria Foto (il backup scrive solo li').
+    /// Per una copia in «Foto iPhone»: libreria illeggibile, o percorso con `.`/`..` ⇒ rifiuto;
+    /// l'originale `originals/<resto del percorso>` esiste ⇒ rifiuto. Il volume della libreria
+    /// Foto (disco del Mac) non distingue le maiuscole, come la copia fatta dal backup.
+    private func photosLibraryRefusal(for entry: LibraryIndexEntry, libraryReadable: Bool) -> DuplicateTrashSkipReason? {
+        guard isInMainLibrary(entry) else { return nil }
+        guard libraryReadable, let photosLibraryRoot else {
+            return .photosLibraryUnreadable(displayPath: entry.displayPath)
+        }
+        let inside = entry.displayPath.split(separator: "/", omittingEmptySubsequences: true).dropFirst()
+        guard !inside.isEmpty, !inside.contains(where: { $0 == "." || $0 == ".." }) else {
+            return .photosLibraryUnreadable(displayPath: entry.displayPath)
+        }
+        let original = photosLibraryRoot.appendingPathComponent(inside.joined(separator: "/"))
+        return FileManager.default.fileExists(atPath: original.path)
+            ? .stillInPhotosLibrary(displayPath: entry.displayPath)
+            : nil
+    }
+
+    /// La cartella `originals` c'e', e' una cartella e si lascia elencare con almeno una voce.
+    /// Vuota conta come illeggibile, come in `PhotosLibraryPresence.read`.
+    private static func isReadableLibraryRoot(_ root: URL?) -> Bool {
+        guard let root, let names = try? FileManager.default.contentsOfDirectory(atPath: root.path) else { return false }
+        return !names.isEmpty
     }
 
     private enum Verification {
@@ -12677,6 +12763,9 @@ final class BackupRunner: ObservableObject {
         // Invalidazione reciproca (D5): una
         // nuova corsa rende obsoleto l'ultimo esito di annullamento mostrato.
         lastTrashRestoreOutcome = nil
+        // La cartella `originals` per il ricontrollo dal vivo del trasher (ADR-0018). `nil` se il
+        // bookmark non si risolve: allora nessuna copia in «Foto iPhone» esce.
+        let photosLibraryRoot = BookmarkManager.shared.urls[.photos]
         let totalBlocks = plan.blocks.count
         let totalFiles = plan.blocks.reduce(0) { $0 + $1.reduce(0) { $0 + $1.leaving.count } }
         duplicateRunProgress = (blockIndex: 1, blockCount: totalBlocks, filesDone: 0, filesTotal: totalFiles)
@@ -12706,8 +12795,12 @@ final class BackupRunner: ObservableObject {
                 }
 
                 let batchId = UUID().uuidString
-                let decisions = block.map { DuplicateTrasher.Decision(group: $0.group, keeper: $0.choice.keeper) }
-                let trasher = DuplicateTrasher(libraryRoot: root, store: store, manifest: manifest)
+                let decisions = block.map {
+                    DuplicateTrasher.Decision(group: $0.group, keeper: $0.choice.keeper,
+                                              keptByPhotosLibrary: $0.choice.keptByPhotosLibrary)
+                }
+                let trasher = DuplicateTrasher(libraryRoot: root, store: store, manifest: manifest,
+                                               photosLibraryRoot: photosLibraryRoot)
                 // Catturato per valore prima della corsa del blocco: l'`onProgress` sotto
                 // legge solo questa costante, mai `filesDoneSoFar` direttamente — quella
                 // cambia solo DOPO che il blocco e' finito, ma una chiusura che catturasse la

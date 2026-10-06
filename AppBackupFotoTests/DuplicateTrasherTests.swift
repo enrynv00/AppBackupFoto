@@ -16,6 +16,9 @@ final class DuplicateTrasherTests: XCTestCase {
     private var trashDir: URL!
     private var store: LibraryIndexStore!
     private var manifest: TrashManifestStore!
+    /// La cartella `originals` finta della libreria Foto (ADR-0018): leggibile e non vuota, senza
+    /// nessuna delle foto dei test, cosi' nessuna copia in «Foto iPhone» risulta ancora in Foto.
+    private var photosLibraryRoot: URL!
 
     override func setUpWithError() throws {
         root = URL(fileURLWithPath: NSTemporaryDirectory())
@@ -29,6 +32,8 @@ final class DuplicateTrasherTests: XCTestCase {
         }
         store = try LibraryIndexStore(url: root.appendingPathComponent("index.sqlite"))
         manifest = try TrashManifestStore(url: root.appendingPathComponent("trash-manifest.json"))
+        photosLibraryRoot = root.appendingPathComponent("originals", isDirectory: true)
+        try FileManager.default.createDirectory(at: photosLibraryRoot.appendingPathComponent("0"), withIntermediateDirectories: true)
     }
 
     override func tearDownWithError() throws {
@@ -73,6 +78,7 @@ final class DuplicateTrasherTests: XCTestCase {
         return DuplicateTrasher(libraryRoot: libraryRoot,
                                 store: store,
                                 manifest: manifest,
+                                photosLibraryRoot: photosLibraryRoot,
                                 trashFunction: { [spy] in try spy!.trash($0) },
                                 hashFunction: hashFunction ?? { sha256Measured(of: $0) })
     }
@@ -121,7 +127,7 @@ final class DuplicateTrasherTests: XCTestCase {
         try makeMedia("Import/c.jpg", contents: "identiche")
         let entries = [try entry("Foto iPhone/a.jpg"), try entry("Import/b.jpg"), try entry("Import/c.jpg")]
         try store.upsert(entries)
-        return (DuplicateTrasher.Decision(group: group(entries), keeper: entries[0]), entries)
+        return (DuplicateTrasher.Decision(group: group(entries), keeper: entries[0], keptByPhotosLibrary: []), entries)
     }
 
     // MARK: - Verifica prima della cancellazione
@@ -191,7 +197,7 @@ final class DuplicateTrasherTests: XCTestCase {
                                        hash: entries[1].hash, hashedAt: 0)
         try store.upsert(entries)
 
-        let outcome = makeTrasher().run([.init(group: group(entries), keeper: entries[0])])
+        let outcome = makeTrasher().run([.init(group: group(entries), keeper: entries[0], keptByPhotosLibrary: [])])
 
         XCTAssertTrue(outcome.trashedFiles.isEmpty)
         XCTAssertEqual(outcome.skippedGroups.count, 1)
@@ -218,7 +224,7 @@ final class DuplicateTrasherTests: XCTestCase {
         try store.upsert(entries)
 
         let stantio = group(entries, hash: String(repeating: "a", count: 64))
-        let outcome = makeTrasher().run([.init(group: stantio, keeper: entries[0])])
+        let outcome = makeTrasher().run([.init(group: stantio, keeper: entries[0], keptByPhotosLibrary: [])])
 
         XCTAssertTrue(outcome.trashedFiles.isEmpty)
         XCTAssertEqual(outcome.skippedGroups.count, 1)
@@ -242,7 +248,7 @@ final class DuplicateTrasherTests: XCTestCase {
         let esterno = try entry(at: fuori, displayPath: "../SSD 2/b.jpg")
         try store.upsert([dentro, esterno])
 
-        let outcome = makeTrasher().run([.init(group: group([dentro, esterno]), keeper: dentro)])
+        let outcome = makeTrasher().run([.init(group: group([dentro, esterno]), keeper: dentro, keptByPhotosLibrary: [])])
 
         XCTAssertEqual(outcome.skippedGroups.count, 1)
         XCTAssertTrue(outcome.trashedFiles.isEmpty)
@@ -258,7 +264,7 @@ final class DuplicateTrasherTests: XCTestCase {
         let entries = [try entry("Foto iPhone/a.jpg"), try entry("Import/note.txt")]
         try store.upsert(entries)
 
-        let outcome = makeTrasher().run([.init(group: group(entries), keeper: entries[0])])
+        let outcome = makeTrasher().run([.init(group: group(entries), keeper: entries[0], keptByPhotosLibrary: [])])
 
         XCTAssertEqual(outcome.skippedGroups.count, 1)
         XCTAssertEqual(spy.calls.count, 0)
@@ -282,7 +288,7 @@ final class DuplicateTrasherTests: XCTestCase {
         let solo = try entry("Foto iPhone/a.jpg")
         try store.upsert([solo])
 
-        let outcome = makeTrasher().run([.init(group: group([solo]), keeper: solo)])
+        let outcome = makeTrasher().run([.init(group: group([solo]), keeper: solo, keptByPhotosLibrary: [])])
 
         XCTAssertEqual(spy.calls.count, 0)
         XCTAssertTrue(outcome.trashedFiles.isEmpty)
@@ -295,7 +301,7 @@ final class DuplicateTrasherTests: XCTestCase {
         try makeMedia("Foto iPhone/estranea.jpg", contents: "identiche")
         let estranea = try entry("Foto iPhone/estranea.jpg")
 
-        let outcome = makeTrasher().run([.init(group: group(entries), keeper: estranea)])
+        let outcome = makeTrasher().run([.init(group: group(entries), keeper: estranea, keptByPhotosLibrary: [])])
 
         XCTAssertTrue(outcome.trashedFiles.isEmpty)
         XCTAssertEqual(outcome.skippedGroups.count, 1)
@@ -315,7 +321,7 @@ final class DuplicateTrasherTests: XCTestCase {
         try makeMedia("Altro/e.jpg", contents: "secondo gruppo")
         let secondi = [try entry("Altro/d.jpg"), try entry("Altro/e.jpg")]
         try store.upsert(secondi)
-        let secondo = DuplicateTrasher.Decision(group: group(secondi), keeper: secondi[0])
+        let secondo = DuplicateTrasher.Decision(group: group(secondi), keeper: secondi[0], keptByPhotosLibrary: [])
 
         spy = TrashSpy(trashDir: trashDir)
         spy.failure = { _, n in
@@ -340,7 +346,7 @@ final class DuplicateTrasherTests: XCTestCase {
         try makeMedia("Altro/e.jpg", contents: "secondo gruppo")
         let secondi = [try entry("Altro/d.jpg"), try entry("Altro/e.jpg")]
         try store.upsert(secondi)
-        let secondo = DuplicateTrasher.Decision(group: group(secondi), keeper: secondi[0])
+        let secondo = DuplicateTrasher.Decision(group: group(secondi), keeper: secondi[0], keptByPhotosLibrary: [])
 
         spy = TrashSpy(trashDir: trashDir)
         spy.failure = { _, n in n == 1 ? NSError(domain: NSCocoaErrorDomain, code: 4) : nil }
@@ -442,7 +448,7 @@ final class DuplicateTrasherTests: XCTestCase {
         try makeMedia("Altro/e.jpg", contents: "secondo gruppo")
         let secondi = [try entry("Altro/d.jpg"), try entry("Altro/e.jpg")]
         try store.upsert(secondi)
-        let secondo = DuplicateTrasher.Decision(group: group(secondi), keeper: secondi[0])
+        let secondo = DuplicateTrasher.Decision(group: group(secondi), keeper: secondi[0], keptByPhotosLibrary: [])
 
         var visti = 0
         let outcome = makeTrasher().run([primo, secondo], isCancelled: {
@@ -539,7 +545,7 @@ final class DuplicateTrasherTests: XCTestCase {
         let secondi = [try entry("Altro/d.jpg"), try entry("Altro/e.jpg")]
         try store.upsert(secondi)
 
-        let outcome = makeTrasher().run([primo, .init(group: group(secondi), keeper: secondi[0])])
+        let outcome = makeTrasher().run([primo, .init(group: group(secondi), keeper: secondi[0], keptByPhotosLibrary: [])])
 
         XCTAssertEqual(outcome.trashedFiles.count, 3)
         XCTAssertTrue(outcome.skippedGroups.isEmpty)
@@ -562,7 +568,7 @@ final class DuplicateTrasherTests: XCTestCase {
         let secondi = [try entry("Altro/d.jpg"), try entry("Altro/e.jpg")]
         try store.upsert(secondi)
 
-        let outcome = makeTrasher().run([primo, .init(group: group(secondi), keeper: secondi[0])])
+        let outcome = makeTrasher().run([primo, .init(group: group(secondi), keeper: secondi[0], keptByPhotosLibrary: [])])
 
         XCTAssertEqual(outcome.skippedGroups.count, 1)
         XCTAssertEqual(outcome.trashedFiles.count, 1)
@@ -604,10 +610,162 @@ final class DuplicateTrasherTests: XCTestCase {
     /// tiene il TERZO, e un mutante che scrivesse `group.members[0]` direbbe il falso.
     func testKeptPath_isTheChosenKeeper_notTheFirstMember() throws {
         let (decision, entries) = try healthyTrio()
-        let other = DuplicateTrasher.Decision(group: decision.group, keeper: entries[2])
+        let other = DuplicateTrasher.Decision(group: decision.group, keeper: entries[2], keptByPhotosLibrary: [])
         let outcome = makeTrasher().run([other])
 
         XCTAssertEqual(Set(outcome.trashedFiles.map(\.originalKey)), [entries[0].path, entries[1].path])
         XCTAssertEqual(Set(outcome.trashedFiles.compactMap(\.keptPath)), ["Import/c.jpg"])
+    }
+
+    // MARK: - Le copie che la libreria Foto del Mac ha ancora (ADR-0018): ultima linea di difesa
+
+    /// Un file nella cartella `originals` finta, come l'ha la libreria Foto.
+    private func makeOriginal(_ relative: String) throws {
+        let url = photosLibraryRoot.appendingPathComponent(relative)
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try "originale".write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    /// Una copia in «Foto iPhone» e una in Takeout, indicizzate; si tiene Takeout, cosi' la copia
+    /// in «Foto iPhone» e' quella che uscirebbe.
+    private func fotoIPhoneLeaving() throws -> (DuplicateTrasher.Decision, [LibraryIndexEntry]) {
+        try makeMedia("Takeout/a.jpg", contents: "identiche")
+        try makeMedia("Foto iPhone/1/a.jpg", contents: "identiche")
+        let entries = [try entry("Takeout/a.jpg"), try entry("Foto iPhone/1/a.jpg")]
+        try store.upsert(entries)
+        return (DuplicateTrasher.Decision(group: group(entries), keeper: entries[0], keptByPhotosLibrary: []), entries)
+    }
+
+    /// Il caso dal vivo del 2026-10-05: la decisione lascia uscire la copia (la fotografia presa
+    /// all'apertura non la vedeva in Foto, o un chiamante ha sbagliato), ma la libreria Foto ha
+    /// l'originale adesso. Il trasher non la passa a `trashItem` e non tocca il gruppo.
+    func testCopyStillInPhotos_isNeverTrashed_evenIfTheDecisionLetsItLeave() throws {
+        let (decision, entries) = try fotoIPhoneLeaving()
+        try makeOriginal("1/a.jpg")
+
+        let outcome = makeTrasher().run([decision])
+
+        XCTAssertEqual(spy.calls.count, 0, "nessun trashItem")
+        XCTAssertTrue(outcome.trashedFiles.isEmpty)
+        XCTAssertEqual(outcome.skippedGroups.first?.reason, .stillInPhotosLibrary(displayPath: "Foto iPhone/1/a.jpg"))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: libraryRoot.appendingPathComponent("Foto iPhone/1/a.jpg").path))
+        XCTAssertTrue(manifest.lastBatch().isEmpty)
+        XCTAssertEqual(try store.entries(withHash: entries[0].hash).count, 2, "l'elenco resta com'era")
+    }
+
+    /// Lo stesso gruppo, con l'originale non piu' in Foto: esce come prima.
+    func testCopyNoLongerInPhotos_leavesAsBefore() throws {
+        let (decision, _) = try fotoIPhoneLeaving()
+        try makeOriginal("1/un-altro.jpg")
+
+        let outcome = makeTrasher().run([decision])
+
+        XCTAssertEqual(outcome.trashedFiles.map(\.originalKey), [normalizedIndexKey("Foto iPhone/1/a.jpg")])
+        XCTAssertTrue(outcome.skippedGroups.isEmpty)
+    }
+
+    /// Libreria Foto non configurata, non trovata o vuota: nel verso sicuro nessuna copia in
+    /// «Foto iPhone» esce, con un motivo che non finge di sapere.
+    func testUnreadablePhotosLibrary_refusesFotoIPhoneCopies() throws {
+        let (decision, _) = try fotoIPhoneLeaving()
+        let empty = root.appendingPathComponent("originals-vuota", isDirectory: true)
+        try FileManager.default.createDirectory(at: empty, withIntermediateDirectories: true)
+        for photosRoot in [nil, root.appendingPathComponent("non-esiste"), empty] {
+            spy = TrashSpy(trashDir: trashDir)
+            let trasher = DuplicateTrasher(libraryRoot: libraryRoot, store: store, manifest: manifest,
+                                           photosLibraryRoot: photosRoot,
+                                           trashFunction: { [spy] in try spy!.trash($0) })
+            let outcome = trasher.run([decision])
+            XCTAssertEqual(spy.calls.count, 0, "radice: \(String(describing: photosRoot))")
+            XCTAssertEqual(outcome.skippedGroups.first?.reason,
+                           .photosLibraryUnreadable(displayPath: "Foto iPhone/1/a.jpg"))
+        }
+    }
+
+    /// Fuori da «Foto iPhone» la libreria Foto non conta, nemmeno se illeggibile: la copia in
+    /// Takeout esce anche con lo stesso percorso relativo dentro `originals`.
+    func testCopiesOutsideFotoIPhone_ignoreThePhotosLibrary() throws {
+        try makeMedia("Foto iPhone/1/a.jpg", contents: "identiche")
+        try makeMedia("Takeout/1/a.jpg", contents: "identiche")
+        let entries = [try entry("Foto iPhone/1/a.jpg"), try entry("Takeout/1/a.jpg")]
+        try store.upsert(entries)
+        try makeOriginal("1/a.jpg")
+        let decision = DuplicateTrasher.Decision(group: group(entries), keeper: entries[0], keptByPhotosLibrary: [])
+
+        let outcome = makeTrasher().run([decision])
+        XCTAssertEqual(outcome.trashedFiles.map(\.originalKey), [normalizedIndexKey("Takeout/1/a.jpg")])
+
+        // Anche con la libreria Foto illeggibile: la tenuta in «Foto iPhone» non esce comunque.
+        try makeMedia("Takeout/1/a.jpg", contents: "identiche")
+        try store.upsert(entries)
+        spy = TrashSpy(trashDir: trashDir)
+        let blind = DuplicateTrasher(libraryRoot: libraryRoot, store: store, manifest: manifest,
+                                     photosLibraryRoot: nil, trashFunction: { [spy] in try spy!.trash($0) })
+        XCTAssertEqual(blind.run([decision]).trashedFiles.count, 1)
+    }
+
+    /// Le copie congelate come «nella libreria» restano: si rileggono (unanimita' su tutto il
+    /// gruppo) ma non arrivano mai a `trashItem`; le altre escono.
+    func testKeptByPhotosLibrary_isRereadButNeverTrashed() throws {
+        try makeMedia("Foto iPhone/1/a.jpg", contents: "identiche")
+        try makeMedia("Foto iPhone/2/a.jpg", contents: "identiche")
+        try makeMedia("Takeout/a.jpg", contents: "identiche")
+        let entries = [try entry("Foto iPhone/1/a.jpg"), try entry("Foto iPhone/2/a.jpg"), try entry("Takeout/a.jpg")]
+        try store.upsert(entries)
+        try makeOriginal("1/a.jpg")
+        try makeOriginal("2/a.jpg")
+        let decision = DuplicateTrasher.Decision(group: group(entries), keeper: entries[0],
+                                                 keptByPhotosLibrary: [entries[1].path])
+        var reread: [String] = []
+        let outcome = makeTrasher(hashFunction: { reread.append($0.lastPathComponent + "@" + $0.deletingLastPathComponent().lastPathComponent); return sha256Measured(of: $0) })
+            .run([decision])
+
+        XCTAssertEqual(spy.calls.map { $0.standardizedFileURL.path },
+                       [libraryRoot.appendingPathComponent("Takeout/a.jpg").standardizedFileURL.path])
+        XCTAssertEqual(outcome.trashedFiles.count, 1)
+        XCTAssertTrue(outcome.skippedGroups.isEmpty)
+        XCTAssertEqual(reread.count, 3, "si rileggono tutte e tre le copie")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: libraryRoot.appendingPathComponent("Foto iPhone/2/a.jpg").path))
+    }
+
+    /// Se restano tutte, non c'e' niente da spostare: nessuna rilettura, nessun `trashItem`.
+    func testAllOthersKeptByPhotos_isNothingToTrash() throws {
+        let (decision, entries) = try fotoIPhoneLeaving()
+        let allKept = DuplicateTrasher.Decision(group: decision.group, keeper: entries[0],
+                                                keptByPhotosLibrary: [entries[1].path])
+        var reads = 0
+        let outcome = makeTrasher(hashFunction: { reads += 1; return sha256Measured(of: $0) }).run([allKept])
+        XCTAssertEqual(outcome.skippedGroups.first?.reason, .nothingToTrash)
+        XCTAssertEqual(spy.calls.count, 0)
+        XCTAssertEqual(reads, 0)
+    }
+
+    /// Un percorso con `..` dentro «Foto iPhone» non si controlla nella libreria Foto: si rifiuta.
+    func testFotoIPhonePathWithDotDot_isRefused() throws {
+        try makeMedia("Takeout/a.jpg", contents: "identiche")
+        try makeMedia("Foto iPhone/1/a.jpg", contents: "identiche")
+        let keeper = try entry("Takeout/a.jpg")
+        let tricky = try entry(at: libraryRoot.appendingPathComponent("Foto iPhone/1/a.jpg"),
+                               displayPath: "Foto iPhone/../Foto iPhone/1/a.jpg")
+        try store.upsert([keeper, tricky])
+        let outcome = makeTrasher().run([.init(group: group([keeper, tricky]), keeper: keeper, keptByPhotosLibrary: [])])
+        XCTAssertEqual(spy.calls.count, 0)
+        XCTAssertEqual(outcome.skippedGroups.first?.reason,
+                       .photosLibraryUnreadable(displayPath: "Foto iPhone/../Foto iPhone/1/a.jpg"))
+    }
+
+    func testPhotosLibrarySkipReasons_haveTheirOwnExplanations() {
+        let motivi: [DuplicateTrashSkipReason] = [
+            .contentDisagrees(displayPath: "a.jpg"), .unreadable(displayPath: "a.jpg"),
+            .sizeChanged(displayPath: "a.jpg"), .outsideLibrary(displayPath: "a.jpg"),
+            .notMedia(displayPath: "a.jpg"), .nothingToTrash, .trashFailed(displayPath: "a.jpg", detail: "x"),
+            .keeperVanished(displayPath: "a.jpg"),
+            .stillInPhotosLibrary(displayPath: "a.jpg"), .photosLibraryUnreadable(displayPath: "a.jpg")
+        ]
+        XCTAssertEqual(Set(motivi.map(\.explanation)).count, motivi.count)
+        for word in ["hash", "indice", "sha256", "entry", "scansione", "originals"] {
+            XCTAssertFalse(DuplicateTrashSkipReason.stillInPhotosLibrary(displayPath: "a.jpg").explanation.lowercased().contains(word))
+            XCTAssertFalse(DuplicateTrashSkipReason.photosLibraryUnreadable(displayPath: "a.jpg").explanation.lowercased().contains(word))
+        }
     }
 }

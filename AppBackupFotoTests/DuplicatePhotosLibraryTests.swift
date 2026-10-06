@@ -199,4 +199,20 @@ final class DuplicatePhotosLibraryTests: XCTestCase {
         let without = DuplicateBatch(groups: [g], rule: nil, photos: .known([]))
         XCTAssertFalse(without.summaryLines().contains { $0.contains("libreria Foto") })
     }
+
+    // MARK: - Esito di una corsa con gruppi lasciati per la libreria Foto (Task 2)
+
+    func testRunOutcome_groupsTheCopiesLeftForThePhotosLibrary() {
+        let g1 = group([entry("Foto iPhone/1/a.jpg"), entry("Takeout/a.jpg")], hash: "h1")
+        let g2 = group([entry("Foto iPhone/2/b.jpg"), entry("Takeout/b.jpg")], hash: "h2")
+        var outcome = DuplicateRunOutcome(totalBlocks: 1)
+        outcome.blocksCompleted = 1
+        outcome.skippedGroups = [(g1, .stillInPhotosLibrary(displayPath: "Foto iPhone/1/a.jpg")),
+                                 (g2, .stillInPhotosLibrary(displayPath: "Foto iPhone/2/b.jpg")),
+                                 (g1, .photosLibraryUnreadable(displayPath: "Foto iPhone/1/a.jpg"))]
+        let texts = DuplicatesStatus.runOutcomeLines(outcome).map(\.text)
+        XCTAssertEqual(texts.filter { $0.contains("perché una copia era ancora nella libreria Foto del Mac") }.count, 1,
+                       "due gruppi per lo stesso motivo: una riga sola")
+        XCTAssertEqual(texts.filter { $0.contains("perché non sono riuscito a controllare la libreria Foto del Mac") }.count, 1)
+    }
 }
