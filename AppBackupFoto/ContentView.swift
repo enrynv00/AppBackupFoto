@@ -4784,10 +4784,6 @@ nonisolated final class DuplicateTrasher: @unchecked Sendable {
         // «il file non c'era» e «il volume e' sparito» restano indistinguibili: presentano
         // lo stesso `NSCocoaErrorDomain/4`.
         let deviceAtStart = deviceIdentifier(of: libraryRoot)
-        // La libreria Foto si lascia leggere? Una volta per blocco. Se no, nessuna copia in
-        // «Foto iPhone» esce (ADR-0018): un `fileExists` falso su una cartella illeggibile
-        // direbbe «non c'e' piu'» proprio dove non si sa.
-        let photosLibraryReadable = Self.isReadableLibraryRoot(photosLibraryRoot)
 
         for (index, decision) in decisions.enumerated() {
             // Un'interruzione lascia un blocco parziale: e' uno stato legittimo, e i gruppi
@@ -4833,6 +4829,10 @@ nonisolated final class DuplicateTrasher: @unchecked Sendable {
             // ricopierebbe. Dal vivo e non dalla fotografia presa all'apertura del pannello: fra
             // le due Enrico puo' aver reimportato una foto. Se una sola copia non passa, il gruppo
             // intero resta intatto (mai «sposto quelle che posso»).
+            // La libreria Foto si lascia leggere? Si ricontrolla prima di OGNI gruppo, non una
+            // volta per blocco: se sparisse a meta' blocco, un `fileExists` falso direbbe «non
+            // c'e' piu' in Foto» proprio dove non si sa (ADR-0018, rilievo del 2026-10-06).
+            let photosLibraryReadable = Self.isReadableLibraryRoot(photosLibraryRoot)
             let photosRefusal: DuplicateTrashSkipReason? = resolved.lazy
                 .filter { self.leaves($0.entry, decision) }
                 .compactMap { self.photosLibraryRefusal(for: $0.entry, libraryReadable: photosLibraryReadable) }

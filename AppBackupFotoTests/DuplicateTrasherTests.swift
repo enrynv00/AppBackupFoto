@@ -768,4 +768,40 @@ final class DuplicateTrasherTests: XCTestCase {
             XCTAssertFalse(DuplicateTrashSkipReason.photosLibraryUnreadable(displayPath: "a.jpg").explanation.lowercased().contains(word))
         }
     }
+
+    /// La libreria Foto si ricontrolla prima di OGNI gruppo, non una volta per blocco (rilievo del
+    /// Security Auditor, 2026-10-06): se `originals` sparisce a meta' blocco, `fileExists` direbbe
+    /// «non c'e' piu' in Foto» proprio dove non si sa, e la copia uscirebbe.
+    func testPhotosLibraryVanishingMidBlock_refusesTheNextGroups() throws {
+        try makeMedia("Takeout/trigger-a.jpg", contents: "trigger")
+        try makeMedia("Takeout2/trigger-b.jpg", contents: "trigger")
+        let trigger = [try entry("Takeout/trigger-a.jpg"), try entry("Takeout2/trigger-b.jpg")]
+        try store.upsert(trigger)
+        let primo = DuplicateTrasher.Decision(group: group(trigger), keeper: trigger[0], keptByPhotosLibrary: [])
+
+        try makeMedia("Takeout/a.jpg", contents: "identiche")
+        try makeMedia("Foto iPhone/1/a.jpg", contents: "identiche")
+        let entries = [try entry("Takeout/a.jpg"), try entry("Foto iPhone/1/a.jpg")]
+        try store.upsert(entries)
+        try makeOriginal("1/a.jpg")
+        let secondo = DuplicateTrasher.Decision(group: group(entries), keeper: entries[0], keptByPhotosLibrary: [])
+
+        var vanished = false
+        let outcome = makeTrasher(hashFunction: { url in
+            let result = sha256Measured(of: url)
+            if url.lastPathComponent == "trigger-b.jpg" {
+                try? FileManager.default.removeItem(at: self.photosLibraryRoot)
+                vanished = true
+            }
+            return result
+        }).run([primo, secondo])
+
+        XCTAssertTrue(vanished, "il trigger non e' scattato: il test non provava quello che doveva")
+        XCTAssertEqual(outcome.skippedGroups.count, 1, "il secondo gruppo va rifiutato")
+        if case .photosLibraryUnreadable = outcome.skippedGroups.first?.1 {} else {
+            XCTFail("motivo atteso: libreria Foto illeggibile, trovato \(String(describing: outcome.skippedGroups.first?.1))")
+        }
+        XCTAssertEqual(outcome.trashedFiles.count, 1, "esce solo la copia del primo gruppo")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: self.libraryRoot.appendingPathComponent("Foto iPhone/1/a.jpg").path))
+    }
 }
