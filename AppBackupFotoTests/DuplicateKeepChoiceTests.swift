@@ -461,8 +461,9 @@ final class DuplicateKeepChoiceTests: XCTestCase {
     // (`cp -p`, `rsync -t` e il restore da Finder preservano l'mtime, misurato nella spec),
     // quindi la regola 3 spesso non discrimina e restano in gara copie che import non sono.
     func testExplanation_notAnImport_doesNotClaimAllOtherCopiesAreImports() {
-        let text = explanation([entry("Other/IMG_0001.JPG"),
-                                entry("Takeout 2/Google Foto/IMG_0001.JPG"),
+        // Cartelle fuori dall'ordine di preferenza (2026-10-06): li' decide ancora la regola 2.
+        let text = explanation([entry("Vacanze 2019/IMG_0001.JPG"),
+                                entry("Mare/Google Foto/IMG_0001.JPG"),
                                 entry("Import/Scheda SD/IMG_0001.JPG")])
         XCTAssertTrue(text.contains("almeno un'altra copia sta in una cartella di scarico"), text)
         XCTAssertFalse(text.contains("tutte le altre copie stanno in una cartella di scarico"), text)
@@ -520,5 +521,33 @@ final class DuplicateKeepChoiceTests: XCTestCase {
                                 entry("Other/IMG_0001.JPG", mtime: 1_700_000_000)])
         XCTAssertFalse(text.contains("«»"), text)
         XCTAssertTrue(text.contains("direttamente sull'SSD, fuori da ogni cartella"), text)
+    }
+
+    // MARK: - Ordine di preferenza delle cartelle (Enrico, 2026-10-06)
+
+    func testPreferredFolder_takeoutBeatsAnOlderCopyInASUS() {
+        let asus = entry("ASUS/Camera Roll/20190613_133729.mp4", mtime: 100)
+        let takeout = entry("Takeout/Google Photos/Photos from 2019/20190613_133729.mp4", mtime: 900)
+        let c = duplicateKeepChoice(group([asus, takeout]), rule: nil, photos: .unknown)
+        XCTAssertEqual(c.keeper.path, takeout.path)
+        XCTAssertEqual(c.reason, .preferredFolder)
+    }
+
+    func testPreferredFolder_followsTheWholeOrder() {
+        let order = ["Foto iPhone/1/a.jpg", "Takeout/a.jpg", "Takeout 2/a.jpg", "Foto Google Drive/a.jpg",
+                     "Import/a.jpg", "Other/a.jpg", "ASUS/a.jpg"]
+        for i in 0..<(order.count - 1) {
+            let members = order[i...].reversed().map { entry($0, mtime: 1) }
+            let c = duplicateKeepChoice(group(Array(members)), rule: nil, photos: .unknown)
+            XCTAssertEqual(c.keeper.displayPath, order[i], "con \(order[i...]) deve restare \(order[i])")
+        }
+    }
+
+    func testPreferredFolder_doesNotApplyWithAFolderOutsideTheOrder() {
+        let old = entry("Vacanze/a.jpg", mtime: 100)
+        let takeout = entry("Takeout/a.jpg", mtime: 900)
+        let c = duplicateKeepChoice(group([takeout, old]), rule: nil, photos: .unknown)
+        XCTAssertEqual(c.keeper.path, old.path)
+        XCTAssertEqual(c.reason, .oldest)
     }
 }

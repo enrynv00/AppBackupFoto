@@ -2075,6 +2075,9 @@ nonisolated enum DuplicateKeepReason {
     /// Fra le copie della libreria principale, e' quella che la libreria Foto del Mac ha
     /// ancora (ADR-0018): resta comunque, quindi tenerla libera le altre.
     case stillInPhotosLibrary
+    /// Sta nella cartella che Enrico preferisce fra quelle del gruppo (ordine deciso il
+    /// 2026-10-06, `duplicateFolderPreference`): ASUS per ultima.
+    case preferredFolder
     /// Sta in una cartella organizzata a mano, e le altre copie stanno in un import.
     case notAnImport
     /// Nessuna delle due regole sopra discrimina: e' la piu' vecchia.
@@ -2144,6 +2147,24 @@ private nonisolated func topLevelFolderKey(of key: String) -> String? {
 
 private nonisolated func isInMainLibrary(_ entry: LibraryIndexEntry) -> Bool {
     topLevelFolderKey(of: entry.path) == mainLibraryFolderKey
+}
+
+/// L'ordine in cui Enrico preferisce tenere una copia, deciso il 2026-10-06 davanti al
+/// pannello (la prima cartella vince). Una cartella che non e' nell'elenco viene dopo
+/// «Other»; `ASUS` (il recupero PhotoRec) e' sempre l'ultima. **Sostituisce** la decisione
+/// del 2026-09-24 «ASUS e Takeout di pari dignita'»: la scelta di oggi e' di Enrico, presa
+/// vedendo che con la sola data restava quasi sempre la copia in `ASUS/`.
+nonisolated let duplicateFolderPreference: [String] =
+    ["Foto iPhone", "Takeout", "Takeout 2", "Foto Google Drive", "Import", "Other"].map(normalizedIndexKey)
+nonisolated let duplicateLastFolder = normalizedIndexKey("ASUS")
+
+/// Posizione di una copia nell'ordine di preferenza (piu' bassa vince), `nil` per un file in
+/// radice o in una cartella che non e' nell'elenco: li' l'ordine di Enrico non dice niente, e
+/// decidono le regole di prima.
+nonisolated func duplicateFolderRank(_ entry: LibraryIndexEntry) -> Int? {
+    guard let folder = topLevelFolderKey(of: entry.path) else { return nil }
+    if folder == duplicateLastFolder { return duplicateFolderPreference.count }
+    return duplicateFolderPreference.firstIndex(of: folder)
 }
 
 private nonisolated func isInImportFolder(_ entry: LibraryIndexEntry) -> Bool {
@@ -2371,7 +2392,7 @@ nonisolated func saveDuplicateFolderRule(_ rule: DuplicateFolderRule?, defaults:
 /// recupero PhotoRec/TestDisk da un PC morto). **Decisione di Enrico del 2026-09-24: resta
 /// di pari dignita' con le altre cartelle, `recup_dir.*` non si declassa** — stesso
 /// argomento gia' usato per `Takeout/`: l'origine automatica non dice niente sul valore del
-/// contenuto. **Non riaprire.** Distribuzione reale (2026-09-24, 141.683 voci): `ASUS`
+/// contenuto. **Riaperta da Enrico il 2026-10-06** (vedi `duplicateFolderPreference`, regola 1c): con la sola data restava quasi sempre la copia in `ASUS/` e si svuotavano le cartelle ordinate; ora ASUS e' l'ultima scelta. Distribuzione reale (2026-09-24, 141.683 voci): `ASUS`
 /// 93.824, `Foto iPhone` 18.530, `Takeout` 13.138, `Takeout 2` 10.708, `Foto Google Drive`
 /// 3.945, `Other` 1.508, `Import` 30.
 ///
@@ -2440,6 +2461,12 @@ nonisolated func duplicateKeepChoice(_ group: DuplicateGroup, rule: DuplicateFol
     // 1b. Fra le copie della libreria principale, quella che la libreria Foto del Mac ha
     //     ancora: resta comunque (ADR-0018), quindi tenerla libera le altre.
     narrow(candidates.filter { photos.holds($0) }, .stillInPhotosLibrary)
+    // 1c. L'ordine di preferenza delle cartelle di Enrico (2026-10-06): ASUS per ultima.
+    //     Solo se ogni copia sta in una cartella dell'elenco: altrimenti l'ordine non e' completo.
+    let ranks = candidates.map(duplicateFolderRank)
+    if !ranks.contains(where: { $0 == nil }), let best = ranks.compactMap({ $0 }).min() {
+        narrow(candidates.filter { duplicateFolderRank($0) == best }, .preferredFolder)
+    }
     // 2. Una cartella organizzata a mano batte uno scarico da scheda o disco.
     narrow(candidates.filter { !isInImportFolder($0) }, .notAnImport)
     // 3. A parita', la piu' vecchia: e' quella che l'utente ha da piu' tempo, e le copie
@@ -2531,6 +2558,10 @@ func duplicateKeepExplanation(_ choice: DuplicateKeepChoice, in group: Duplicate
     case .stillInPhotosLibrary:
         lead = "Tengo la copia che si trova \(place): è ancora nella libreria Foto del Mac, quindi "
             + "resta comunque. Se la spostassi, il prossimo backup dal Mac la ricopierebbe."
+    case .preferredFolder:
+        lead = "Tengo la copia che si trova \(place): fra le cartelle in cui c'è questa foto è quella "
+            + "che preferisci (Foto iPhone, poi Takeout, Takeout 2, Foto Google Drive, Import, Other; "
+            + "ASUS per ultima)."
     case .notAnImport:
         lead = allOthersAreImports
             ? "Tengo la copia che si trova \(place): tutte le altre copie stanno in una cartella di scarico, "
