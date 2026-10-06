@@ -215,4 +215,105 @@ final class DuplicatePhotosLibraryTests: XCTestCase {
                        "due gruppi per lo stesso motivo: una riga sola")
         XCTAssertEqual(texts.filter { $0.contains("perché non sono riuscito a controllare la libreria Foto del Mac") }.count, 1)
     }
+
+    // MARK: - Il pannello: casella, motivo, riga in testa (Task 3)
+
+    /// Una garanzia dell'inventario fresca che copre il gruppo «sha-a» (stessa costruzione di
+    /// `DuplicateCertificationTests`): SSD, HDD e Cubbit completi, copie dell'SSD viste.
+    private func freshCertification() -> DuplicateCertification {
+        func md5(_ c: Character) -> String { String(repeating: c, count: 32) }
+        func file(_ path: String) -> InventoryLocalFile {
+            InventoryLocalFile(key: normalizedIndexKey(path), displayPath: path, size: 10, mtime: 1, status: .ok,
+                               digest: ContentDigest(size: 10, sha256: "sha-a", md5: md5("a"), multipartETag: nil),
+                               hashedAt: 2)
+        }
+        func state(_ a: InventoryArchive) -> InventoryArchiveState {
+            InventoryArchiveState(archive: a, runId: 7, complete: true, reason: nil, unreadable: 0,
+                                  startedAt: 1_000, finishedAt: 5_000)
+        }
+        let snapshot = InventorySnapshot(
+            ssd: [file("Foto iPhone/1/a.jpg"), file("Takeout/a.jpg")],
+            hdd: [file("Foto iPhone/1/a.jpg"), file("Takeout/a.jpg")],
+            s3: [InventoryS3Object(key: normalizedIndexKey("Takeout/a.jpg"), displayKey: "Takeout/a.jpg", size: 10,
+                                   etag: "\"\(md5("a"))\"")],
+            states: [.ssd: state(.ssd), .hdd: state(.hdd), .s3: state(.s3)])
+        let g = DuplicateGroup(hash: "sha-a", size: 10, members: [
+            LibraryIndexEntry(path: normalizedIndexKey("Foto iPhone/1/a.jpg"), displayPath: "Foto iPhone/1/a.jpg",
+                              size: 10, mtime: 1, hash: "sha-a", hashedAt: 2),
+            LibraryIndexEntry(path: normalizedIndexKey("Takeout/a.jpg"), displayPath: "Takeout/a.jpg",
+                              size: 10, mtime: 1, hash: "sha-a", hashedAt: 2)])
+        let c = DuplicateCertification(basis: DuplicateCertificationBasis(snapshot: snapshot), lastArchiveWriteAt: nil, groups: [g])
+        XCTAssertTrue(c.isSelectable("sha-a"), "premessa: il gruppo e' certificato")
+        return c
+    }
+
+    func testCanSelect_needsTheGuarantee_andSomethingToMove() {
+        let fresh = freshCertification()
+        XCTAssertTrue(DuplicatesStatus.canSelect("sha-a", certification: fresh, nothingToMove: []))
+        XCTAssertFalse(DuplicatesStatus.canSelect("sha-a", certification: fresh, nothingToMove: ["sha-a"]),
+                       "certificato ma tutte le copie in piu' restano: niente da spuntare")
+        XCTAssertFalse(DuplicatesStatus.canSelect("sha-a", certification: nil, nothingToMove: []))
+        let stale = DuplicateCertification(basis: .unreadable, lastArchiveWriteAt: nil, groups: [])
+        XCTAssertFalse(DuplicatesStatus.canSelect("sha-a", certification: stale, nothingToMove: []))
+    }
+
+    /// «Niente da spostare» viene prima di tutto: vale qualunque sia l'inventario.
+    func testRowLine_nothingToMoveComesFirst() {
+        let stale = DuplicateCertification(basis: .unreadable, lastArchiveWriteAt: nil, groups: [])
+        let known = DuplicatesStatus.nothingToMoveRowLine(photosLibraryKnown: true)
+        XCTAssertEqual(DuplicatesStatus.rowBlockedLine("h", certification: nil, nothingToMove: ["h"], photosLibraryKnown: true), known)
+        XCTAssertEqual(DuplicatesStatus.rowBlockedLine("h", certification: stale, nothingToMove: ["h"], photosLibraryKnown: true), known)
+        XCTAssertEqual(DuplicatesStatus.rowBlockedLine("h", certification: stale, nothingToMove: ["h"], photosLibraryKnown: false),
+                       DuplicatesStatus.nothingToMoveRowLine(photosLibraryKnown: false))
+    }
+
+    func testRowLine_otherwiseTheGuaranteeDecides() {
+        let stale = DuplicateCertification(basis: .unreadable, lastArchiveWriteAt: nil, groups: [])
+        XCTAssertEqual(DuplicatesStatus.rowBlockedLine("h", certification: nil, nothingToMove: [], photosLibraryKnown: true),
+                       DuplicatesStatus.certificationPendingRowLine)
+        XCTAssertEqual(DuplicatesStatus.rowBlockedLine("h", certification: stale, nothingToMove: ["altro"], photosLibraryKnown: true),
+                       DuplicatesStatus.blockedRowLine(.inventoryUnreadable))
+        XCTAssertNil(DuplicatesStatus.rowBlockedLine("sha-a", certification: freshCertification(), nothingToMove: [],
+                                                     photosLibraryKnown: true))
+    }
+
+    func testNothingToMoveLine_saysWhatToDo_orWhyItCannotTell() {
+        XCTAssertEqual(DuplicatesStatus.nothingToMoveRowLine(photosLibraryKnown: true),
+                       "Non si può spuntare: le copie in più stanno tutte in «Foto iPhone» e sono ancora nella "
+                       + "libreria Foto del Mac. Se le spostassi nel Cestino, il prossimo backup dal Mac le "
+                       + "ricopierebbe. Se vuoi tenerne una sola, togli i doppioni dalla libreria Foto, non da qui.")
+        XCTAssertEqual(DuplicatesStatus.nothingToMoveRowLine(photosLibraryKnown: false),
+                       "Non si può spuntare: le copie in più stanno tutte in «Foto iPhone» e l'app non è riuscita "
+                       + "a leggere la libreria Foto del Mac, quindi per sicurezza restano dove sono.")
+    }
+
+    func testPhotosLibraryLine() {
+        XCTAssertNil(DuplicatesStatus.photosLibraryLine(photosLibraryKnown: true, keptCopies: 0))
+        let one = DuplicatesStatus.photosLibraryLine(photosLibraryKnown: true, keptCopies: 1)
+        XCTAssertEqual(one?.tone, .info)
+        XCTAssertEqual(one?.text, "1 copia in «Foto iPhone» resta dove è, perché è ancora nella libreria Foto del Mac: "
+            + "se la spostassi nel Cestino, il prossimo backup dal Mac la ricopierebbe. Per tenerne una sola, "
+            + "togli i doppioni dalla libreria Foto.")
+        XCTAssertEqual(DuplicatesStatus.photosLibraryLine(photosLibraryKnown: true, keptCopies: 3)?.text,
+                       "3 copie in «Foto iPhone» restano dove sono, perché sono ancora nella libreria Foto del Mac: "
+                       + "se le spostassi nel Cestino, il prossimo backup dal Mac le ricopierebbe. Per tenerne una "
+                       + "sola, togli i doppioni dalla libreria Foto.")
+        let unknown = DuplicatesStatus.photosLibraryLine(photosLibraryKnown: false, keptCopies: 0)
+        XCTAssertEqual(unknown?.tone, .warning)
+        XCTAssertEqual(unknown?.id, "photos-unknown")
+        XCTAssertEqual(DuplicatesStatus.photosLibraryLine(photosLibraryKnown: false, keptCopies: 5)?.id, "photos-unknown",
+                       "senza libreria leggibile vale l'avviso, non il conteggio")
+    }
+
+    func testNewTexts_haveNoJargon() {
+        let texts = [DuplicatesStatus.nothingToMoveRowLine(photosLibraryKnown: true),
+                     DuplicatesStatus.nothingToMoveRowLine(photosLibraryKnown: false),
+                     DuplicatesStatus.photosLibraryLine(photosLibraryKnown: false, keptCopies: 0)?.text ?? "",
+                     DuplicatesStatus.photosLibraryLine(photosLibraryKnown: true, keptCopies: 2)?.text ?? ""]
+        for text in texts {
+            for word in ["hash", "indice", "sha", "scansione", "entry", "originals", "bookmark", "cache"] {
+                XCTAssertFalse(text.lowercased().contains(word), "gergo «\(word)» in: \(text)")
+            }
+        }
+    }
 }

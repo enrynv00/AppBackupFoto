@@ -4203,6 +4203,60 @@ extension DuplicatesStatus {
         + "quindi non ho spostato niente. Chiudi e riapri la finestra Doppioni e scegli di nuovo."
 }
 
+// MARK: - Le copie che la libreria Foto del Mac ha ancora, nel pannello Doppioni (ADR-0018)
+
+/// Regole e frasi del pannello per le copie che restano perche' la libreria Foto del Mac le ha
+/// ancora. Logica pura, testata senza aprire la finestra; stesso registro anti-gergo.
+extension DuplicatesStatus {
+    /// Un gruppo si puo' spuntare solo se la garanzia dell'inventario e' pronta e lo copre
+    /// (ADR-0017) **e** ha almeno una copia da spostare (ADR-0018). Un punto solo per tutti i
+    /// percorsi della finestra: casella, selezione in massa, conteggi, riepilogo.
+    static func canSelect(_ hash: String, certification: DuplicateCertification?, nothingToMove: Set<String>) -> Bool {
+        guard let certification, !nothingToMove.contains(hash) else { return false }
+        return certification.isSelectable(hash)
+    }
+
+    /// La riga sotto un gruppo che non si puo' spuntare, `nil` se si puo'. Precedenza: niente da
+    /// spostare (vale qualunque sia l'inventario, e si risolve solo in Foto) > garanzia non ancora
+    /// pronta > motivo della garanzia.
+    static func rowBlockedLine(_ hash: String, certification: DuplicateCertification?,
+                               nothingToMove: Set<String>, photosLibraryKnown: Bool) -> String? {
+        if nothingToMove.contains(hash) { return nothingToMoveRowLine(photosLibraryKnown: photosLibraryKnown) }
+        guard let certification else { return certificationPendingRowLine }
+        return certification.block(for: hash).map { blockedRowLine($0) }
+    }
+
+    /// Perche' un gruppo non ha niente da spostare. Con la libreria letta, dice anche cosa fare:
+    /// togliere i doppioni da Foto, non da qui.
+    static func nothingToMoveRowLine(photosLibraryKnown: Bool) -> String {
+        photosLibraryKnown
+            ? "Non si può spuntare: le copie in più stanno tutte in «Foto iPhone» e sono ancora nella "
+                + "libreria Foto del Mac. Se le spostassi nel Cestino, il prossimo backup dal Mac le "
+                + "ricopierebbe. Se vuoi tenerne una sola, togli i doppioni dalla libreria Foto, non da qui."
+            : "Non si può spuntare: le copie in più stanno tutte in «Foto iPhone» e l'app non è riuscita "
+                + "a leggere la libreria Foto del Mac, quindi per sicurezza restano dove sono."
+    }
+
+    /// La riga in testa al pannello sulla libreria Foto. `nil` se si e' lasciata leggere e nessuna
+    /// copia resta per lei.
+    static func photosLibraryLine(photosLibraryKnown: Bool, keptCopies: Int) -> Line? {
+        guard photosLibraryKnown else {
+            return Line(id: "photos-unknown", tone: .warning, text:
+                "L'app non è riuscita a leggere la libreria Foto del Mac: per sicurezza nessuna copia in "
+                + "«Foto iPhone» si sposta, perché se fosse ancora in Foto il prossimo backup la "
+                + "ricopierebbe. Controlla in Configurazione la cartella della Libreria Foto, poi riapri "
+                + "questa finestra.")
+        }
+        guard keptCopies > 0 else { return nil }
+        let one = keptCopies == 1
+        return Line(id: "photos-kept", tone: .info, text:
+            "\(count(keptCopies, "copia", "copie")) in «Foto iPhone» \(one ? "resta" : "restano") dove "
+            + "\(one ? "è" : "sono"), perché \(one ? "è" : "sono") ancora nella libreria Foto del Mac: se "
+            + "\(one ? "la" : "le") spostassi nel Cestino, il prossimo backup dal Mac \(one ? "la" : "le") "
+            + "ricopierebbe. Per tenerne una sola, togli i doppioni dalla libreria Foto.")
+    }
+}
+
 // MARK: - Righe di stato del pannello Doppioni (Task 6, 2026-08-31)
 
 /// Cosa dire in cima al pannello Doppioni, perche' la cancellazione e' disattivata in questo
@@ -16777,6 +16831,14 @@ struct HamburgerPanel: View {
                         HamburgerRow(icon: "checklist", label: "Inventario", iconColor: .indigo) {
                             openWindow(id: "inventory")
                         }
+                        // Richiesta di Enrico del 2026-10-05: fino a oggi si arrivava ai Doppioni
+                        // solo da Tools -> Diagnostica -> «Vedi le copie doppie…», e non la trovava
+                        // (rovescia la scelta del 2026-08-28, «nessuna voce nell'hamburger»). Stessa
+                        // finestra, stesso gate Touch ID (`Window("Doppioni", id: "duplicates")`);
+                        // il bottone in Diagnostica resta.
+                        HamburgerRow(icon: "square.on.square", label: "Doppioni", iconColor: .purple) {
+                            openWindow(id: "duplicates")
+                        }
                         HamburgerRow(icon: "arrow.triangle.2.circlepath", label: "Controlla aggiornamenti", iconColor: .cyan) {
                             updater.controller.checkForUpdates(nil)
                         }
@@ -17950,6 +18012,8 @@ struct DuplicatesView: View {
 
             certificationBanner
 
+            photosLibraryBanner
+
             Label(DuplicatesStatus.mirrorsUntouchedNote(), systemImage: "externaldrive.badge.checkmark")
                 .font(AppFont.caption).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -18445,7 +18509,7 @@ struct DuplicatesView: View {
     private func toggleSelection(_ hash: String) {
         // Seconda difesa (la casella e' gia' spenta): un gruppo non certificato non entra mai
         // nella selezione; toglierlo invece si puo' sempre.
-        guard selectedHashes.contains(hash) || certification?.isSelectable(hash) == true else { return }
+        guard selectedHashes.contains(hash) || canSelect(hash) else { return }
         if selectedHashes.contains(hash) { selectedHashes.remove(hash) } else { selectedHashes.insert(hash) }
         recomputeSelectionStats()
     }
@@ -18457,7 +18521,7 @@ struct DuplicatesView: View {
         guard let loadedBatch else { return }
         for i in visibleIndices {
             let hash = loadedBatch.groups[i].group.hash
-            if certification?.isSelectable(hash) == true { selectedHashes.insert(hash) }
+            if canSelect(hash) { selectedHashes.insert(hash) }
         }
         recomputeSelectionStats()
     }
@@ -18630,7 +18694,7 @@ struct DuplicatesView: View {
                 // piu' nel batch appena ricostruito (rilettura dopo un annullamento, un
                 // gruppo scomparso) non deve restare a contare in `selectionStats`.
                 self.selectedHashes = self.selectedHashes.filter {
-                    finalByHash[$0] != nil && self.certification?.isSelectable($0) == true
+                    finalByHash[$0] != nil && self.canSelect($0)
                 }
                 self.recountBlocked()
                 self.recomputeSelectionStats()
@@ -18661,7 +18725,9 @@ struct DuplicatesView: View {
         // certificazione che da qui viaggia col blocco fino al runner.
         guard let certification else { return }
         let selected = loadedBatch.groups.filter {
-            selectedHashes.contains($0.group.hash) && certification.isSelectable($0.group.hash)
+            selectedHashes.contains($0.group.hash)
+                && DuplicatesStatus.canSelect($0.group.hash, certification: certification,
+                                              nothingToMove: loadedBatch.nothingToMove)
         }
         guard !selected.isEmpty else { return }
         let batch = DuplicateBatch(entries: selected)
@@ -18717,8 +18783,27 @@ extension DuplicatesView {
     /// La riga sotto un gruppo che non si puo' spuntare, `nil` se si puo'. Una lettura O(1)
     /// nella certificazione gia' calcolata.
     private func blockedRowLine(for hash: String) -> String? {
-        guard let certification else { return DuplicatesStatus.certificationPendingRowLine }
-        return certification.block(for: hash).map { DuplicatesStatus.blockedRowLine($0) }
+        DuplicatesStatus.rowBlockedLine(hash, certification: certification,
+                                        nothingToMove: loadedBatch?.nothingToMove ?? [],
+                                        photosLibraryKnown: photosPresence.isKnown)
+    }
+
+    /// Si puo' spuntare adesso? Letture O(1) su insiemi gia' calcolati (`DuplicatesStatus.canSelect`).
+    private func canSelect(_ hash: String) -> Bool {
+        DuplicatesStatus.canSelect(hash, certification: certification, nothingToMove: loadedBatch?.nothingToMove ?? [])
+    }
+
+    /// La riga in testa sulla libreria Foto del Mac (ADR-0018): solo con l'elenco letto.
+    @ViewBuilder
+    private var photosLibraryBanner: some View {
+        if case .loaded = loadState,
+           let line = DuplicatesStatus.photosLibraryLine(photosLibraryKnown: photosPresence.isKnown,
+                                                         keptCopies: loadedBatch?.keptByPhotosLibraryCount ?? 0) {
+            Label(line.text, systemImage: line.tone == .warning ? "exclamationmark.triangle" : "photo.on.rectangle")
+                .font(AppFont.caption)
+                .foregroundStyle(line.tone == .warning ? AppColor.warning : Color.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
     }
 
     /// Ricalcola quali gruppi si possono spuntare, fuori dal main. La base dell'inventario si
@@ -18739,7 +18824,7 @@ extension DuplicatesView {
                 self.runner.rememberDuplicateCertificationBasis(basis)
                 guard self.certificationToken == token else { return }
                 self.certification = result
-                self.selectedHashes = self.selectedHashes.filter { result.isSelectable($0) }
+                self.selectedHashes = self.selectedHashes.filter { self.canSelect($0) }
                 self.recomputeSelectionStats()
                 self.recountBlocked()
             }
@@ -18755,11 +18840,15 @@ extension DuplicatesView {
             ruleCoveredBlockedCount = 0
             return
         }
+        let nothingToMove = loadedBatch.nothingToMove
+        func selectable(_ hash: String) -> Bool {
+            DuplicatesStatus.canSelect(hash, certification: certification, nothingToMove: nothingToMove)
+        }
         visibleBlockedCount = visibleIndices.reduce(0) { total, i in
             guard loadedBatch.groups.indices.contains(i) else { return total }
-            return total + (certification.isSelectable(loadedBatch.groups[i].group.hash) ? 0 : 1)
+            return total + (selectable(loadedBatch.groups[i].group.hash) ? 0 : 1)
         }
-        ruleCoveredBlockedCount = ruleCoveredHashes.reduce(0) { $0 + (certification.isSelectable($1) ? 0 : 1) }
+        ruleCoveredBlockedCount = ruleCoveredHashes.reduce(0) { $0 + (selectable($1) ? 0 : 1) }
     }
 }
 
@@ -18822,19 +18911,35 @@ enum IntegritySummary {
 /// dalla posizione nella lista. Rilievo di Enrico del 2026-09-03: davanti a un'operazione che
 /// sposta file veri, una freccia e un rientro non bastano a capire cosa si sta confermando.
 private struct DuplicateRoleBadge: View {
-    enum Kind { case kept, leaving }
+    /// `keptInPhotos` (ADR-0018): una copia che resta perche' la libreria Foto del Mac la ha ancora.
+    enum Kind { case kept, keptInPhotos, leaving }
     let kind: Kind
 
+    private var text: String {
+        switch kind {
+        case .kept: return "RESTA"
+        case .keptInPhotos: return "RESTA · È ANCORA IN FOTO"
+        case .leaving: return "NEL CESTINO"
+        }
+    }
+
+    private var color: Color { kind == .leaving ? AppColor.warning : AppColor.success }
+
+    private var accessibilityText: String {
+        switch kind {
+        case .kept: return "Questa copia resta sull'SSD"
+        case .keptInPhotos: return "Questa copia resta sull'SSD: è ancora nella libreria Foto del Mac"
+        case .leaving: return "Questa copia viene spostata nel Cestino"
+        }
+    }
+
     var body: some View {
-        Text(kind == .kept ? "RESTA" : "NEL CESTINO")
+        Text(text)
             .font(.system(size: 9, weight: .bold))
-            .foregroundStyle(kind == .kept ? AppColor.success : AppColor.warning)
+            .foregroundStyle(color)
             .padding(.horizontal, 5).padding(.vertical, 1)
-            .background(
-                RoundedRectangle(cornerRadius: 3)
-                    .fill((kind == .kept ? AppColor.success : AppColor.warning).opacity(0.15)))
-            .accessibilityLabel(kind == .kept ? "Questa copia resta sull'SSD"
-                                              : "Questa copia viene spostata nel Cestino")
+            .background(RoundedRectangle(cornerRadius: 3).fill(color.opacity(0.15)))
+            .accessibilityLabel(accessibilityText)
     }
 }
 
@@ -18968,6 +19073,21 @@ private struct DuplicateGroupRow: View {
                     Label(blockedReason, systemImage: "lock")
                         .font(AppFont.caption).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
+                }
+
+                // ADR-0018: le altre copie che restano perche' la libreria Foto del Mac le ha
+                // ancora. Senza queste righe sparirebbero dalla lista: l'utente non vedrebbe
+                // ne' che esistono ne' perche' restano.
+                ForEach(entry.keptByPhotosLibrary, id: \.path) { kept in
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: AppSpacing.xs) {
+                            DuplicateRoleBadge(kind: .keptInPhotos)
+                            Text(kept.displayPath).font(.caption).foregroundStyle(.secondary)
+                                .lineLimit(1).truncationMode(.middle)
+                            RevealInFinderButton(url: url(for: kept))
+                        }
+                        DuplicateFileDetail(entry: kept).padding(.leading, AppSpacing.md)
+                    }
                 }
 
                 ForEach(entry.leaving, id: \.path) { leaving in
