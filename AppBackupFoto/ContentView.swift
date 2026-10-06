@@ -2072,6 +2072,9 @@ nonisolated enum DuplicateKeepReason {
     case userFolderRule
     /// Sta nella libreria principale, e le altre copie no.
     case mainLibrary
+    /// Fra le copie della libreria principale, e' quella che la libreria Foto del Mac ha
+    /// ancora (ADR-0018): resta comunque, quindi tenerla libera le altre.
+    case stillInPhotosLibrary
     /// Sta in una cartella organizzata a mano, e le altre copie stanno in un import.
     case notAnImport
     /// Nessuna delle due regole sopra discrimina: e' la piu' vecchia.
@@ -2108,6 +2111,13 @@ nonisolated struct DuplicateKeepChoice {
     /// nominata. Nessun chiamante esistente costruisce `DuplicateKeepChoice` a mano (solo
     /// `duplicateKeepChoice` lo fa), quindi il campo e' additivo e non rompe niente a monte.
     let tiedPaths: Set<String>
+
+    /// Le chiavi delle ALTRE copie (non la tenuta) che restano dove sono perche' stanno in
+    /// «Foto iPhone» e la libreria Foto del Mac ha ancora il loro originale (ADR-0018): se
+    /// uscissero, il backup MAC -> SSD successivo le ricopierebbe. Decise qui, insieme alla
+    /// tenuta, e congelate con lei fino al `DuplicateTrasher` — mai ricalcolate altrove.
+    /// Vuoto quando nessuna copia del gruppo e' nella libreria Foto.
+    let keptByPhotosLibrary: Set<String>
 }
 
 /// La cartella di primo livello di una chiave, oppure `nil` per un file che sta nella
@@ -2138,6 +2148,107 @@ private nonisolated func isInMainLibrary(_ entry: LibraryIndexEntry) -> Bool {
 
 private nonisolated func isInImportFolder(_ entry: LibraryIndexEntry) -> Bool {
     topLevelFolderKey(of: entry.path) == importFolderKey
+}
+
+// MARK: - Le copie che la libreria Foto del Mac ha ancora (ADR-0018, 2026-10-05)
+
+/// Quali copie in «Foto iPhone» hanno ancora il loro originale nella libreria Foto del Mac.
+///
+/// Il backup MAC -> SSD copia `originals/<X>/<file>` in `Foto iPhone/<X>/<file>` e copia solo
+/// cio' che manca (zero-overwrite). Una copia in «Foto iPhone» spostata nel Cestino mentre il
+/// suo originale c'e' ancora **torna al backup successivo**: verificato dal vivo il 2026-10-05
+/// (degli 8 file spostati da «Foto iPhone» dal pannello Doppioni, 6 erano gia' tornati). La
+/// libreria Foto contiene doppioni veri (asset diversi, stesso contenuto), quindi l'SSD ha gruppi
+/// di doppioni dentro «Foto iPhone». Decisione di Enrico (opzione 1, ADR-0018): una copia cosi'
+/// non si sposta MAI; le altre copie dello stesso gruppo (fuori da «Foto iPhone», o in «Foto
+/// iPhone» ma non piu' in Foto) si spostano come prima.
+///
+/// `mainLibraryKeys` sono le chiavi dell'elenco (`normalizedIndexKey`: NFC + minuscole) che i
+/// file di `originals` hanno sull'SSD: «foto iphone/<percorso dentro originals>». `nil` = non si
+/// sa (libreria non configurata, non trovata, letta a meta', o vuota): **nel verso sicuro ogni
+/// copia in «Foto iPhone» conta come nella libreria**. Le copie fuori da «Foto iPhone» non
+/// dipendono mai da questo tipo: il backup scrive solo li'.
+///
+/// E' una fotografia presa una volta per caricamento del pannello, fuori dal main (`read`), che
+/// serve a scegliere la tenuta e a mostrare cosa resta. Non e' l'ultima parola: subito prima di
+/// spostare, `DuplicateTrasher` ricontrolla dal vivo ogni copia in uscita.
+// `nonisolated`: value type senza stato condiviso, costruito in un `Task.detached` e letto da
+// `duplicateKeepChoice` fuori dal main.
+nonisolated struct PhotosLibraryPresence: Equatable, Sendable {
+    let mainLibraryKeys: Set<String>?
+
+    /// Non si sa: ogni copia in «Foto iPhone» resta.
+    static let unknown = PhotosLibraryPresence(mainLibraryKeys: nil)
+
+    static func known(_ keys: Set<String>) -> PhotosLibraryPresence {
+        PhotosLibraryPresence(mainLibraryKeys: keys)
+    }
+
+    var isKnown: Bool { mainLibraryKeys != nil }
+
+    /// Vero se questa copia dell'SSD sta in «Foto iPhone» (confronto per componente, come
+    /// `duplicateKeepChoice`: «Foto iPhone 2» e' un'altra cartella) e la libreria Foto ha
+    /// ancora il suo originale — o non si sa.
+    func holds(_ entry: LibraryIndexEntry) -> Bool {
+        guard isInMainLibrary(entry) else { return false }
+        guard let mainLibraryKeys else { return true }
+        return mainLibraryKeys.contains(normalizedIndexKey(entry.path))
+    }
+
+    /// La chiave dell'elenco che la copia sull'SSD di un file di `originals` ha: lo stesso
+    /// percorso relativo sotto «Foto iPhone», normalizzato come ogni chiave dell'elenco.
+    static func key(forOriginalsRelativePath relative: String) -> String {
+        normalizedIndexKey(mainLibraryFolderKey + "/" + relative)
+    }
+
+    /// Legge l'elenco dei file di `originals` (la cartella del bookmark `.photos`). Fuori dal
+    /// main: ~18.500 file, misurati in 0,1 s con `find` il 2026-10-05. Sola lettura: nessun
+    /// file della libreria Foto viene aperto, solo le cartelle elencate (regola assoluta 3).
+    ///
+    /// Nel verso sicuro restituisce `.unknown`, mai un elenco parziale: root `nil`, assente o
+    /// non cartella; enumeratore `nil`; una cartella che non si lascia aprire (`errorHandler`,
+    /// stessa disciplina di `LibraryIndexer.scan`: il suo default e' «prosegui in silenzio»);
+    /// un file che non risulta sotto la root; nessun file trovato (una libreria vuota e una
+    /// libreria illeggibile si confondono, e la seconda renderebbe spostabile tutto).
+    /// Include ogni voce che non e' una cartella, nascosti compresi: contare un file in piu'
+    /// tiene una copia in piu', contarne uno in meno la farebbe ricopiare.
+    static func read(originalsRoot: URL?, fileManager fm: FileManager = .default) -> PhotosLibraryPresence {
+        guard let root = originalsRoot else { return .unknown }
+        var isDirectory: ObjCBool = false
+        guard fm.fileExists(atPath: root.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            return .unknown
+        }
+        let failures = ReadFailures()
+        guard let enumerator = fm.enumerator(at: root,
+                                             includingPropertiesForKeys: [.isDirectoryKey],
+                                             options: [],
+                                             errorHandler: { _, _ in
+                                                 failures.count += 1
+                                                 return true
+                                             }) else { return .unknown }
+        // Le due forme della root, come in `DuplicateTrasher`: l'enumeratore restituisce
+        // percorsi in forma `realpath` (`/private/var/...` per una root `/var/...`).
+        let rootForms = [root.standardizedFileURL.path, realResolvedPath(root)].map {
+            $0.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+        }
+        var keys = Set<String>()
+        for case let url as URL in enumerator {
+            if (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true { continue }
+            guard let relative = rootForms.lazy.compactMap({ relativePath(of: url.path, under: $0) }).first else {
+                return .unknown
+            }
+            keys.insert(key(forOriginalsRelativePath: relative))
+        }
+        guard failures.count == 0, !keys.isEmpty else { return .unknown }
+        return .known(keys)
+    }
+
+    /// Contatore condiviso con l'`errorHandler` (closure `@escaping`, non puo' catturare un
+    /// `var` locale). Nessun lock: l'enumeratore la chiama in modo sincrono dal thread che
+    /// esegue `read`, stesso schema di `LibraryIndexer`/`InventoryScanner`.
+    private final class ReadFailures {
+        var count = 0
+    }
 }
 
 /// La regola dell'utente «tieni la copia in X, cestina quelle in Y…» (ADR-0011).
@@ -2283,7 +2394,18 @@ nonisolated func saveDuplicateFolderRule(_ rule: DuplicateFolderRule?, defaults:
 ///   di "tenere" l'unica copia esistente e' una riga che nel pannello Doppioni dichiara
 ///   doppione un file che copie non ne ha.
 // `nonisolated`: pura, chiamata dal pannello Doppioni fuori dal main thread (Task 5).
-nonisolated func duplicateKeepChoice(_ group: DuplicateGroup, rule: DuplicateFolderRule?) -> DuplicateKeepChoice {
+///
+/// **Regola 1b — la copia che la libreria Foto ha ancora (ADR-0018, 2026-10-05).** Fra le
+/// copie rimaste dopo la regola 1, si preferisce quella che `photos.holds` (in «Foto iPhone» e
+/// ancora in Foto): resta comunque, quindi tenerla permette di spostare le altre. Dopo la
+/// regola 1 e non prima, perche' ogni copia «nella libreria» sta in «Foto iPhone»: la tenuta
+/// e' la stessa nei due ordini, e cosi' il motivo del caso comune (una copia in «Foto iPhone»,
+/// le altre fuori) resta `.mainLibrary`. Dopo la regola 0: la regola dell'utente resta
+/// sovrana — se chiede di tenere fuori da «Foto iPhone», le copie «nella libreria» restano lo
+/// stesso (`keptByPhotosLibrary`) e il gruppo puo' restare senza niente da spostare. Anche
+/// `photos` non ha un default (stessa disciplina di `rule`).
+nonisolated func duplicateKeepChoice(_ group: DuplicateGroup, rule: DuplicateFolderRule?,
+                                     photos: PhotosLibraryPresence) -> DuplicateKeepChoice {
     precondition(group.members.count > 1, "un gruppo di doppioni ha sempre almeno due membri")
 
     var candidates = group.members
@@ -2315,6 +2437,9 @@ nonisolated func duplicateKeepChoice(_ group: DuplicateGroup, rule: DuplicateFol
     // 1. La libreria principale vince: e' la cartella che il job Mac -> SSD riscriverebbe
     //    comunque, e da cui partono i mirror su HDD e su Cubbit.
     narrow(candidates.filter(isInMainLibrary), .mainLibrary)
+    // 1b. Fra le copie della libreria principale, quella che la libreria Foto del Mac ha
+    //     ancora: resta comunque (ADR-0018), quindi tenerla libera le altre.
+    narrow(candidates.filter { photos.holds($0) }, .stillInPhotosLibrary)
     // 2. Una cartella organizzata a mano batte uno scarico da scheda o disco.
     narrow(candidates.filter { !isInImportFolder($0) }, .notAnImport)
     // 3. A parita', la piu' vecchia: e' quella che l'utente ha da piu' tempo, e le copie
@@ -2336,10 +2461,17 @@ nonisolated func duplicateKeepChoice(_ group: DuplicateGroup, rule: DuplicateFol
     }
     // `min` restituisce nil solo su array vuoto, escluso dalla precondition; il fallback
     // esiste per non far dipendere da un `!` la funzione che decide cosa NON cestinare.
-    return DuplicateKeepChoice(keeper: keeper ?? candidates[0],
+    let chosen = keeper ?? candidates[0]
+    // Le altre copie che la libreria Foto ha ancora restano: decise qui, una volta sola,
+    // insieme alla tenuta (ADR-0018).
+    let keptByPhotos = Set(group.members.lazy
+        .filter { $0.path != chosen.path && photos.holds($0) }
+        .map(\.path))
+    return DuplicateKeepChoice(keeper: chosen,
                                reason: reason,
                                tiedCandidates: candidates.count,
-                               tiedPaths: Set(candidates.map(\.path)))
+                               tiedPaths: Set(candidates.map(\.path)),
+                               keptByPhotosLibrary: keptByPhotos)
 }
 
 /// Come si dice all'utente la scelta di `duplicateKeepChoice`.
@@ -2396,6 +2528,9 @@ func duplicateKeepExplanation(_ choice: DuplicateKeepChoice, in group: Duplicate
     case .mainLibrary:
         lead = "Tengo la copia che si trova \(place): è nella tua libreria principale, "
             + "quella che l'app riempie a ogni backup delle foto del Mac."
+    case .stillInPhotosLibrary:
+        lead = "Tengo la copia che si trova \(place): è ancora nella libreria Foto del Mac, quindi "
+            + "resta comunque. Se la spostassi, il prossimo backup dal Mac la ricopierebbe."
     case .notAnImport:
         lead = allOthersAreImports
             ? "Tengo la copia che si trova \(place): tutte le altre copie stanno in una cartella di scarico, "
@@ -2450,7 +2585,22 @@ func duplicateKeepExplanation(_ choice: DuplicateKeepChoice, in group: Duplicate
         + "in base all'ultimo controllo delle foto sull'SSD."
     }
 
-    return lead + tie + copies
+    // Le altre copie che restano per la libreria Foto (ADR-0018): dirlo qui, accanto al numero
+    // di copie, perche' «identiche» non si legga come «andranno tutte nel Cestino».
+    let keptByPhotos = choice.keptByPhotosLibrary.count
+    let photosClause: String
+    switch (keptByPhotos, keptByPhotos == others.count) {
+    case (0, _): photosClause = ""
+    case (1, true): photosClause = " Anche quella resta in «Foto iPhone», perché è ancora nella libreria Foto del Mac."
+    case (_, true): photosClause = " Restano anche tutte quelle, in «Foto iPhone», perché sono ancora nella libreria "
+        + "Foto del Mac."
+    case (1, false): photosClause = " Una di queste resta comunque in «Foto iPhone», perché è ancora nella libreria "
+        + "Foto del Mac."
+    default: photosClause = " \(keptByPhotos) di queste restano comunque in «Foto iPhone», perché sono ancora nella "
+        + "libreria Foto del Mac."
+    }
+
+    return lead + tie + copies + photosClause
 }
 
 /// Vero se **tutte** le copie del gruppo stanno sotto la stessa cartella di primo livello
@@ -2609,8 +2759,18 @@ nonisolated struct DuplicateBatch {
         /// Le copie che se ne vanno: tutte tranne quella tenuta, ricavate **per differenza**
         /// e non con un `dropFirst()`. Nel Task 2 quella scorciatoia e' sopravvissuta a 31
         /// test perche' in ogni fixture la tenuta era il primo membro.
+        ///
+        /// Senza la tenuta **e senza le copie che la libreria Foto del Mac ha ancora**
+        /// (`choice.keptByPhotosLibrary`, ADR-0018): quelle restano, e tutto quello che deriva da
+        /// `leaving` (file, spazio, cartelle, piano della corsa, progresso, cosa arriva al
+        /// trasher) le esclude da solo.
         var leaving: [LibraryIndexEntry] {
-            group.members.filter { $0.path != choice.keeper.path }
+            group.members.filter { $0.path != choice.keeper.path && !choice.keptByPhotosLibrary.contains($0.path) }
+        }
+
+        /// Le altre copie che restano perche' la libreria Foto del Mac le ha ancora (ADR-0018).
+        var keptByPhotosLibrary: [LibraryIndexEntry] {
+            group.members.filter { $0.path != choice.keeper.path && choice.keptByPhotosLibrary.contains($0.path) }
         }
 
         /// `size × (copie − 1)`, mai `size × copie`: la copia che resta occupa comunque il
@@ -2641,17 +2801,24 @@ nonisolated struct DuplicateBatch {
     /// dove sta tutto il peso della prima conferma (ADR-0005, decisione 4).
     let folderBreakdown: [(folder: String, count: Int)]
     let exceedsCap: Bool
+    /// I gruppi senza niente da spostare: ogni copia oltre la tenuta resta perche' la libreria
+    /// Foto del Mac la ha ancora (ADR-0018). Nel pannello la casella resta spenta con il motivo.
+    let nothingToMove: Set<String>
+    /// Quante copie restano in tutto per la libreria Foto (non la tenuta).
+    let keptByPhotosLibraryCount: Int
 
     /// Punto **unico** in cui la scelta si calcola: `duplicateKeepChoice` gira una volta
     /// per gruppo, qui, con la regola dell'utente passata esplicitamente (parametro senza
     /// default, stessa disciplina dei quattro gate di ADR-0009).
-    init(groups: [DuplicateGroup], rule: DuplicateFolderRule?) {
+    /// `photos` (ADR-0018) senza default, come `rule`: un chiamante che lo dimentica non deve
+    /// compilare.
+    init(groups: [DuplicateGroup], rule: DuplicateFolderRule?, photos: PhotosLibraryPresence) {
         // I gruppi ridotti a un solo membro si scartano prima: `duplicateKeepChoice` ha una
         // precondition su almeno due membri, e questo e' il confine dove il filtro va messo
         // (non ammorbidendo la guardia).
         let entries = groups
             .filter { $0.members.count > 1 }
-            .map { Entry(group: $0, choice: duplicateKeepChoice($0, rule: rule)) }
+            .map { Entry(group: $0, choice: duplicateKeepChoice($0, rule: rule, photos: photos)) }
         self.init(entries: entries)
     }
 
@@ -2695,6 +2862,9 @@ nonisolated struct DuplicateBatch {
         // Il primo dei due che scatta. `>` e non `>=`: alla soglia esatta il blocco passa.
         self.exceedsCap = self.fileCount > duplicateBatchFileCap
             || self.reclaimableBytes > duplicateBatchByteCap
+
+        self.nothingToMove = Set(entries.lazy.filter { $0.leaving.isEmpty }.map(\.group.hash))
+        self.keptByPhotosLibraryCount = entries.reduce(0) { $0 + $1.choice.keptByPhotosLibrary.count }
     }
 
     /// La cartella di **primo livello** che contiene il file, come e' scritta su disco:
@@ -2747,6 +2917,16 @@ nonisolated struct DuplicateBatch {
         if folderBreakdown.count > 1 {
             out.append("In tutto, i file escono da "
                 + "\(DuplicateBatch.count(folderBreakdown.count, "cartella", "cartelle")) diverse.")
+        }
+
+        // ADR-0018: chi conferma deve sapere che alcune copie dei gruppi scelti restano, e perche'.
+        if keptByPhotosLibraryCount > 0 {
+            out.append(keptByPhotosLibraryCount == 1
+                ? "Resta dov'è 1 copia in «Foto iPhone», perché è ancora nella libreria Foto del Mac: "
+                    + "se la spostassi, il prossimo backup dal Mac la ricopierebbe."
+                : "Restano dove sono \(DuplicateBatch.count(keptByPhotosLibraryCount, "copia", "copie")) in "
+                    + "«Foto iPhone», perché sono ancora nella libreria Foto del Mac: se le spostassi, il "
+                    + "prossimo backup dal Mac le ricopierebbe.")
         }
 
         out.append("Le copie che stanno sull'HDD e su Cubbit restano dove sono: questa operazione "
@@ -17635,6 +17815,11 @@ struct DuplicatesView: View {
 
     @State private var thumbnailCache = DuplicateThumbnailCache()
 
+    /// Quali copie in «Foto iPhone» la libreria Foto del Mac ha ancora (ADR-0018), letto fuori
+    /// dal main a ogni `loadGroups()` e riusato da `applyRule`: una fotografia per caricamento.
+    /// `.unknown` finche' non e' letto: nel verso sicuro ogni copia in «Foto iPhone» resta.
+    @State private var photosPresence: PhotosLibraryPresence = .unknown
+
     // MARK: - La garanzia dell'inventario (ROADMAP #46, ADR-0017)
 
     /// Quali gruppi si possono spuntare, calcolato fuori dal main da `refreshCertification()`,
@@ -18254,7 +18439,7 @@ struct DuplicatesView: View {
         selectionStats = (0, 0)
         showRuleEditor = false
         guard case .loaded(let groups) = loadState else { return }
-        rebuildBatch(from: groups, rule: rule)
+        rebuildBatch(from: groups, rule: rule, photos: photosPresence)
     }
 
     /// Carica i gruppi **fuori dal main thread**: `duplicateGroups()` passa dalla coda
@@ -18268,12 +18453,18 @@ struct DuplicatesView: View {
         }
         loadState = .loading
         let rule = folderRule
+        // La cartella `originals` del bookmark `.photos` (non security-scoped dal 2026-07-29,
+        // come l'SSD letto qui sotto da `urls[.ssd]`): `nil` se non si risolve, e allora ogni
+        // copia in «Foto iPhone» resta (ADR-0018).
+        let originalsRoot = BookmarkManager.shared.urls[.photos]
         Task.detached(priority: .utility) {
             do {
                 let groups = try store.duplicateGroups()
+                let photos = PhotosLibraryPresence.read(originalsRoot: originalsRoot)
                 await MainActor.run {
                     self.loadState = .loaded(groups)
-                    self.rebuildBatch(from: groups, rule: rule)
+                    self.photosPresence = photos
+                    self.rebuildBatch(from: groups, rule: rule, photos: photos)
                     self.refreshCertification()
                 }
             } catch {
@@ -18292,11 +18483,12 @@ struct DuplicatesView: View {
     /// dentro (via `DuplicateBatch(groups:rule:)`), **una volta sola**, esattamente come
     /// prima — non e' un secondo posto che scelga fra i membri di un gruppo, e' l'unico
     /// posto, chiamato di nuovo perche' la regola e' cambiata.
-    private func rebuildBatch(from rawGroups: [DuplicateGroup], rule: DuplicateFolderRule?) {
+    private func rebuildBatch(from rawGroups: [DuplicateGroup], rule: DuplicateFolderRule?,
+                              photos: PhotosLibraryPresence) {
         isApplyingFilter = true
         let currentFilter = filter
         Task.detached(priority: .utility) {
-            let batch = DuplicateBatch(groups: rawGroups, rule: rule)
+            let batch = DuplicateBatch(groups: rawGroups, rule: rule, photos: photos)
             let groupsOnly = batch.groups.map(\.group)
             let folders = duplicateFolderList(groupsOnly)
             var byHash: [String: DuplicateBatch.Entry] = [:]

@@ -26,11 +26,11 @@ final class DuplicateKeepChoiceTests: XCTestCase {
     }
 
     private func choice(_ members: [LibraryIndexEntry]) -> DuplicateKeepChoice {
-        duplicateKeepChoice(group(members), rule: nil)
+        duplicateKeepChoice(group(members), rule: nil, photos: .known([]))
     }
 
     private func choice(_ members: [LibraryIndexEntry], rule: DuplicateFolderRule) -> DuplicateKeepChoice {
-        duplicateKeepChoice(group(members), rule: rule)
+        duplicateKeepChoice(group(members), rule: rule, photos: .known([]))
     }
 
     private func rule(keepIn: String, trashIn: Set<String>) -> DuplicateFolderRule {
@@ -104,7 +104,7 @@ final class DuplicateKeepChoiceTests: XCTestCase {
     func testExplanation_namesTheUserRule() {
         let keeper = entry("Takeout/IMG_0001.JPG")
         let g = group([entry("Foto iPhone/IMG_0001.JPG"), keeper])
-        let c = duplicateKeepChoice(g, rule: rule(keepIn: "Takeout", trashIn: ["Foto iPhone"]))
+        let c = duplicateKeepChoice(g, rule: rule(keepIn: "Takeout", trashIn: ["Foto iPhone"]), photos: .known([]))
         let text = duplicateKeepExplanation(c, in: g)
         XCTAssertTrue(text.contains("hai chiesto di tenere le copie che stanno lì"), text)
         XCTAssertTrue(text.contains("«Takeout»"), text)
@@ -116,7 +116,7 @@ final class DuplicateKeepChoiceTests: XCTestCase {
     func testExplanation_hasNoJargon() {
         let keeper = entry("Takeout/IMG_0001.JPG")
         let g = group([entry("Foto iPhone/IMG_0001.JPG"), keeper])
-        let c = duplicateKeepChoice(g, rule: rule(keepIn: "Takeout", trashIn: ["Foto iPhone"]))
+        let c = duplicateKeepChoice(g, rule: rule(keepIn: "Takeout", trashIn: ["Foto iPhone"]), photos: .known([]))
         let text = duplicateKeepExplanation(c, in: g).lowercased()
         for word in ["hash", "indice", "sha256", "scansione", "entry", "registro", "cache"] {
             XCTAssertFalse(text.contains(word), "la spiegazione dice «\(word)»: \(text)")
@@ -194,7 +194,7 @@ final class DuplicateKeepChoiceTests: XCTestCase {
         let c = entry("Other/ccc/IMG_0001.JPG")
         let permutations = [[a, b, c], [a, c, b], [b, a, c], [b, c, a], [c, a, b], [c, b, a]]
         for members in permutations {
-            let result = duplicateKeepChoice(group(members), rule: nil)
+            let result = duplicateKeepChoice(group(members), rule: nil, photos: .known([]))
             XCTAssertEqual(result.keeper.path, a.path,
                            "ordine di input \(members.map(\.displayPath))")
             XCTAssertEqual(result.reason, .deterministicTieBreak)
@@ -327,7 +327,7 @@ final class DuplicateKeepChoiceTests: XCTestCase {
 
     private func explanation(_ members: [LibraryIndexEntry]) -> String {
         let g = group(members)
-        return duplicateKeepExplanation(duplicateKeepChoice(g, rule: nil), in: g)
+        return duplicateKeepExplanation(duplicateKeepChoice(g, rule: nil, photos: .known([])), in: g)
     }
 
     func testExplanation_namesTheRealFolderOfTheKeptFile() {
@@ -367,7 +367,7 @@ final class DuplicateKeepChoiceTests: XCTestCase {
         var out: [DuplicateKeepReason: String] = [:]
         for members in cases {
             let g = group(members)
-            let c = duplicateKeepChoice(g, rule: nil)
+            let c = duplicateKeepChoice(g, rule: nil, photos: .known([]))
             out[c.reason] = duplicateKeepExplanation(c, in: g)
         }
         return out
@@ -449,7 +449,7 @@ final class DuplicateKeepChoiceTests: XCTestCase {
         let members = [entry("Foto iPhone/a/IMG_0001.JPG", mtime: 1_700_000_100),
                        entry("Foto iPhone/b/IMG_0001.JPG", mtime: 1_700_000_100),
                        entry("Foto iPhone/c/IMG_0001.JPG", mtime: 1_700_000_200)]
-        let c = duplicateKeepChoice(group(members), rule: nil)
+        let c = duplicateKeepChoice(group(members), rule: nil, photos: .known([]))
         XCTAssertEqual(c.reason, .oldest)
         XCTAssertEqual(c.tiedCandidates, 2)
         let text = duplicateKeepExplanation(c, in: group(members))

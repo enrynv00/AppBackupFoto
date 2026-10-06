@@ -24,7 +24,7 @@ final class DuplicateRunPlanTests: XCTestCase {
                                        LibraryIndexEntry(path: $0.path, displayPath: $0.displayPath, size: $0.size,
                                                          mtime: $0.mtime, hash: hash, hashedAt: $0.hashedAt)
                                    })
-        let choice = DuplicateKeepChoice(keeper: keeper, reason: .oldest, tiedCandidates: 1, tiedPaths: [])
+        let choice = DuplicateKeepChoice(keeper: keeper, reason: .oldest, tiedCandidates: 1, tiedPaths: [], keptByPhotosLibrary: [])
         return DuplicateBatch.Entry(group: group, choice: choice)
     }
 

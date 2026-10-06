@@ -258,7 +258,7 @@ final class DuplicateCertificationTests: XCTestCase {
     func testUncoveredGroupCount_countsTheGroupsTheCertificationDoesNotCover() {
         let other = group("b", ["Other/b1.jpg", "Other/b2.jpg"])
         let c = certify(safeSnapshot(), [safeGroup, other])
-        let entries = [safeGroup, other].map { DuplicateBatch.Entry(group: $0, choice: duplicateKeepChoice($0, rule: nil)) }
+        let entries = [safeGroup, other].map { DuplicateBatch.Entry(group: $0, choice: duplicateKeepChoice($0, rule: nil, photos: .known([]))) }
         XCTAssertEqual(c.uncoveredGroupCount(in: DuplicateRunPlan(entries: entries)), 1)
         XCTAssertEqual(c.uncoveredGroupCount(in: DuplicateRunPlan(entries: [entries[0]])), 0)
     }

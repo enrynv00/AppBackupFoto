@@ -84,7 +84,7 @@ final class MainThreadIsolationTests: XCTestCase {
     func testDuplicateBatch_runsWithoutTheMainThread() {
         let done = DispatchSemaphore(value: 0)
         Task.detached {
-            _ = DuplicateBatch(groups: [], rule: nil)
+            _ = DuplicateBatch(groups: [], rule: nil, photos: .unknown)
             done.signal()
         }
         XCTAssertEqual(done.wait(timeout: .now() + 10), .success,
@@ -341,5 +341,22 @@ final class MainThreadIsolationTests: XCTestCase {
         }
         XCTAssertEqual(done.wait(timeout: .now() + 10), .success,
                        "DuplicateCertificationBasis.load ha avuto bisogno del main thread: manca un nonisolated?")
+    }
+
+    // MARK: - Le copie che la libreria Foto del Mac ha ancora (ADR-0018)
+
+    /// La lettura di `originals` gira nel `Task.detached` di `DuplicatesView.loadGroups()`.
+    func testPhotosLibraryPresenceRead_runsWithoutTheMainThread() throws {
+        let originals = tmp.appendingPathComponent("originals/1")
+        try FileManager.default.createDirectory(at: originals, withIntermediateDirectories: true)
+        try Data("x".utf8).write(to: originals.appendingPathComponent("a.jpg"))
+        let root = tmp.appendingPathComponent("originals")
+        let done = DispatchSemaphore(value: 0)
+        Task.detached {
+            _ = PhotosLibraryPresence.read(originalsRoot: root)
+            done.signal()
+        }
+        XCTAssertEqual(done.wait(timeout: .now() + 10), .success,
+                       "PhotosLibraryPresence.read ha avuto bisogno del main thread: manca un nonisolated?")
     }
 }
