@@ -74,6 +74,8 @@ Attenzione a una frase che questa pagina ha portato fino al 2026-08-27: «il pan
 
 **Inventario fresco** — completo su tutti e tre gli archivi e più recente dell'ultimo job che scrive sugli archivi (Mac → SSD, SSD → HDD, SSD → Cubbit, import). Lo invecchia anche un job che non ha copiato niente; non lo invecchiano spostamenti nel Cestino, annullamenti, riparazioni, inventario, lettura dell'elenco.
 
+**Copia nella libreria Foto** (termine nuovo, 2026-10-05, ADR-0018) — una copia in `Foto iPhone/` il cui originale è ancora in `~/Pictures/Photos Library.photoslibrary/originals`: non si sposta mai, perché il backup Mac → SSD la ricopierebbe (copia solo ciò che manca). Fra le copie della libreria principale è anche preferita come copia tenuta (regola **1b**, dopo la regola 1): tenerne un'altra lascerebbe comunque due copie sull'SSD. Se la libreria Foto non si lascia leggere, vale «non si sa»: ogni copia in `Foto iPhone/` resta dov'è.
+
 **Percorso tenuto** — nel registro del Cestino e nella storia degli spostamenti, per ogni foto spostata, il percorso della copia rimasta, relativo alla radice dell'SSD: è lo stesso percorso sull'HDD e la stessa chiave su Cubbit, e il progetto 4 terrà quella.
 
 **Membri a pari merito** — le copie che valgono quanto quella tenuta, e fra cui ha deciso solo il tie-break. Vanno **marcate nella lista**, non solo contate: sapere che «un'altra copia va bene quanto questa» senza sapere *quale* è un'informazione vera e non azionabile.
