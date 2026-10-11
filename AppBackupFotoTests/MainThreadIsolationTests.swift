@@ -375,4 +375,16 @@ final class MainThreadIsolationTests: XCTestCase {
         XCTAssertEqual(done.wait(timeout: .now() + 10), .success,
                        "AlignmentPlanner/TrashHistoryReader hanno avuto bisogno del main thread: manca nonisolated?")
     }
+
+    func testAlignmentLogStore_runsWithoutTheMainThread() throws {
+        let store = try AlignmentLogStore(url: tmp.appendingPathComponent("alignment-hdd.jsonl"))
+        let done = DispatchSemaphore(value: 0)
+        Task.detached {
+            try? store.append(AlignmentLogEntry(event: .failed, id: "1", blockId: "b", archive: .hdd, at: Date()))
+            _ = store.state(for: .hdd)
+            done.signal()
+        }
+        XCTAssertEqual(done.wait(timeout: .now() + 10), .success,
+                       "AlignmentLogStore ha avuto bisogno del main thread: manca nonisolated?")
+    }
 }

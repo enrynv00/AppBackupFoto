@@ -8580,6 +8580,254 @@ nonisolated enum AlignmentRunPlan {
     }
 }
 
+// MARK: - Doppioni su HDD e Cubbit: il registro (ROADMAP #47, ADR-0019)
+
+/// Una riga del registro del progetto 4 (`alignment-hdd.jsonl`, `alignment-cubbit.jsonl`). Le
+/// righe di una stessa copia condividono `id`: «pending» porta tutto quello che serve a
+/// ricostruire cosa si stava togliendo, le altre portano l'esito.
+// `nonisolated`: value type, scritto dal motore fuori dal main e letto dalla finestra.
+nonisolated struct AlignmentLogEntry: Codable, Equatable, Sendable {
+    enum Event: String, Codable, Sendable {
+        /// Scritta PRIMA di toccare l'archivio: se l'app si chiude a meta', il registro dice
+        /// che quella copia era in uscita.
+        case pending
+        /// Tolta: nel Cestino dell'HDD (`trashedPath`) o con un segno di cancellazione su Cubbit
+        /// (`deleteMarkerVersionId`).
+        case removed
+        /// Non tolta, con il motivo (`detail`).
+        case failed
+        /// Rimessa a posto da «Annulla l'ultimo blocco».
+        case restored
+    }
+
+    var event: Event
+    var id: String
+    var blockId: String
+    var archive: AlignmentArchive
+    var at: Date
+    /// Solo nella riga «pending».
+    var leavingPath: String? = nil
+    var leavingKey: String? = nil
+    var keptPath: String? = nil
+    var size: Int64? = nil
+    var sha256: String? = nil
+    /// Cubbit: l'ETag della copia tolta, per verificare l'annullamento.
+    var etag: String? = nil
+    /// HDD: dove stava la copia, percorso assoluto (e' li' che l'annullamento la rimette).
+    var originalAbsolutePath: String? = nil
+    /// Solo nella riga «removed».
+    var trashedPath: String? = nil
+    var deleteMarkerVersionId: String? = nil
+    var detail: String? = nil
+}
+
+nonisolated extension AlignmentLogEntry {
+    private enum CodingKeys: String, CodingKey {
+        case event, id, blockId, archive, at, leavingPath, leavingKey, keptPath, size, sha256, etag,
+             originalAbsolutePath, trashedPath, deleteMarkerVersionId, detail
+    }
+
+    /// `init(from:)` esplicita con `decodeIfPresent` (regola del progetto per i tipi persistiti,
+    /// fatto misurato n. 5 di #31): severa su evento, identita', blocco, archivio e data —
+    /// senza, la riga non racconta niente — tollerante sul resto.
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        event = try c.decode(Event.self, forKey: .event)
+        id = try c.decode(String.self, forKey: .id)
+        blockId = try c.decode(String.self, forKey: .blockId)
+        archive = try c.decode(AlignmentArchive.self, forKey: .archive)
+        at = try c.decode(Date.self, forKey: .at)
+        leavingPath = try c.decodeIfPresent(String.self, forKey: .leavingPath)
+        leavingKey = try c.decodeIfPresent(String.self, forKey: .leavingKey)
+        keptPath = try c.decodeIfPresent(String.self, forKey: .keptPath)
+        size = try c.decodeIfPresent(Int64.self, forKey: .size)
+        sha256 = try c.decodeIfPresent(String.self, forKey: .sha256)
+        etag = try c.decodeIfPresent(String.self, forKey: .etag)
+        originalAbsolutePath = try c.decodeIfPresent(String.self, forKey: .originalAbsolutePath)
+        trashedPath = try c.decodeIfPresent(String.self, forKey: .trashedPath)
+        deleteMarkerVersionId = try c.decodeIfPresent(String.self, forKey: .deleteMarkerVersionId)
+        detail = try c.decodeIfPresent(String.self, forKey: .detail)
+    }
+}
+
+/// Una copia tolta, ricostruita dalle righe del registro.
+// `nonisolated`: value type puro.
+nonisolated struct AlignmentRemoval: Equatable, Sendable {
+    let id: String
+    let blockId: String
+    let archive: AlignmentArchive
+    let leavingPath: String
+    let leavingKey: String
+    let keptPath: String
+    let size: Int64
+    let sha256: String
+    let etag: String?
+    let originalAbsolutePath: String?
+    let trashedPath: String?
+    let deleteMarkerVersionId: String?
+    let removedAt: Date
+    let restoredAt: Date?
+}
+
+/// Lo stato che il registro racconta, per UN archivio. Logica pura sulle righe lette.
+// `nonisolated`: value type puro, calcolato fuori dal main.
+nonisolated struct AlignmentLogState: Sendable {
+    let archive: AlignmentArchive
+    /// In ordine di uscita. Solo le copie con una riga «removed».
+    let removals: [AlignmentRemoval]
+    /// Righe «pending» senza esito: l'app si e' chiusa mentre toglieva quella copia. Si
+    /// controllano a mano (il riepilogo le nomina), l'annullamento non le tocca.
+    let unfinished: [AlignmentLogEntry]
+    /// Righe che non si sono lasciate leggere.
+    let malformedLines: Int
+
+    init(archive: AlignmentArchive, entries: [AlignmentLogEntry], malformedLines: Int = 0) {
+        self.archive = archive
+        self.malformedLines = malformedLines
+        var pending: [String: AlignmentLogEntry] = [:]
+        var order: [String] = []
+        var removed: [String: AlignmentLogEntry] = [:]
+        var removedOrder: [String] = []
+        var closed = Set<String>()
+        var restoredAt: [String: Date] = [:]
+        for e in entries where e.archive == archive {
+            switch e.event {
+            case .pending:
+                if pending[e.id] == nil { order.append(e.id) }
+                pending[e.id] = e
+            case .removed:
+                if removed[e.id] == nil { removedOrder.append(e.id) }
+                removed[e.id] = e
+                closed.insert(e.id)
+            case .failed:
+                closed.insert(e.id)
+            case .restored:
+                restoredAt[e.id] = e.at
+            }
+        }
+        removals = removedOrder.compactMap { id in
+            guard let p = pending[id], let r = removed[id], let leavingPath = p.leavingPath, let leavingKey = p.leavingKey,
+                  let keptPath = p.keptPath, let size = p.size, let sha256 = p.sha256 else { return nil }
+            return AlignmentRemoval(id: id, blockId: p.blockId, archive: archive, leavingPath: leavingPath,
+                                    leavingKey: leavingKey, keptPath: keptPath, size: size, sha256: sha256, etag: p.etag,
+                                    originalAbsolutePath: p.originalAbsolutePath, trashedPath: r.trashedPath,
+                                    deleteMarkerVersionId: r.deleteMarkerVersionId, removedAt: r.at,
+                                    restoredAt: restoredAt[id])
+        }
+        unfinished = order.filter { !closed.contains($0) }.compactMap { pending[$0] }
+    }
+
+    /// Le copie tolte e non rimesse: il controllo le salta (`AlignmentStayReason.alreadyRemoved`).
+    var removedKeys: Set<String> { Set(removals.filter { $0.restoredAt == nil }.map(\.leavingKey)) }
+
+    /// Le copie dell'ultimo blocco ancora da rimettere a posto. L'ultimo e' quello della riga
+    /// «removed» scritta per ultima (stessa regola di `TrashManifestStore.pendingInLastBatch`):
+    /// un annullamento si fa a un solo livello (decisione di Enrico del 2026-09-20, ripresa qui).
+    var lastBlockToRestore: [AlignmentRemoval] {
+        guard let last = removals.last?.blockId else { return [] }
+        return removals.filter { $0.blockId == last && $0.restoredAt == nil }
+    }
+
+    /// Per la conferma di «Annulla l'ultimo blocco»: quante copie e quando. `nil` = niente da fare.
+    var lastBlockSummary: RestorableBatchSummary? {
+        guard let last = removals.last?.blockId else { return nil }
+        let block = removals.filter { $0.blockId == last }
+        let pending = block.filter { $0.restoredAt == nil }
+        guard let oldest = pending.map(\.removedAt).min() else { return nil }
+        return RestorableBatchSummary(pendingCount: pending.count, batchCount: block.count, trashedAt: oldest)
+    }
+}
+
+/// Il registro del progetto 4, sul disco interno (`Application Support/AppBackupFoto/`), mai su
+/// un archivio. In SOLA AGGIUNTA, una riga JSON per evento: 89.442 copie per archivio, e un
+/// registro riscritto per intero a ogni riga (come `TrashManifestStore`) costerebbe in modo
+/// quadratico. Diverso da `TrashHistory` in un punto voluto: qui una scrittura fallita LANCIA,
+/// e il motore si ferma — una copia tolta senza registro e' proprio quello da evitare.
+///
+/// Durabilita': `write(2)` senza `fsync`, come `TrashManifestStore` (scrittura atomica senza
+/// `fsync`): una chiusura dell'app non perde niente, uno spegnimento brusco puo' perdere le
+/// ultime righe. Le copie restano comunque recuperabili (Cestino dell'HDD con il suo «Rimetti
+/// a posto», versioni di Cubbit per 30 giorni).
+// `nonisolated`: `append` arriva dal motore fuori dal main, `read`/`state` da un `Task.detached`.
+// Ogni accesso al file passa da `lock.withLock`; `url` e' `let`. Vedi ADR-0006.
+nonisolated final class AlignmentLogStore: @unchecked Sendable {
+    enum StoreError: Error, LocalizedError {
+        case invalidLocation(String)
+        case writeFailed(String)
+        var errorDescription: String? {
+            switch self {
+            case .invalidLocation(let p): return "Posizione non consentita per il registro: \(p)"
+            case .writeFailed(let d): return "Il registro non si e' lasciato scrivere: \(d)"
+            }
+        }
+    }
+
+    struct ReadResult: Sendable {
+        let entries: [AlignmentLogEntry]
+        let malformedLines: Int
+        let unreadable: Bool
+    }
+
+    private let url: URL
+    private let lock = NSLock()
+
+    init(url: URL) throws {
+        // Stessa allow-list degli altri registri: nomina i percorsi delle foto.
+        guard isAllowedStoreLocation(url) else { throw StoreError.invalidLocation(url.path) }
+        self.url = url
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    }
+
+    /// Aggiunge una riga e torna solo quando e' tutta sul file. Lancia su qualunque errore.
+    func append(_ entry: AlignmentLogEntry) throws {
+        var line = try JSONEncoder().encode(entry)
+        line.append(0x0A)
+        try lock.withLock {
+            let fd = open(url.path, O_APPEND | O_CREAT | O_WRONLY, 0o600)
+            guard fd >= 0 else { throw StoreError.writeFailed(String(cString: strerror(errno))) }
+            defer { close(fd) }
+            _ = fchmod(fd, 0o600)
+            var written = 0
+            try line.withUnsafeBytes { buffer in
+                while written < buffer.count {
+                    let n = write(fd, buffer.baseAddress!.advanced(by: written), buffer.count - written)
+                    if n < 0 {
+                        if errno == EINTR { continue }
+                        throw StoreError.writeFailed(String(cString: strerror(errno)))
+                    }
+                    written += n
+                }
+            }
+        }
+    }
+
+    /// Tutte le righe. Un file assente e' un registro vuoto; uno che non si apre e' `unreadable`.
+    func read() -> ReadResult {
+        lock.withLock {
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                return ReadResult(entries: [], malformedLines: 0, unreadable: false)
+            }
+            guard let data = try? Data(contentsOf: url) else {
+                return ReadResult(entries: [], malformedLines: 0, unreadable: true)
+            }
+            let decoder = JSONDecoder()
+            var entries: [AlignmentLogEntry] = []
+            var malformed = 0
+            for line in data.split(separator: 0x0A, omittingEmptySubsequences: true) {
+                if let e = try? decoder.decode(AlignmentLogEntry.self, from: Data(line)) { entries.append(e) } else { malformed += 1 }
+            }
+            return ReadResult(entries: entries, malformedLines: malformed, unreadable: false)
+        }
+    }
+
+    /// Lo stato per un archivio, o `nil` se il registro non si lascia leggere.
+    func state(for archive: AlignmentArchive) -> AlignmentLogState? {
+        let r = read()
+        guard !r.unreadable else { return nil }
+        return AlignmentLogState(archive: archive, entries: r.entries, malformedLines: r.malformedLines)
+    }
+}
+
 // MARK: - Riparazione: i testi (ROADMAP #45, ADR-0016)
 
 /// I testi della riparazione nella finestra Inventario. Logica pura, come `InventoryStatus`:
