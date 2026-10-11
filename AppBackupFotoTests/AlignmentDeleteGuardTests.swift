@@ -53,4 +53,8 @@ final class AlignmentDeleteGuardTests: XCTestCase {
         // due HEAD). Se ne serve un secondo, va scritto perche' in ADR-0019.
         XCTAssertEqual(count("cloud.delete(key:", in: try source()), 1)
     }
+
+    func testTheUndoRemovesDeleteMarkersFromOnePlaceOnly() throws {
+        XCTAssertEqual(count("cloud.removeDeleteMarker(", in: try source()), 1)
+    }
 }

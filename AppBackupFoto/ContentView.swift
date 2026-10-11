@@ -3481,7 +3481,10 @@ nonisolated final class TrashHistory: @unchecked Sendable {
 // protetto dal proprio lock (`TrashManifestStore`). Vedi ADR-0006, ADR-0009.
 nonisolated final class TrashRestorer: @unchecked Sendable {
     private let libraryRoot: URL
-    private let manifest: TrashManifestStore
+    /// Come si segna «rimessa a posto». Per il Cestino dell'SSD e' `TrashManifestStore.markRestored`
+    /// (init qui sotto, invariata); per l'HDD del progetto 4 (ADR-0019) una riga «restored» nel
+    /// registro di quel progetto. Un errore si ignora come prima (la riconciliazione D3 la recupera).
+    private let markRestored: (TrashedItem, Date) throws -> Void
     private let moveFunction: (URL, URL) throws -> Void
     private let hashFunction: (URL) -> MeasuredHash?
     private let volumeIdentity: (URL) -> dev_t?
@@ -3490,14 +3493,24 @@ nonisolated final class TrashRestorer: @unchecked Sendable {
     /// `DuplicateTrasher`/`isAlreadyInLibrary`: la root puo' essere raggiunta per symlink.
     private let rootForms: [[String]]
 
+    convenience init(libraryRoot: URL,
+                     manifest: TrashManifestStore,
+                     moveFunction: @escaping (URL, URL) throws -> Void = { try FileManager.default.moveItem(at: $0, to: $1) },
+                     hashFunction: @escaping (URL) -> MeasuredHash? = { sha256Measured(of: $0) },
+                     volumeIdentity: @escaping (URL) -> dev_t? = { deviceIdentifier(of: $0) },
+                     now: @escaping () -> Date = Date.init) {
+        self.init(libraryRoot: libraryRoot, markRestored: { try manifest.markRestored($0, at: $1) },
+                  moveFunction: moveFunction, hashFunction: hashFunction, volumeIdentity: volumeIdentity, now: now)
+    }
+
     init(libraryRoot: URL,
-         manifest: TrashManifestStore,
+         markRestored: @escaping (TrashedItem, Date) throws -> Void,
          moveFunction: @escaping (URL, URL) throws -> Void = { try FileManager.default.moveItem(at: $0, to: $1) },
          hashFunction: @escaping (URL) -> MeasuredHash? = { sha256Measured(of: $0) },
          volumeIdentity: @escaping (URL) -> dev_t? = { deviceIdentifier(of: $0) },
          now: @escaping () -> Date = Date.init) {
         self.libraryRoot = libraryRoot
-        self.manifest = manifest
+        self.markRestored = markRestored
         self.moveFunction = moveFunction
         self.hashFunction = hashFunction
         self.volumeIdentity = volumeIdentity
@@ -3570,7 +3583,7 @@ nonisolated final class TrashRestorer: @unchecked Sendable {
                     outcome.alreadyInPlace.append(item)
                     // La foto e' tornata: se la scrittura del registro fallisce non si
                     // ritenta qui, la prossima esecuzione la riconoscera' comunque via D3.
-                    try? manifest.markRestored(item, at: now())
+                    try? markRestored(item, now())
                 } else {
                     outcome.skipped.append((item, .missingInTrash))
                 }
@@ -3632,7 +3645,7 @@ nonisolated final class TrashRestorer: @unchecked Sendable {
                 outcome.restored.append(item)
                 // Foto tornata: se la scrittura del registro fallisce non si ritenta qui, la
                 // prossima esecuzione la riconosce comunque via D3.
-                try? manifest.markRestored(item, at: now())
+                try? markRestored(item, now())
             } catch {
                 // Mai "gia' fatto": si ricontrolla `st_dev` anche su un fallimento della
                 // mossa, non solo su un file mancante.
@@ -9157,6 +9170,177 @@ nonisolated extension ArchiveAligner {
                 out.stop = .logNotWritten(error.localizedDescription); break
             }
             out.removed.append(c)
+        }
+        return out
+    }
+}
+
+/// Perche' una copia dell'ultimo blocco non e' stata rimessa a posto. Ogni caso ha la sua frase.
+// `nonisolated`: value type puro.
+nonisolated enum AlignmentUndoSkipReason: String, CaseIterable, Sendable {
+    /// Il registro non dice dove e' finita (nessun percorso nel Cestino, nessun segno registrato).
+    case notRestorable
+    /// Non e' piu' nel Cestino dell'HDD: il Cestino e' stato svuotato.
+    case missingInTrash
+    /// Nel Cestino c'e' un file diverso da quello tolto.
+    case changed
+    /// Al suo posto c'e' gia' un altro file (HDD) o un'altra foto (Cubbit): mai sovrascrivere.
+    case occupied
+    case moveFailed
+    case unreadable
+    case outsideArchive
+    /// Su Cubbit: piu' vecchia dei giorni della regola, la versione potrebbe non esserci piu'.
+    case tooOld
+    /// Su Cubbit: il segno registrato non c'e' piu'.
+    case markerNotFound
+    /// Su Cubbit: la versione registrata NON e' un segno di cancellazione. Non si tocca mai.
+    case notADeleteMarker
+    /// Su Cubbit: il segno registrato non e' l'ultimo stato della chiave.
+    case markerNotLatest
+    /// Su Cubbit: tolto il segno, la HEAD non ritrova la stessa foto.
+    case verifyFailed
+}
+
+/// L'esito di «Annulla l'ultimo blocco».
+// `nonisolated`: value type, prodotto fuori dal main.
+nonisolated struct AlignmentUndoOutcome: Sendable {
+    var restored = 0
+    /// Gia' al suo posto: rimessa a mano, o un annullamento precedente interrotto prima del registro.
+    var alreadyBack = 0
+    var skipped: [AlignmentUndoSkipReason: Int] = [:]
+    var skippedExamples: [AlignmentUndoSkipReason: [String]] = [:]
+    var stop: AlignmentStopReason? = nil
+    var notAttempted = 0
+
+    var skippedCount: Int { skipped.values.reduce(0, +) }
+
+    mutating func skip(_ path: String, _ r: AlignmentUndoSkipReason) {
+        skipped[r, default: 0] += 1
+        if skippedExamples[r, default: []].count < 3 { skippedExamples[r, default: []].append(path) }
+    }
+}
+
+// `nonisolated`: chiamata da `undoCubbit`, fuori dal main.
+nonisolated extension AlignmentCubbitSafety {
+    /// Per quanti giorni un segno di cancellazione si puo' togliere ritrovando la foto: la
+    /// regola attiva piu' corta. `nil` = nessuna regola, le versioni restano per sempre.
+    static func undoWindowDays(rules: [S3Syncer.LifecycleRule]) -> Int? {
+        rules.filter(\.enabled).compactMap(\.noncurrentDays).min()
+    }
+}
+
+// `nonisolated` anche qui: i membri di un'estensione non annotata sarebbero MainActor per il
+// default del target, e `undoCubbit` (async) salterebbe sul main senza un warning (BUG-7, caso
+// D). Trovato scrivendo questo piano: `testArchiveAlignerUndo_runsWithoutTheMainThread` era rosso.
+nonisolated extension ArchiveAligner {
+    private func restoredEntry(_ r: AlignmentRemoval) -> AlignmentLogEntry {
+        AlignmentLogEntry(event: .restored, id: r.id, blockId: r.blockId, archive: r.archive, at: now())
+    }
+
+    /// Rimette a posto le copie dell'ultimo blocco (`AlignmentLogState.lastBlockToRestore`).
+    @concurrent
+    func undo(_ removals: [AlignmentRemoval], archive: AlignmentArchive,
+              isCancelled: @escaping @Sendable () -> Bool = { false },
+              onProgress: @escaping @Sendable (Int) -> Void = { _ in }) async -> AlignmentUndoOutcome {
+        switch archive {
+        case .hdd: return undoHDD(removals, isCancelled: isCancelled, onProgress: onProgress)
+        case .cubbit: return await undoCubbit(removals, isCancelled: isCancelled, onProgress: onProgress)
+        }
+    }
+
+    /// Sull'HDD: `TrashRestorer`, la stessa cura dell'annullamento dei Doppioni (confinamento,
+    /// rilettura e riverifica nel Cestino, mai sovrascrivere, `st_dev` a ogni fallimento).
+    private func undoHDD(_ removals: [AlignmentRemoval], isCancelled: @escaping @Sendable () -> Bool,
+                         onProgress: @escaping @Sendable (Int) -> Void) -> AlignmentUndoOutcome {
+        var out = AlignmentUndoOutcome()
+        guard let hddRoot, volumeIdentity(hddRoot) != nil else {
+            out.stop = .volumeMissing(.hdd); out.notAttempted = removals.count; return out
+        }
+        var items: [TrashedItem] = []
+        var idByTrashedPath: [String: AlignmentRemoval] = [:]
+        for r in removals where r.archive == .hdd {
+            guard let original = r.originalAbsolutePath, !original.isEmpty, let trashed = r.trashedPath, !trashed.isEmpty else {
+                out.skip(r.leavingPath, .notRestorable); continue
+            }
+            items.append(TrashedItem(batchId: r.blockId, originalDisplayPath: original, originalKey: r.leavingKey,
+                                     trashedPath: trashed, size: r.size, hash: r.sha256, trashedAt: r.removedAt,
+                                     keptPath: r.keptPath))
+            idByTrashedPath[trashed] = r
+        }
+        let log = self.log
+        let stamp = self.now
+        let byTrashedPath = idByTrashedPath
+        let restorer = TrashRestorer(libraryRoot: hddRoot, markRestored: { item, _ in
+            guard let r = byTrashedPath[item.trashedPath] else { return }
+            try log(AlignmentLogEntry(event: .restored, id: r.id, blockId: r.blockId, archive: .hdd, at: stamp()))
+        }, hashFunction: hashFunction, volumeIdentity: volumeIdentity, now: now)
+        let result = restorer.run(items, onProgress: { done, _ in onProgress(done) }, isCancelled: isCancelled)
+        out.restored = result.restored.count
+        out.alreadyBack = result.alreadyInPlace.count
+        out.notAttempted = result.notAttempted
+        for (item, reason) in result.skipped {
+            let path = idByTrashedPath[item.trashedPath]?.leavingPath ?? item.originalDisplayPath
+            switch reason {
+            case .missingInTrash: out.skip(path, .missingInTrash)
+            case .alteredInTrash: out.skip(path, .changed)
+            case .originalPathOccupied: out.skip(path, .occupied)
+            case .moveFailed: out.skip(path, .moveFailed)
+            case .unreadableInTrash: out.skip(path, .unreadable)
+            case .outsideLibrary: out.skip(path, .outsideArchive)
+            }
+        }
+        if result.stoppedBecauseVolumeVanished { out.stop = .volumeVanished(.hdd) } else if result.interrupted { out.stop = .interrupted }
+        return out
+    }
+
+    /// Su Cubbit: per ogni copia, la versione registrata deve essere un SEGNO di cancellazione e
+    /// l'ultimo stato della chiave; solo allora il DELETE con versione lo toglie, e la HEAD
+    /// deve ritrovare la stessa foto. Una copia gia' tornata si riconosce e si segna.
+    private func undoCubbit(_ removals: [AlignmentRemoval], isCancelled: @escaping @Sendable () -> Bool,
+                            onProgress: @escaping @Sendable (Int) -> Void) async -> AlignmentUndoOutcome {
+        var out = AlignmentUndoOutcome()
+        guard let cloud else { out.stop = .cubbitError("Cubbit non configurato"); out.notAttempted = removals.count; return out }
+        let window: Int?
+        do {
+            window = AlignmentCubbitSafety.undoWindowDays(rules: try await cloud.lifecycleRules())
+        } catch {
+            out.stop = .cubbitError(error.localizedDescription); out.notAttempted = removals.count; return out
+        }
+        for (index, r) in removals.enumerated() {
+            if isCancelled() { out.stop = .interrupted; out.notAttempted += removals.count - index; break }
+            defer { onProgress(index + 1) }
+            guard r.archive == .cubbit, let marker = r.deleteMarkerVersionId, !marker.isEmpty else {
+                out.skip(r.leavingPath, .notRestorable); continue
+            }
+            // Un giorno di margine: la regola di Cubbit non scatta al secondo.
+            if let window, now().timeIntervalSince(r.removedAt) >= TimeInterval(window - 1) * 86_400 {
+                out.skip(r.leavingPath, .tooOld); continue
+            }
+            do {
+                if let h = try await cloud.head(key: r.leavingPath) {
+                    if h.size == r.size, RepairRules.normalizedETag(h.etag) == r.etag {
+                        do { try log(restoredEntry(r)) } catch { out.stop = .logNotWritten(error.localizedDescription); break }
+                        out.alreadyBack += 1
+                    } else {
+                        out.skip(r.leavingPath, .occupied)
+                    }
+                    continue
+                }
+                let versions = try await cloud.versions(key: r.leavingPath)
+                guard let entry = versions.first(where: { $0.versionId == marker }) else { out.skip(r.leavingPath, .markerNotFound); continue }
+                // L'unico DELETE con versione ammesso: solo su un SEGNO registrato, mai su dati.
+                guard entry.isDeleteMarker else { out.skip(r.leavingPath, .notADeleteMarker); continue }
+                guard entry.isLatest else { out.skip(r.leavingPath, .markerNotLatest); continue }
+                _ = try await cloud.removeDeleteMarker(key: r.leavingPath, versionId: marker)
+                guard let after = try await cloud.head(key: r.leavingPath), after.size == r.size,
+                      RepairRules.normalizedETag(after.etag) == r.etag else {
+                    out.skip(r.leavingPath, .verifyFailed); continue
+                }
+            } catch {
+                out.stop = .cubbitError(error.localizedDescription); out.notAttempted += removals.count - index - 1; break
+            }
+            do { try log(restoredEntry(r)) } catch { out.restored += 1; out.stop = .logNotWritten(error.localizedDescription); break }
+            out.restored += 1
         }
         return out
     }
