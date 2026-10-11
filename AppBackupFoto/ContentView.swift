@@ -4388,7 +4388,7 @@ enum DuplicatesStatus {
     /// bottone disattivato dice sempre perche', non un semplice grigiore.
     static func trashDisabledReason(isRunning: Bool, isIndexing: Bool, ssdMounted: Bool,
                                     isTrashingDuplicates: Bool, isRestoringFromTrash: Bool,
-                                    isInventorying: Bool, isRepairing: Bool) -> String? {
+                                    isInventorying: Bool, isRepairing: Bool, isAligning: Bool) -> String? {
         guard ssdMounted else {
             return "L'SSD non è collegato in questo momento: senza, l'app non può né "
                 + "riverificare né spostare niente."
@@ -4420,6 +4420,11 @@ enum DuplicatesStatus {
         guard !isRepairing else {
             return "L'app sta riparando una foto: aspetta che finisca prima di spostare copie nel Cestino."
         }
+        // ROADMAP #47: la corsa su HDD o Cubbit legge l'SSD per le condizioni 3 e 4.
+        guard !isAligning else {
+            return "L'app sta togliendo da HDD o Cubbit le copie già tolte dall'SSD: aspetta che finisca "
+                + "prima di spostare copie nel Cestino."
+        }
         return nil
     }
 
@@ -4431,7 +4436,7 @@ enum DuplicatesStatus {
     static func undoDisabledReason(ssdMounted: Bool, isRunning: Bool, isIndexing: Bool,
                                    isTrashingDuplicates: Bool, isRestoringFromTrash: Bool,
                                    summary: RestorableBatchSummary?, hasEverTrashed: Bool,
-                                   isInventorying: Bool, isRepairing: Bool) -> String? {
+                                   isInventorying: Bool, isRepairing: Bool, isAligning: Bool) -> String? {
         guard ssdMounted else {
             return "L'SSD non è collegato: le foto da rimettere a posto sono nel suo Cestino. "
                 + "Ricollegalo e riprova."
@@ -4456,6 +4461,10 @@ enum DuplicatesStatus {
         }
         guard !isRepairing else {
             return "L'app sta riparando una foto: aspetta che finisca prima di annullare lo spostamento."
+        }
+        guard !isAligning else {
+            return "L'app sta togliendo copie doppie da HDD o Cubbit: aspetta che finisca prima di annullare "
+                + "lo spostamento."
         }
         guard summary != nil else {
             return hasEverTrashed
@@ -7181,7 +7190,7 @@ nonisolated enum InventoryRefresh {
 /// nei cancelli di quelle operazioni, col parametro `isInventorying`.
 enum InventoryStartGate {
     static func blockedReason(isRunning: Bool, isIndexing: Bool, isTrashingDuplicates: Bool,
-                              isRestoringFromTrash: Bool, isInventorying: Bool, isRepairing: Bool,
+                              isRestoringFromTrash: Bool, isInventorying: Bool, isRepairing: Bool, isAligning: Bool,
                               ssdMounted: Bool, hddMounted: Bool, hasCubbitConfig: Bool) -> String? {
         if isInventorying { return "L'inventario si sta già aggiornando." }
         if isTrashingDuplicates {
@@ -7195,6 +7204,10 @@ enum InventoryStartGate {
         if isRepairing {
             return "L'app sta riparando una foto: aspetta che finisca, poi aggiorna l'inventario per "
                 + "confermare la riparazione."
+        }
+        if isAligning {
+            return "L'app sta togliendo copie doppie da HDD o Cubbit: aspetta che finisca, altrimenti "
+                + "l'inventario leggerebbe gli archivi mentre cambiano."
         }
         if isRunning {
             return "C'è un backup in corso: aspetta che finisca, altrimenti l'inventario "
@@ -7237,7 +7250,7 @@ enum InventoryStartGate {
 /// lettura dell'elenco > dischi non collegati > Cubbit non configurato.
 enum RepairStartGate {
     static func blockedReason(isRunning: Bool, isIndexing: Bool, isTrashingDuplicates: Bool,
-                              isRestoringFromTrash: Bool, isInventorying: Bool, isRepairing: Bool,
+                              isRestoringFromTrash: Bool, isInventorying: Bool, isRepairing: Bool, isAligning: Bool,
                               ssdMounted: Bool, hddMounted: Bool, hasCubbitConfig: Bool) -> String? {
         if isRepairing { return "C'è già una riparazione in corso: le foto si riparano una alla volta." }
         if isTrashingDuplicates {
@@ -7248,6 +7261,9 @@ enum RepairStartGate {
         }
         if isInventorying {
             return "L'inventario si sta aggiornando: aspetta che finisca, poi ripara."
+        }
+        if isAligning {
+            return "L'app sta togliendo copie doppie da HDD o Cubbit: aspetta che finisca, poi ripara."
         }
         if isRunning {
             return "C'è un backup in corso: aspetta che finisca, altrimenti la riparazione scriverebbe "
@@ -7270,6 +7286,42 @@ enum RepairStartGate {
 
     static let cubbitUnreachable =
         "Cubbit non risponde in questo momento: controlla la connessione a Internet e riprova."
+}
+
+/// Perche' «Togli le copie…» del progetto 4 non puo' partire adesso, `nil` se puo' (ROADMAP #47,
+/// ADR-0019). Il verso opposto sta nei cancelli delle altre operazioni, col parametro
+/// `isAligning`. Precedenza scritta a parole: un'altra corsa > spostamento/annullamento >
+/// riparazione > inventario > backup > lettura dell'elenco > dischi > Cubbit non configurato.
+/// L'SSD serve sempre (condizioni 3 e 4 dal vivo); l'HDD solo per l'HDD; Cubbit solo per Cubbit.
+enum AlignmentStartGate {
+    static func blockedReason(archive: AlignmentArchive, isRunning: Bool, isIndexing: Bool, isTrashingDuplicates: Bool,
+                              isRestoringFromTrash: Bool, isInventorying: Bool, isRepairing: Bool, isAligning: Bool,
+                              ssdMounted: Bool, hddMounted: Bool, hasCubbitConfig: Bool) -> String? {
+        if isAligning { return "Le copie doppie si stanno già togliendo: un archivio alla volta." }
+        if isTrashingDuplicates {
+            return "L'app sta spostando nel Cestino delle copie doppie dell'SSD: aspetta che finisca."
+        }
+        if isRestoringFromTrash {
+            return "L'app sta rimettendo a posto delle foto dal Cestino dell'SSD: aspetta che finisca."
+        }
+        if isRepairing { return "L'app sta riparando una foto: aspetta che finisca." }
+        if isInventorying {
+            return "L'inventario si sta aggiornando: aspetta che finisca, poi controlla di nuovo."
+        }
+        if isRunning {
+            return "C'è un backup in corso: aspetta che finisca. Dopo un backup serve anche un inventario nuovo."
+        }
+        if isIndexing { return "L'app sta aggiornando l'elenco delle foto sull'SSD: aspetta che finisca." }
+        if !ssdMounted {
+            return "L'SSD non è collegato: serve per controllare che la copia tenuta ci sia ancora e che "
+                + "quella da togliere non sia tornata."
+        }
+        if archive == .hdd && !hddMounted { return "L'HDD non è collegato." }
+        if archive == .cubbit && !hasCubbitConfig {
+            return "L'app non ha letto le credenziali di Cubbit: controlla in Diagnostica, poi riprova."
+        }
+        return nil
+    }
 }
 
 /// I testi della finestra Inventario. Logica pura, come `DuplicatesStatus`: nessuna stringa
@@ -9838,7 +9890,8 @@ enum JobStartGate {
     /// fra loro (si escludono a vicenda in `BackupRunner`), ma l'ordine qui fissa comunque
     /// quale frase l'utente legge se mai lo stato risultasse incoerente.
     static func blockedReason(isIndexing: Bool, isTrashingDuplicates: Bool,
-                              isRestoringFromTrash: Bool, isInventorying: Bool, isRepairing: Bool) -> String? {
+                              isRestoringFromTrash: Bool, isInventorying: Bool, isRepairing: Bool,
+                              isAligning: Bool) -> String? {
         if isTrashingDuplicates {
             return "L'app sta spostando nel Cestino le copie doppie che hai confermato. "
                 + "Aspetta che finisca, oppure fermala con «Interrompi» nella finestra Doppioni."
@@ -9851,6 +9904,12 @@ enum JobStartGate {
         // stessi posti nello stesso momento potrebbe copiare la foto a meta' riparazione.
         if isRepairing {
             return "L'app sta riparando una foto. Aspetta che finisca: di solito bastano pochi secondi."
+        }
+        // ROADMAP #47: un backup ricopierebbe su HDD e Cubbit proprio le copie che la corsa toglie,
+        // e renderebbe vecchio l'inventario su cui la corsa si fida.
+        if isAligning {
+            return "L'app sta togliendo da HDD o Cubbit le copie doppie già tolte dall'SSD. Aspetta che "
+                + "finisca, oppure fermala con «Interrompi» nella finestra Inventario."
         }
         // ROADMAP #44: l'inventario legge SSD, HDD e Cubbit; un job che ci scrive sopra
         // renderebbe falso quello che sta leggendo.
@@ -9872,7 +9931,7 @@ enum LibraryIndexCommandGate {
     /// la barra di avanzamento, la frase sul backup lo confonderebbe.
     static func disabledReason(isIndexing: Bool, jobIsRunning: Bool,
                                isTrashingDuplicates: Bool, isRestoringFromTrash: Bool,
-                               isInventorying: Bool, isRepairing: Bool) -> String? {
+                               isInventorying: Bool, isRepairing: Bool, isAligning: Bool) -> String? {
         // Lo spostamento nel Cestino ha la precedenza sulle altre: da quando gira
         // davvero fuori dal main (2026-09-19, BUG-7) puo' essere in corso insieme a
         // un'altra causa, ed e' quella piu' vicina al danno se qualcuno lo ignorasse.
@@ -9887,6 +9946,9 @@ enum LibraryIndexCommandGate {
         if isRepairing {
             return "L'app sta riparando una foto: leggere le foto adesso potrebbe trovarla a metà. "
                 + "Riprova quando ha finito."
+        }
+        if isAligning {
+            return "L'app sta togliendo copie doppie da HDD o Cubbit: aspetta che finisca, poi aggiorna l'elenco."
         }
         if isInventorying {
             return "L'app sta facendo l'inventario e sta leggendo le stesse foto: aggiornare "
@@ -13971,7 +14033,7 @@ final class BackupRunner: ObservableObject {
     /// atomici rispetto a ogni altro gate perche' girano entrambi sul MainActor.
     func beginDuplicateTrashing() -> SimpleAlert? {
         guard !isTrashingDuplicates, !isRunning, !isIndexing, !isRestoringFromTrash, !isInventorying,
-              !isRepairing else {
+              !isRepairing, !isAligning else {
             return SimpleAlert(title: "Meglio non farlo adesso",
                 message: "C'è già un'altra operazione in corso (un backup, una lettura "
                     + "dell'elenco, un inventario, una riparazione, un altro spostamento nel Cestino o "
@@ -14011,7 +14073,7 @@ final class BackupRunner: ObservableObject {
     /// impostazione sono atomici perche' girano entrambi sul MainActor.
     func beginTrashRestore() -> SimpleAlert? {
         guard !isRestoringFromTrash, !isTrashingDuplicates, !isRunning, !isIndexing, !isInventorying,
-              !isRepairing else {
+              !isRepairing, !isAligning else {
             return SimpleAlert(title: "Meglio non farlo adesso",
                 message: "C'è già un'altra operazione in corso (un backup, una lettura "
                     + "dell'elenco, un inventario, una riparazione, uno spostamento nel Cestino o un "
@@ -14031,7 +14093,7 @@ final class BackupRunner: ObservableObject {
     /// altrimenti alza il flag. Controllo e impostazione sono atomici: entrambi sul MainActor.
     func beginRepair() -> SimpleAlert? {
         guard !isRepairing, !isTrashingDuplicates, !isRestoringFromTrash, !isInventorying, !isRunning,
-              !isIndexing else {
+              !isIndexing, !isAligning else {
             return SimpleAlert(title: "Meglio non farlo adesso",
                 message: "C'è già un'altra operazione in corso (un backup, una lettura dell'elenco, "
                     + "un inventario, uno spostamento nel Cestino, un annullamento o un'altra "
@@ -14044,6 +14106,31 @@ final class BackupRunner: ObservableObject {
     /// Chiamato SEMPRE dall'unico punto in cui una riparazione finisce (`finishRepair`).
     func endRepair() {
         isRepairing = false
+    }
+
+    /// Vero mentre una corsa del progetto 4 toglie copie da HDD o Cubbit, o ne rimette a posto
+    /// l'ultimo blocco (ROADMAP #47, ADR-0019). Vive QUI per la stessa ragione di
+    /// `isTrashingDuplicates`: riaprire la finestra Inventario non deve permettere una seconda
+    /// corsa, ne' un backup, una lettura, un inventario, una riparazione, uno spostamento.
+    @Published private(set) var isAligning = false
+
+    /// Rifiuta se c'e' gia' un'altra operazione in corso, altrimenti alza il flag. Controllo e
+    /// impostazione sono atomici: entrambi sul MainActor.
+    func beginAlignment() -> SimpleAlert? {
+        guard !isAligning, !isRepairing, !isTrashingDuplicates, !isRestoringFromTrash, !isInventorying,
+              !isRunning, !isIndexing else {
+            return SimpleAlert(title: "Meglio non farlo adesso",
+                message: "C'è già un'altra operazione in corso (un backup, una lettura dell'elenco, "
+                    + "un inventario, una riparazione, uno spostamento nel Cestino, un annullamento o "
+                    + "un'altra pulizia di HDD o Cubbit). Aspetta che finisca.")
+        }
+        isAligning = true
+        return nil
+    }
+
+    /// Chiamato SEMPRE dall'unico punto in cui una corsa o un annullamento del progetto 4 finisce.
+    func endAlignment() {
+        isAligning = false
     }
 
     /// Chiamato SEMPRE dallo stesso `MainActor.run` che pubblica l'esito dell'annullamento —
@@ -14110,7 +14197,8 @@ final class BackupRunner: ObservableObject {
                                                              isTrashingDuplicates: isTrashingDuplicates,
                                                              isRestoringFromTrash: isRestoringFromTrash,
                                                              summary: restorableBatch, hasEverTrashed: (trashManifestStore?.totalRecorded ?? 0) > 0,
-                                                             isInventorying: isInventorying, isRepairing: isRepairing) {
+                                                             isInventorying: isInventorying, isRepairing: isRepairing,
+                                                             isAligning: isAligning) {
             onAlert(SimpleAlert(title: "Meglio non farlo adesso", message: reason))
             return
         }
@@ -14229,7 +14317,8 @@ final class BackupRunner: ObservableObject {
                                                            isTrashingDuplicates: isTrashingDuplicates,
                                                            isRestoringFromTrash: isRestoringFromTrash,
                                                            isInventorying: isInventorying,
-                                                           isRepairing: isRepairing)
+                                                           isRepairing: isRepairing,
+                                                           isAligning: isAligning)
         if let reason {
             onAlert(SimpleAlert(title: "Meglio non farlo adesso", message: reason))
             return
@@ -14595,7 +14684,8 @@ final class BackupRunner: ObservableObject {
                                                               isTrashingDuplicates: isTrashingDuplicates,
                                                               isRestoringFromTrash: isRestoringFromTrash,
                                                               isInventorying: isInventorying,
-                                                              isRepairing: isRepairing) {
+                                                              isRepairing: isRepairing,
+                                                              isAligning: isAligning) {
             onAlert?(SimpleAlert(title: "Meglio non farlo adesso", message: reason))
             return
         }
@@ -14706,6 +14796,7 @@ final class BackupRunner: ObservableObject {
         if let reason = InventoryStartGate.blockedReason(
             isRunning: isRunning, isIndexing: isIndexing, isTrashingDuplicates: isTrashingDuplicates,
             isRestoringFromTrash: isRestoringFromTrash, isInventorying: isInventorying, isRepairing: isRepairing,
+            isAligning: isAligning,
             ssdMounted: VolumeMonitor.shared.ssdMounted, hddMounted: VolumeMonitor.shared.hddMounted,
             hasCubbitConfig: s3Config != nil) {
             onAlert(SimpleAlert(title: "Meglio non farlo adesso", message: reason))
@@ -14848,6 +14939,7 @@ final class BackupRunner: ObservableObject {
         if let reason = RepairStartGate.blockedReason(
             isRunning: isRunning, isIndexing: isIndexing, isTrashingDuplicates: isTrashingDuplicates,
             isRestoringFromTrash: isRestoringFromTrash, isInventorying: isInventorying, isRepairing: isRepairing,
+            isAligning: isAligning,
             ssdMounted: VolumeMonitor.shared.ssdMounted, hddMounted: VolumeMonitor.shared.hddMounted,
             hasCubbitConfig: s3Config != nil) {
             onAlert(SimpleAlert(title: "Meglio non farlo adesso", message: reason))
@@ -15683,7 +15775,8 @@ final class BackupRunner: ObservableObject {
                                                     isTrashingDuplicates: isTrashingDuplicates,
                                                     isRestoringFromTrash: isRestoringFromTrash,
                                                     isInventorying: isInventorying,
-                                                    isRepairing: isRepairing) {
+                                                    isRepairing: isRepairing,
+                                                    isAligning: isAligning) {
             pendingAlert = SimpleAlert(title: "Meglio non farlo adesso", message: reason)
             return
         }
@@ -19032,7 +19125,8 @@ struct LibraryIndexCard: View {
                                                isTrashingDuplicates: runner.isTrashingDuplicates,
                                                isRestoringFromTrash: runner.isRestoringFromTrash,
                                                isInventorying: runner.isInventorying,
-                                               isRepairing: runner.isRepairing)
+                                               isRepairing: runner.isRepairing,
+                                               isAligning: runner.isAligning)
     }
 
     private var commandsDisabled: Bool { commandsDisabledReason != nil }
@@ -19651,7 +19745,8 @@ struct DuplicatesView: View {
                                              isTrashingDuplicates: runner.isTrashingDuplicates,
                                              isRestoringFromTrash: runner.isRestoringFromTrash,
                                              isInventorying: runner.isInventorying,
-                                             isRepairing: runner.isRepairing)
+                                             isRepairing: runner.isRepairing,
+                                             isAligning: runner.isAligning)
     }
 
     private var canRequestTrash: Bool {
@@ -19674,7 +19769,7 @@ struct DuplicatesView: View {
             ssdMounted: volumes.ssdMounted, isRunning: runner.isRunning, isIndexing: runner.isIndexing,
             isTrashingDuplicates: runner.isTrashingDuplicates, isRestoringFromTrash: runner.isRestoringFromTrash,
             summary: runner.restorableBatch, hasEverTrashed: (runner.trashManifestStore?.totalRecorded ?? 0) > 0,
-            isInventorying: runner.isInventorying, isRepairing: runner.isRepairing)
+            isInventorying: runner.isInventorying, isRepairing: runner.isRepairing, isAligning: runner.isAligning)
     }
 
     private var undoConfirmationText: TrashRestoreStatus.Confirmation? {
@@ -20663,7 +20758,7 @@ struct InventoryView: View {
         InventoryStartGate.blockedReason(
             isRunning: runner.isRunning, isIndexing: runner.isIndexing,
             isTrashingDuplicates: runner.isTrashingDuplicates, isRestoringFromTrash: runner.isRestoringFromTrash,
-            isInventorying: runner.isInventorying, isRepairing: runner.isRepairing,
+            isInventorying: runner.isInventorying, isRepairing: runner.isRepairing, isAligning: runner.isAligning,
             ssdMounted: volumes.ssdMounted, hddMounted: volumes.hddMounted,
             hasCubbitConfig: runner.s3Config != nil)
     }
@@ -20672,7 +20767,7 @@ struct InventoryView: View {
         RepairStartGate.blockedReason(
             isRunning: runner.isRunning, isIndexing: runner.isIndexing,
             isTrashingDuplicates: runner.isTrashingDuplicates, isRestoringFromTrash: runner.isRestoringFromTrash,
-            isInventorying: runner.isInventorying, isRepairing: runner.isRepairing,
+            isInventorying: runner.isInventorying, isRepairing: runner.isRepairing, isAligning: runner.isAligning,
             ssdMounted: volumes.ssdMounted, hddMounted: volumes.hddMounted, hasCubbitConfig: runner.s3Config != nil)
     }
 

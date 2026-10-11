@@ -38,12 +38,12 @@ final class InventoryRefreshTests: XCTestCase {
     // MARK: - Cancello di partenza
 
     private func reason(isRunning: Bool = false, isIndexing: Bool = false, isTrashingDuplicates: Bool = false,
-                        isRestoringFromTrash: Bool = false, isInventorying: Bool = false, isRepairing: Bool = false,
+                        isRestoringFromTrash: Bool = false, isInventorying: Bool = false, isRepairing: Bool = false, isAligning: Bool = false,
                         ssdMounted: Bool = true, hddMounted: Bool = true, hasCubbitConfig: Bool = true) -> String? {
         InventoryStartGate.blockedReason(isRunning: isRunning, isIndexing: isIndexing,
                                          isTrashingDuplicates: isTrashingDuplicates,
                                          isRestoringFromTrash: isRestoringFromTrash, isInventorying: isInventorying,
-                                         isRepairing: isRepairing,
+                                         isRepairing: isRepairing, isAligning: isAligning,
                                          ssdMounted: ssdMounted, hddMounted: hddMounted, hasCubbitConfig: hasCubbitConfig)
     }
 

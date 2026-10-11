@@ -443,23 +443,23 @@ final class LibraryIndexStatusTests: XCTestCase {
     /// l'aggiornamento automatico si'. Chi premeva "Aggiorna" durante un backup faceva
     /// leggere per intero l'SSD mentre una copia ci scriveva sopra.
     func testCommandGate_blocksWhileACopyJobIsRunning() {
-        XCTAssertNotNil(LibraryIndexCommandGate.disabledReason(isIndexing: false, jobIsRunning: true, isTrashingDuplicates: false, isRestoringFromTrash: false, isInventorying: false, isRepairing: false))
+        XCTAssertNotNil(LibraryIndexCommandGate.disabledReason(isIndexing: false, jobIsRunning: true, isTrashingDuplicates: false, isRestoringFromTrash: false, isInventorying: false, isRepairing: false, isAligning: false))
     }
 
     func testCommandGate_blocksWhileTheListIsBeingRead() {
-        XCTAssertNotNil(LibraryIndexCommandGate.disabledReason(isIndexing: true, jobIsRunning: false, isTrashingDuplicates: false, isRestoringFromTrash: false, isInventorying: false, isRepairing: false))
+        XCTAssertNotNil(LibraryIndexCommandGate.disabledReason(isIndexing: true, jobIsRunning: false, isTrashingDuplicates: false, isRestoringFromTrash: false, isInventorying: false, isRepairing: false, isAligning: false))
     }
 
     func testCommandGate_allowsWhenNothingElseIsGoingOn() {
-        XCTAssertNil(LibraryIndexCommandGate.disabledReason(isIndexing: false, jobIsRunning: false, isTrashingDuplicates: false, isRestoringFromTrash: false, isInventorying: false, isRepairing: false))
+        XCTAssertNil(LibraryIndexCommandGate.disabledReason(isIndexing: false, jobIsRunning: false, isTrashingDuplicates: false, isRestoringFromTrash: false, isInventorying: false, isRepairing: false, isAligning: false))
     }
 
     /// Le due cause hanno due frasi diverse: un bottone grigio senza motivo, o con il motivo
     /// sbagliato, e' la stessa disciplina gia' applicata a `RestoreView` e al pannello
     /// Doppioni — disattivare **e** dire perche'.
     func testCommandGate_tellsTheTwoCausesApart() {
-        let job = LibraryIndexCommandGate.disabledReason(isIndexing: false, jobIsRunning: true, isTrashingDuplicates: false, isRestoringFromTrash: false, isInventorying: false, isRepairing: false)
-        let lettura = LibraryIndexCommandGate.disabledReason(isIndexing: true, jobIsRunning: false, isTrashingDuplicates: false, isRestoringFromTrash: false, isInventorying: false, isRepairing: false)
+        let job = LibraryIndexCommandGate.disabledReason(isIndexing: false, jobIsRunning: true, isTrashingDuplicates: false, isRestoringFromTrash: false, isInventorying: false, isRepairing: false, isAligning: false)
+        let lettura = LibraryIndexCommandGate.disabledReason(isIndexing: true, jobIsRunning: false, isTrashingDuplicates: false, isRestoringFromTrash: false, isInventorying: false, isRepairing: false, isAligning: false)
         XCTAssertNotEqual(job, lettura)
     }
 
@@ -468,7 +468,7 @@ final class LibraryIndexStatusTests: XCTestCase {
     /// la causa piu' vicina al danno.
     func testCommandGate_blocksWhileTrashingIsInProgress() {
         let reason = LibraryIndexCommandGate.disabledReason(isIndexing: true, jobIsRunning: false,
-                                                             isTrashingDuplicates: true, isRestoringFromTrash: false, isInventorying: false, isRepairing: false)
+                                                             isTrashingDuplicates: true, isRestoringFromTrash: false, isInventorying: false, isRepairing: false, isAligning: false)
         XCTAssertNotNil(reason)
         XCTAssertTrue(reason!.lowercased().contains("cestino"))
     }
@@ -476,10 +476,10 @@ final class LibraryIndexStatusTests: XCTestCase {
     /// Il motivo finisce a schermo come tutte le altre righe della card.
     func testCommandGate_reasonsCarryNoJargon() {
         let gergo = ["indice", "hash", "sha", "scansione", "sqlite", "mtime", "cache", "entry"]
-        for reason in [LibraryIndexCommandGate.disabledReason(isIndexing: true, jobIsRunning: false, isTrashingDuplicates: false, isRestoringFromTrash: false, isInventorying: false, isRepairing: false),
-                       LibraryIndexCommandGate.disabledReason(isIndexing: false, jobIsRunning: true, isTrashingDuplicates: false, isRestoringFromTrash: false, isInventorying: false, isRepairing: false),
-                       LibraryIndexCommandGate.disabledReason(isIndexing: true, jobIsRunning: true, isTrashingDuplicates: false, isRestoringFromTrash: false, isInventorying: false, isRepairing: false),
-                       LibraryIndexCommandGate.disabledReason(isIndexing: false, jobIsRunning: false, isTrashingDuplicates: false, isRestoringFromTrash: true, isInventorying: false, isRepairing: false)] {
+        for reason in [LibraryIndexCommandGate.disabledReason(isIndexing: true, jobIsRunning: false, isTrashingDuplicates: false, isRestoringFromTrash: false, isInventorying: false, isRepairing: false, isAligning: false),
+                       LibraryIndexCommandGate.disabledReason(isIndexing: false, jobIsRunning: true, isTrashingDuplicates: false, isRestoringFromTrash: false, isInventorying: false, isRepairing: false, isAligning: false),
+                       LibraryIndexCommandGate.disabledReason(isIndexing: true, jobIsRunning: true, isTrashingDuplicates: false, isRestoringFromTrash: false, isInventorying: false, isRepairing: false, isAligning: false),
+                       LibraryIndexCommandGate.disabledReason(isIndexing: false, jobIsRunning: false, isTrashingDuplicates: false, isRestoringFromTrash: true, isInventorying: false, isRepairing: false, isAligning: false)] {
             let detto = (reason ?? "").lowercased()
             for parola in gergo {
                 XCTAssertFalse(detto.contains(parola), "gergo nel motivo: '\(parola)' in «\(detto)»")
@@ -491,12 +491,12 @@ final class LibraryIndexStatusTests: XCTestCase {
     /// manuale, con un motivo distinto dagli altri due.
     func testCommandGate_restoringInProgress_disablesWithAReason() {
         let reason = LibraryIndexCommandGate.disabledReason(isIndexing: false, jobIsRunning: false,
-                                                             isTrashingDuplicates: false, isRestoringFromTrash: true, isInventorying: false, isRepairing: false)
+                                                             isTrashingDuplicates: false, isRestoringFromTrash: true, isInventorying: false, isRepairing: false, isAligning: false)
         XCTAssertNotNil(reason)
         let job = LibraryIndexCommandGate.disabledReason(isIndexing: false, jobIsRunning: true,
-                                                          isTrashingDuplicates: false, isRestoringFromTrash: false, isInventorying: false, isRepairing: false)
+                                                          isTrashingDuplicates: false, isRestoringFromTrash: false, isInventorying: false, isRepairing: false, isAligning: false)
         let trashing = LibraryIndexCommandGate.disabledReason(isIndexing: false, jobIsRunning: false,
-                                                               isTrashingDuplicates: true, isRestoringFromTrash: false, isInventorying: false, isRepairing: false)
+                                                               isTrashingDuplicates: true, isRestoringFromTrash: false, isInventorying: false, isRepairing: false, isAligning: false)
         XCTAssertNotEqual(reason, job)
         XCTAssertNotEqual(reason, trashing)
     }
@@ -508,7 +508,7 @@ final class LibraryIndexStatusTests: XCTestCase {
     /// Il danno e' un altro — un'importazione in corso usa l'elenco per non ricopiare foto
     /// gia' presenti, e togliergielo sotto significa fargliele ricopiare.
     func testResetGate_hasItsOwnReason_notTheReadingOne() {
-        let lettura = LibraryIndexCommandGate.disabledReason(isIndexing: false, jobIsRunning: true, isTrashingDuplicates: false, isRestoringFromTrash: false, isInventorying: false, isRepairing: false)
+        let lettura = LibraryIndexCommandGate.disabledReason(isIndexing: false, jobIsRunning: true, isTrashingDuplicates: false, isRestoringFromTrash: false, isInventorying: false, isRepairing: false, isAligning: false)
         let svuota = LibraryIndexCommandGate.resetDisabledReason(isIndexing: false, jobIsRunning: true, isTrashingDuplicates: false, isInventorying: false)
         XCTAssertNotNil(svuota)
         XCTAssertNotEqual(svuota, lettura, "svuotare e rileggere non hanno lo stesso motivo")
@@ -546,7 +546,7 @@ final class LibraryIndexStatusTests: XCTestCase {
     func testCommandGate_blocksDuringTheInventory_withItsOwnReason() {
         let reason = LibraryIndexCommandGate.disabledReason(isIndexing: false, jobIsRunning: false,
                                                             isTrashingDuplicates: false, isRestoringFromTrash: false,
-                                                            isInventorying: true, isRepairing: false)
+                                                            isInventorying: true, isRepairing: false, isAligning: false)
         XCTAssertNotNil(reason)
         XCTAssertTrue(reason!.contains("inventario"))
     }

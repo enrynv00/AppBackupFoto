@@ -18,19 +18,19 @@ final class RepairGatesTests: XCTestCase {
 
     func testJobsDoNotStart_whileRepairing() {
         let r = JobStartGate.blockedReason(isIndexing: false, isTrashingDuplicates: false, isRestoringFromTrash: false,
-                                           isInventorying: false, isRepairing: true)
+                                           isInventorying: false, isRepairing: true, isAligning: false)
         XCTAssertTrue(r?.contains("riparando") == true)
         assertNoJargon(r)
-        let others = [JobStartGate.blockedReason(isIndexing: true, isTrashingDuplicates: false, isRestoringFromTrash: false, isInventorying: false, isRepairing: false),
-                      JobStartGate.blockedReason(isIndexing: false, isTrashingDuplicates: true, isRestoringFromTrash: false, isInventorying: false, isRepairing: false),
-                      JobStartGate.blockedReason(isIndexing: false, isTrashingDuplicates: false, isRestoringFromTrash: true, isInventorying: false, isRepairing: false),
-                      JobStartGate.blockedReason(isIndexing: false, isTrashingDuplicates: false, isRestoringFromTrash: false, isInventorying: true, isRepairing: false)]
+        let others = [JobStartGate.blockedReason(isIndexing: true, isTrashingDuplicates: false, isRestoringFromTrash: false, isInventorying: false, isRepairing: false, isAligning: false),
+                      JobStartGate.blockedReason(isIndexing: false, isTrashingDuplicates: true, isRestoringFromTrash: false, isInventorying: false, isRepairing: false, isAligning: false),
+                      JobStartGate.blockedReason(isIndexing: false, isTrashingDuplicates: false, isRestoringFromTrash: true, isInventorying: false, isRepairing: false, isAligning: false),
+                      JobStartGate.blockedReason(isIndexing: false, isTrashingDuplicates: false, isRestoringFromTrash: false, isInventorying: true, isRepairing: false, isAligning: false)]
         XCTAssertFalse(others.contains(r), "una frase sua")
     }
 
     func testReadingTheList_doesNotStart_whileRepairing() {
         let r = LibraryIndexCommandGate.disabledReason(isIndexing: false, jobIsRunning: false, isTrashingDuplicates: false,
-                                                       isRestoringFromTrash: false, isInventorying: false, isRepairing: true)
+                                                       isRestoringFromTrash: false, isInventorying: false, isRepairing: true, isAligning: false)
         XCTAssertTrue(r?.contains("riparando") == true)
         assertNoJargon(r)
     }
@@ -38,7 +38,7 @@ final class RepairGatesTests: XCTestCase {
     func testTrashing_doesNotStart_whileRepairing() {
         let r = DuplicatesStatus.trashDisabledReason(isRunning: false, isIndexing: false, ssdMounted: true,
                                                      isTrashingDuplicates: false, isRestoringFromTrash: false,
-                                                     isInventorying: false, isRepairing: true)
+                                                     isInventorying: false, isRepairing: true, isAligning: false)
         XCTAssertTrue(r?.contains("riparando") == true)
         assertNoJargon(r)
     }
@@ -48,14 +48,14 @@ final class RepairGatesTests: XCTestCase {
         let r = DuplicatesStatus.undoDisabledReason(ssdMounted: true, isRunning: false, isIndexing: false,
                                                     isTrashingDuplicates: false, isRestoringFromTrash: false,
                                                     summary: summary, hasEverTrashed: true,
-                                                    isInventorying: false, isRepairing: true)
+                                                    isInventorying: false, isRepairing: true, isAligning: false)
         XCTAssertTrue(r?.contains("riparando") == true)
         assertNoJargon(r)
     }
 
     func testInventory_doesNotStart_whileRepairing() {
         let r = InventoryStartGate.blockedReason(isRunning: false, isIndexing: false, isTrashingDuplicates: false,
-                                                 isRestoringFromTrash: false, isInventorying: false, isRepairing: true,
+                                                 isRestoringFromTrash: false, isInventorying: false, isRepairing: true, isAligning: false,
                                                  ssdMounted: true, hddMounted: true, hasCubbitConfig: true)
         XCTAssertTrue(r?.contains("riparando") == true)
         assertNoJargon(r)
@@ -64,7 +64,7 @@ final class RepairGatesTests: XCTestCase {
     /// Un'operazione in corso viene prima dei dischi scollegati anche per l'inventario.
     func testInventory_repairComesBeforeMissingDisks() {
         let r = InventoryStartGate.blockedReason(isRunning: false, isIndexing: false, isTrashingDuplicates: false,
-                                                 isRestoringFromTrash: false, isInventorying: false, isRepairing: true,
+                                                 isRestoringFromTrash: false, isInventorying: false, isRepairing: true, isAligning: false,
                                                  ssdMounted: false, hddMounted: false, hasCubbitConfig: false)
         XCTAssertTrue(r?.contains("riparando") == true)
     }
@@ -72,12 +72,12 @@ final class RepairGatesTests: XCTestCase {
     // MARK: - Verso 2: «Ripara…» non parte durante le altre operazioni
 
     private func repair(isRunning: Bool = false, isIndexing: Bool = false, isTrashingDuplicates: Bool = false,
-                        isRestoringFromTrash: Bool = false, isInventorying: Bool = false, isRepairing: Bool = false,
+                        isRestoringFromTrash: Bool = false, isInventorying: Bool = false, isRepairing: Bool = false, isAligning: Bool = false,
                         ssdMounted: Bool = true, hddMounted: Bool = true, hasCubbitConfig: Bool = true) -> String? {
         RepairStartGate.blockedReason(isRunning: isRunning, isIndexing: isIndexing,
                                       isTrashingDuplicates: isTrashingDuplicates,
                                       isRestoringFromTrash: isRestoringFromTrash, isInventorying: isInventorying,
-                                      isRepairing: isRepairing, ssdMounted: ssdMounted, hddMounted: hddMounted,
+                                      isRepairing: isRepairing, isAligning: isAligning, ssdMounted: ssdMounted, hddMounted: hddMounted,
                                       hasCubbitConfig: hasCubbitConfig)
     }
 
@@ -87,7 +87,7 @@ final class RepairGatesTests: XCTestCase {
 
     func testRepair_eachConditionBlocksWithItsOwnReason() {
         let all = [repair(isRunning: true), repair(isIndexing: true), repair(isTrashingDuplicates: true),
-                   repair(isRestoringFromTrash: true), repair(isInventorying: true), repair(isRepairing: true),
+                   repair(isRestoringFromTrash: true), repair(isInventorying: true), repair(isRepairing: true, isAligning: false),
                    repair(ssdMounted: false), repair(hddMounted: false), repair(hasCubbitConfig: false)]
         XCTAssertTrue(all.allSatisfy { $0 != nil })
         XCTAssertEqual(Set(all.compactMap { $0 }).count, all.count, "nove motivi, nove frasi diverse")
@@ -98,7 +98,7 @@ final class RepairGatesTests: XCTestCase {
 
     /// Precedenza: un'altra riparazione prima di tutto, le operazioni prima dei dischi.
     func testRepair_precedence() {
-        XCTAssertEqual(repair(isRunning: true, isTrashingDuplicates: true, isRepairing: true), repair(isRepairing: true))
+        XCTAssertEqual(repair(isRunning: true, isTrashingDuplicates: true, isRepairing: true, isAligning: false), repair(isRepairing: true, isAligning: false))
         XCTAssertEqual(repair(isRunning: true, isInventorying: true), repair(isInventorying: true))
         XCTAssertEqual(repair(isRunning: true, ssdMounted: false), repair(isRunning: true))
         XCTAssertEqual(repair(ssdMounted: false, hddMounted: false), repair(ssdMounted: false))
