@@ -9078,6 +9078,76 @@ nonisolated final class S3RepairCloud: RepairCloud, @unchecked Sendable {
     }
 }
 
+// MARK: - Doppioni su Cubbit: cosa il motore chiede a Cubbit (ROADMAP #47, ADR-0019)
+
+/// Quello che il motore del progetto 4 chiede a Cubbit. In produzione `S3AlignmentCloud` (sopra
+/// `S3Syncer`); nei test un Cubbit finto con le versioni.
+nonisolated protocol AlignmentCloud: Sendable {
+    /// `nil` = l'oggetto non c'e' (o il suo ultimo stato e' un segno di cancellazione).
+    func head(key: String) async throws -> S3Syncer.S3ObjectHead?
+    func versioning() async throws -> S3Syncer.BucketVersioning
+    func lifecycleRules() async throws -> [S3Syncer.LifecycleRule]
+    /// DELETE senza versione: crea il segno di cancellazione.
+    func delete(key: String) async throws -> S3Syncer.DeleteResult
+    func versions(key: String) async throws -> [S3Syncer.VersionEntry]
+    /// Toglie il segno di cancellazione `versionId` di `key`: l'annullamento.
+    func removeDeleteMarker(key: String, versionId: String) async throws -> S3Syncer.DeleteResult
+}
+
+/// Il Cubbit vero per il motore del progetto 4. Stessa forma di `S3RepairCloud`: solo `let`,
+/// ogni chiamata salta sul main il tempo di costruire e firmare la richiesta.
+// `nonisolated`: solo proprieta' `let`; `S3Syncer` e' isolato al MainActor (quindi `Sendable`).
+nonisolated final class S3AlignmentCloud: AlignmentCloud, @unchecked Sendable {
+    private let syncer: S3Syncer
+    private let config: S3Syncer.S3Config
+
+    init(syncer: S3Syncer, config: S3Syncer.S3Config) {
+        self.syncer = syncer
+        self.config = config
+    }
+
+    func head(key: String) async throws -> S3Syncer.S3ObjectHead? { try await syncer.headObject(config: config, key: key) }
+    func versioning() async throws -> S3Syncer.BucketVersioning { try await syncer.bucketVersioning(config: config) }
+    func lifecycleRules() async throws -> [S3Syncer.LifecycleRule] { try await syncer.bucketLifecycleRules(config: config) }
+    func delete(key: String) async throws -> S3Syncer.DeleteResult {
+        try await syncer.deleteObjectForAlignment(config: config, key: key)
+    }
+    func versions(key: String) async throws -> [S3Syncer.VersionEntry] {
+        try await syncer.listObjectVersions(config: config, key: key)
+    }
+    func removeDeleteMarker(key: String, versionId: String) async throws -> S3Syncer.DeleteResult {
+        try await syncer.removeDeleteMarkerForAlignment(config: config, key: key, versionId: versionId)
+    }
+}
+
+/// Se Cubbit e' pronto per togliere copie (condizione 7 della spec). Logica pura sulle due
+/// letture. Le versioni devono essere accese; le regole di scadenza devono far sparire le
+/// versioni vecchie di tutto il bucket, e MAI prima di `minimumDays` giorni (e' la finestra in
+/// cui «Annulla» funziona, D5 del piano); nessuna regola deve far sparire le foto attuali.
+// `nonisolated`: pura, valutata dal motore fuori dal main.
+nonisolated enum AlignmentCubbitSafety: Equatable, Sendable {
+    case ready(days: Int)
+    case versioningNotEnabled(S3Syncer.BucketVersioning)
+    case noExpiryRule
+    case expiryTooShort(days: Int)
+    case expiresCurrentPhotos
+
+    static let minimumDays = 30
+
+    static func evaluate(versioning: S3Syncer.BucketVersioning, rules: [S3Syncer.LifecycleRule]) -> AlignmentCubbitSafety {
+        guard versioning == .enabled else { return .versioningNotEnabled(versioning) }
+        let enabled = rules.filter(\.enabled)
+        if enabled.contains(where: \.expiresCurrentObjects) { return .expiresCurrentPhotos }
+        // Il minimo fra TUTTE le regole attive, anche quelle per una sola cartella: una regola
+        // da 1 giorno su «Takeout/» renderebbe l'annullamento impossibile li'.
+        if let shortest = enabled.compactMap(\.noncurrentDays).min(), shortest < minimumDays {
+            return .expiryTooShort(days: shortest)
+        }
+        guard let days = enabled.filter(\.wholeBucket).compactMap(\.noncurrentDays).min() else { return .noExpiryRule }
+        return .ready(days: days)
+    }
+}
+
 // MARK: - Testi e regole della card "Foto gia' salvate" (roadmap #31, Task 6)
 
 /// I nomi dei comandi della card, in un punto solo. Non e' pignoleria: due dei messaggi
@@ -11694,6 +11764,249 @@ final class S3Syncer {
         beginNewOperation()
         let gate = AdaptiveUploadGate(startingLimit: 1, ceiling: 1)
         try await upload(url: url, key: key, config: config, gate: gate, onStart: {}, onStatus: { _ in })
+    }
+
+    // MARK: - Richieste del progetto 4: doppioni su Cubbit (ROADMAP #47, ADR-0019)
+    //
+    // Le uniche richieste DELETE su oggetti del progetto, oltre ad `AbortMultipartUpload`. Le
+    // chiama SOLO `S3AlignmentCloud`, per `ArchiveAligner` (`AlignmentDeleteGuardTests` lo
+    // pretende leggendo il sorgente). Il percorso e' quello di `objectRequestPath`, lo stesso
+    // della HEAD che le precede: la HEAD e il DELETE parlano della stessa chiave per costruzione.
+
+    /// Lo stato delle versioni del bucket (`GetBucketVersioning`). Un bucket su cui non sono mai
+    /// state accese risponde senza `<Status>`.
+    nonisolated enum BucketVersioning: Equatable, Sendable {
+        case enabled
+        case suspended
+        case neverEnabled
+        case unrecognized(String)
+    }
+
+    /// Una regola di scadenza del bucket, per quel che serve all'app: si legge, non si scrive mai.
+    nonisolated struct LifecycleRule: Equatable, Sendable {
+        let id: String
+        let enabled: Bool
+        /// Vale per tutto il bucket: `<Prefix>` vuoto o assente, e nessun `<Filter>` che restringa.
+        let wholeBucket: Bool
+        /// `NoncurrentVersionExpiration/NoncurrentDays`: dopo quanti giorni una versione vecchia sparisce.
+        let noncurrentDays: Int?
+        /// `Expiration` con `Days` o `Date`: farebbe sparire le foto ATTUALI. L'app non parte.
+        let expiresCurrentObjects: Bool
+    }
+
+    /// L'esito di un DELETE: se ha creato (o tolto) un segno di cancellazione, e con quale versione.
+    nonisolated struct DeleteResult: Equatable, Sendable {
+        let isDeleteMarker: Bool
+        let versionId: String?
+    }
+
+    /// Una voce di `ListObjectVersions`: una versione di dati o un segno di cancellazione.
+    nonisolated struct VersionEntry: Equatable, Sendable {
+        let key: String
+        let versionId: String
+        let isLatest: Bool
+        let isDeleteMarker: Bool
+        let etag: String?
+        let size: Int64?
+    }
+
+    nonisolated struct VersionsPage: Equatable, Sendable {
+        let entries: [VersionEntry]
+        let isTruncated: Bool
+        let nextKeyMarker: String?
+        let nextVersionIdMarker: String?
+        /// Blocchi senza chiave o senza versione leggibile: non si fanno sparire in silenzio.
+        let malformedEntries: Int
+    }
+
+    /// Il testo del primo `<tag>…</tag>` (decodificato), `""` per `<tag/>`, `nil` se manca.
+    nonisolated static func xmlTag(_ xml: Substring, _ tag: String) -> String? {
+        if xml.range(of: "<\(tag)/>") != nil, xml.range(of: "<\(tag)>") == nil { return "" }
+        guard let s = xml.range(of: "<\(tag)>"), let e = xml.range(of: "</\(tag)>", range: s.upperBound..<xml.endIndex) else {
+            return nil
+        }
+        return xmlDecode(String(xml[s.upperBound..<e.lowerBound]))
+    }
+
+    /// I blocchi `<tag>…</tag>` di primo livello, nell'ordine del documento.
+    nonisolated static func xmlBlocks(_ xml: Substring, _ tag: String) -> [Substring] {
+        var out: [Substring] = []
+        var rest = xml
+        while let s = rest.range(of: "<\(tag)>"), let e = rest.range(of: "</\(tag)>", range: s.upperBound..<rest.endIndex) {
+            out.append(rest[s.upperBound..<e.lowerBound])
+            rest = rest[e.upperBound...]
+        }
+        return out
+    }
+
+    nonisolated static func parseVersioning(_ xml: String) -> BucketVersioning {
+        guard let status = xmlTag(xml[...], "Status")?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !status.isEmpty else { return .neverEnabled }
+        switch status {
+        case "Enabled": return .enabled
+        case "Suspended": return .suspended
+        default: return .unrecognized(status)
+        }
+    }
+
+    /// 200 = le regole; 404 = nessuna regola (`NoSuchLifecycleConfiguration`); altro = errore.
+    nonisolated static func parseLifecycle(statusCode: Int, body: String) throws -> [LifecycleRule] {
+        if statusCode == 404 { return [] }
+        guard statusCode == 200 else {
+            throw S3HTTPError(statusCode: statusCode, message: "Errore lettura regole di scadenza: \(body.prefix(200))")
+        }
+        return xmlBlocks(body[...], "Rule").map { rule in
+            var outside = String(rule)
+            var filterRestricts = false
+            var filterPrefix = ""
+            if let f = xmlBlocks(rule, "Filter").first {
+                filterRestricts = f.contains("<Tag>") || f.contains("<And>") || f.contains("ObjectSize")
+                filterPrefix = xmlTag(f, "Prefix") ?? ""
+                if let r = outside.range(of: "<Filter>" + f + "</Filter>") { outside.removeSubrange(r) }
+            }
+            let prefix = xmlTag(outside[...], "Prefix") ?? ""
+            let expiration = xmlBlocks(rule, "Expiration").first
+            let noncurrent = xmlBlocks(rule, "NoncurrentVersionExpiration").first
+            return LifecycleRule(
+                id: xmlTag(rule, "ID") ?? "",
+                enabled: xmlTag(outside[...], "Status")?.trimmingCharacters(in: .whitespaces) == "Enabled",
+                wholeBucket: prefix.isEmpty && filterPrefix.isEmpty && !filterRestricts,
+                noncurrentDays: noncurrent.flatMap { xmlTag($0, "NoncurrentDays") }.flatMap { Int($0.trimmingCharacters(in: .whitespaces)) },
+                expiresCurrentObjects: expiration.map { xmlTag($0, "Days") != nil || xmlTag($0, "Date") != nil } ?? false)
+        }
+    }
+
+    nonisolated static func parseDelete(statusCode: Int, deleteMarker: String?, versionId: String?, key: String) throws -> DeleteResult {
+        guard (200...299).contains(statusCode) else {
+            throw S3HTTPError(statusCode: statusCode, message: "Errore DELETE \(key)")
+        }
+        let v = versionId?.trimmingCharacters(in: .whitespaces)
+        return DeleteResult(isDeleteMarker: deleteMarker?.trimmingCharacters(in: .whitespaces).lowercased() == "true",
+                            versionId: (v?.isEmpty ?? true) ? nil : v)
+    }
+
+    nonisolated static func parseVersionsPage(_ xml: String) -> VersionsPage {
+        var entries: [VersionEntry] = []
+        var malformed = 0
+        var rest = xml[...]
+        // Versioni e segni nell'ordine del documento: si cerca il prossimo dei due.
+        while true {
+            let v = rest.range(of: "<Version>"), d = rest.range(of: "<DeleteMarker>")
+            guard v != nil || d != nil else { break }
+            let isMarker = d != nil && (v == nil || d!.lowerBound < v!.lowerBound)
+            let tag = isMarker ? "DeleteMarker" : "Version"
+            let start = isMarker ? d! : v!
+            guard let end = rest.range(of: "</\(tag)>", range: start.upperBound..<rest.endIndex) else { malformed += 1; break }
+            let block = rest[start.upperBound..<end.lowerBound]
+            rest = rest[end.upperBound...]
+            guard let key = xmlTag(block, "Key"), !key.isEmpty, let version = xmlTag(block, "VersionId"), !version.isEmpty else {
+                malformed += 1; continue
+            }
+            entries.append(VersionEntry(key: key, versionId: version,
+                                        isLatest: xmlTag(block, "IsLatest")?.lowercased() == "true",
+                                        isDeleteMarker: isMarker, etag: xmlTag(block, "ETag"),
+                                        size: xmlTag(block, "Size").flatMap { Int64($0) }))
+        }
+        let truncated = xmlTag(xml[...], "IsTruncated")?.lowercased() == "true"
+        let nk = xmlTag(xml[...], "NextKeyMarker").flatMap { $0.isEmpty ? nil : $0 }
+        let nv = xmlTag(xml[...], "NextVersionIdMarker").flatMap { $0.isEmpty ? nil : $0 }
+        return VersionsPage(entries: entries, isTruncated: truncated, nextKeyMarker: nk, nextVersionIdMarker: nv,
+                            malformedEntries: malformed)
+    }
+
+    /// Una richiesta sul bucket (non su un oggetto) con la query data, firmata. Sola lettura.
+    private func bucketGET(config: S3Config, queryItems: [URLQueryItem]) async throws -> (Int, String) {
+        guard var comps = URLComponents(string: config.endpoint + "/" + Self.encodeKeyStrict(config.bucket)) else {
+            throw NSError(domain: "S3", code: 8, userInfo: [NSLocalizedDescriptionKey: "URL non valido per il bucket"])
+        }
+        comps.queryItems = queryItems
+        comps.percentEncodedQuery = Self.encodePlusInQuery(comps.percentEncodedQuery)
+        guard let url = comps.url else {
+            throw NSError(domain: "S3", code: 8, userInfo: [NSLocalizedDescriptionKey: "URL non valido per il bucket"])
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        sign(&req, config: config, body: Data(), date: Date())
+        let (data, resp) = try await session.data(for: req)
+        return ((resp as? HTTPURLResponse)?.statusCode ?? -1, String(data: data, encoding: .utf8) ?? "")
+    }
+
+    /// `GetBucketVersioning`, sola lettura: l'app non cambia mai la configurazione del bucket.
+    func bucketVersioning(config: S3Config) async throws -> BucketVersioning {
+        let (code, body) = try await bucketGET(config: config, queryItems: [URLQueryItem(name: "versioning", value: nil)])
+        guard code == 200 else { throw S3HTTPError(statusCode: code, message: "Errore lettura versioni: \(body.prefix(200))") }
+        return Self.parseVersioning(body)
+    }
+
+    /// `GetBucketLifecycleConfiguration`, sola lettura.
+    func bucketLifecycleRules(config: S3Config) async throws -> [LifecycleRule] {
+        let (code, body) = try await bucketGET(config: config, queryItems: [URLQueryItem(name: "lifecycle", value: nil)])
+        return try Self.parseLifecycle(statusCode: code, body: body)
+    }
+
+    /// Tutte le versioni (e i segni di cancellazione) della chiave ESATTA `key`: la lista per
+    /// prefisso porterebbe anche `a.jpg.json` insieme ad `a.jpg`, e si scartano. Lancia su una
+    /// lista illeggibile o incompleta.
+    func listObjectVersions(config: S3Config, key: String) async throws -> [VersionEntry] {
+        var out: [VersionEntry] = []
+        var marker: (key: String, version: String)? = nil
+        repeat {
+            var q = [URLQueryItem(name: "prefix", value: key), URLQueryItem(name: "versions", value: nil)]
+            if let marker {
+                q.append(URLQueryItem(name: "key-marker", value: marker.key))
+                q.append(URLQueryItem(name: "version-id-marker", value: marker.version))
+            }
+            let (code, body) = try await bucketGET(config: config, queryItems: q)
+            guard code == 200 else { throw S3HTTPError(statusCode: code, message: "Errore elenco versioni di \(key)") }
+            let page = Self.parseVersionsPage(body)
+            guard page.malformedEntries == 0 else { throw S3HTTPError(statusCode: 200, message: "Elenco versioni di \(key) illeggibile") }
+            out += page.entries.filter { $0.key == key }
+            if page.isTruncated {
+                guard let nk = page.nextKeyMarker, let nv = page.nextVersionIdMarker else {
+                    throw S3HTTPError(statusCode: 200, message: "Elenco versioni di \(key) troncato senza seguito")
+                }
+                marker = (nk, nv)
+            } else {
+                marker = nil
+            }
+        } while marker != nil
+        return out
+    }
+
+    /// DELETE di una copia SENZA versione (ADR-0019): con le versioni accese crea un segno di
+    /// cancellazione e la versione resta per i giorni della regola. Chi chiama ha gia' letto lo
+    /// stato delle versioni e fatto la HEAD della copia e della copia tenuta.
+    func deleteObjectForAlignment(config: S3Config, key: String) async throws -> DeleteResult {
+        let path = Self.objectRequestPath(bucket: config.bucket, key: key)
+        guard let url = URL(string: config.endpoint + path) else {
+            throw NSError(domain: "S3", code: 12, userInfo: [NSLocalizedDescriptionKey: "URL non valido per il file: \(key)"])
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "DELETE"
+        sign(&req, config: config, body: Data(), date: Date(), canonicalURI: path)
+        let (_, resp) = try await session.data(for: req)
+        let http = resp as? HTTPURLResponse
+        return try Self.parseDelete(statusCode: http?.statusCode ?? -1,
+                                    deleteMarker: http?.value(forHTTPHeaderField: "x-amz-delete-marker"),
+                                    versionId: http?.value(forHTTPHeaderField: "x-amz-version-id"), key: key)
+    }
+
+    /// L'UNICO DELETE con versione del progetto: toglie un segno di cancellazione che il registro
+    /// ha annotato, per annullare. Chi chiama ha gia' verificato con `listObjectVersions` che
+    /// `versionId` e' un segno di cancellazione di `key`, mai una versione di dati.
+    func removeDeleteMarkerForAlignment(config: S3Config, key: String, versionId: String) async throws -> DeleteResult {
+        let path = Self.objectRequestPath(bucket: config.bucket, key: key)
+        guard let url = URL(string: config.endpoint + path + "?versionId=" + Self.encodeKeyStrict(versionId)) else {
+            throw NSError(domain: "S3", code: 12, userInfo: [NSLocalizedDescriptionKey: "URL non valido per il file: \(key)"])
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "DELETE"
+        sign(&req, config: config, body: Data(), date: Date(), canonicalURI: path)
+        let (_, resp) = try await session.data(for: req)
+        let http = resp as? HTTPURLResponse
+        return try Self.parseDelete(statusCode: http?.statusCode ?? -1,
+                                    deleteMarker: http?.value(forHTTPHeaderField: "x-amz-delete-marker"),
+                                    versionId: http?.value(forHTTPHeaderField: "x-amz-version-id"), key: key)
     }
 
     // MARK: - AWS Signature V4
