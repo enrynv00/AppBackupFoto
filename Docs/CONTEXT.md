@@ -122,6 +122,12 @@ Attenzione a una frase che questa pagina ha portato fino al 2026-08-27: «il pan
 
 ---
 
+## Doppioni su HDD e Cubbit (roadmap #47)
+
+**Copia già tolta dall'SSD** — una voce della storia degli spostamenti del pannello Doppioni (`trash-history.jsonl`): una copia che è uscita dall'SSD, con il percorso della copia che l'SSD ha tenuto (`keptPaths`). Su HDD e Cubbit si toglie solo se la copia tenuta è identica lì (stesso contenuto, non solo stesso nome) e c'è ancora sull'SSD — mai per il solo fatto che la storia lo dice.
+
+---
+
 ## Import da sorgenti locali (roadmap #27-A)
 
 **Sorgente di import** — una fotocamera, scheda SD, drone, vecchio disco o telefono da cui si importa una tantum. Diversa dalla **Sorgente** (la Libreria Foto), che è un flusso continuo.
