@@ -7341,8 +7341,9 @@ enum InventoryStatus {
     static let displayOrder: [InventoryCategory] = [.safe, .missingSomewhere, .onlyOutsideSSD, .toCheck, .undetermined]
 
     static let readOnlyNote = "L'inventario guarda soltanto: non copia, non sposta e non cancella "
-        + "niente, né sull'SSD né sull'HDD né su Cubbit. L'unica cosa che da qui può scrivere è "
-        + "«Ripara…», una foto alla volta e solo dopo la tua conferma."
+        + "niente, né sull'SSD né sull'HDD né su Cubbit. Da qui scrivono solo «Ripara…», una foto alla "
+        + "volta, e «Togli le copie…», che toglie da HDD e Cubbit le copie già tolte dall'SSD: sempre e "
+        + "solo dopo la tua conferma."
     static let refreshButton = "Aggiorna l'inventario"
     static let stopButton = "Interrompi"
     static let stoppingLine = "Mi fermo appena finisco il file o la pagina dell'elenco che sto leggendo…"
@@ -9395,6 +9396,288 @@ nonisolated extension ArchiveAligner {
             out.restored += 1
         }
         return out
+    }
+}
+
+/// L'esito di una corsa (tutti i blocchi smaltiti prima che si fermasse).
+// `nonisolated`: value type, accumulato fuori dal main.
+nonisolated struct AlignmentRunOutcome: Sendable {
+    let archive: AlignmentArchive
+    let totalBlocks: Int
+    var blocksCompleted = 0
+    var removedCount = 0
+    var removedBytes: Int64 = 0
+    var skipped: [AlignmentSkipReason: Int] = [:]
+    var skippedExamples: [AlignmentSkipReason: [String]] = [:]
+    var stop: AlignmentStopReason? = nil
+
+    mutating func absorb(_ b: AlignmentBlockOutcome) {
+        removedCount += b.removed.count
+        removedBytes += b.removedBytes
+        for (r, n) in b.skipped { skipped[r, default: 0] += n }
+        for (r, paths) in b.skippedExamples {
+            skippedExamples[r] = Array((skippedExamples[r, default: []] + paths).prefix(3))
+        }
+    }
+}
+
+// `nonisolated`: la finestra usa l'archivio come elemento di un foglio (`.sheet(item:)`).
+nonisolated extension AlignmentArchive: Identifiable {
+    var id: String { rawValue }
+}
+
+// MARK: - Doppioni su HDD e Cubbit: i testi (ROADMAP #47, ADR-0019)
+
+/// I testi della sezione «Copie già tolte dall'SSD» della finestra Inventario. Logica pura, come
+/// `RepairStatus`: nessuna stringa nasce dentro la View. Registro: niente gergo («hash», «ETag»,
+/// «MD5», «bucket», «DELETE», «segno di cancellazione», «versionId»): Enrico legge SSD, HDD,
+/// Cubbit, copie, Cestino; «versioni» si', e' la parola della spec.
+enum AlignmentStatus {
+    typealias Line = InventoryStatus.Line
+
+    static let sectionTitle = "Copie già tolte dall'SSD, ancora su HDD e Cubbit"
+    static let sectionExplanation = "Le copie doppie che hai tolto dall'SSD ci sono ancora sull'HDD e su "
+        + "Cubbit. Qui si tolgono anche da lì, una alla volta, solo se la copia che l'SSD ha tenuto c'è "
+        + "ancora sull'SSD ed è identica sullo stesso archivio. Sull'HDD vanno nel suo Cestino (l'app non lo "
+        + "svuota mai); su Cubbit si possono recuperare per 30 giorni."
+    static let checkButton = "Controlla senza togliere"
+    static let runButton = "Togli le copie…"
+    static let undoButton = "Annulla l'ultimo blocco"
+    static let stopButton = "Interrompi"
+    static let continueButton = "Continua…"
+    static let cancelButton = "Annulla"
+    static let confirmButton = "Togli le copie"
+    static let undoConfirmButton = "Rimetti a posto"
+    static let checkingLine = "Controllo la storia degli spostamenti e l'inventario…"
+    static let stoppingLine = "Mi fermo dopo la copia in corso…"
+    /// Secondi per copia, per la stima a parole (misure del 2026-10-10: Cubbit ~110 ms a
+    /// richiesta, tre richieste per copia; HDD: due riletture di file piccoli e uno spostamento).
+    static func secondsPerCopy(_ a: AlignmentArchive) -> Double { a == .hdd ? 0.05 : 0.35 }
+
+    static func archiveName(_ a: AlignmentArchive) -> String { a == .hdd ? "HDD" : "Cubbit" }
+
+    private static func number(_ n: Int) -> String { n.formatted() }
+    private static func count(_ n: Int, _ singular: String, _ plural: String) -> String {
+        "\(number(n)) \(n == 1 ? singular : plural)"
+    }
+    private static func bytes(_ b: Int64) -> String { ByteCountFormatter.string(fromByteCount: b, countStyle: .file) }
+
+    /// Perche' una copia resta, in una frase che segue «N restano: …».
+    static func stayReasonText(_ r: AlignmentStayReason, archive a: AlignmentArchive) -> String {
+        let x = archiveName(a)
+        switch r {
+        case .keptUnknown: return "la storia non dice quale copia l'SSD ha tenuto"
+        case .outsideSSD: return "venivano da un posto che oggi non è l'SSD delle foto"
+        case .unsafePath: return "il loro percorso non è sicuro da usare"
+        case .sameAsKept: return "sono la stessa copia che l'SSD ha tenuto"
+        case .repeatedInHistory: return "compaiono più volte nella storia: contano una volta sola"
+        case .conflictingKept: return "la storia nomina per loro due copie tenute diverse"
+        case .alreadyRemoved: return "le hai già tolte da \(x)"
+        case .backOnSSD: return "sono di nuovo sull'SSD: il backup le ricopierebbe"
+        case .keptNotOnSSD: return "la copia che l'SSD aveva tenuto non c'è più sull'SSD, o non si è lasciata leggere"
+        case .notInArchive: return "non ci sono su \(x): niente da togliere"
+        case .keptNotInArchive: return "la copia tenuta non c'è su \(x)"
+        case .pathCollision: return "su \(x) due nomi diversi diventano lo stesso se non si guardano maiuscole e minuscole"
+        case .unreadableInArchive: return "sull'HDD una delle due copie non si è lasciata leggere per intero"
+        case .notCertifiable: return "su Cubbit l'app non riesce a confermare che il contenuto sia lo stesso senza scaricarle"
+        case .contentDiffers: return "su \(x) non sono identiche alla copia tenuta"
+        case .keptAlsoLeaving: return "sono a loro volta la copia tenuta di un'altra foto"
+        }
+    }
+
+    /// L'esito di «Controlla senza togliere».
+    static func planLines(_ p: AlignmentPlan, calendar: Calendar = .current) -> [Line] {
+        let x = archiveName(p.archive)
+        var out: [Line] = []
+        if p.historyUnreadable {
+            return [Line(id: "align-history", tone: .warning, text:
+                "La storia degli spostamenti dell'SSD non si lascia leggere: da \(x) non tolgo niente.")]
+        }
+        if let block = p.block {
+            return [Line(id: "align-block", tone: .warning, text:
+                "Da \(x) non tolgo niente perché \(DuplicatesStatus.certificationReason(block, calendar: calendar)). "
+                + "Aggiorna l'inventario e controlla di nuovo.")]
+        }
+        if p.candidates.isEmpty {
+            out.append(Line(id: "align-none", tone: .ok, text: "Da \(x) non c'è niente da togliere."))
+        } else {
+            out.append(Line(id: "align-count", tone: .info, text:
+                "Da \(x) si possono togliere \(count(p.candidates.count, "copia", "copie")) "
+                + "(\(bytes(p.bytes))): per ognuna la copia che l'SSD ha tenuto c'è ancora sull'SSD ed è "
+                + "identica su \(x)."))
+        }
+        for r in AlignmentStayReason.allCases {
+            guard let n = p.stays[r], n > 0 else { continue }
+            out.append(Line(id: "align-stay-\(r.rawValue)", tone: r == .alreadyRemoved || r == .repeatedInHistory ? .info : .warning,
+                            text: "\(count(n, "copia resta", "copie restano")): \(stayReasonText(r, archive: p.archive))."))
+        }
+        if p.malformedHistoryLines > 0 {
+            out.append(Line(id: "align-malformed", tone: .warning, text:
+                "\(count(p.malformedHistoryLines, "riga della storia non si è lasciata leggere", "righe della storia non si sono lasciate leggere")): le loro copie restano."))
+        }
+        return out
+    }
+
+    /// Cosa l'app ha letto su Cubbit: versioni e regola dei 30 giorni (sola lettura).
+    static func cubbitSafetyLine(_ s: AlignmentCubbitSafety) -> Line {
+        switch s {
+        case .ready(let days):
+            return Line(id: "cubbit-ready", tone: .ok, text:
+                "Su Cubbit le versioni sono accese: una copia tolta si può recuperare per \(count(days, "giorno", "giorni")).")
+        case .versioningNotEnabled:
+            return Line(id: "cubbit-versions", tone: .warning, text:
+                "Su Cubbit le versioni non sono accese: senza, una copia tolta non si potrebbe più recuperare. "
+                + "Finché non si accendono, da Cubbit non tolgo niente.")
+        case .noExpiryRule:
+            return Line(id: "cubbit-rule", tone: .warning, text:
+                "Su Cubbit manca la regola che fa sparire le versioni vecchie dopo 30 giorni: lo spazio non si "
+                + "libererebbe mai. Finché non c'è, da Cubbit non tolgo niente.")
+        case .expiryTooShort(let days):
+            return Line(id: "cubbit-short", tone: .warning, text:
+                "Su Cubbit una regola fa sparire le versioni vecchie dopo \(count(days, "giorno", "giorni")): troppo "
+                + "presto per poter tornare indietro. Ne servono almeno \(AlignmentCubbitSafety.minimumDays).")
+        case .expiresCurrentPhotos:
+            return Line(id: "cubbit-danger", tone: .warning, text:
+                "Su Cubbit c'è una regola che farebbe sparire anche le foto di oggi: da Cubbit non tolgo niente. "
+                + "Fai controllare subito le regole di Cubbit.")
+        }
+    }
+
+    static func summaryTitle(_ a: AlignmentArchive) -> String { "Togliere le copie doppie da \(archiveName(a))?" }
+
+    /// Il riepilogo prima della conferma (decisione 2 della spec, «come nel pannello Doppioni»).
+    static func summaryLines(_ p: AlignmentPlan, blocks: Int) -> [String] {
+        let x = archiveName(p.archive)
+        var out = ["Tolgo da \(x) \(count(p.candidates.count, "copia", "copie")) (\(bytes(p.bytes))) che hai già tolto dall'SSD.",
+                   "Per ognuna la copia che l'SSD ha tenuto resta, identica, sull'SSD e su \(x).",
+                   "Prima di ogni copia ricontrollo dal vivo che le due copie siano ancora identiche: se qualcosa è "
+                   + "cambiato, la lascio dov'è e te lo dico."]
+        if p.archive == .hdd {
+            out.append("Le copie vanno nel Cestino dell'HDD: lo spazio si libera solo quando svuoti il Cestino "
+                       + "dell'HDD. L'app non lo svuota mai.")
+        } else {
+            out.append("Su Cubbit ogni copia tolta si può recuperare per 30 giorni; dopo, lo spazio si libera da solo.")
+        }
+        if blocks > 1 {
+            out.append("Procedo a blocchi da al massimo \(number(duplicateBatchFileCap)) copie (\(number(blocks)) blocchi): "
+                       + "«\(undoButton)» rimette a posto solo l'ultimo.")
+        }
+        out.append("Ci vorrà \(DuplicatesStatus.approxDuration(seconds: Double(p.candidates.count) * secondsPerCopy(p.archive))). "
+                   + "Puoi fermarti quando vuoi con «\(stopButton)».")
+        out.append("L'SSD non viene toccato.")
+        return out
+    }
+
+    static let confirmTitle = "Togliere davvero queste copie?"
+    static func confirmMessage(_ p: AlignmentPlan) -> String {
+        p.archive == .hdd
+            ? "Le \(number(p.candidates.count)) copie vanno nel Cestino dell'HDD. La copia tenuta resta, identica, sull'HDD e sull'SSD."
+            : "Le \(number(p.candidates.count)) copie spariscono da Cubbit e restano recuperabili per 30 giorni. La copia tenuta resta, identica, su Cubbit e sull'SSD."
+    }
+
+    static func progressLine(_ a: AlignmentArchive, done: Int, total: Int, block: Int, blocks: Int) -> String {
+        "Tolgo da \(archiveName(a)) le copie doppie: \(number(done)) di \(number(total))"
+            + (blocks > 1 ? " (blocco \(block) di \(blocks))" : "")
+    }
+
+    static func skipReasonText(_ r: AlignmentSkipReason) -> String {
+        switch r {
+        case .unsafePath: return "il percorso non era sicuro da usare"
+        case .backOnSSD: return "erano tornate sull'SSD"
+        case .keptChangedOnSSD: return "la copia tenuta sull'SSD non c'era più o era cambiata"
+        case .goneFromArchive: return "non c'erano già più"
+        case .keptMissingInArchive: return "la copia tenuta non c'era più"
+        case .locked: return "sono bloccate (l'opzione «Bloccato» del Finder): l'app non le sblocca"
+        case .unreadable: return "non si sono lasciate rileggere"
+        case .contentChanged: return "non erano più identiche a quelle viste dall'inventario"
+        case .otherVolume: return "stavano su un altro disco"
+        }
+    }
+
+    static func stopLine(_ s: AlignmentStopReason, archive a: AlignmentArchive, calendar: Calendar = .current) -> String {
+        let x = archiveName(a)
+        switch s {
+        case .interrupted: return "Ti sei fermato tu: quello che è già stato tolto è nel registro."
+        case .volumeMissing(let v): return "\(v == .ssd ? "L'SSD" : "L'HDD") non era collegato: non ho toccato niente."
+        case .volumeVanished(let v): return "\(v == .ssd ? "L'SSD" : "L'HDD") si è scollegato: mi sono fermato subito."
+        case .logNotWritten: return "Il registro sul Mac non si è lasciato scrivere: senza registro non tolgo niente, mi sono fermato."
+        case .trashFailed(let path, let detail):
+            return "Non sono riuscito a spostare nel Cestino dell'HDD «\(path)» (\(detail)): mi sono fermato. La copia è ancora al suo posto."
+        case .keptVanished(let path):
+            return "Subito dopo, la copia tenuta «\(path)» non c'era più: mi sono fermato. Premi «\(undoButton)» per rimettere a posto."
+        case .cubbitNotReady(let safety): return cubbitSafetyLine(safety).text
+        case .cubbitError: return "\(x) non ha risposto come doveva: mi sono fermato. Quello che è già stato tolto è nel registro."
+        case .deleteWithoutMarker(let path):
+            return "Cubbit ha tolto «\(path)» senza tenerne la versione recuperabile: mi sono fermato subito. "
+                + "La copia tenuta è ancora su Cubbit, sull'SSD e sull'HDD. Fai ricontrollare le versioni di Cubbit."
+        case .inventoryNoLongerValid(let block):
+            return "Mi sono fermato perché \(DuplicatesStatus.certificationReason(block, calendar: calendar)): aggiorna l'inventario e controlla di nuovo."
+        }
+    }
+
+    static func runOutcomeLines(_ o: AlignmentRunOutcome) -> [Line] {
+        let x = archiveName(o.archive)
+        var out = [Line(id: "run-removed", tone: o.removedCount > 0 ? .ok : .info, text:
+            "Tolte da \(x) \(count(o.removedCount, "copia", "copie")) (\(bytes(o.removedBytes)))"
+            + (o.archive == .hdd ? ": sono nel Cestino dell'HDD." : ": si possono recuperare per 30 giorni."))]
+        if let stop = o.stop {
+            out.append(Line(id: "run-stop", tone: stop == .interrupted ? .info : .warning, text: stopLine(stop, archive: o.archive)))
+        }
+        for r in AlignmentSkipReason.allCases {
+            guard let n = o.skipped[r], n > 0 else { continue }
+            out.append(Line(id: "run-skip-\(r.rawValue)", tone: .warning, text:
+                "\(count(n, "copia è rimasta", "copie sono rimaste")) perché \(skipReasonText(r))."))
+        }
+        return out
+    }
+
+    static func undoConfirmation(_ a: AlignmentArchive, summary: RestorableBatchSummary, calendar: Calendar = .current) -> (title: String, message: String) {
+        ("Rimettere a posto l'ultimo blocco?",
+         "Rimetto su \(archiveName(a)) \(count(summary.pendingCount, "copia tolta", "copie tolte")) il "
+         + "\(DuplicatesStatus.dayAndTime(summary.trashedAt, calendar: calendar)). Ogni copia viene ricontrollata; "
+         + "se al suo posto c'è già qualcos'altro, l'app non lo sovrascrive e te lo dice.")
+    }
+
+    static func undoSkipText(_ r: AlignmentUndoSkipReason) -> String {
+        switch r {
+        case .notRestorable: return "il registro non dice dove sono finite"
+        case .missingInTrash: return "non sono più nel Cestino dell'HDD: probabilmente è stato svuotato"
+        case .changed: return "nel Cestino c'è un file diverso da quello tolto"
+        case .occupied: return "al loro posto c'è già qualcos'altro, e l'app non sovrascrive mai"
+        case .moveFailed: return "lo spostamento non è riuscito"
+        case .unreadable: return "non si sono lasciate rileggere"
+        case .outsideArchive: return "dovevano tornare in un posto fuori dall'archivio"
+        case .tooOld: return "sono passati troppi giorni: Cubbit potrebbe non averle più"
+        case .markerNotFound, .markerNotLatest: return "su Cubbit non risultano più tolte da questa app"
+        case .notADeleteMarker: return "su Cubbit il registro non corrisponde: l'app non tocca niente"
+        case .verifyFailed: return "dopo averle rimesse, Cubbit non mostra la stessa foto"
+        }
+    }
+
+    static func undoOutcomeLines(_ a: AlignmentArchive, _ o: AlignmentUndoOutcome) -> [Line] {
+        var out = [Line(id: "undo-restored", tone: o.restored + o.alreadyBack > 0 ? .ok : .info, text:
+            "Rimesse su \(archiveName(a)) \(count(o.restored, "copia", "copie"))"
+            + (o.alreadyBack > 0 ? "; \(count(o.alreadyBack, "era già al suo posto", "erano già al loro posto"))." : "."))]
+        if let stop = o.stop {
+            out.append(Line(id: "undo-stop", tone: stop == .interrupted ? .info : .warning, text: stopLine(stop, archive: a)))
+        }
+        for r in AlignmentUndoSkipReason.allCases {
+            guard let n = o.skipped[r], n > 0 else { continue }
+            out.append(Line(id: "undo-skip-\(r.rawValue)", tone: .warning, text:
+                "\(count(n, "copia non è tornata", "copie non sono tornate")) perché \(undoSkipText(r))."))
+        }
+        if o.notAttempted > 0 {
+            out.append(Line(id: "undo-left", tone: .info, text: "\(count(o.notAttempted, "copia resta", "copie restano")) da rimettere: premi di nuovo «\(undoButton)»."))
+        }
+        return out
+    }
+
+    /// Righe «pending» senza esito: l'app si e' chiusa mentre toglieva quelle copie.
+    static func unfinishedLine(_ n: Int, archive a: AlignmentArchive) -> Line? {
+        guard n > 0 else { return nil }
+        return Line(id: "align-unfinished", tone: .warning, text:
+            "\(count(n, "copia risulta", "copie risultano")) a metà su \(archiveName(a)): l'app si è chiusa mentre le "
+            + "toglieva. Il registro sul Mac le elenca: vanno controllate a mano.")
     }
 }
 
@@ -15001,6 +15284,266 @@ final class BackupRunner: ObservableObject {
         repairingKey = nil
         if let outcome { lastRepairOutcome = outcome }
         refreshRepairRecords()
+    }
+
+    // MARK: Doppioni su HDD e Cubbit (ROADMAP #47, ADR-0019)
+
+    /// I registri del progetto 4, uno per archivio, sul disco interno come gli altri (BUG-10:
+    /// sotto test in una cartella temporanea). Lazy e `try?`: senza registro la corsa non parte.
+    private(set) lazy var alignmentHDDLog: AlignmentLogStore? = {
+        try? AlignmentLogStore(url: backupRunnerStoreRoot().appendingPathComponent("alignment-hdd.jsonl"))
+    }()
+    private(set) lazy var alignmentCubbitLog: AlignmentLogStore? = {
+        try? AlignmentLogStore(url: backupRunnerStoreRoot().appendingPathComponent("alignment-cubbit.jsonl"))
+    }()
+    private func alignmentLog(_ a: AlignmentArchive) -> AlignmentLogStore? { a == .hdd ? alignmentHDDLog : alignmentCubbitLog }
+
+    /// L'ultimo controllo per archivio: e' lui che la corsa usa, congelato (mai ricalcolato fra
+    /// il riepilogo e la corsa). Dopo una corsa si azzera: le copie tolte vanno ricontate.
+    @Published private(set) var alignmentPlans: [AlignmentArchive: AlignmentPlan] = [:]
+    @Published private(set) var alignmentCubbitSafety: AlignmentCubbitSafety? = nil
+    @Published private(set) var alignmentChecking: AlignmentArchive? = nil
+    /// L'archivio su cui gira una corsa o un annullamento; `nil` se nessuno.
+    @Published private(set) var alignmentRunArchive: AlignmentArchive? = nil
+    @Published private(set) var alignmentProgress: (done: Int, total: Int, block: Int, blocks: Int)? = nil
+    @Published private(set) var alignmentStopRequested = false
+    @Published private(set) var lastAlignmentOutcome: [AlignmentArchive: AlignmentRunOutcome] = [:]
+    @Published private(set) var lastAlignmentUndoOutcome: [AlignmentArchive: AlignmentUndoOutcome] = [:]
+    @Published private(set) var alignmentUndoSummary: [AlignmentArchive: RestorableBatchSummary] = [:]
+    @Published private(set) var alignmentUnfinished: [AlignmentArchive: Int] = [:]
+    private var alignmentCancelFlag: CancelFlag? = nil
+
+    private var trashHistoryURL: URL { backupRunnerStoreRoot().appendingPathComponent("trash-history.jsonl") }
+
+    /// Rilegge i due registri fuori dal main: cosa si puo' annullare, cosa e' rimasto a meta'.
+    func refreshAlignmentLogSummaries() {
+        let logs = AlignmentArchive.allCases.compactMap { a in alignmentLog(a).map { (a, $0) } }
+        Task.detached(priority: .utility) { [weak self] in
+            guard let self else { return }
+            var summaries: [AlignmentArchive: RestorableBatchSummary] = [:]
+            var unfinished: [AlignmentArchive: Int] = [:]
+            for (a, log) in logs {
+                guard let s = log.state(for: a) else { continue }
+                summaries[a] = s.lastBlockSummary
+                unfinished[a] = s.unfinished.count
+            }
+            let (s, u) = (summaries, unfinished)
+            await MainActor.run {
+                if self.alignmentUndoSummary != s { self.alignmentUndoSummary = s }
+                if self.alignmentUnfinished != u { self.alignmentUnfinished = u }
+            }
+        }
+    }
+
+    /// «Controlla senza togliere» (regola assoluta 4): le condizioni 1-5 sull'inventario e sulla
+    /// storia, e per Cubbit lo stato delle versioni (sola lettura). Non tocca nessun archivio.
+    func startAlignmentCheck(_ archive: AlignmentArchive, onAlert: @escaping AlertSink) {
+        guard alignmentChecking == nil, !isAligning else { return }
+        guard let store = libraryIndexStore, let log = alignmentLog(archive), let ssdRoot = bm.urls[.ssd] else {
+            onAlert(SimpleAlert(title: "Controllo non disponibile",
+                                message: "L'elenco delle foto, il registro o l'SSD non sono disponibili in questo momento."))
+            return
+        }
+        alignmentChecking = archive
+        let lastWrite = ArchiveWriteClock.lastWriteAt()
+        let historyURL = trashHistoryURL
+        let cloud: S3AlignmentCloud? = archive == .cubbit ? s3Config.map { S3AlignmentCloud(syncer: S3Syncer(), config: $0) } : nil
+        Task.detached(priority: .userInitiated) {
+            let history = TrashHistoryReader.read(url: historyURL)
+            let logState = log.state(for: archive)
+            var plan: AlignmentPlan? = nil
+            if let logState {
+                if let snapshot = try? store.inventorySnapshot() {
+                    plan = AlignmentPlanner.plan(archive: archive, history: history, ssdRoot: ssdRoot, snapshot: snapshot,
+                                                 lastArchiveWriteAt: lastWrite, alreadyRemoved: logState.removedKeys)
+                } else {
+                    plan = .blocked(archive, block: .inventoryUnreadable)
+                }
+            }
+            var safety: AlignmentCubbitSafety? = nil
+            if let cloud, let v = try? await cloud.versioning(), let rules = try? await cloud.lifecycleRules() {
+                safety = AlignmentCubbitSafety.evaluate(versioning: v, rules: rules)
+            }
+            let (finalPlan, finalSafety) = (plan, safety)
+            await MainActor.run {
+                self.alignmentChecking = nil
+                guard let finalPlan, let logState else {
+                    onAlert(SimpleAlert(title: "Il registro non si lascia leggere",
+                                        message: "Il registro delle copie tolte da \(AlignmentStatus.archiveName(archive)) non si "
+                                            + "lascia leggere: finché non si risolve, l'app non toglie niente."))
+                    return
+                }
+                self.alignmentPlans[archive] = finalPlan
+                if archive == .cubbit { self.alignmentCubbitSafety = finalSafety }
+                self.alignmentUndoSummary[archive] = logState.lastBlockSummary
+                self.alignmentUnfinished[archive] = logState.unfinished.count
+            }
+        }
+    }
+
+    /// «Togli le copie» confermato: la corsa a blocchi sul piano congelato dal controllo. Le
+    /// precondizioni si rivalutano QUI, all'avvio vero; `isAligning` per l'intera corsa (non per
+    /// blocco: fra due blocchi non deve poter partire nient'altro); prima di OGNI blocco dischi
+    /// collegati e inventario ancora quello che ha certificato le copie (ADR-0017, stessa funzione).
+    func startAlignmentRun(_ plan: AlignmentPlan, onAlert: @escaping AlertSink) {
+        let archive = plan.archive
+        guard let runId = plan.runId, plan.block == nil, !plan.candidates.isEmpty else {
+            onAlert(SimpleAlert(title: "Meglio non farlo adesso", message: "Premi prima «\(AlignmentStatus.checkButton)»."))
+            return
+        }
+        if let reason = AlignmentStartGate.blockedReason(
+            archive: archive, isRunning: isRunning, isIndexing: isIndexing, isTrashingDuplicates: isTrashingDuplicates,
+            isRestoringFromTrash: isRestoringFromTrash, isInventorying: isInventorying, isRepairing: isRepairing,
+            isAligning: isAligning, ssdMounted: VolumeMonitor.shared.ssdMounted, hddMounted: VolumeMonitor.shared.hddMounted,
+            hasCubbitConfig: s3Config != nil) {
+            onAlert(SimpleAlert(title: "Meglio non farlo adesso", message: reason))
+            return
+        }
+        guard let store = libraryIndexStore, let log = alignmentLog(archive) else {
+            onAlert(SimpleAlert(title: "Non è stato possibile procedere", message: "L'elenco delle foto o il registro non sono disponibili."))
+            return
+        }
+        guard let roots = alignmentRoots(archive, onAlert: onAlert) else { return }
+        let cloud: S3AlignmentCloud? = archive == .cubbit ? s3Config.map { S3AlignmentCloud(syncer: S3Syncer(), config: $0) } : nil
+        if let alert = beginAlignment() {
+            closeAlignmentAccess()
+            onAlert(alert)
+            return
+        }
+        let flag = CancelFlag()
+        alignmentCancelFlag = flag
+        alignmentStopRequested = false
+        alignmentRunArchive = archive
+        lastAlignmentOutcome[archive] = nil
+        lastAlignmentUndoOutcome[archive] = nil
+        let blocks = AlignmentRunPlan.blocks(plan.candidates)
+        let total = plan.candidates.count
+        alignmentProgress = (0, total, 1, blocks.count)
+
+        Task.detached(priority: .utility) {
+            let aligner = ArchiveAligner(ssdRoot: roots.ssd, hddRoot: roots.hdd, cloud: cloud, log: { try log.append($0) })
+            var run = AlignmentRunOutcome(archive: archive, totalBlocks: blocks.count)
+            var doneSoFar = 0
+            for (index, block) in blocks.enumerated() {
+                if flag.isCancelled { run.stop = .interrupted; break }
+                let (ssdMounted, hddMounted, lastWrite) = await MainActor.run {
+                    (VolumeMonitor.shared.ssdMounted, VolumeMonitor.shared.hddMounted, ArchiveWriteClock.lastWriteAt())
+                }
+                guard ssdMounted else { run.stop = .volumeVanished(.ssd); break }
+                if archive == .hdd && !hddMounted { run.stop = .volumeVanished(.hdd); break }
+                // Condizione 1, prima di OGNI blocco: stesso giro, ancora completo, nessun backup dopo.
+                if let b = DuplicateCertification.runBlock(states: try? store.inventoryStates(), lastArchiveWriteAt: lastWrite,
+                                                           certifiedRunId: runId) {
+                    run.stop = .inventoryNoLongerValid(b); break
+                }
+                let before = doneSoFar
+                let count = block.count
+                let progress: @Sendable (Int) -> Void = { done in
+                    guard done % 25 == 0 || done == count else { return }
+                    // Un aggiornamento arrivato dopo la fine non riaccende la barra (stesso schema della riparazione).
+                    Task { @MainActor in if self.isAligning { self.alignmentProgress = (before + done, total, index + 1, blocks.count) } }
+                }
+                let blockId = UUID().uuidString
+                let outcome = archive == .hdd
+                    ? await aligner.runHDDBlock(block, blockId: blockId, isCancelled: { flag.isCancelled }, onProgress: progress)
+                    : await aligner.runCubbitBlock(block, blockId: blockId, isCancelled: { flag.isCancelled }, onProgress: progress)
+                run.absorb(outcome)
+                doneSoFar += block.count
+                if let stop = outcome.stop { run.stop = stop; break }
+                run.blocksCompleted += 1
+            }
+            let final = run
+            let state = log.state(for: archive)
+            await MainActor.run {
+                self.lastAlignmentOutcome[archive] = final
+                // Il piano e' consumato: le copie tolte ora sono «gia' tolte», si ricontrolla.
+                self.alignmentPlans[archive] = nil
+                self.finishAlignment(archive, logState: state)
+            }
+        }
+    }
+
+    /// «Annulla l'ultimo blocco» confermato.
+    func startAlignmentUndo(_ archive: AlignmentArchive, onAlert: @escaping AlertSink) {
+        if let reason = AlignmentStartGate.blockedReason(
+            archive: archive, isRunning: isRunning, isIndexing: isIndexing, isTrashingDuplicates: isTrashingDuplicates,
+            isRestoringFromTrash: isRestoringFromTrash, isInventorying: isInventorying, isRepairing: isRepairing,
+            isAligning: isAligning, ssdMounted: VolumeMonitor.shared.ssdMounted, hddMounted: VolumeMonitor.shared.hddMounted,
+            hasCubbitConfig: s3Config != nil) {
+            onAlert(SimpleAlert(title: "Meglio non farlo adesso", message: reason))
+            return
+        }
+        guard let log = alignmentLog(archive) else { return }
+        guard let roots = alignmentRoots(archive, onAlert: onAlert) else { return }
+        let cloud: S3AlignmentCloud? = archive == .cubbit ? s3Config.map { S3AlignmentCloud(syncer: S3Syncer(), config: $0) } : nil
+        if let alert = beginAlignment() {
+            closeAlignmentAccess()
+            onAlert(alert)
+            return
+        }
+        let flag = CancelFlag()
+        alignmentCancelFlag = flag
+        alignmentStopRequested = false
+        alignmentRunArchive = archive
+        lastAlignmentUndoOutcome[archive] = nil
+        lastAlignmentOutcome[archive] = nil
+        Task.detached(priority: .utility) {
+            let removals = log.state(for: archive)?.lastBlockToRestore ?? []
+            let total = removals.count
+            await MainActor.run { self.alignmentProgress = (0, total, 1, 1) }
+            let aligner = ArchiveAligner(ssdRoot: roots.ssd, hddRoot: roots.hdd, cloud: cloud, log: { try log.append($0) })
+            let outcome = await aligner.undo(removals, archive: archive, isCancelled: { flag.isCancelled }, onProgress: { done in
+                Task { @MainActor in if self.isAligning { self.alignmentProgress = (done, total, 1, 1) } }
+            })
+            let state = log.state(for: archive)
+            await MainActor.run {
+                self.lastAlignmentUndoOutcome[archive] = outcome
+                self.alignmentPlans[archive] = nil
+                self.finishAlignment(archive, logState: state)
+            }
+        }
+    }
+
+    /// «Interrompi» (idempotente): la corsa si ferma fra una copia e l'altra.
+    func stopAlignment() {
+        guard isAligning, !alignmentStopRequested else { return }
+        alignmentStopRequested = true
+        alignmentCancelFlag?.cancel()
+    }
+
+    /// Le radici di SSD (sempre) e HDD (solo per l'HDD), aperte; `nil` dopo aver mostrato l'avviso.
+    private func alignmentRoots(_ archive: AlignmentArchive, onAlert: @escaping AlertSink) -> (ssd: URL, hdd: URL?)? {
+        guard let ssdURL = bm.startAccessing(.ssd), isLikelyVolumeRoot(ssdURL) else {
+            bm.stopAccessing(.ssd)
+            onAlert(SimpleAlert(title: "SSD non valido",
+                                message: "Vai in Impostazioni e riseleziona l'SSD scegliendo '/Volumes/SSD - Enri' (la radice del disco, non una cartella)."))
+            return nil
+        }
+        guard archive == .hdd else { return (ssdURL, nil) }
+        guard let hddURL = bm.startAccessing(.hdd), isLikelyVolumeRoot(hddURL) else {
+            closeAlignmentAccess()
+            onAlert(SimpleAlert(title: "HDD non valido",
+                                message: "Vai in Impostazioni e riseleziona l'HDD scegliendo '/Volumes/BackupHDD' (la radice del disco, non una cartella)."))
+            return nil
+        }
+        return (ssdURL, hddURL)
+    }
+
+    private func closeAlignmentAccess() {
+        bm.stopAccessing(.ssd)
+        bm.stopAccessing(.hdd)
+    }
+
+    /// L'UNICO punto in cui una corsa o un annullamento del progetto 4 finisce, su ogni percorso.
+    private func finishAlignment(_ archive: AlignmentArchive, logState: AlignmentLogState?) {
+        closeAlignmentAccess()
+        endAlignment()
+        alignmentProgress = nil
+        alignmentStopRequested = false
+        alignmentCancelFlag = nil
+        alignmentRunArchive = nil
+        alignmentUndoSummary[archive] = logState?.lastBlockSummary
+        alignmentUnfinished[archive] = logState?.unfinished.count ?? 0
     }
 
     // `autoRefreshLibraryIndexIfEnabled()` e `LibraryIndexAutoRefresh.shouldRun` sono stati
@@ -20745,6 +21288,10 @@ struct InventoryView: View {
     /// foglio, perche' un alert non si presenta mentre un foglio si sta chiudendo.
     @State private var pendingRepair: RepairCandidate? = nil
     @State private var confirmRepair: RepairCandidate? = nil
+    /// Il riepilogo del progetto 4 aperto (per archivio) e il piano da confermare dopo la sua
+    /// chiusura: stessa forma di `pendingRepair`/`confirmRepair`.
+    @State private var alignmentSheet: AlignmentArchive? = nil
+    @State private var confirmAlignment: AlignmentPlan? = nil
 
     var body: some View {
         if gate.touchIDEnabled && !gate.unlocked {
@@ -20795,6 +21342,8 @@ struct InventoryView: View {
                         ForEach(InventoryStatus.displayOrder, id: \.self) { category in
                             categoryRow(category, summary: summary)
                         }
+                        Divider()
+                        alignmentSection
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
@@ -20813,6 +21362,17 @@ struct InventoryView: View {
         .task {
             runner.loadInventoryIfNeeded()
             runner.refreshRepairRecords()
+            runner.refreshAlignmentLogSummaries()
+        }
+        .sheet(item: $alignmentSheet, onDismiss: {
+            guard let plan = confirmAlignment else { return }
+            confirmAlignment = nil
+            alert = SimpleAlert(title: AlignmentStatus.confirmTitle, message: AlignmentStatus.confirmMessage(plan),
+                                isDestructive: true, confirmTitle: AlignmentStatus.confirmButton,
+                                cancelTitle: AlignmentStatus.cancelButton,
+                                onConfirm: { runner.startAlignmentRun(plan, onAlert: { alert = $0 }) })
+        }) { archive in
+            alignmentSummarySheet(archive)
         }
         .sheet(item: $pendingRepair, onDismiss: {
             guard let c = confirmRepair else { return }
@@ -20938,6 +21498,112 @@ struct InventoryView: View {
                     pendingRepair = nil
                 }
                 .disabled(repairDisabledReason != nil)
+            }
+        }
+        .padding(AppSpacing.lg)
+        .frame(width: 520)
+    }
+
+    private func alignmentDisabledReason(_ archive: AlignmentArchive) -> String? {
+        AlignmentStartGate.blockedReason(
+            archive: archive, isRunning: runner.isRunning, isIndexing: runner.isIndexing,
+            isTrashingDuplicates: runner.isTrashingDuplicates, isRestoringFromTrash: runner.isRestoringFromTrash,
+            isInventorying: runner.isInventorying, isRepairing: runner.isRepairing, isAligning: runner.isAligning,
+            ssdMounted: volumes.ssdMounted, hddMounted: volumes.hddMounted, hasCubbitConfig: runner.s3Config != nil)
+    }
+
+    /// «Togli le copie…» si puo' premere solo dopo un controllo che certifica qualcosa (e su
+    /// Cubbit con le versioni lette accese): la corsa usa proprio quel piano.
+    private func alignmentPlanReady(_ archive: AlignmentArchive) -> AlignmentPlan? {
+        guard let plan = runner.alignmentPlans[archive], plan.block == nil, !plan.candidates.isEmpty else { return nil }
+        if archive == .cubbit { guard case .ready = runner.alignmentCubbitSafety else { return nil } }
+        return plan
+    }
+
+    /// Progetto 4 (ROADMAP #47, ADR-0019): HDD e Cubbit separati.
+    private var alignmentSection: some View {
+        VStack(alignment: .leading, spacing: AppSpacing.sm) {
+            Text(AlignmentStatus.sectionTitle).font(AppFont.body)
+            Text(AlignmentStatus.sectionExplanation)
+                .font(AppFont.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            ForEach(AlignmentArchive.allCases) { archive in alignmentRow(archive) }
+        }
+        .padding(.vertical, AppSpacing.xs)
+    }
+
+    @ViewBuilder
+    private func alignmentRow(_ archive: AlignmentArchive) -> some View {
+        VStack(alignment: .leading, spacing: AppSpacing.xs) {
+            Text(AlignmentStatus.archiveName(archive)).font(AppFont.body)
+            if runner.alignmentRunArchive == archive {
+                HStack(spacing: AppSpacing.sm) {
+                    ProgressView().controlSize(.small)
+                    if runner.alignmentStopRequested {
+                        Text(AlignmentStatus.stoppingLine).font(AppFont.caption)
+                    } else if let p = runner.alignmentProgress {
+                        Text(AlignmentStatus.progressLine(archive, done: p.done, total: p.total, block: p.block, blocks: p.blocks))
+                            .font(AppFont.caption)
+                    }
+                    Button(AlignmentStatus.stopButton) { runner.stopAlignment() }
+                        .disabled(runner.alignmentStopRequested)
+                }
+            } else {
+                HStack(spacing: AppSpacing.sm) {
+                    Button(AlignmentStatus.checkButton) { runner.startAlignmentCheck(archive, onAlert: { alert = $0 }) }
+                        .disabled(runner.alignmentChecking != nil || runner.isAligning)
+                    Button(AlignmentStatus.runButton) { alignmentSheet = archive }
+                        .disabled(alignmentPlanReady(archive) == nil || alignmentDisabledReason(archive) != nil)
+                    if let summary = runner.alignmentUndoSummary[archive] {
+                        Button(AlignmentStatus.undoButton) {
+                            let c = AlignmentStatus.undoConfirmation(archive, summary: summary)
+                            alert = SimpleAlert(title: c.title, message: c.message, confirmTitle: AlignmentStatus.undoConfirmButton,
+                                                cancelTitle: AlignmentStatus.cancelButton,
+                                                onConfirm: { runner.startAlignmentUndo(archive, onAlert: { alert = $0 }) })
+                        }
+                        .disabled(alignmentDisabledReason(archive) != nil)
+                    }
+                }
+                if runner.alignmentChecking == archive {
+                    HStack(spacing: AppSpacing.sm) {
+                        ProgressView().controlSize(.small)
+                        Text(AlignmentStatus.checkingLine).font(AppFont.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            if archive == .cubbit, let safety = runner.alignmentCubbitSafety { lineView(AlignmentStatus.cubbitSafetyLine(safety)) }
+            if let plan = runner.alignmentPlans[archive] { ForEach(AlignmentStatus.planLines(plan)) { lineView($0) } }
+            if let line = AlignmentStatus.unfinishedLine(runner.alignmentUnfinished[archive] ?? 0, archive: archive) { lineView(line) }
+            if let o = runner.lastAlignmentOutcome[archive] { ForEach(AlignmentStatus.runOutcomeLines(o)) { lineView($0) } }
+            if let u = runner.lastAlignmentUndoOutcome[archive] { ForEach(AlignmentStatus.undoOutcomeLines(archive, u)) { lineView($0) } }
+            if let reason = alignmentDisabledReason(archive), !runner.isAligning {
+                Label(reason, systemImage: "info.circle")
+                    .font(AppFont.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    /// Il riepilogo prima della conferma distruttiva, come per «Ripara…».
+    private func alignmentSummarySheet(_ archive: AlignmentArchive) -> some View {
+        let plan = alignmentPlanReady(archive)
+        return VStack(alignment: .leading, spacing: AppSpacing.md) {
+            Text(AlignmentStatus.summaryTitle(archive)).font(AppFont.title)
+            if let plan {
+                ForEach(Array(AlignmentStatus.summaryLines(plan, blocks: AlignmentRunPlan.blocks(plan.candidates).count).enumerated()),
+                        id: \.offset) { _, line in
+                    Text(line).font(AppFont.body).fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            HStack {
+                Spacer()
+                Button(AlignmentStatus.cancelButton, role: .cancel) { alignmentSheet = nil }
+                    .keyboardShortcut(.cancelAction)
+                Button(AlignmentStatus.continueButton) {
+                    confirmAlignment = plan
+                    alignmentSheet = nil
+                }
+                .disabled(plan == nil || alignmentDisabledReason(archive) != nil)
             }
         }
         .padding(AppSpacing.lg)
