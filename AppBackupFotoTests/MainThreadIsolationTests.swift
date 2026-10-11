@@ -387,4 +387,17 @@ final class MainThreadIsolationTests: XCTestCase {
         XCTAssertEqual(done.wait(timeout: .now() + 10), .success,
                        "AlignmentLogStore ha avuto bisogno del main thread: manca nonisolated?")
     }
+
+    func testArchiveAlignerHDDBlock_runsWithoutTheMainThread() throws {
+        let ssd = tmp.appendingPathComponent("SSD"), hdd = tmp.appendingPathComponent("HDD")
+        for d in [ssd, hdd] { try FileManager.default.createDirectory(at: d, withIntermediateDirectories: true) }
+        let aligner = ArchiveAligner(ssdRoot: ssd, hddRoot: hdd, cloud: nil, log: { _ in })
+        let done = DispatchSemaphore(value: 0)
+        Task.detached {
+            _ = await aligner.runHDDBlock([], blockId: "b")
+            done.signal()
+        }
+        XCTAssertEqual(done.wait(timeout: .now() + 10), .success,
+                       "ArchiveAligner.runHDDBlock ha avuto bisogno del main thread (manca @concurrent o nonisolated?).")
+    }
 }

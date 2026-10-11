@@ -8828,6 +8828,258 @@ nonisolated final class AlignmentLogStore: @unchecked Sendable {
     }
 }
 
+// MARK: - Doppioni su HDD e Cubbit: il motore (ROADMAP #47, ADR-0019)
+
+/// Uno dei due dischi coinvolti in una corsa.
+nonisolated enum AlignmentVolume: String, Sendable { case ssd, hdd }
+
+/// Perche' una copia del blocco non e' stata tolta al ricontrollo dal vivo (condizione 6). La
+/// corsa prosegue con la copia successiva: sono i casi in cui il disco o Cubbit non sono piu'
+/// quelli che l'inventario ha visto, e la risposta giusta e' lasciare la copia dov'e'.
+// `nonisolated`: value type puro.
+nonisolated enum AlignmentSkipReason: String, CaseIterable, Sendable {
+    /// Un percorso non sicuro, o che risolve fuori dalla radice del disco.
+    case unsafePath
+    /// La copia uscita e' di nuovo sull'SSD (condizione 4, dal vivo).
+    case backOnSSD
+    /// La copia tenuta non c'e' piu' sull'SSD, o ha un'altra dimensione (condizione 3, dal vivo).
+    case keptChangedOnSSD
+    /// La copia da togliere non c'e' piu' sull'archivio: niente da fare.
+    case goneFromArchive
+    /// La copia tenuta non c'e' piu' sull'archivio (condizione 2, dal vivo).
+    case keptMissingInArchive
+    /// Solo HDD: il file ha il blocco «Bloccato» (`uchg`). L'app non lo sblocca (D3 del piano).
+    case locked
+    /// Solo HDD: una delle due copie non si e' lasciata rileggere.
+    case unreadable
+    /// Contenuto, dimensione (o ETag su Cubbit) diversi da quelli dell'inventario.
+    case contentChanged
+    /// Solo HDD: la copia sta su un altro disco (un collegamento che porta fuori dall'HDD).
+    case otherVolume
+}
+
+/// Perche' una corsa si e' fermata. Ogni caso ha la sua frase in `AlignmentStatus`.
+// `nonisolated`: value type puro.
+nonisolated enum AlignmentStopReason: Equatable, Sendable {
+    case interrupted
+    /// Il disco non c'era gia' all'inizio del blocco.
+    case volumeMissing(AlignmentVolume)
+    /// Il disco e' sparito a meta' (`st_dev` cambiato): «non c'e'» non vuol dire «gia' fatto».
+    case volumeVanished(AlignmentVolume)
+    /// Il registro non si e' lasciato scrivere: senza registro non si toglie niente.
+    case logNotWritten(String)
+    /// `trashItem` e' fallito per un motivo che non e' il blocco «Bloccato».
+    case trashFailed(path: String, detail: String)
+    /// Dopo aver tolto la copia, la copia tenuta non c'era piu': ci si ferma subito. La copia
+    /// tolta e' nel Cestino ed e' nel registro: «Annulla l'ultimo blocco» la rimette.
+    case keptVanished(path: String)
+    /// Condizione 7: versioni non accese, o regole di scadenza non adatte.
+    case cubbitNotReady(AlignmentCubbitSafety)
+    case cubbitError(String)
+    /// Cubbit ha cancellato senza creare il segno di cancellazione: ci si ferma subito.
+    case deleteWithoutMarker(path: String)
+    /// Prima di un blocco: l'inventario non e' piu' quello che ha certificato le copie.
+    case inventoryNoLongerValid(DuplicateCertificationBlock)
+}
+
+/// L'esito di un blocco.
+// `nonisolated`: value type, prodotto dal motore fuori dal main.
+nonisolated struct AlignmentBlockOutcome: Sendable {
+    var removed: [AlignmentCandidate] = []
+    var skipped: [AlignmentSkipReason: Int] = [:]
+    var skippedExamples: [AlignmentSkipReason: [String]] = [:]
+    var stop: AlignmentStopReason? = nil
+
+    var removedBytes: Int64 { removed.reduce(0) { $0 + $1.size } }
+    var skippedCount: Int { skipped.values.reduce(0, +) }
+
+    mutating func skip(_ c: AlignmentCandidate, _ r: AlignmentSkipReason) {
+        skipped[r, default: 0] += 1
+        if skippedExamples[r, default: []].count < 3 { skippedExamples[r, default: []].append(c.leavingPath) }
+    }
+}
+
+/// Il motore del progetto 4: toglie da HDD o Cubbit le copie gia' uscite dall'SSD, un blocco
+/// alla volta, una copia alla volta, con il ricontrollo dal vivo subito prima di ogni copia e il
+/// registro scritto prima di toccare l'archivio e subito dopo. Il blocco arriva gia' deciso
+/// (`AlignmentPlanner`): il motore non sceglie cosa togliere, RIFIUTA soltanto.
+///
+/// - HDD: `trashItem` nel Cestino dell'HDD (stesso volume, l'app non lo svuota mai).
+/// - Cubbit (Task 5): DELETE senza versione, solo con le versioni accese.
+///
+/// Le funzioni di disco e il Cubbit sono iniettati: i casi da coprire (un disco che sparisce,
+/// un file bloccato, un `trashItem` che fallisce) non si producono su file veri senza una corsa.
+/// In produzione sono quelle vere (default), stesso schema di `RepairEngine`.
+// `nonisolated`: i blocchi girano fuori dal main (rilettura di file interi, rete). Solo
+// proprieta' `let` (URL, closure `@Sendable`, il Cubbit `Sendable`); lo stato di un blocco e'
+// tutto locale. Un blocco alla volta: lo garantisce `BackupRunner.isAligning` (Task 7).
+// Le funzioni `async` sono `@concurrent` (ADR-0006).
+nonisolated final class ArchiveAligner: @unchecked Sendable {
+    /// I blocchi «Bloccato» che `trashItem` non scavalca: utente e sistema, immutabile e solo-aggiunta.
+    static let lockedFlags = UInt32(UF_IMMUTABLE) | UInt32(SF_IMMUTABLE) | UInt32(UF_APPEND) | UInt32(SF_APPEND)
+
+    private let ssdRoot: URL
+    private let hddRoot: URL?
+    private let cloud: (any AlignmentCloud)?
+    private let log: @Sendable (AlignmentLogEntry) throws -> Void
+    private let now: @Sendable () -> Date
+    private let makeId: @Sendable () -> String
+    private let hashFunction: @Sendable (URL) -> MeasuredHash?
+    private let trashFunction: @Sendable (URL) throws -> URL?
+    private let volumeIdentity: @Sendable (URL) -> dev_t?
+    private let fileFlags: @Sendable (URL) -> UInt32?
+    private let fileSize: @Sendable (URL) -> Int64?
+
+    init(ssdRoot: URL, hddRoot: URL?, cloud: (any AlignmentCloud)?,
+         log: @escaping @Sendable (AlignmentLogEntry) throws -> Void,
+         now: @escaping @Sendable () -> Date = { Date() },
+         makeId: @escaping @Sendable () -> String = { UUID().uuidString },
+         hashFunction: @escaping @Sendable (URL) -> MeasuredHash? = { sha256Measured(of: $0) },
+         trashFunction: @escaping @Sendable (URL) throws -> URL? = { url in
+             var resulting: NSURL?
+             try FileManager.default.trashItem(at: url, resultingItemURL: &resulting)
+             return resulting as URL?
+         },
+         volumeIdentity: @escaping @Sendable (URL) -> dev_t? = { deviceIdentifier(of: $0) },
+         fileFlags: @escaping @Sendable (URL) -> UInt32? = { url in
+             var st = stat()
+             return lstat(url.path, &st) == 0 ? st.st_flags : nil
+         },
+         fileSize: @escaping @Sendable (URL) -> Int64? = { url in
+             var st = stat()
+             return stat(url.path, &st) == 0 ? Int64(st.st_size) : nil
+         }) {
+        self.ssdRoot = ssdRoot
+        self.hddRoot = hddRoot
+        self.cloud = cloud
+        self.log = log
+        self.now = now
+        self.makeId = makeId
+        self.hashFunction = hashFunction
+        self.trashFunction = trashFunction
+        self.volumeIdentity = volumeIdentity
+        self.fileFlags = fileFlags
+        self.fileSize = fileSize
+    }
+
+    private func pendingEntry(_ c: AlignmentCandidate, id: String, blockId: String, absolute: String?) -> AlignmentLogEntry {
+        AlignmentLogEntry(event: .pending, id: id, blockId: blockId, archive: c.archive, at: now(),
+                          leavingPath: c.leavingPath, leavingKey: c.leavingKey, keptPath: c.keptPath, size: c.size,
+                          sha256: c.sha256, etag: c.leavingETag, originalAbsolutePath: absolute)
+    }
+
+    private func outcomeEntry(_ e: AlignmentLogEntry.Event, _ c: AlignmentCandidate, id: String, blockId: String,
+                              trashedPath: String? = nil, marker: String? = nil, detail: String? = nil) -> AlignmentLogEntry {
+        AlignmentLogEntry(event: e, id: id, blockId: blockId, archive: c.archive, at: now(),
+                          trashedPath: trashedPath, deleteMarkerVersionId: marker, detail: detail)
+    }
+
+    /// Le condizioni 3 e 4 dal vivo sull'SSD, uguali per HDD e Cubbit. `nil` = la copia puo'
+    /// proseguire; altrimenti il motivo per saltarla. Il disco si ricontrolla PRIMA: un SSD
+    /// sparito farebbe sembrare «non tornata» ogni copia.
+    private enum SSDCheck { case ok, skip(AlignmentSkipReason), stop(AlignmentStopReason) }
+
+    private func checkSSD(_ c: AlignmentCandidate, ssdDevice: dev_t) -> SSDCheck {
+        guard volumeIdentity(ssdRoot) == ssdDevice else { return .stop(.volumeVanished(.ssd)) }
+        guard let pSSD = RepairEngine.confined(ssdRoot, c.ssdLeavingPath),
+              let kSSD = RepairEngine.confined(ssdRoot, c.ssdKeptPath) else { return .skip(.unsafePath) }
+        if RepairEngine.itemExists(pSSD) { return .skip(.backOnSSD) }
+        guard fileSize(kSSD) == c.ssdKeptSize else {
+            return volumeIdentity(ssdRoot) == ssdDevice ? .skip(.keptChangedOnSSD) : .stop(.volumeVanished(.ssd))
+        }
+        return .ok
+    }
+
+    /// Un blocco sull'HDD. Non lancia: ogni copia non tolta ha il suo motivo, e la corsa si ferma
+    /// solo sui guasti (disco sparito, registro, `trashItem` fallito, copia tenuta sparita).
+    @concurrent
+    func runHDDBlock(_ block: [AlignmentCandidate], blockId: String,
+                     isCancelled: @escaping @Sendable () -> Bool = { false },
+                     onProgress: @escaping @Sendable (Int) -> Void = { _ in }) async -> AlignmentBlockOutcome {
+        var out = AlignmentBlockOutcome()
+        guard let hddRoot, let hddDevice = volumeIdentity(hddRoot) else { out.stop = .volumeMissing(.hdd); return out }
+        guard let ssdDevice = volumeIdentity(ssdRoot) else { out.stop = .volumeMissing(.ssd); return out }
+
+        copies: for (index, c) in block.enumerated() {
+            // Solo FRA una copia e l'altra: una copia a meta' non esiste.
+            if isCancelled() { out.stop = .interrupted; break }
+            defer { onProgress(index + 1) }
+
+            // Un collegamento simbolico non si sposta mai: `trashItem` toglierebbe il collegamento,
+            // la rilettura avrebbe letto il file a cui porta.
+            guard c.archive == .hdd,
+                  let pURL = RepairEngine.confined(hddRoot, c.leavingPath),
+                  let kURL = RepairEngine.confined(hddRoot, c.keptPath),
+                  IndexableKind.of(url: pURL) != .notIndexable,
+                  (try? pURL.resourceValues(forKeys: [.isSymbolicLinkKey]))?.isSymbolicLink != true else {
+                out.skip(c, .unsafePath); continue
+            }
+
+            // Il disco e' ancora lo stesso, prima di qualunque verdetto su questa copia: un HDD
+            // rimontato (o un altro disco con lo stesso nome) non e' quello che l'inventario ha visto.
+            guard volumeIdentity(hddRoot) == hddDevice else { out.stop = .volumeVanished(.hdd); break }
+            switch checkSSD(c, ssdDevice: ssdDevice) {
+            case .ok: break
+            case .skip(let r): out.skip(c, r); continue copies
+            case .stop(let s): out.stop = s; break copies
+            }
+
+            // Il disco prima del verdetto: «non c'e'» e «l'HDD e' sparito» si somigliano.
+            guard RepairEngine.itemExists(pURL) else {
+                if volumeIdentity(hddRoot) != hddDevice { out.stop = .volumeVanished(.hdd); break }
+                out.skip(c, .goneFromArchive); continue
+            }
+            guard RepairEngine.itemExists(kURL) else {
+                if volumeIdentity(hddRoot) != hddDevice { out.stop = .volumeVanished(.hdd); break }
+                out.skip(c, .keptMissingInArchive); continue
+            }
+            if let flags = fileFlags(pURL), flags & Self.lockedFlags != 0 { out.skip(c, .locked); continue }
+            guard volumeIdentity(pURL) == hddDevice else { out.skip(c, .otherVolume); continue }
+
+            // Condizione 6: rilettura e rihash di ENTRAMBE le copie, uguali fra loro e all'inventario.
+            // Rileggere solo quella che esce direbbe che non e' cambiata, non che e' uguale a
+            // quella che resta (ADR-0005, la contro-domanda).
+            guard let p = hashFunction(pURL), let k = hashFunction(kURL) else {
+                if volumeIdentity(hddRoot) != hddDevice { out.stop = .volumeVanished(.hdd); break }
+                out.skip(c, .unreadable); continue
+            }
+            guard p.hash == c.sha256, k.hash == c.sha256, p.size == c.size, k.size == c.size else {
+                out.skip(c, .contentChanged); continue
+            }
+
+            // Il registro PRIMA di toccare l'HDD.
+            let id = makeId()
+            do {
+                try log(pendingEntry(c, id: id, blockId: blockId, absolute: pURL.path))
+            } catch {
+                out.stop = .logNotWritten(error.localizedDescription); break
+            }
+            let resulting: URL?
+            do {
+                resulting = try trashFunction(pURL)
+            } catch {
+                try? log(outcomeEntry(.failed, c, id: id, blockId: blockId, detail: error.localizedDescription))
+                // Mai «era gia' fatto»: lo stesso errore arriva da un disco che sparisce.
+                if volumeIdentity(hddRoot) != hddDevice { out.stop = .volumeVanished(.hdd); break }
+                if let flags = fileFlags(pURL), flags & Self.lockedFlags != 0 { out.skip(c, .locked); continue }
+                out.stop = .trashFailed(path: c.leavingPath, detail: (error as NSError).localizedDescription); break
+            }
+            // Il registro SUBITO, prima della copia successiva: dov'e' finita nel Cestino.
+            do {
+                try log(outcomeEntry(.removed, c, id: id, blockId: blockId, trashedPath: resulting?.path))
+            } catch {
+                out.removed.append(c)
+                out.stop = .logNotWritten(error.localizedDescription); break
+            }
+            out.removed.append(c)
+            // Post-condizione: la copia tenuta c'e' ancora. Non dovrebbe mai mancare, e proprio per
+            // questo ci si ferma: la copia appena tolta e' nel registro, «Annulla» la rimette.
+            guard RepairEngine.itemExists(kURL) else { out.stop = .keptVanished(path: c.keptPath); break }
+        }
+        return out
+    }
+}
+
 // MARK: - Riparazione: i testi (ROADMAP #45, ADR-0016)
 
 /// I testi della riparazione nella finestra Inventario. Logica pura, come `InventoryStatus`:
