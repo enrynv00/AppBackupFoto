@@ -3385,7 +3385,9 @@ nonisolated struct TrashHistoryEntry: Codable {
 /// riga, `.jsonl`) con i percorsi originali delle foto di quel blocco.
 ///
 /// **Non e' un annullamento.** Non ha bottoni, non legge mai il proprio contenuto per
-/// decidere niente, e non aggiunge nessun percorso distruttivo: `TrashManifestStore` resta
+/// decidere niente (da ADR-0019 la legge `TrashHistoryReader`, per il progetto 4: e' l'elenco
+/// delle copie che si possono togliere anche da HDD e Cubbit), e non aggiunge nessun percorso
+/// distruttivo: `TrashManifestStore` resta
 /// l'unico documento da cui «Annulla l'ultimo spostamento» rimette a posto le foto. Questa
 /// storia esiste perche' il registro di ripristino ricorda al massimo
 /// `TrashManifestStore.maxItems` voci (2.000) e le pota, mentre una corsa puo' toccarne
@@ -8245,6 +8247,336 @@ nonisolated final class RepairEngine: @unchecked Sendable {
         // 5. REGISTRO.
         onStep(.log)
         return finish(.repaired)
+    }
+}
+
+// MARK: - Doppioni su HDD e Cubbit: le regole pure (ROADMAP #47, ADR-0019)
+
+/// I due archivi che il progetto 4 rimette uguali all'SSD. L'SSD non e' fra questi: non si tocca.
+// `nonisolated`: value type puro, usato dal motore e dal registro fuori dal main.
+nonisolated enum AlignmentArchive: String, Codable, CaseIterable, Sendable {
+    case hdd, cubbit
+
+    /// Lo stesso archivio, come lo chiama l'inventario.
+    var inventoryArchive: InventoryArchive { self == .hdd ? .hdd : .s3 }
+}
+
+/// La storia degli spostamenti (`trash-history.jsonl`, `TrashHistory`) letta dal disco. Da
+/// ADR-0019 la storia non e' piu' solo da leggere a mano: e' l'elenco delle copie che il
+/// progetto 4 puo' togliere da HDD e Cubbit (decisione 1 di Enrico). Una riga che non si
+/// decodifica non porta copie (verso sicuro: restano), ma si conta.
+// `nonisolated`: pura, letta fuori dal main insieme all'inventario.
+nonisolated enum TrashHistoryReader {
+    struct Result: Sendable {
+        let entries: [TrashHistoryEntry]
+        /// Righe non vuote che non si sono lasciate decodificare.
+        let malformedLines: Int
+        /// Il file c'e' ma non si e' lasciato leggere: allora non si toglie niente.
+        let unreadable: Bool
+
+        static let empty = Result(entries: [], malformedLines: 0, unreadable: false)
+    }
+
+    /// Un file assente e' una storia vuota (non si e' mai spostato niente); uno illeggibile no.
+    static func read(url: URL, fm: FileManager = .default) -> Result {
+        guard fm.fileExists(atPath: url.path) else { return .empty }
+        guard let data = try? Data(contentsOf: url) else {
+            return Result(entries: [], malformedLines: 0, unreadable: true)
+        }
+        var entries: [TrashHistoryEntry] = []
+        var malformed = 0
+        let decoder = JSONDecoder()
+        for line in data.split(separator: 0x0A, omittingEmptySubsequences: true) {
+            if let e = try? decoder.decode(TrashHistoryEntry.self, from: Data(line)) {
+                entries.append(e)
+            } else {
+                malformed += 1
+            }
+        }
+        return Result(entries: entries, malformedLines: malformed, unreadable: false)
+    }
+}
+
+/// Perche' una copia uscita dall'SSD resta sull'archivio. Ogni caso ha la sua frase in
+/// `AlignmentStatus.stayReasonLine`. L'ordine dei casi e' la precedenza con cui si controllano.
+// `nonisolated`: value type puro.
+nonisolated enum AlignmentStayReason: String, CaseIterable, Sendable {
+    /// La storia non dice quale copia l'SSD ha tenuto (righe scritte prima di ADR-0017).
+    case keptUnknown
+    /// Il percorso d'origine non sta sotto la radice dell'SSD di oggi.
+    case outsideSSD
+    /// Un percorso vuoto, con `.`/`..`, o dentro la quarantena.
+    case unsafePath
+    /// La copia uscita e la copia tenuta sono lo stesso percorso (condizione 5).
+    case sameAsKept
+    /// La stessa copia compare piu' volte nella storia con la stessa tenuta: conta una volta.
+    case repeatedInHistory
+    /// La stessa copia compare nella storia con due copie tenute diverse.
+    case conflictingKept
+    /// Il registro dice che e' gia' stata tolta da questo archivio, e non e' stata rimessa.
+    case alreadyRemoved
+    /// La copia e' di nuovo sull'SSD (condizione 4): il backup la ricopierebbe.
+    case backOnSSD
+    /// La copia tenuta non c'e' sull'SSD, o non vi e' stata letta bene (condizione 3).
+    case keptNotOnSSD
+    /// La copia uscita non c'e' su questo archivio: niente da togliere.
+    case notInArchive
+    /// La copia tenuta non c'e' su questo archivio (condizione 2).
+    case keptNotInArchive
+    /// Due percorsi diversi diventano lo stesso confrontati senza maiuscole (condizione 5).
+    case pathCollision
+    /// Sull'HDD una delle due copie non si e' lasciata leggere per intero nell'inventario.
+    case unreadableInArchive
+    /// Su Cubbit una delle due copie non e' certificata per contenuto (ADR-0015).
+    case notCertifiable
+    /// Le due copie sull'archivio, o la tenuta sull'SSD, non hanno lo stesso contenuto.
+    case contentDiffers
+    /// Difesa in piu': la copia da togliere e' la copia tenuta di un'altra voce.
+    case keptAlsoLeaving
+}
+
+/// Una copia da togliere da un archivio: tutto quello che il motore deve ricontrollare dal
+/// vivo, congelato al momento del controllo (come `DuplicateBatch.Entry`).
+// `nonisolated`: value type, prodotto fuori dal main e passato al motore.
+nonisolated struct AlignmentCandidate: Equatable, Sendable, Identifiable {
+    let archive: AlignmentArchive
+    /// `normalizedIndexKey` della copia uscita e della copia tenuta.
+    let leavingKey: String
+    let keptKey: String
+    /// I percorsi come sono scritti SU QUESTO ARCHIVIO (sull'HDD il percorso relativo alla
+    /// radice, su Cubbit la chiave vera, con le maiuscole).
+    let leavingPath: String
+    let keptPath: String
+    /// I percorsi come sono scritti sull'SSD, per il ricontrollo dal vivo delle condizioni 3 e 4.
+    let ssdLeavingPath: String
+    let ssdKeptPath: String
+    let ssdKeptSize: Int64
+    let size: Int64
+    /// Il contenuto comune a copia uscita, copia tenuta e copia tenuta sull'SSD.
+    let sha256: String
+    /// Solo Cubbit: gli ETag delle due copie nell'inventario, senza virgolette (`RepairRules.normalizedETag`).
+    let leavingETag: String?
+    let keptETag: String?
+
+    var id: String { archive.rawValue + ":" + leavingKey }
+}
+
+/// L'esito del controllo «senza togliere» (regola assoluta 4): cosa si toglierebbe, quanto
+/// spazio, e quante copie restano e perche'. Si calcola senza toccare niente.
+// `nonisolated`: value type, calcolato in un `Task.detached` e mostrato dalla finestra.
+nonisolated struct AlignmentPlan: Sendable {
+    let archive: AlignmentArchive
+    /// Il giro dell'inventario che certifica le copie: il ricontrollo prima di ogni blocco
+    /// pretende lo stesso. `nil` se il controllo non certifica niente.
+    let runId: Int64?
+    /// Il motivo che vale per tutte le copie (condizione 1), `nil` se l'inventario e' fresco.
+    let block: DuplicateCertificationBlock?
+    /// La storia non si e' lasciata leggere: non si toglie niente.
+    let historyUnreadable: Bool
+    let malformedHistoryLines: Int
+    /// Le voci della storia (una per copia uscita), ripetizioni comprese.
+    let historyCopies: Int
+    /// In ordine di copia tenuta, poi di copia uscita.
+    let candidates: [AlignmentCandidate]
+    let stays: [AlignmentStayReason: Int]
+    /// Fino a tre percorsi d'esempio per motivo, per il riepilogo.
+    let stayExamples: [AlignmentStayReason: [String]]
+
+    var bytes: Int64 { candidates.reduce(0) { $0 + $1.size } }
+    var stayCount: Int { stays.values.reduce(0, +) }
+
+    static func blocked(_ archive: AlignmentArchive, block: DuplicateCertificationBlock?, historyUnreadable: Bool = false,
+                        malformedHistoryLines: Int = 0, historyCopies: Int = 0) -> AlignmentPlan {
+        AlignmentPlan(archive: archive, runId: nil, block: block, historyUnreadable: historyUnreadable,
+                      malformedHistoryLines: malformedHistoryLines, historyCopies: historyCopies,
+                      candidates: [], stays: [:], stayExamples: [:])
+    }
+}
+
+/// Le condizioni 1-5 della spec (`Docs/superpowers/specs/2026-10-10-archive-alignment-hdd-cubbit-design.md`,
+/// «Regole»), sulla storia e sull'inventario. Logica PURA: nessun disco, nessuna rete. La
+/// condizione 6 (il ricontrollo dal vivo) e la 7 (le versioni su Cubbit) sono del motore.
+// `nonisolated`: pura, calcolata fuori dal main (l'inventario ha centinaia di migliaia di righe).
+nonisolated enum AlignmentPlanner {
+    static func plan(archive: AlignmentArchive, history: TrashHistoryReader.Result, ssdRoot: URL,
+                     snapshot: InventorySnapshot, lastArchiveWriteAt: Date?,
+                     alreadyRemoved: Set<String>) -> AlignmentPlan {
+        let pairCount = history.entries.reduce(0) { $0 + $1.originalPaths.count }
+        guard !history.unreadable else {
+            return .blocked(archive, block: nil, historyUnreadable: true, historyCopies: pairCount)
+        }
+        // Condizione 1: la stessa regola di ADR-0017, con la stessa funzione.
+        let freshness = DuplicateInventoryFreshness.evaluate(states: snapshot.states, lastArchiveWriteAt: lastArchiveWriteAt)
+        guard case .fresh(let runId, _, _) = freshness else {
+            return .blocked(archive, block: DuplicateCertificationBlock(freshness: freshness),
+                            malformedHistoryLines: history.malformedLines, historyCopies: pairCount)
+        }
+
+        var stays: [AlignmentStayReason: Int] = [:]
+        var examples: [AlignmentStayReason: [String]] = [:]
+        func stay(_ r: AlignmentStayReason, _ path: String) {
+            stays[r, default: 0] += 1
+            if examples[r, default: []].count < 3 { examples[r, default: []].append(path) }
+        }
+
+        // 1. Dalla storia alle coppie (copia uscita, copia tenuta), relative alla radice dell'SSD.
+        let rootForms = [ssdRoot.standardizedFileURL.path, realResolvedPath(ssdRoot)].map {
+            $0.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+        }
+        var pairs: [(leaving: String, kept: String)] = []
+        for entry in history.entries {
+            for (i, original) in entry.originalPaths.enumerated() {
+                let kept = entry.keptPaths.flatMap { i < $0.count ? $0[i] : nil } ?? ""
+                guard !kept.isEmpty else { stay(.keptUnknown, original); continue }
+                // `.`/`..` si guardano sul percorso SCRITTO, prima che la standardizzazione li tolga.
+                let raw = original.split(separator: "/", omittingEmptySubsequences: true)
+                guard !raw.contains(where: { $0 == "." || $0 == ".." }) else { stay(.unsafePath, original); continue }
+                guard let leaving = rootForms.lazy.compactMap({ relativePath(of: original, under: $0) }).first else {
+                    stay(.outsideSSD, original); continue
+                }
+                guard RepairPaths.safeComponents(leaving) != nil, RepairPaths.safeComponents(kept) != nil else {
+                    stay(.unsafePath, leaving); continue
+                }
+                guard normalizedIndexKey(leaving) != normalizedIndexKey(kept) else { stay(.sameAsKept, leaving); continue }
+                pairs.append((leaving, kept))
+            }
+        }
+
+        // 2. Una copia per percorso: ripetizioni con la stessa tenuta contano una volta; con due
+        //    tenute diverse la copia resta (la storia si contraddice).
+        var byLeaving: [String: [(leaving: String, kept: String)]] = [:]
+        var order: [String] = []
+        for p in pairs {
+            let k = normalizedIndexKey(p.leaving)
+            if byLeaving[k] == nil { order.append(k) }
+            byLeaving[k, default: []].append(p)
+        }
+
+        let ssd = Dictionary(grouping: snapshot.ssd, by: \.key)
+        let localArchive = archive == .hdd ? Dictionary(grouping: snapshot.hdd, by: \.key) : [:]
+        let cubbit = archive == .cubbit ? Dictionary(grouping: snapshot.s3, by: \.key) : [:]
+        let etagCandidates = archive == .cubbit ? localETagCandidates(snapshot) : [:]
+
+        var candidates: [AlignmentCandidate] = []
+        for leavingKey in order {
+            let group = byLeaving[leavingKey]!
+            let first = group[0]
+            if Set(group.map { normalizedIndexKey($0.kept) }).count > 1 {
+                for p in group { stay(.conflictingKept, p.leaving) }
+                continue
+            }
+            for p in group.dropFirst() { stay(.repeatedInHistory, p.leaving) }
+            let keptKey = normalizedIndexKey(first.kept)
+
+            if alreadyRemoved.contains(leavingKey) { stay(.alreadyRemoved, first.leaving); continue }
+            // Condizione 4: la copia uscita e' tornata sull'SSD (qualunque riga, anche illeggibile).
+            if ssd[leavingKey] != nil { stay(.backOnSSD, first.leaving); continue }
+            // Condizione 3: la copia tenuta c'e' sull'SSD, una volta sola, letta bene.
+            guard let ssdKeptRows = ssd[keptKey], ssdKeptRows.count == 1, ssdKeptRows[0].status == .ok,
+                  let ssdKept = ssdKeptRows[0].digest else {
+                stay(.keptNotOnSSD, first.leaving); continue
+            }
+            let ssdKeptRow = ssdKeptRows[0]
+
+            switch archive {
+            case .hdd:
+                guard let pRows = localArchive[leavingKey] else { stay(.notInArchive, first.leaving); continue }
+                guard let kRows = localArchive[keptKey] else { stay(.keptNotInArchive, first.leaving); continue }
+                guard pRows.count == 1, kRows.count == 1 else { stay(.pathCollision, first.leaving); continue }
+                let p = pRows[0], k = kRows[0]
+                guard p.status == .ok, k.status == .ok, let pd = p.digest, let kd = k.digest else {
+                    stay(.unreadableInArchive, first.leaving); continue
+                }
+                // Condizione 2 (e 3): stesso contenuto fra le due copie sull'HDD e la tenuta sull'SSD.
+                guard pd.sha256 == kd.sha256, kd.sha256 == ssdKept.sha256,
+                      p.size == k.size, k.size == ssdKeptRow.size else {
+                    stay(.contentDiffers, first.leaving); continue
+                }
+                candidates.append(AlignmentCandidate(
+                    archive: .hdd, leavingKey: leavingKey, keptKey: keptKey, leavingPath: p.displayPath,
+                    keptPath: k.displayPath, ssdLeavingPath: first.leaving, ssdKeptPath: ssdKeptRow.displayPath,
+                    ssdKeptSize: ssdKeptRow.size, size: p.size, sha256: pd.sha256, leavingETag: nil, keptETag: nil))
+            case .cubbit:
+                guard let pRows = cubbit[leavingKey] else { stay(.notInArchive, first.leaving); continue }
+                guard let kRows = cubbit[keptKey] else { stay(.keptNotInArchive, first.leaving); continue }
+                guard pRows.count == 1, kRows.count == 1 else { stay(.pathCollision, first.leaving); continue }
+                let p = pRows[0], k = kRows[0]
+                // Condizione 2 su Cubbit: la stessa certificazione per contenuto dell'inventario.
+                guard case .certified(let pSha) = S3ETagMatcher.verdict(etag: p.etag, size: p.size,
+                                                                        candidates: etagCandidates[p.size] ?? []),
+                      case .certified(let kSha) = S3ETagMatcher.verdict(etag: k.etag, size: k.size,
+                                                                        candidates: etagCandidates[k.size] ?? []) else {
+                    stay(.notCertifiable, first.leaving); continue
+                }
+                guard pSha == kSha, kSha == ssdKept.sha256, p.size == k.size, k.size == ssdKeptRow.size else {
+                    stay(.contentDiffers, first.leaving); continue
+                }
+                candidates.append(AlignmentCandidate(
+                    archive: .cubbit, leavingKey: leavingKey, keptKey: keptKey, leavingPath: p.displayKey,
+                    keptPath: k.displayKey, ssdLeavingPath: first.leaving, ssdKeptPath: ssdKeptRow.displayPath,
+                    ssdKeptSize: ssdKeptRow.size, size: p.size, sha256: pSha,
+                    leavingETag: RepairRules.normalizedETag(p.etag), keptETag: RepairRules.normalizedETag(k.etag)))
+            }
+        }
+
+        let (kept, dropped) = dropLeavingThatIsKept(candidates)
+        for c in dropped { stay(.keptAlsoLeaving, c.ssdLeavingPath) }
+        let sorted = kept.sorted { ($0.keptKey, $0.leavingKey) < ($1.keptKey, $1.leavingKey) }
+        return AlignmentPlan(archive: archive, runId: runId, block: nil, historyUnreadable: false,
+                             malformedHistoryLines: history.malformedLines, historyCopies: pairCount,
+                             candidates: sorted, stays: stays, stayExamples: examples)
+    }
+
+    /// Difesa in piu': nessuna copia da togliere puo' essere la copia tenuta di un'altra voce.
+    /// Con un inventario coerente non succede mai (la tenuta e' sull'SSD, la copia uscita no:
+    /// condizioni 3 e 4), ma una regola che "non puo' succedere" si scrive comunque.
+    static func dropLeavingThatIsKept(_ candidates: [AlignmentCandidate]) -> (kept: [AlignmentCandidate], dropped: [AlignmentCandidate]) {
+        let keptKeys = Set(candidates.map(\.keptKey))
+        var kept: [AlignmentCandidate] = []
+        var dropped: [AlignmentCandidate] = []
+        for c in candidates {
+            if keptKeys.contains(c.leavingKey) { dropped.append(c) } else { kept.append(c) }
+        }
+        return (kept, dropped)
+    }
+
+    /// I file letti su SSD e HDD, per dimensione, come li vede `InventoryClassifier` per
+    /// certificare un oggetto Cubbit (un candidato per contenuto, il primo incontrato).
+    /// `AlignmentPlannerTests.testCubbitVerdict_matchesTheClassifier` pretende che i due
+    /// certifichino le stesse cose.
+    static func localETagCandidates(_ s: InventorySnapshot) -> [Int64: [S3ETagMatcher.Candidate]] {
+        var out: [Int64: [S3ETagMatcher.Candidate]] = [:]
+        var known = Set<String>()
+        for f in s.ssd + s.hdd {
+            guard f.status == .ok, let d = f.digest, known.insert(d.sha256).inserted else { continue }
+            out[f.size, default: []].append(.init(size: f.size, sha256: d.sha256, md5: d.md5, multipartETag: d.multipartETag,
+                                                  alternativeETags: d.alternativeMultipartETags))
+        }
+        return out
+    }
+}
+
+/// La corsa a blocchi: stessi tetti dei Doppioni (`duplicateBatchFileCap`, `duplicateBatchByteCap`,
+/// D2 del piano): il blocco e' anche la granularita' di «Annulla l'ultimo blocco». Una copia
+/// piu' grande del tetto ha un blocco tutto suo.
+// `nonisolated`: pura.
+nonisolated enum AlignmentRunPlan {
+    static func blocks(_ candidates: [AlignmentCandidate], fileCap: Int = duplicateBatchFileCap,
+                       byteCap: Int64 = duplicateBatchByteCap) -> [[AlignmentCandidate]] {
+        var out: [[AlignmentCandidate]] = []
+        var current: [AlignmentCandidate] = []
+        var bytes: Int64 = 0
+        for c in candidates {
+            if !current.isEmpty && (current.count >= fileCap || bytes + c.size > byteCap) {
+                out.append(current)
+                current = []
+                bytes = 0
+            }
+            current.append(c)
+            bytes += c.size
+        }
+        if !current.isEmpty { out.append(current) }
+        return out
     }
 }
 

@@ -359,4 +359,20 @@ final class MainThreadIsolationTests: XCTestCase {
         XCTAssertEqual(done.wait(timeout: .now() + 10), .success,
                        "PhotosLibraryPresence.read ha avuto bisogno del main thread: manca un nonisolated?")
     }
+
+    // MARK: - Doppioni su HDD e Cubbit (ROADMAP #47, ADR-0019)
+
+    func testAlignmentPlanner_runsWithoutTheMainThread() throws {
+        let done = DispatchSemaphore(value: 0)
+        let url = tmp.appendingPathComponent("trash-history.jsonl")
+        Task.detached {
+            let history = TrashHistoryReader.read(url: url)
+            _ = AlignmentPlanner.plan(archive: .cubbit, history: history, ssdRoot: URL(fileURLWithPath: "/Volumes/SSD - Enri"),
+                                      snapshot: InventorySnapshot(), lastArchiveWriteAt: nil, alreadyRemoved: [])
+            _ = AlignmentRunPlan.blocks([])
+            done.signal()
+        }
+        XCTAssertEqual(done.wait(timeout: .now() + 10), .success,
+                       "AlignmentPlanner/TrashHistoryReader hanno avuto bisogno del main thread: manca nonisolated?")
+    }
 }
