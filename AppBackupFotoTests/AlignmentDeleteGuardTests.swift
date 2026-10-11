@@ -47,4 +47,10 @@ final class AlignmentDeleteGuardTests: XCTestCase {
         XCTAssertEqual(count("deleteObjectForAlignment(", in: src), 2, "definizione + S3AlignmentCloud")
         XCTAssertEqual(count("removeDeleteMarkerForAlignment(", in: src), 2, "definizione + S3AlignmentCloud")
     }
+
+    func testTheEngineSendsTheDeleteFromOnePlaceOnly() throws {
+        // Un solo punto del motore manda il DELETE senza versione (dopo le versioni lette e le
+        // due HEAD). Se ne serve un secondo, va scritto perche' in ADR-0019.
+        XCTAssertEqual(count("cloud.delete(key:", in: try source()), 1)
+    }
 }

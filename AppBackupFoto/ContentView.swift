@@ -9080,6 +9080,88 @@ nonisolated final class ArchiveAligner: @unchecked Sendable {
     }
 }
 
+// `nonisolated` anche qui: i membri di un'estensione non annotata sarebbero MainActor per il
+// default del target (BUG-7): una funzione `async` senza `@concurrent` salterebbe sul main.
+nonisolated extension ArchiveAligner {
+    /// Un blocco su Cubbit. Non lancia: ogni copia non tolta ha il suo motivo; la corsa si ferma
+    /// su versioni spente o regole non adatte, errori di Cubbit, registro, e su un DELETE che
+    /// non ha creato il segno di cancellazione.
+    @concurrent
+    func runCubbitBlock(_ block: [AlignmentCandidate], blockId: String,
+                        isCancelled: @escaping @Sendable () -> Bool = { false },
+                        onProgress: @escaping @Sendable (Int) -> Void = { _ in }) async -> AlignmentBlockOutcome {
+        var out = AlignmentBlockOutcome()
+        guard let cloud else { out.stop = .cubbitError("Cubbit non configurato"); return out }
+        // Condizione 7, PRIMA DI OGNI BLOCCO: le versioni si leggono, non si cambiano mai.
+        do {
+            let safety = AlignmentCubbitSafety.evaluate(versioning: try await cloud.versioning(),
+                                                        rules: try await cloud.lifecycleRules())
+            guard case .ready = safety else { out.stop = .cubbitNotReady(safety); return out }
+        } catch {
+            out.stop = .cubbitError(error.localizedDescription); return out
+        }
+        guard let ssdDevice = volumeIdentity(ssdRoot) else { out.stop = .volumeMissing(.ssd); return out }
+
+        copies: for (index, c) in block.enumerated() {
+            if isCancelled() { out.stop = .interrupted; break }
+            defer { onProgress(index + 1) }
+
+            guard c.archive == .cubbit, let leavingETag = c.leavingETag, let keptETag = c.keptETag,
+                  RepairPaths.safeComponents(c.leavingPath) != nil, RepairPaths.safeComponents(c.keptPath) != nil,
+                  normalizedIndexKey(c.leavingPath) != normalizedIndexKey(c.keptPath) else {
+                out.skip(c, .unsafePath); continue
+            }
+            switch checkSSD(c, ssdDevice: ssdDevice) {
+            case .ok: break
+            case .skip(let r): out.skip(c, r); continue copies
+            case .stop(let s): out.stop = s; break copies
+            }
+
+            // Condizione 6 su Cubbit: HEAD della copia tenuta e della copia uscita, ADESSO.
+            do {
+                guard let k = try await cloud.head(key: c.keptPath) else { out.skip(c, .keptMissingInArchive); continue }
+                guard k.size == c.size, RepairRules.normalizedETag(k.etag) == keptETag else { out.skip(c, .contentChanged); continue }
+                guard let p = try await cloud.head(key: c.leavingPath) else { out.skip(c, .goneFromArchive); continue }
+                guard p.size == c.size, RepairRules.normalizedETag(p.etag) == leavingETag else { out.skip(c, .contentChanged); continue }
+            } catch {
+                out.stop = .cubbitError(error.localizedDescription); break
+            }
+
+            let id = makeId()
+            do {
+                try log(pendingEntry(c, id: id, blockId: blockId, absolute: nil))
+            } catch {
+                out.stop = .logNotWritten(error.localizedDescription); break
+            }
+            // DELETE SENZA versione: con le versioni accese crea il segno di cancellazione, e la
+            // versione della foto resta per i giorni della regola. Mai un DELETE con versione qui.
+            let result: S3Syncer.DeleteResult
+            do {
+                result = try await cloud.delete(key: c.leavingPath)
+            } catch {
+                try? log(outcomeEntry(.failed, c, id: id, blockId: blockId, detail: error.localizedDescription))
+                out.stop = .cubbitError(error.localizedDescription); break
+            }
+            guard result.isDeleteMarker, let marker = result.versionId else {
+                // Le versioni dicevano «accese» e Cubbit ha cancellato senza segno: la copia
+                // tenuta su Cubbit c'e' (HEAD appena fatta), ma ci si ferma SUBITO.
+                try? log(outcomeEntry(.removed, c, id: id, blockId: blockId, marker: result.versionId,
+                                      detail: "cancellata senza segno di cancellazione"))
+                out.removed.append(c)
+                out.stop = .deleteWithoutMarker(path: c.leavingPath); break
+            }
+            do {
+                try log(outcomeEntry(.removed, c, id: id, blockId: blockId, marker: marker))
+            } catch {
+                out.removed.append(c)
+                out.stop = .logNotWritten(error.localizedDescription); break
+            }
+            out.removed.append(c)
+        }
+        return out
+    }
+}
+
 // MARK: - Riparazione: i testi (ROADMAP #45, ADR-0016)
 
 /// I testi della riparazione nella finestra Inventario. Logica pura, come `InventoryStatus`:
