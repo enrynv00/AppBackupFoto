@@ -426,4 +426,22 @@ final class MainThreadIsolationTests: XCTestCase {
         XCTAssertEqual(done.wait(timeout: .now() + 10), .success,
                        "ArchiveAligner.undo ha avuto bisogno del main thread (manca @concurrent?).")
     }
+
+    /// 2026-10-14: i tentativi delle letture su Cubbit (e `S3Syncer.isRetryable`, che li decide)
+    /// girano fuori dal main come il motore che li chiama.
+    func testRetryingAlignmentCloud_retriesWithoutTheMainThread() throws {
+        let fake = FakeAlignmentCloud()
+        fake.put("a.jpg", "x")
+        let flaky = FlakyAlignmentCloud(fake)
+        flaky.fail(.head, with: URLError(.networkConnectionLost), S3Syncer.S3HTTPError(statusCode: 503, message: "x"))
+        let cloud = RetryingAlignmentCloud(flaky, sleep: { _ in })
+        let done = DispatchSemaphore(value: 0)
+        Task.detached {
+            _ = try? await cloud.head(key: "a.jpg")
+            done.signal()
+        }
+        XCTAssertEqual(done.wait(timeout: .now() + 10), .success,
+                       "RetryingAlignmentCloud ha avuto bisogno del main thread (manca nonisolated su S3Syncer.isRetryable?).")
+        XCTAssertEqual(flaky.calls(.head), 3)
+    }
 }

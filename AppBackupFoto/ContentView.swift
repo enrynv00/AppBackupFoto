@@ -9973,6 +9973,80 @@ nonisolated final class S3AlignmentCloud: AlignmentCloud, @unchecked Sendable {
     }
 }
 
+/// Il Cubbit del motore del progetto 4 che non si ferma al primo singhiozzo della rete. Le sole
+/// LETTURE (`head`, `versioning`, `lifecycleRules`, `versions`) si ritentano da sole su un errore
+/// passeggero — stessa regola dell'upload, `S3Syncer.isRetryable`: rete, 5xx, 429; mai un altro
+/// 4xx, mai un'interruzione — con le attese di `delays`, prima di lasciar fermare la corsa. Una
+/// lettura ripetuta non cambia niente su Cubbit.
+///
+/// Le due richieste che CAMBIANO Cubbit passano dritte, una volta sola, sempre: con le versioni
+/// accese un DELETE ripetuto dopo una risposta persa creerebbe un secondo segno di cancellazione
+/// che il registro non conosce, e «Annulla» toglierebbe solo il primo: la foto resterebbe
+/// nascosta. Lo stesso per la rimozione di un segno (ADR-0019, nota del 2026-10-14).
+///
+/// Un'interruzione (`isCancelled`, o il task cancellato) prima o durante un'attesa la chiude
+/// subito e restituisce l'ultimo errore: nessun tentativo in piu'.
+// `nonisolated`: solo proprieta' `let` (il Cubbit sotto e' `Sendable`, closure `@Sendable`, un
+// array di valori); i tentativi sono variabili locali di ogni chiamata, nessuno stato condiviso.
+nonisolated final class RetryingAlignmentCloud: AlignmentCloud, @unchecked Sendable {
+    /// Tre tentativi in piu', dopo 2, 5 e 15 secondi: ~22 s di pazienza per ogni lettura.
+    static let defaultDelays: [Duration] = [.seconds(2), .seconds(5), .seconds(15)]
+
+    private let base: any AlignmentCloud
+    private let delays: [Duration]
+    private let isCancelled: @Sendable () -> Bool
+    private let sleep: @Sendable (Duration) async -> Void
+
+    /// `sleep` iniettabile per i test; il default aspetta a fette e smette appena `isCancelled`.
+    init(_ base: any AlignmentCloud, delays: [Duration] = RetryingAlignmentCloud.defaultDelays,
+         isCancelled: @escaping @Sendable () -> Bool = { false },
+         sleep: (@Sendable (Duration) async -> Void)? = nil) {
+        self.base = base
+        self.delays = delays
+        self.isCancelled = isCancelled
+        self.sleep = sleep ?? { await RetryingAlignmentCloud.pause($0, isCancelled: isCancelled) }
+    }
+
+    func head(key: String) async throws -> S3Syncer.S3ObjectHead? { try await reading { try await base.head(key: key) } }
+    func versioning() async throws -> S3Syncer.BucketVersioning { try await reading { try await base.versioning() } }
+    func lifecycleRules() async throws -> [S3Syncer.LifecycleRule] { try await reading { try await base.lifecycleRules() } }
+    func versions(key: String) async throws -> [S3Syncer.VersionEntry] { try await reading { try await base.versions(key: key) } }
+
+    /// MAI ritentato: vedi sopra.
+    func delete(key: String) async throws -> S3Syncer.DeleteResult { try await base.delete(key: key) }
+    /// MAI ritentato: vedi sopra.
+    func removeDeleteMarker(key: String, versionId: String) async throws -> S3Syncer.DeleteResult {
+        try await base.removeDeleteMarker(key: key, versionId: versionId)
+    }
+
+    private var stopped: Bool { isCancelled() || Task.isCancelled }
+
+    private func reading<T>(_ read: () async throws -> T) async throws -> T {
+        var attempt = 0
+        while true {
+            do {
+                return try await read()
+            } catch {
+                guard attempt < delays.count, S3Syncer.isRetryable(error), !stopped else { throw error }
+                await sleep(delays[attempt])
+                attempt += 1
+                if stopped { throw error }
+            }
+        }
+    }
+
+    /// Aspetta `duration` a fette da un quarto di secondo: «Interrompi» non aspetta 15 secondi.
+    static func pause(_ duration: Duration, isCancelled: @Sendable () -> Bool) async {
+        let step = Duration.milliseconds(250)
+        var left = duration
+        while left > .zero, !isCancelled(), !Task.isCancelled {
+            let slice = min(step, left)
+            try? await Task.sleep(for: slice)
+            left -= slice
+        }
+    }
+}
+
 /// Se Cubbit e' pronto per togliere copie (condizione 7 della spec). Logica pura sulle due
 /// letture. Le versioni devono essere accese; le regole di scadenza devono far sparire le
 /// versioni vecchie di tutto il bucket, e MAI prima di `minimumDays` giorni (e' la finestra in
@@ -12416,7 +12490,9 @@ final class S3Syncer {
         return ordered.sorted()
     }
 
-    static func isRetryable(_ error: Error) -> Bool {
+    // `nonisolated`: pura, chiamata anche fuori dal main da `RetryingAlignmentCloud` (BUG-7:
+    // senza, ogni tentativo di lettura del progetto 4 salterebbe sul main thread).
+    nonisolated static func isRetryable(_ error: Error) -> Bool {
         if error is CancellationError { return false }
         if let httpError = error as? S3HTTPError {
             // 429 (Too Many Requests) è esattamente il segnale di congestione che il
@@ -15347,7 +15423,9 @@ final class BackupRunner: ObservableObject {
         alignmentChecking = archive
         let lastWrite = ArchiveWriteClock.lastWriteAt()
         let historyURL = trashHistoryURL
-        let cloud: S3AlignmentCloud? = archive == .cubbit ? s3Config.map { S3AlignmentCloud(syncer: S3Syncer(), config: $0) } : nil
+        // Le letture si ritentano da sole su un errore passeggero (ADR-0019, nota del 2026-10-14).
+        let cloud: RetryingAlignmentCloud? = archive == .cubbit
+            ? s3Config.map { RetryingAlignmentCloud(S3AlignmentCloud(syncer: S3Syncer(), config: $0)) } : nil
         Task.detached(priority: .userInitiated) {
             let history = TrashHistoryReader.read(url: historyURL)
             let logState = log.state(for: archive)
@@ -15404,13 +15482,17 @@ final class BackupRunner: ObservableObject {
             return
         }
         guard let roots = alignmentRoots(archive, onAlert: onAlert) else { return }
-        let cloud: S3AlignmentCloud? = archive == .cubbit ? s3Config.map { S3AlignmentCloud(syncer: S3Syncer(), config: $0) } : nil
+        let flag = CancelFlag()
+        // Le letture si ritentano da sole su un errore passeggero, il DELETE mai; «Interrompi»
+        // chiude anche un'attesa fra due tentativi (ADR-0019, nota del 2026-10-14).
+        let cloud: RetryingAlignmentCloud? = archive == .cubbit
+            ? s3Config.map { RetryingAlignmentCloud(S3AlignmentCloud(syncer: S3Syncer(), config: $0), isCancelled: { flag.isCancelled }) }
+            : nil
         if let alert = beginAlignment() {
             closeAlignmentAccess()
             onAlert(alert)
             return
         }
-        let flag = CancelFlag()
         alignmentCancelFlag = flag
         alignmentStopRequested = false
         alignmentRunArchive = archive
@@ -15475,13 +15557,17 @@ final class BackupRunner: ObservableObject {
         }
         guard let log = alignmentLog(archive) else { return }
         guard let roots = alignmentRoots(archive, onAlert: onAlert) else { return }
-        let cloud: S3AlignmentCloud? = archive == .cubbit ? s3Config.map { S3AlignmentCloud(syncer: S3Syncer(), config: $0) } : nil
+        let flag = CancelFlag()
+        // Le letture si ritentano da sole su un errore passeggero, la rimozione del segno mai
+        // (ADR-0019, nota del 2026-10-14).
+        let cloud: RetryingAlignmentCloud? = archive == .cubbit
+            ? s3Config.map { RetryingAlignmentCloud(S3AlignmentCloud(syncer: S3Syncer(), config: $0), isCancelled: { flag.isCancelled }) }
+            : nil
         if let alert = beginAlignment() {
             closeAlignmentAccess()
             onAlert(alert)
             return
         }
-        let flag = CancelFlag()
         alignmentCancelFlag = flag
         alignmentStopRequested = false
         alignmentRunArchive = archive

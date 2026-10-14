@@ -57,4 +57,15 @@ final class AlignmentDeleteGuardTests: XCTestCase {
     func testTheUndoRemovesDeleteMarkersFromOnePlaceOnly() throws {
         XCTAssertEqual(count("cloud.removeDeleteMarker(", in: try source()), 1)
     }
+
+    /// 2026-10-14 (nota in ADR-0019): ogni Cubbit che `BackupRunner` da' al motore ritenta da
+    /// solo le letture (`RetryingAlignmentCloud`), e quel Cubbit passa i due DELETE una volta
+    /// sola (lo provano `AlignmentEngineCubbitTests`). Un `S3AlignmentCloud` nudo farebbe fermare
+    /// una corsa di ore al primo errore passeggero della rete.
+    func testEveryCubbitGivenToTheEngine_retriesItsReads() throws {
+        let src = try source()
+        let built = count("S3AlignmentCloud(syncer:", in: src)
+        XCTAssertEqual(built, 3, "controllo, corsa, annullamento")
+        XCTAssertEqual(count("RetryingAlignmentCloud(S3AlignmentCloud(syncer:", in: src), built)
+    }
 }
