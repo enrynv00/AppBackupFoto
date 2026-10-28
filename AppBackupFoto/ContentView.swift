@@ -1273,6 +1273,9 @@ struct JobStats {
     /// del passo 1 sopra restano quelli della copia, invariati. Serve solo a CompletionSheet
     /// e alla notifica di fine job.
     var listStepOutcome: BackupListStep.Outcome? = nil
+    /// I file non caricati su Cubbit (ROADMAP #43). Come `listStepOutcome`: NON persistito e
+    /// nessun conteggio lo legge; serve alla `CompletionSheet` e al fondo del log.
+    var failedFiles: [FailedFile] = []
 }
 
 struct SpeedSample: Identifiable {
@@ -11136,6 +11139,10 @@ nonisolated final class FileSyncer: @unchecked Sendable {
         /// l'utente sono la stessa cosa ("questa foto ce l'avevi gia'").
         /// E' un sottoinsieme di `skipped`, come `changedSkipped`.
         var duplicatesSkipped = 0
+        /// I file non caricati, con il motivo (ROADMAP #43). Oggi lo riempie solo il job verso
+        /// Cubbit (`runSyncS3`, da `S3Syncer.SyncResult.failures`); `FileSyncer` non lo tocca:
+        /// lo stesso buco nelle copie locali e' un ticket a parte (D4 = A).
+        var failedFiles: [FailedFile] = []
         var startDate = Date()
         var percent: Int { total > 0 ? min(100, done * 100 / total) : 0 }
         var elapsedSec: Int { Int(Date().timeIntervalSince(startDate)) }
@@ -11630,6 +11637,35 @@ nonisolated enum S3UploadText {
     /// si trova piu' sull'SSD» le due frasi si contraddirebbero sulla stessa riga.
     static func failedLine(key: String, reason: String) -> String {
         "Non caricato: «\(key)» — \(reason). Il prossimo backup verso Cubbit lo riproverà da solo."
+    }
+}
+
+/// I testi del riepilogo di fine job sui file non caricati (ROADMAP #43). Logica pura: la
+/// `CompletionSheet` e `finishCopyStep` li usano e basta.
+// `nonisolated`: pura.
+nonisolated enum UploadFailureSummary {
+    static func headline(count: Int) -> String {
+        count == 1 ? "1 file non caricato su Cubbit" : "\(count) file non caricati su Cubbit"
+    }
+
+    static let reassurance = "Sull'SSD non è stato toccato niente: il prossimo backup verso Cubbit riproverà da solo questi file."
+
+    static let whereIsTheFullList = "L'elenco completo è in fondo al registro: scheda Log → Salva."
+
+    /// Al massimo `limit` righe `percorso — motivo`, poi «…e altri N».
+    static func visibleLines(_ failures: [FailedFile], limit: Int) -> [String] {
+        var lines = failures.prefix(limit).map { "\($0.path) — \($0.reason)" }
+        let more = failures.count - lines.count
+        if more == 1 { lines.append("…e altro 1") }
+        else if more > 1 { lines.append("…e altri \(more)") }
+        return lines
+    }
+
+    /// L'elenco COMPLETO, senza limite, per il fondo del log: e' il posto dove deve stare tutto.
+    static func logLines(_ failures: [FailedFile]) -> [String] {
+        guard !failures.isEmpty else { return [] }
+        return ["\(headline(count: failures.count)) — elenco completo:"]
+            + failures.map { "  \($0.path) — \($0.reason)" }
     }
 }
 
@@ -15979,6 +16015,7 @@ final class BackupRunner: ObservableObject {
                 fr.copied = r.uploaded; fr.skipped = r.skipped
                 fr.errors = r.errors; fr.done = r.done; fr.total = r.total
                 fr.changedSkipped = r.changedSkipped
+                fr.failedFiles = r.failures
                 return fr
             }
         } catch {
@@ -16488,7 +16525,15 @@ final class BackupRunner: ObservableObject {
             stats.copiedUnverified = r.copiedUnverified  // copiati ma non verificabili: fuori da copied/verifiedOk
             stats.changedSkipped = r.changedSkipped  // file cambiati, non copiati (roadmap #13)
             stats.duplicatesSkipped = r.duplicatesSkipped  // gia' in libreria, non copiati (roadmap #31)
+            stats.failedFiles = r.failedFiles        // non caricati su Cubbit (roadmap #43)
         }
+        // L'elenco completo dei file non caricati finisce in fondo al log QUI, in modo sincrono.
+        // Le singole righe «Non caricato» di `S3Syncer.sync` arrivano per strade asincrone e
+        // possono comparire poco dopo: l'elenco completo non dipende da loro. Una sola `append`
+        // per tutto l'elenco: ognuna misura e taglia `output` sul main, e con migliaia di file
+        // (rete caduta a meta' job) una per riga bloccherebbe la finestra.
+        let failureList = UploadFailureSummary.logLines(stats.failedFiles)
+        if !failureList.isEmpty { append(failureList.joined(separator: "\n") + "\n") }
         JobHistoryStore.save(JobSummary(date: Date(), label: label, copied: stats.copied,
             skipped: stats.skipped, errors: stats.errors,
             hashErrors: stats.hashErrors, succeeded: true,
@@ -18735,7 +18780,25 @@ struct CompletionSheet: View {
                       systemImage: "doc.on.doc")
                     .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
             }
-            if stats.errors > 0 {
+            if !stats.failedFiles.isEmpty {
+                // ROADMAP #43: quali file non sono arrivati su Cubbit e perche'. I percorsi sono
+                // lunghi: si taglia nel mezzo, perche' e' la parte finale col nome che conta.
+                // `id: \.offset`: due righe possono essere identiche, `\.self` darebbe ID doppi.
+                VStack(alignment: .leading, spacing: AppSpacing.xs) {
+                    Label(UploadFailureSummary.headline(count: stats.failedFiles.count),
+                          systemImage: "exclamationmark.triangle.fill")
+                        .font(.callout).foregroundStyle(AppColor.warning)
+                    Text(UploadFailureSummary.reassurance).font(.caption).foregroundStyle(.secondary)
+                    ForEach(Array(UploadFailureSummary.visibleLines(stats.failedFiles, limit: 8).enumerated()),
+                            id: \.offset) { _, line in
+                        Text(line).font(.caption).lineLimit(1).truncationMode(.middle)
+                    }
+                    Text(UploadFailureSummary.whereIsTheFullList).font(.caption).foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: 520, alignment: .leading)
+            }
+            // La riga generica resta per gli errori senza elenco (copie locali, D4 = A).
+            if stats.errors > 0 && stats.failedFiles.isEmpty {
                 Label("Controlla il log per i dettagli sugli errori.", systemImage: "exclamationmark.triangle.fill")
                     .font(.caption).foregroundStyle(AppColor.warning).multilineTextAlignment(.center)
             }

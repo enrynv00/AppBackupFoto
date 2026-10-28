@@ -156,4 +156,60 @@ final class S3UploadTextTests: XCTestCase {
             XCTAssertEqual(r.failures.count, n)
         }
     }
+
+    // MARK: - Il riepilogo di fine job (Task 5)
+
+    private func failures(_ n: Int) -> [FailedFile] {
+        (0..<n).map { i in FailedFile(path: "Cartella/file-\(i + 1).mp4", reason: "motivo \(i + 1)") }
+    }
+
+    func testHeadline_singularAndPlural() {
+        XCTAssertEqual(UploadFailureSummary.headline(count: 1), "1 file non caricato su Cubbit")
+        XCTAssertEqual(UploadFailureSummary.headline(count: 2), "2 file non caricati su Cubbit")
+    }
+
+    func testReassurance_saysNothingWasTouchedAndTheNextBackupRetries() {
+        XCTAssertTrue(UploadFailureSummary.reassurance.contains("SSD"))
+        XCTAssertTrue(UploadFailureSummary.reassurance.contains("toccato"))
+        XCTAssertTrue(UploadFailureSummary.reassurance.contains("prossimo backup"))
+        XCTAssertTrue(UploadFailureSummary.whereIsTheFullList.contains("Log"))
+        XCTAssertTrue(UploadFailureSummary.whereIsTheFullList.contains("Salva"))
+    }
+
+    func testVisibleLines_showsAtMostTheLimit() {
+        let lines = UploadFailureSummary.visibleLines(failures(3), limit: 8)
+        XCTAssertEqual(lines, ["Cartella/file-1.mp4 — motivo 1", "Cartella/file-2.mp4 — motivo 2",
+                               "Cartella/file-3.mp4 — motivo 3"])
+    }
+
+    func testVisibleLines_overflowSaysHowManyMore() {
+        let twelve = UploadFailureSummary.visibleLines(failures(12), limit: 8)
+        XCTAssertEqual(twelve.count, 9)
+        XCTAssertEqual(twelve.prefix(8).last, "Cartella/file-8.mp4 — motivo 8")
+        XCTAssertEqual(twelve.last, "…e altri 4")
+        XCTAssertEqual(UploadFailureSummary.visibleLines(failures(9), limit: 8).last, "…e altro 1")
+        XCTAssertEqual(UploadFailureSummary.visibleLines(failures(8), limit: 8).count, 8)
+    }
+
+    func testVisibleLines_empty_isEmpty() {
+        XCTAssertTrue(UploadFailureSummary.visibleLines([], limit: 8).isEmpty)
+        XCTAssertTrue(UploadFailureSummary.logLines([]).isEmpty)
+    }
+
+    func testLogLines_listEveryFailureWithFullPath() {
+        let lines = UploadFailureSummary.logLines(failures(12))
+        guard lines.count == 13 else { return XCTFail("attese 13 righe (intestazione + 12), sono \(lines.count)") }
+        XCTAssertTrue(lines[0].contains("12 file non caricati su Cubbit"), lines[0])
+        for i in 1...12 {
+            XCTAssertTrue(lines[i].contains("Cartella/file-\(i).mp4 — motivo \(i)"), lines[i])
+        }
+    }
+
+    func testAllSummaryTexts_haveNoJargon() {
+        var texts = [UploadFailureSummary.headline(count: 1), UploadFailureSummary.headline(count: 3),
+                     UploadFailureSummary.reassurance, UploadFailureSummary.whereIsTheFullList]
+        texts += UploadFailureSummary.visibleLines(failures(10), limit: 8)
+        texts += UploadFailureSummary.logLines(failures(2))
+        for t in texts { Self.assertNoJargon(t) }
+    }
 }
