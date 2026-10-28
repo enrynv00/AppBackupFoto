@@ -137,4 +137,23 @@ final class S3UploadTextTests: XCTestCase {
         XCTAssertTrue(line.contains("prossimo backup"), line)
         Self.assertNoJargon(line)
     }
+
+    // MARK: - Il risultato ricorda quali file non si sono caricati (Task 4)
+
+    func testRecordFailure_countsAndRemembers() {
+        var r = S3Syncer.SyncResult()
+        r.recordFailure(key: "a/1.mp4", reason: "uno")
+        r.recordFailure(key: "b/2.jpg", reason: "due")
+        XCTAssertEqual(r.errors, 2)
+        XCTAssertEqual(r.failures, [FailedFile(path: "a/1.mp4", reason: "uno"), FailedFile(path: "b/2.jpg", reason: "due")])
+    }
+
+    func testRecordFailure_errorsAlwaysEqualsFailuresCount() {
+        for n in [0, 1, 5] {
+            var r = S3Syncer.SyncResult()
+            for i in 0..<n { r.recordFailure(key: "f\(i)", reason: "x") }
+            XCTAssertEqual(r.errors, n)
+            XCTAssertEqual(r.failures.count, n)
+        }
+    }
 }

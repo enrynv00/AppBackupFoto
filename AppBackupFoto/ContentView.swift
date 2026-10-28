@@ -11743,6 +11743,14 @@ final class S3Syncer {
         /// `CloudUsageTotals.afterSync`). Non persistito: `JobStats` non è `Codable` e nessun
         /// conteggio del riepilogo lo legge, lo consuma solo `sync()` per notificare il sink.
         var cloudUsageAfter: CloudUsageTotals? = nil
+        /// I file non caricati, con il motivo, nell'ordine in cui sono falliti (ROADMAP #43).
+        /// `errors` e `failures` si muovono INSIEME, sempre e solo da `recordFailure`: un
+        /// contatore di errori senza l'elenco di cosa e' fallito non e' una diagnosi.
+        var failures: [FailedFile] = []
+        mutating func recordFailure(key: String, reason: String) {
+            errors += 1
+            failures.append(FailedFile(path: key, reason: reason))
+        }
         var percent: Int { total > 0 ? min(100, done * 100 / total) : 0 }
         var elapsedSec: Int { Int(Date().timeIntervalSince(startDate)) }
         // ETA basato sugli upload effettivi (non sui file già presenti su S3)
@@ -11756,6 +11764,15 @@ final class S3Syncer {
         static func hms(_ s: Int) -> String {
             String(format: "%02d:%02d:%02d", s/3600, (s%3600)/60, s%60)
         }
+    }
+
+    /// Come e' finito il task di un file in `sync()` (ROADMAP #43). Il motivo viaggia gia' come
+    /// testo: l'`Error` resta nel task figlio che l'ha ricevuto.
+    // `nonisolated`: value type, restituito dai task figli del gruppo di `sync()`.
+    nonisolated enum FileUploadOutcome: Sendable {
+        case uploaded
+        case failed(reason: String)
+        case stopped
     }
 
     static func readFileInChunks(path: String, chunkSize: Int,
@@ -12144,13 +12161,13 @@ final class S3Syncer {
         // (adaptiveConcurrencyCeiling): oltre quel numero di file "in corso" il gate non
         // farebbe comunque salire la concorrenza di rete effettiva, quindi non è un
         // collo di bottiglia per il throughput.
-        await withTaskGroup(of: (url: URL, size: Int64, ok: Bool).self) { group in
+        await withTaskGroup(of: (url: URL, key: String, size: Int64, outcome: FileUploadOutcome).self) { group in
             var index = 0
             func addNext() {
                 guard index < toUpload.count, !self.cancelled, !Task.isCancelled else { return }
                 let item = toUpload[index]; index += 1
                 group.addTask { [self] in
-                    if self.cancelled || Task.isCancelled { return (item.url, item.size, false) }
+                    if self.cancelled || Task.isCancelled { return (item.url, item.key, item.size, .stopped) }
                     do {
                         // onStart annuncia "Carico: X" solo quando il file ottiene
                         // davvero il primo slot di rete dal gate (vedi upload()/
@@ -12166,22 +12183,36 @@ final class S3Syncer {
                                 }
                             },
                             onStatus: onStatus)
-                        return (item.url, item.size, true)
+                        return (item.url, item.key, item.size, .uploaded)
                     } catch {
-                        return (item.url, item.size, false)
+                        // Il motivo si calcola QUI: oltre il task figlio viaggia solo il testo.
+                        if self.cancelled || Task.isCancelled { return (item.url, item.key, item.size, .stopped) }
+                        return (item.url, item.key, item.size, .failed(reason: S3UploadText.reason(for: error)))
                     }
                 }
             }
             for _ in 0..<Self.adaptiveConcurrencyCeiling { addNext() }
-            while let outcome = await group.next() {
+            while let finished = await group.next() {
                 // Dopo un'interruzione tutti i task ancora in coda tornano subito con
-                // ok=false senza aver mai caricato nulla: contarli come errori (e
+                // `.stopped` senza aver mai caricato nulla: contarli come errori (e
                 // ridisegnare la UI per ognuno) produrrebbe decine di migliaia di falsi
                 // errori dopo lo stop. Il vecchio runBounded semplicemente non li
                 // schedulava — questa guardia ne conserva il comportamento.
                 if self.cancelled || Task.isCancelled { continue }
-                if outcome.ok { result.uploaded += 1; result.uploadedBytes += outcome.size }
-                else { result.errors += 1 }
+                switch finished.outcome {
+                case .uploaded:
+                    result.uploaded += 1; result.uploadedBytes += finished.size
+                case .failed(let reason):
+                    // ROADMAP #43: ogni file non caricato lascia una riga con il motivo, e il suo
+                    // nome finisce nel risultato (riepilogo di fine job e fondo del log).
+                    result.recordFailure(key: finished.key, reason: reason)
+                    let line = S3UploadText.failedLine(key: finished.key, reason: reason)
+                    DispatchQueue.main.async { onStatus(line) }
+                case .stopped:
+                    // Arriva solo dopo uno stop, e il flag di stop non torna falso dentro lo
+                    // stesso job: la guardia qui sopra lo intercetta gia'. Resta per lo `switch`.
+                    continue
+                }
                 result.done += 1
                 let snap = result
                 DispatchQueue.main.async { onProgress(snap) }
