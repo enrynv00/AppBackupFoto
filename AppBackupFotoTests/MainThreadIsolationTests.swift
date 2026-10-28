@@ -444,4 +444,19 @@ final class MainThreadIsolationTests: XCTestCase {
                        "RetryingAlignmentCloud ha avuto bisogno del main thread (manca nonisolated su S3Syncer.isRetryable?).")
         XCTAssertEqual(flaky.calls(.head), 3)
     }
+
+    /// ROADMAP #43: il registro completo del job scrive sulla sua coda, mai sul main.
+    func testJobLogFile_writesWithoutTheMainThread() {
+        let dir = tmp.appendingPathComponent("Logs")
+        let done = DispatchSemaphore(value: 0)
+        Task.detached {
+            let log = JobLogFile(directory: dir, startedAt: Date(), header: "h")
+            log.write("riga\n", at: Date())
+            log.finish(closingLine: "fine")
+            log.waitForPendingWrites()
+            done.signal()
+        }
+        XCTAssertEqual(done.wait(timeout: .now() + 5), .success,
+                       "JobLogFile ha avuto bisogno del main thread: il tipo e' tornato @MainActor?")
+    }
 }

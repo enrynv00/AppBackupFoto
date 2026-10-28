@@ -14473,6 +14473,261 @@ enum DiskFormatter {
     }
 }
 
+// MARK: - Registro completo di ogni job sul disco del Mac (ROADMAP #43, ADR-0014)
+
+/// Il registro COMPLETO di un job, in un file `backup_AAAA-MM-GG_hh-mm-ss.log` dentro
+/// `~/Library/Logs/AppBackupFoto/`: sul disco del Mac, mai sull'SSD ne' sull'HDD, mai sotto
+/// `Log/` del repository. `BackupRunner.output` resta tagliato a `maxOut` apposta (la `Text`
+/// della scheda Log ridisegna tutta la stringa a ogni riga, ADR-0010): il registro completo e'
+/// questo file, e «Salva» della scheda Log esporta lui. Vale per tutti i job (D5 = A).
+///
+/// Ogni riga non vuota porta l'ora (D6 = A): e' l'unico modo di sapere se 99 nuovi tentativi
+/// vengono da un minuto di rete caduta o da ore di Cubbit lento. Nell'app le righe restano
+/// come prima.
+///
+/// Il registro su disco non deve MAI far fallire ne' rallentare un job: ogni errore lo fa
+/// tacere (`broken`), e basta. Per questo si scrive con `FileHandle.write(contentsOf:)`, che
+/// lancia: `write(_ data:)` solleva un'eccezione Objective-C su disco pieno e manderebbe in
+/// crash l'app a meta' di un backup.
+///
+/// `nonisolated`, `@unchecked Sendable`: `handle`, `opened`, `finished` e `broken` si leggono e
+/// si scrivono SOLO sulla coda seriale `queue`; tutto il resto e' `let`. Nessun I/O sul main: il
+/// costruttore calcola solo l'URL, cartella e file li crea il primo blocco sulla coda.
+nonisolated final class JobLogFile: @unchecked Sendable {
+    /// Quanti registri tenere (D1 = A): gli ultimi 50 job, il nuovo compreso.
+    static let keepCount = 50
+    /// Dove il registro non si scrive mai, nemmeno passando da un collegamento (regola 5 del piano).
+    static let defaultRefusedRoots = ["/Volumes"]
+    /// La prima riga di un'esportazione quando il file non c'e' (cartella non scrivibile).
+    static let unavailableNote = "Il registro completo di questo job non è disponibile sul disco del Mac: qui sotto c'è solo la parte che l'app mostrava nella scheda Log."
+
+    /// `~/Library/Logs/AppBackupFoto`. Sotto test (BUG-10: il test host e' l'app stessa, con le
+    /// stesse cartelle dell'utente) una cartella nella directory temporanea, come
+    /// `backupRunnerStoreRoot`.
+    static func defaultDirectory(isRunningUnderTests: Bool = isRunningUnderTests()) -> URL {
+        if isRunningUnderTests {
+            return URL(fileURLWithPath: NSTemporaryDirectory())
+                .appendingPathComponent("AppBackupFotoTestHost", isDirectory: true)
+                .appendingPathComponent("Logs", isDirectory: true)
+        }
+        return FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Logs", isDirectory: true)
+            .appendingPathComponent("AppBackupFoto", isDirectory: true)
+    }
+
+    private static func parts(_ date: Date, _ timeZone: TimeZone) -> [Int] {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = timeZone
+        let c = cal.dateComponents([.year, .month, .day, .hour, .minute, .second], from: date)
+        return [c.year ?? 0, c.month ?? 0, c.day ?? 0, c.hour ?? 0, c.minute ?? 0, c.second ?? 0]
+    }
+
+    /// `backup_AAAA-MM-GG_hh-mm-ss.log`, l'ora d'inizio del job nel fuso del Mac.
+    static func fileName(startedAt: Date, timeZone: TimeZone = .current) -> String {
+        let p = parts(startedAt, timeZone)
+        return String(format: "backup_%04d-%02d-%02d_%02d-%02d-%02d.log", p[0], p[1], p[2], p[3], p[4], p[5])
+    }
+
+    /// `AAAA-MM-GG hh:mm:ss`.
+    static func timestamp(_ date: Date, timeZone: TimeZone = .current) -> String {
+        let p = parts(date, timeZone)
+        return String(format: "%04d-%02d-%02d %02d:%02d:%02d", p[0], p[1], p[2], p[3], p[4], p[5])
+    }
+
+    /// L'ora davanti a OGNI riga non vuota di `text` (D6). Le righe vuote restano vuote, e il
+    /// `\n` finale resta dov'era.
+    static func stamped(_ text: String, at date: Date, timeZone: TimeZone = .current) -> String {
+        let prefix = timestamp(date, timeZone: timeZone) + "  "
+        let lines = text.components(separatedBy: "\n")
+        var out = ""
+        for (i, line) in lines.enumerated() {
+            if !line.isEmpty { out += prefix + line }
+            if i < lines.count - 1 { out += "\n" }
+        }
+        return out
+    }
+
+    /// Vero solo per il nome ESATTO che questa classe scrive: `backup_` + `AAAA-MM-GG_hh-mm-ss`
+    /// (solo cifre ASCII) + `.log`. Niente `/`, niente `..`, niente maiuscole diverse.
+    static func isLogFileName(_ name: String) -> Bool {
+        let template = Array("backup_dddd-dd-dd_dd-dd-dd.log".utf8)
+        let chars = Array(name.utf8)
+        guard chars.count == template.count else { return false }
+        for (c, t) in zip(chars, template) {
+            if t == UInt8(ascii: "d") {
+                guard c >= UInt8(ascii: "0") && c <= UInt8(ascii: "9") else { return false }
+            } else if c != t {
+                return false
+            }
+        }
+        return true
+    }
+
+    /// I registri da togliere per tenerne `keep` (D1): i piu' VECCHI fra i nomi esatti (il nome
+    /// porta l'ora, quindi l'ordine alfabetico e' quello del tempo), mai `protecting` — il job che
+    /// sta partendo, anche se l'orologio e' tornato indietro e il suo nome e' il piu' vecchio.
+    static func namesToPrune(_ names: [String], keep: Int, protecting: String) -> [String] {
+        let valid = Set(names.filter(isLogFileName))
+        let excess = valid.count - max(keep, 0)
+        guard excess > 0 else { return [] }
+        return Array(valid.subtracting([protecting]).sorted().prefix(excess))
+    }
+
+    static func closingLine(phaseLabel: String, copied: Int, skipped: Int, errors: Int, elapsed: String) -> String {
+        "Fine del job: \(phaseLabel) · copiati \(copied) · saltati \(skipped) · errori \(errors) · durata \(elapsed)"
+    }
+
+    /// Vero se `path` sta dentro una delle `refusedRoots`, confrontato per COMPONENTI (mai
+    /// `hasPrefix`: `/VolumesX` non sta dentro `/Volumes`). Solo lessicale, nessun accesso al disco.
+    static func isRefused(_ path: String, refusedRoots: [String]) -> Bool {
+        let comps = URL(fileURLWithPath: path).standardized.pathComponents
+        return refusedRoots.contains { root in
+            let r = URL(fileURLWithPath: root).standardized.pathComponents
+            return comps.count >= r.count && Array(comps.prefix(r.count)) == r
+        }
+    }
+
+    /// Il percorso vero di `directory`, risolvendo i collegamenti della parte che esiste gia':
+    /// una cartella dei log che passa da un collegamento verso un volume esterno si riconosce
+    /// PRIMA di creare qualunque cosa.
+    static func resolvedPath(of directory: URL) -> String {
+        var existing = directory.standardized
+        var tail: [String] = []
+        while !FileManager.default.fileExists(atPath: existing.path), existing.pathComponents.count > 1 {
+            tail.insert(existing.lastPathComponent, at: 0)
+            existing = existing.deletingLastPathComponent()
+        }
+        return ([realResolvedPath(existing)] + tail).joined(separator: "/")
+    }
+
+    let url: URL
+    private let directory: URL
+    private let refusedRoots: [String]
+    private let queue = DispatchQueue(label: "enri.AppBackupFoto.JobLogFile", qos: .utility)
+    private var handle: FileHandle?   // solo sulla coda
+    private var opened = false        // solo sulla coda
+    private var finished = false      // solo sulla coda
+    private var broken = false        // solo sulla coda
+
+    /// `refusedRoots` si cambia solo nei test, per provare il rifiuto senza toccare `/Volumes`.
+    init(directory: URL, startedAt: Date, header: String,
+         refusedRoots: [String] = JobLogFile.defaultRefusedRoots) {
+        self.directory = directory
+        self.url = directory.appendingPathComponent(JobLogFile.fileName(startedAt: startedAt))
+        self.refusedRoots = refusedRoots
+        queue.async { self.openOnQueue(header: header, at: startedAt) }
+    }
+
+    /// Accoda `text` (una o piu' righe), con l'ora davanti a ogni riga. Dopo `finish` non fa niente.
+    func write(_ text: String, at date: Date) {
+        queue.async {
+            guard self.opened, !self.finished else { return }
+            self.appendOnQueue(JobLogFile.stamped(text, at: date))
+        }
+    }
+
+    /// L'ultima riga, poi il file si chiude. Le righe che arrivano dopo non entrano nel file.
+    func finish(closingLine: String) {
+        let now = Date()
+        queue.async {
+            guard self.opened, !self.finished else { return }
+            self.appendOnQueue(JobLogFile.stamped(closingLine + "\n", at: now))
+            try? self.handle?.close()
+            self.handle = nil
+            self.finished = true
+        }
+    }
+
+    /// Copia il registro intero in `destination` (scelta dall'utente nel pannello «Salva»). Gira
+    /// sulla STESSA coda delle scritture, quindi vede tutte quelle accodate prima. Senza file
+    /// (cartella non scrivibile) scrive `fallback` (la parte visibile nell'app) preceduta da
+    /// `unavailableNote`, e `completion(false)`. Se la scrittura si era interrotta a meta' (disco
+    /// pieno), esporta il file com'e': contiene l'inizio, la parte che l'app non ha piu'.
+    /// `completion` sul main.
+    func export(to destination: URL, fallback: String, completion: @escaping @Sendable (Bool) -> Void) {
+        queue.async {
+            var ok = false
+            if self.opened, let data = try? Data(contentsOf: self.url) {
+                ok = (try? data.write(to: destination, options: .atomic)) != nil
+            } else {
+                _ = try? Data((JobLogFile.unavailableNote + "\n\n" + fallback).utf8).write(to: destination, options: .atomic)
+            }
+            DispatchQueue.main.async { completion(ok) }
+        }
+    }
+
+    /// Solo per i test: aspetta che la coda abbia finito.
+    func waitForPendingWrites() {
+        queue.sync {}
+    }
+
+    private func openOnQueue(header: String, at date: Date) {
+        guard !Self.isRefused(directory.path, refusedRoots: refusedRoots),
+              !Self.isRefused(Self.resolvedPath(of: directory), refusedRoots: refusedRoots) else {
+            broken = true
+            return
+        }
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        } catch {
+            broken = true
+            return
+        }
+        guard !Self.isRefused(realResolvedPath(directory), refusedRoots: refusedRoots) else {
+            broken = true
+            return
+        }
+        prune()
+        // Creato solo se manca, altrimenti in coda (due job nello stesso secondo accodano, non
+        // sovrascrivono); mai attraverso un collegamento; `0600` perche' contiene i percorsi
+        // delle foto, come l'elenco.
+        let fd = Darwin.open(url.path, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW, 0o600)
+        guard fd >= 0 else {
+            broken = true
+            return
+        }
+        handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        opened = true
+        appendOnQueue(Self.stamped(header.hasSuffix("\n") ? header : header + "\n", at: date))
+    }
+
+    private func appendOnQueue(_ text: String) {
+        guard let handle, !broken else { return }
+        do {
+            try handle.write(contentsOf: Data(text.utf8))
+        } catch {
+            broken = true
+        }
+    }
+
+    /// Conservazione (D1 = A): tiene gli ultimi `keepCount` registri, il nuovo compreso. E'
+    /// l'UNICA cancellazione di file di questo intervento, e puo' toccare SOLO:
+    /// - un file REGOLARE (mai una cartella, mai un collegamento: `attributesOfItem` non segue
+    ///   i collegamenti);
+    /// - direttamente dentro la cartella dei log dell'app, gia' controllata fuori da `/Volumes`
+    ///   anche risolvendo i collegamenti (il nome ha superato `isLogFileName`, quindi non
+    ///   contiene `/` ne' `..`);
+    /// - con il nome ESATTO `backup_AAAA-MM-GG_hh-mm-ss.log`, cioe' un registro scritto da qui;
+    /// - mai il registro del job che sta partendo (`protecting`).
+    /// Un errore si ignora: un vecchio registro rimasto non e' un problema. Nessuna foto puo'
+    /// arrivare qui. `JobLogFileTests.testJobLogFile_hasExactlyOneRemoveItem_insidePrune` conta
+    /// le cancellazioni di questa classe.
+    private func prune() {
+        let fm = FileManager.default
+        guard let entries = try? fm.contentsOfDirectory(atPath: directory.path) else { return }
+        let regularLogs = entries.filter { name in
+            guard Self.isLogFileName(name),
+                  let type = try? fm.attributesOfItem(atPath: directory.appendingPathComponent(name).path)[.type]
+                    as? FileAttributeType else { return false }
+            return type == .typeRegular
+        }
+        let current = url.lastPathComponent
+        for name in Self.namesToPrune(regularLogs + [current], keep: Self.keepCount, protecting: current) {
+            try? fm.removeItem(at: directory.appendingPathComponent(name))
+        }
+    }
+}
+
 // MARK: - BackupRunner
 @MainActor
 final class BackupRunner: ObservableObject {
