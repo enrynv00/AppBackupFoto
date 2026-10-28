@@ -11553,6 +11553,86 @@ nonisolated final class FileSyncer: @unchecked Sendable {
 
 }
 
+// MARK: - File non caricati su Cubbit (ROADMAP #43, ADR-0014)
+
+/// Un file che il backup verso Cubbit non ha caricato, con il motivo gia' in parole semplici.
+/// `path` e' il percorso relativo alla radice dell'SSD, che per Cubbit coincide con la chiave.
+// `nonisolated`: value type immutabile; nasce nei task figli di `S3Syncer.sync` e viaggia fino
+// al riepilogo sul main.
+nonisolated struct FailedFile: Equatable, Sendable {
+    let path: String
+    let reason: String
+}
+
+/// I testi del log quando un file fatica ad arrivare su Cubbit (ROADMAP #43, ADR-0014). Logica
+/// pura: nessuna stringa di questi casi nasce in `sync()` o nella View.
+// `nonisolated`: pura, chiamata dai task figli di `sync()` e da `S3Syncer.runWithRetry`.
+nonisolated enum S3UploadText {
+    /// Il motivo di un errore, in una frase semplice seguita dal codice fra parentesi.
+    ///
+    /// Il codice c'e' apposta (D2 = A): `-1001` (Cubbit non risponde in tempo) e `-1005` (la
+    /// connessione cade) chiedono rimedi diversi, e senza il numero la prossima volta non si
+    /// saprebbe quale dei due e' successo. Mai il nome tecnico del tipo d'errore ne' il suo
+    /// dominio: solo il numero.
+    ///
+    /// «Il prossimo backup lo riprovera'» (`failedLine`) e' vero perche' `S3Syncer.shouldUpload`
+    /// carica ogni chiave ASSENTE dal bucket: un PUT fallito non crea l'oggetto, e un caricamento
+    /// a parti fallito viene annullato. **Limite dichiarato**: se Cubbit completa un caricamento a
+    /// parti ma la risposta si perde, il nuovo tentativo di completamento riceve un 404 e il file
+    /// risulta «non caricato» mentre e' gia' su Cubbit; il backup dopo lo vede presente e lo
+    /// salta. Innocuo, gia' vero prima di questo intervento.
+    static func reason(for error: Error) -> String {
+        if error is CancellationError { return "interrotto" }   // non si mostra: chi chiama esclude lo stop prima
+        if let http = error as? S3Syncer.S3HTTPError { return httpReason(http.statusCode) }
+        if let url = error as? URLError { return networkReason(url.code.rawValue) }
+        let ns = error as NSError
+        if ns.domain == NSURLErrorDomain { return networkReason(ns.code) }
+        if ns.domain == NSCocoaErrorDomain, ns.code == NSFileReadNoSuchFileError || ns.code == NSFileNoSuchFileError {
+            return "il file non si trova più sull'SSD (codice \(ns.code))"
+        }
+        // `S3` 13/14: `readFileInChunks` non riesce ad aprire o a leggere il file. 256...511:
+        // gli errori di lettura di Foundation (`NSFileReadErrorMinimum...NSFileReadErrorMaximum`).
+        if (ns.domain == "S3" && (ns.code == 13 || ns.code == 14))
+            || (ns.domain == NSCocoaErrorDomain && (256...511).contains(ns.code)) {
+            return "il file non si è potuto leggere dall'SSD (codice \(ns.code))"
+        }
+        return "errore imprevisto (codice \(ns.code))"
+    }
+
+    private static func networkReason(_ code: Int) -> String {
+        switch code {
+        case URLError.notConnectedToInternet.rawValue: return "il Mac non è collegato a Internet (codice \(code))"
+        case URLError.networkConnectionLost.rawValue: return "la connessione si è interrotta (codice \(code))"
+        case URLError.timedOut.rawValue: return "Cubbit non ha risposto in tempo (codice \(code))"
+        case URLError.cannotFindHost.rawValue, URLError.cannotConnectToHost.rawValue, URLError.dnsLookupFailed.rawValue:
+            return "Cubbit non è raggiungibile (codice \(code))"
+        default: return "problema di rete (codice \(code))"
+        }
+    }
+
+    private static func httpReason(_ status: Int) -> String {
+        switch status {
+        case 429: return "Cubbit ha chiesto di rallentare (codice 429)"
+        case 500...599: return "problema temporaneo di Cubbit (codice \(status))"
+        case 403: return "Cubbit ha rifiutato il file: credenziali o permessi (codice 403)"
+        case 400...499: return "Cubbit ha rifiutato il file (codice \(status))"
+        default: return "risposta di Cubbit non valida (codice \(status))"
+        }
+    }
+
+    /// La riga di un nuovo tentativo: chi, perche', fra quanto, quale tentativo.
+    static func retryLine(key: String, reason: String, delaySeconds: Int, nextAttempt: Int, maxAttempts: Int) -> String {
+        let wait = delaySeconds == 1 ? "1 secondo" : "\(delaySeconds) secondi"
+        return "Connessione difficile con Cubbit per «\(key)»: \(reason). Riprovo tra \(wait) (tentativo \(nextAttempt) di \(maxAttempts))."
+    }
+
+    /// La riga di un file che non si e' caricato. Non dice «resta sull'SSD»: con il motivo «non
+    /// si trova piu' sull'SSD» le due frasi si contraddirebbero sulla stessa riga.
+    static func failedLine(key: String, reason: String) -> String {
+        "Non caricato: «\(key)» — \(reason). Il prossimo backup verso Cubbit lo riproverà da solo."
+    }
+}
+
 // MARK: - S3Syncer (native Swift, no rclone subprocess)
 final class S3Syncer {
 
