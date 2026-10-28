@@ -163,6 +163,7 @@ final class JobLogFileTests: XCTestCase {
         XCTAssertTrue(JobLogFile.isRefused("/Volumes/SSD - Enri/Logs", refusedRoots: roots))
         XCTAssertTrue(JobLogFile.isRefused("/Volumes", refusedRoots: roots))
         XCTAssertTrue(JobLogFile.isRefused("/Users/x/../../Volumes/BackupHDD", refusedRoots: roots))
+        XCTAssertTrue(JobLogFile.isRefused("/volumes/SSD - Enri/Logs", refusedRoots: roots))
         XCTAssertFalse(JobLogFile.isRefused("/VolumesX/a", refusedRoots: roots))
         XCTAssertFalse(JobLogFile.isRefused("/Users/x/Library/Logs/AppBackupFoto", refusedRoots: roots))
     }

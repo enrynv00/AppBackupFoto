@@ -11636,7 +11636,7 @@ nonisolated enum S3UploadText {
     /// La riga di un file che non si e' caricato. Non dice «resta sull'SSD»: con il motivo «non
     /// si trova piu' sull'SSD» le due frasi si contraddirebbero sulla stessa riga.
     static func failedLine(key: String, reason: String) -> String {
-        "Non caricato: «\(key)» — \(reason). Il prossimo backup verso Cubbit lo riproverà da solo."
+        "Non caricato: «\(key)» — \(reason). Il prossimo backup verso Cubbit lo ricontrollerà da solo."
     }
 }
 
@@ -11648,7 +11648,7 @@ nonisolated enum UploadFailureSummary {
         count == 1 ? "1 file non caricato su Cubbit" : "\(count) file non caricati su Cubbit"
     }
 
-    static let reassurance = "Sull'SSD non è stato toccato niente: il prossimo backup verso Cubbit riproverà da solo questi file."
+    static let reassurance = "Sull'SSD non è stato toccato niente: il prossimo backup verso Cubbit ricontrollerà da solo questi file."
 
     static let whereIsTheFullList = "L'elenco completo è in fondo al registro: scheda Log → Salva."
 
@@ -12250,7 +12250,10 @@ final class S3Syncer {
                     continue
                 }
                 result.done += 1
-                let snap = result
+                // L'elenco dei falliti NON viaggia con il progresso: copiarlo a ogni file costerebbe
+                // O(n²) con migliaia di fallimenti. Arriva solo nel risultato finale.
+                var snap = result
+                snap.failures = []
                 DispatchQueue.main.async { onProgress(snap) }
                 addNext()
             }
@@ -12416,6 +12419,7 @@ final class S3Syncer {
                               onStatus: @escaping (String) -> Void,
                               operation: () async throws -> T) async throws -> T {
         try await Self.runWithRetry(
+            maxAttempts: Self.uploadMaxAttempts,
             isCancelled: { self.cancelled || Task.isCancelled },
             sleep: { try await Task.sleep(nanoseconds: UInt64($0 * 1_000_000_000)) },
             onRetry: { reason, delay, next in
@@ -14583,7 +14587,10 @@ nonisolated final class JobLogFile: @unchecked Sendable {
         let comps = URL(fileURLWithPath: path).standardized.pathComponents
         return refusedRoots.contains { root in
             let r = URL(fileURLWithPath: root).standardized.pathComponents
-            return comps.count >= r.count && Array(comps.prefix(r.count)) == r
+            // Senza distinguere maiuscole: su APFS case-insensitive `/volumes/...` porta allo
+            // stesso volume di `/Volumes/...`, e `realpath` non normalizza il caso.
+            return comps.count >= r.count
+                && zip(comps, r).allSatisfy { $0.caseInsensitiveCompare($1) == .orderedSame }
         }
     }
 
@@ -16764,6 +16771,7 @@ final class BackupRunner: ObservableObject {
         listStepState = nil   // un job interrotto durante la copia non deve lasciare "passo 1 di 2" sull'intestazione
         phase = .failed("Interrotto dall'utente")
         completionSnapshot = (phase, stats)
+        stats.elapsed = makeElapsed()   // il timer e' gia' fermo: senza, la riga di chiusura del file avrebbe una durata vecchia
         closeJobLog()
         JobHistoryStore.save(JobSummary(date: Date(), label: jobLabel, copied: stats.copied,
             skipped: stats.skipped, errors: stats.errors, hashErrors: stats.hashErrors,
