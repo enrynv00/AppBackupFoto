@@ -12294,23 +12294,69 @@ final class S3Syncer {
         return (objs, nextToken)
     }
 
-    private func retrying<T>(key: String, maxAttempts: Int = 3,
-                              onStatus: @escaping (String) -> Void,
-                              operation: () async throws -> T) async throws -> T {
+    /// Quante volte si prova ogni richiesta del caricamento verso Cubbit (PUT di un file, avvio,
+    /// parte e completamento di un caricamento a parti): 5, con attese di 1, 2, 4 e 8 secondi
+    /// (`retryDelaySeconds`), 15 secondi in tutto. Fino al 2026-10 erano 3 (attese 1 e 2 s).
+    /// Tre costi, dichiarati (ADR-0014):
+    /// 1. Lo slot del gate (`AdaptiveUploadGate`) resta occupato per tutti i tentativi di
+    ///    un'unita' di lavoro: fino a 15 s di attese in piu', e fino a ~25 minuti se ogni
+    ///    tentativo scade dopo i 300 s di `timeoutIntervalForRequest`.
+    /// 2. Il gate riceve solo l'esito FINALE dell'unita': un errore risolto al secondo tentativo
+    ///    conta come successo, quindi con 5 tentativi il gate rallenta meno spesso di prima. E'
+    ///    voluto (D3 = A): prima si leggono i motivi nel log di un backup vero, poi si decide.
+    /// 3. In un caricamento a parti ogni parte ha i suoi 5 tentativi, e solo una parte che li
+    ///    esaurisce fa annullare il file intero, come prima.
+    // `nonisolated`: una costante; e' il valore di default di `runWithRetry`, che Swift valuta
+    // fuori dal MainActor (senza, un warning di isolamento).
+    nonisolated static let uploadMaxAttempts = 5
+
+    /// Attesa prima del tentativo successivo a `attempt` (1, 2, 4, 8 secondi).
+    nonisolated static func retryDelaySeconds(afterFailedAttempt attempt: Int) -> Double {
+        pow(2, Double(attempt - 1))
+    }
+
+    /// Il ciclo dei tentativi, con l'attesa e l'interruzione passate da fuori: cosi' si prova
+    /// senza rete e senza attese vere (`S3SyncerRetryTests`). Stesso ordine dei controlli di
+    /// sempre: prima l'interruzione, poi «ancora tentativi e errore passeggero»
+    /// (`isRetryable`, invariata), poi l'attesa. La riga del log non nasce qui: `onRetry`
+    /// riceve il motivo gia' in parole semplici, e la costruisce chi chiama.
+    ///
+    /// Separato apposta da `RetryingAlignmentCloud` (progetto 4): li' si ritentano solo LETTURE,
+    /// con altre attese (2, 5, 15 s), un'attesa a fette che «Interrompi» spezza e nessuna riga
+    /// nel log; qui si ritentano le scritture del backup, che sono zero-overwrite per
+    /// costruzione. In comune hanno la sola regola su cosa e' passeggero, `isRetryable`.
+    static func runWithRetry<T>(maxAttempts: Int = uploadMaxAttempts,
+                                isCancelled: () -> Bool,
+                                sleep: (Double) async throws -> Void,
+                                onRetry: (_ reason: String, _ delaySeconds: Int, _ nextAttempt: Int) -> Void,
+                                operation: () async throws -> T) async throws -> T {
         var attempt = 1
         while true {
             do {
                 return try await operation()
             } catch {
-                guard !cancelled, !Task.isCancelled else { throw error }
+                guard !isCancelled() else { throw error }
                 guard attempt < maxAttempts, S3Syncer.isRetryable(error) else { throw error }
-                let delaySec = pow(2.0, Double(attempt - 1))   // 1s, 2s
+                let delay = retryDelaySeconds(afterFailedAttempt: attempt)
                 attempt += 1
-                let msg = "Errore di rete su \(key), riprovo tra \(Int(delaySec))s (tentativo \(attempt)/\(maxAttempts))"
-                DispatchQueue.main.async { onStatus(msg) }
-                try await Task.sleep(nanoseconds: UInt64(delaySec * 1_000_000_000))
+                onRetry(S3UploadText.reason(for: error), Int(delay), attempt)
+                try await sleep(delay)
             }
         }
+    }
+
+    private func retrying<T>(key: String,
+                              onStatus: @escaping (String) -> Void,
+                              operation: () async throws -> T) async throws -> T {
+        try await Self.runWithRetry(
+            isCancelled: { self.cancelled || Task.isCancelled },
+            sleep: { try await Task.sleep(nanoseconds: UInt64($0 * 1_000_000_000)) },
+            onRetry: { reason, delay, next in
+                let msg = S3UploadText.retryLine(key: key, reason: reason, delaySeconds: delay,
+                                                 nextAttempt: next, maxAttempts: Self.uploadMaxAttempts)
+                DispatchQueue.main.async { onStatus(msg) }
+            },
+            operation: operation)
     }
 
     private func upload(url: URL, key: String, config: S3Config, gate: AdaptiveUploadGate,
