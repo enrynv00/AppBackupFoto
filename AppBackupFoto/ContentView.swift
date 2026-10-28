@@ -16086,7 +16086,15 @@ final class BackupRunner: ObservableObject {
     // aggiorna solo come ultimo passo di un backup/importazione (`BackupListStep.shouldRun`,
     // chiamato da `finishCopyStep`) o a mano da Diagnostica (`rebuildLibraryIndex`).
 
+    /// `output` resta tagliato a `maxOut` APPOSTA: la `Text` della scheda Log ridisegna tutta la
+    /// stringa a ogni riga (ADR-0010). Il registro completo e' il file di `jobLog` (ROADMAP #43,
+    /// ADR-0014): da qui in poi `maxOut` limita solo cio' che si vede.
     private let maxOut = 60_000
+    /// Il registro su disco del job in corso; `nil` fuori da un job. Si apre in `run` (dopo il
+    /// cancello) e si chiude in `closeJobLog`, sui tre percorsi in cui un job finisce.
+    private var jobLog: JobLogFile?
+    /// L'ultimo registro aperto, anche a job finito: «Salva» della scheda Log esporta questo.
+    private var lastJobLog: JobLogFile?
     private let maxSpeedSamples = 120
     private let lastDeepKey = "lastDeepMirrorDate"
     private var lastSpeedSampleDate: Date = .distantPast
@@ -16756,6 +16764,7 @@ final class BackupRunner: ObservableObject {
         listStepState = nil   // un job interrotto durante la copia non deve lasciare "passo 1 di 2" sull'intestazione
         phase = .failed("Interrotto dall'utente")
         completionSnapshot = (phase, stats)
+        closeJobLog()
         JobHistoryStore.save(JobSummary(date: Date(), label: jobLabel, copied: stats.copied,
             skipped: stats.skipped, errors: stats.errors, hashErrors: stats.hashErrors,
             succeeded: false, changedSkipped: stats.changedSkipped,
@@ -16846,6 +16855,7 @@ final class BackupRunner: ObservableObject {
             append("STATUS: \(BackupListStep.completionLine(listOutcome).text)\n")
         }
         completionSnapshot = (phase, stats)
+        closeJobLog()
     }
 
     /// - Parameter refreshesLibraryIndex: il job **scrive** sull'SSD (Mac -> SSD, Importa),
@@ -16874,6 +16884,12 @@ final class BackupRunner: ObservableObject {
         wasStopped = false
         let now = Date()
         completionSnapshot = nil; startTime = now
+        // ROADMAP #43: il registro completo su disco, dopo il cancello (un job rifiutato non apre
+        // file). Si chiude in `closeJobLog`, sui tre percorsi in cui un job finisce.
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+        jobLog = JobLogFile(directory: JobLogFile.defaultDirectory(), startedAt: now,
+                            header: "AppBackupFoto \(version) — \(label)")
+        lastJobLog = jobLog
         speedHistory = [SpeedSample(time: now.addingTimeInterval(-2.0), value: 0),
                         SpeedSample(time: now, value: 0)]
         lastSpeedSampleDate = now.addingTimeInterval(-2.1)
@@ -16913,6 +16929,7 @@ final class BackupRunner: ObservableObject {
                     self.listStepState = nil   // un job fallito non deve lasciare "passo 1 di 2" sull'intestazione
                     self.stats.elapsed = self.makeElapsed()
                     self.phase = .failed("Errore: \(error.localizedDescription)")
+                    self.closeJobLog()   // il motivo dell'errore entra nel file con la riga di chiusura
                     Notifier.send(self.phase.label,
                         "Copiati \(self.stats.copied) · Skippati \(self.stats.skipped) · Errori \(self.stats.errors)")
                     self.completionSnapshot = (self.phase, self.stats)
@@ -16989,9 +17006,34 @@ final class BackupRunner: ObservableObject {
         return FileSyncer.SyncResult.hms(Int(smoothedEtaSec))
     }
 
+    /// L'unico punto da cui passano tutte le righe del log (`publishStatus`, passo 2, riepilogo
+    /// dei file non caricati): il file le riceve PRIMA del taglio a `maxOut`.
     private func append(_ text: String) {
+        jobLog?.write(text, at: Date())
         output += text
         if output.count > maxOut { output = String(output.suffix(maxOut)) }
+    }
+
+    /// Chiude il registro su disco del job con i numeri di `stats` e la fase (che sul percorso di
+    /// errore porta il motivo). Le righe che arrivano dopo (aggiornamenti asincroni in ritardo) si
+    /// vedono nell'app ma non entrano nel file: accettato, perche' l'elenco dei file non caricati
+    /// entra prima, in modo sincrono (`finishCopyStep`).
+    private func closeJobLog() {
+        jobLog?.finish(closingLine: JobLogFile.closingLine(phaseLabel: phase.label, copied: stats.copied,
+                                                           skipped: stats.skipped, errors: stats.errors,
+                                                           elapsed: stats.elapsed))
+        jobLog = nil
+    }
+
+    /// «Salva» della scheda Log: il registro INTERO dell'ultimo job, non solo gli ultimi
+    /// `maxOut` caratteri. Senza un registro (nessun job da quando l'app e' aperta) scrive la
+    /// parte visibile, come prima.
+    func exportFullLog(to destination: URL) {
+        if let log = lastJobLog {
+            log.export(to: destination, fallback: output) { _ in }
+        } else {
+            try? output.data(using: .utf8)?.write(to: destination)
+        }
     }
 
     private func makeElapsed() -> String {
@@ -18661,7 +18703,8 @@ struct ContentView: View {
                     }
                     .padding(.horizontal, AppSpacing.lg).padding(.vertical, AppSpacing.sm).background(.regularMaterial)
                     Divider()
-                    SpeedLogPanel(history: runner.speedHistory, output: runner.output, speedUnit: runner.speedUnit, activeTab: $activeSpeedTab)
+                    SpeedLogPanel(history: runner.speedHistory, output: runner.output, speedUnit: runner.speedUnit, activeTab: $activeSpeedTab,
+                                  onSave: { runner.exportFullLog(to: $0) })
                         .padding(.horizontal, AppSpacing.lg).padding(.top, AppSpacing.md).padding(.bottom, AppSpacing.sm)
                     if runner.phase != .idle {
                         Divider()
@@ -19714,6 +19757,8 @@ struct SpeedLogPanel: View {
     let output: String
     let speedUnit: String
     @Binding var activeTab: SpeedLogTab
+    /// «Salva»: esporta il registro completo del job (`BackupRunner.exportFullLog`, ROADMAP #43).
+    let onSave: (URL) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: AppSpacing.sm) {
@@ -19740,7 +19785,7 @@ struct SpeedLogPanel: View {
                         p.allowedContentTypes = [.plainText]
                         p.nameFieldStringValue = "backup_log_\(Int(Date().timeIntervalSince1970)).txt"
                         if p.runModal() == .OK, let url = p.url {
-                            try? output.data(using: .utf8)?.write(to: url)
+                            onSave(url)
                         }
                     } label: { Label("Salva", systemImage: "square.and.arrow.down") }
                     .buttonStyle(.borderless).controlSize(.small)
