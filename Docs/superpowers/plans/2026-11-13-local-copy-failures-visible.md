@@ -201,11 +201,11 @@ Equivalenti dichiarati: 5d, `LocalCopySummary` senza `nonisolated` (chiamata sol
 
 ### Task 7: documentazione
 
-- [ ] `.claude/rules/architecture.md`, sezione `FileSyncer`: voce nuova (ogni file non copiato e ogni copia non identica lascia una riga e finisce in `failedCopies`; due soli punti; percorso relativo costruito cartella per cartella, con il fatto `/private/var`; `progressSnapshot`; motivi da `LocalCopyText` con codice/codice; le misure del 2026-11-13; cosa non è coperto da test).
-- [ ] `.claude/rules/bug-history.md`: in coda a BUG-11 «stesso buco nelle copie locali chiuso da ADR-0020», senza un BUG nuovo.
-- [ ] `Docs/ROADMAP.md` #49: «⏳ implementato il …, verifica dal vivo da fare», correggendo «`failedFiles` già pronto» in «elenco a parte `failedCopies`, ADR-0020»; non ✅ prima del Task 8.
-- [ ] `Docs/CLAUDE.md`: righe «Mac → SSD» e «SSD → HDD» (elenco dei file non copiati e dei motivi); riga «Test automatici» (1.477 → 1.525 misurati; `LocalCopyTextTests` (37) e `FileSyncerFailedCopiesTests` (10) nuovi, `MainThreadIsolationTests` +1); undicesimo tocco in «Stato attuale» con le righe toccate.
-- [ ] Commit solo documentazione.
+- [x] `.claude/rules/architecture.md`, sezione `FileSyncer`: voce nuova (ogni file non copiato e ogni copia non identica lascia una riga e finisce in `failedCopies`; due soli punti; percorso relativo costruito cartella per cartella, con il fatto `/private/var`; `progressSnapshot`; motivi da `LocalCopyText` con codice/codice; le misure del 2026-11-13; cosa non è coperto da test).
+- [x] `.claude/rules/bug-history.md`: in coda a BUG-11 «stesso buco nelle copie locali chiuso da ADR-0020», senza un BUG nuovo.
+- [x] `Docs/ROADMAP.md` #49: «⏳ implementato il …, verifica dal vivo da fare», correggendo «`failedFiles` già pronto» in «elenco a parte `failedCopies`, ADR-0020»; non ✅ prima del Task 8.
+- [x] `Docs/CLAUDE.md`: righe «Mac → SSD» e «SSD → HDD» (elenco dei file non copiati e dei motivi); riga «Test automatici» (1.477 → 1.525 misurati; `LocalCopyTextTests` (37) e `FileSyncerFailedCopiesTests` (10) nuovi, `MainThreadIsolationTests` +1); undicesimo tocco in «Stato attuale» con le righe toccate.
+- [x] Commit solo documentazione.
 
 ### Task 8: verifica dal vivo (Enrico, SSD collegato, app compilata da questo branch)
 
