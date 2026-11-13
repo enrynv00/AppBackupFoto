@@ -11669,6 +11669,128 @@ nonisolated enum UploadFailureSummary {
     }
 }
 
+// MARK: - File non copiati nelle copie locali (ROADMAP #49, ADR-0020)
+
+/// I testi del log quando una copia locale (Mac → SSD, SSD → HDD, Importa) non copia un file o
+/// lo copia non identico. Logica pura: nessuna stringa di questi casi nasce in `syncFile`.
+// `nonisolated`: pura, senza stato e senza accesso al disco; la chiama `syncFile` dalla coda di
+// fondo di `FileSyncer`.
+nonisolated enum LocalCopyText {
+    /// Il motivo di un errore di `createDirectory`/`copyItem`, in una frase semplice seguita dal
+    /// codice fra parentesi: «(codice C/P)» con codice Cocoa e di sistema, «(codice N)» con uno
+    /// solo. Mai il nome tecnico del tipo d'errore ne' il suo dominio: solo i numeri.
+    ///
+    /// Si decide prima sul codice di sistema (POSIX), poi su quello Cocoa: il Cocoa da solo
+    /// confonde «permesso negato» (13) e «macOS non ha dato il permesso» (1, file bloccato o
+    /// «Accesso completo al disco» perso).
+    ///
+    /// Misurato il 2026-11-13 su immagini APFS ed exFAT (FSKit): disco pieno = 640/28 e nessuna
+    /// copia parziale a destinazione; sorgente illeggibile e cartella di destinazione non
+    /// scrivibile danno lo STESSO 513/13 (per questo «permesso negato» non dice quale dei due);
+    /// una destinazione comparsa dopo il controllo dà 516/17 e resta intatta. NON misurati:
+    /// errori a meta' copia diversi dal disco pieno (lettura, disco staccato).
+    ///
+    /// La riga che la usa (`failedLine`) non promette che il prossimo backup lo rifara': dopo un
+    /// errore a meta' copia non e' misurato che a destinazione non resti niente, e un file
+    /// rimasto li' per la regola zero-overwrite non verrebbe riprovato.
+    static func reason(for error: Error) -> String {
+        let ns = error as NSError
+        var posix: Int?
+        var cocoa: Int?
+        if ns.domain == NSPOSIXErrorDomain {
+            posix = ns.code
+        } else {
+            if ns.domain == NSCocoaErrorDomain { cocoa = ns.code }
+            if let under = ns.userInfo[NSUnderlyingErrorKey] as? NSError, under.domain == NSPOSIXErrorDomain {
+                posix = under.code
+            }
+        }
+        let code: String
+        switch (cocoa, posix) {
+        case let (c?, p?): code = "\(c)/\(p)"
+        case let (c?, nil): code = "\(c)"
+        case let (nil, p?): code = "\(p)"
+        case (nil, nil): code = "\(ns.code)"
+        }
+        // Codici di sistema: 28 ENOSPC, 13 EACCES, 1 EPERM, 2 ENOENT, 17 EEXIST, 30 EROFS,
+        // 63 ENAMETOOLONG, 20 ENOTDIR, 5 EIO, 6 ENXIO.
+        // Codici Cocoa: 640 spazio, 513/257 permesso, 4/260 file assente, 516 esiste gia',
+        // 642 volume in sola lettura.
+        let kind: Kind
+        if let posix {
+            switch posix {
+            case 28: kind = .diskFull
+            case 13: kind = .permissionDenied
+            case 1: kind = .notPermittedByMacOS
+            case 2: kind = .vanished
+            case 17: kind = .alreadyThere
+            case 30: kind = .readOnlyDisk
+            case 63: kind = .nameTooLong
+            case 20: kind = .parentIsAFile
+            case 5: kind = .ioError
+            case 6: kind = .diskNotResponding
+            default: kind = cocoaKind(cocoa)
+            }
+        } else {
+            kind = cocoaKind(cocoa)
+        }
+        return text(for: kind) + " (codice \(code))"
+    }
+
+    private enum Kind {
+        case diskFull, permissionDenied, notPermittedByMacOS, vanished, alreadyThere, readOnlyDisk
+        case nameTooLong, parentIsAFile, ioError, diskNotResponding, unknown
+    }
+
+    private static func cocoaKind(_ cocoa: Int?) -> Kind {
+        switch cocoa {
+        case 640?: return .diskFull
+        case 513?, 257?: return .permissionDenied
+        case 4?, 260?: return .vanished
+        case 516?: return .alreadyThere
+        case 642?: return .readOnlyDisk
+        default: return .unknown
+        }
+    }
+
+    private static func text(for kind: Kind) -> String {
+        switch kind {
+        case .diskFull: return "il disco di destinazione è pieno"
+        case .permissionDenied:
+            return "permesso negato: non si è potuto leggere il file o scrivere nella cartella di destinazione"
+        case .notPermittedByMacOS:
+            return "macOS non ha dato il permesso: il file è bloccato oppure all'app manca l'«Accesso completo al disco»"
+        case .vanished: return "il file non c'è più dove l'app lo cercava"
+        case .alreadyThere:
+            return "a destinazione c'è già un file con questo nome: non è stato sovrascritto"
+        case .readOnlyDisk: return "il disco di destinazione è in sola lettura"
+        case .nameTooLong: return "il nome del file o di una cartella è troppo lungo"
+        case .parentIsAFile: return "a destinazione c'è un file al posto di una cartella"
+        case .ioError: return "il disco ha dato un errore di lettura o scrittura"
+        case .diskNotResponding: return "il disco non risponde: forse è stato scollegato"
+        case .unknown: return "errore imprevisto"
+        }
+    }
+
+    static let mismatchReason = "la copia appena fatta non è identica all'originale"
+
+    /// La riga di un file non copiato. Non promette niente sul prossimo backup (vedi `reason`).
+    static func failedLine(path: String, reason: String) -> String {
+        "Non copiato: «\(path)» — \(reason)."
+    }
+
+    /// La riga di una copia non identica. Per la regola zero-overwrite l'app non la rifara' da sola.
+    static func mismatchLine(path: String) -> String {
+        "Copia non identica: «\(path)» — \(mismatchReason). L'app non sovrascrive mai, quindi non la rifà da sola."
+    }
+
+    /// Il percorso relativo di un elemento, costruito cartella per cartella: togliere la radice
+    /// dalla stringa sbaglierebbe con i collegamenti (`/var` → `/private/var`, misurato).
+    static func relativeChild(of parent: String, name: String) -> String {
+        parent.isEmpty ? name : parent + "/" + name
+    }
+}
+
 // MARK: - S3Syncer (native Swift, no rclone subprocess)
 final class S3Syncer {
 
