@@ -230,7 +230,8 @@ final class LocalCopyTextTests: XCTestCase {
         let onlyFailed = LocalCopySummary.reassurance(failed: 2, mismatched: 0)
         XCTAssertEqual(onlyFailed.count, 1)
         XCTAssertTrue(onlyFailed[0].contains("originali non sono stati toccati"), onlyFailed[0])
-        XCTAssertTrue(onlyFailed[0].contains("mancano ancora"), onlyFailed[0])
+        XCTAssertTrue(onlyFailed[0].contains("non ci sono"), onlyFailed[0])
+        XCTAssertTrue(onlyFailed[0].contains("a metà"), onlyFailed[0])
 
         let onlyMismatched = LocalCopySummary.reassurance(failed: 0, mismatched: 2)
         XCTAssertEqual(onlyMismatched.count, 1)
@@ -267,5 +268,26 @@ final class LocalCopyTextTests: XCTestCase {
             for line in LocalCopySummary.reassurance(failed: f, mismatched: m) { Self.assertNoJargon(line) }
         }
         Self.assertNoJargon(LocalCopySummary.whereIsTheFullList)
+    }
+
+    // MARK: - Dalla revisione del Task 5
+
+    func testReason_nonCocoaDomain_neverUsesTheCocoaBands() {
+        XCTAssertTrue(reason(NSError(domain: "XYZ", code: 640)).contains("errore imprevisto (codice 640)"))
+        XCTAssertTrue(reason(NSError(domain: "XYZ", code: 300)).contains("errore imprevisto (codice 300)"))
+    }
+
+    func testReason_unknownPosix_fallsBackToCocoa() {
+        let r = reason(cocoa(640, posix: 22))
+        XCTAssertTrue(r.contains("pieno"), r)
+        XCTAssertTrue(r.contains("(codice 640/22)"), r)
+    }
+
+    func testReason_bandEdges() {
+        XCTAssertTrue(reason(cocoa(255, posix: nil)).contains("errore imprevisto"))
+        XCTAssertTrue(reason(cocoa(256, posix: nil)).contains("non si è potuto leggere"))
+        XCTAssertTrue(reason(cocoa(511, posix: nil)).contains("non si è potuto leggere"))
+        XCTAssertTrue(reason(cocoa(767, posix: nil)).contains("non si è potuto scrivere"))
+        XCTAssertTrue(reason(cocoa(768, posix: nil)).contains("errore imprevisto"))
     }
 }

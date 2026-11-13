@@ -11860,7 +11860,7 @@ nonisolated enum LocalCopySummary {
     static func reassurance(failed: Int, mismatched: Int) -> [String] {
         var lines: [String] = []
         if failed > 0 {
-            lines.append("Gli originali non sono stati toccati: il prossimo backup riprova da solo i file che a destinazione mancano ancora.")
+            lines.append("Gli originali non sono stati toccati. Il prossimo backup, o un nuovo import, riprova i file che a destinazione non ci sono; se ne è rimasto uno a metà, l'app non lo sostituisce e va controllato a mano.")
         }
         if mismatched > 0 {
             lines.append("Le copie non identiche restano come sono: l'app non sovrascrive mai, quindi non le rifà da sola. Vanno controllate a mano.")
