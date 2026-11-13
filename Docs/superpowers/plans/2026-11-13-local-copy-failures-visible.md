@@ -207,7 +207,13 @@ Equivalenti dichiarati: 5d, `LocalCopySummary` senza `nonisolated` (chiamata sol
 - [x] `Docs/CLAUDE.md`: righe «Mac → SSD» e «SSD → HDD» (elenco dei file non copiati e dei motivi); riga «Test automatici» (1.477 → 1.525 misurati; `LocalCopyTextTests` (37) e `FileSyncerFailedCopiesTests` (10) nuovi, `MainThreadIsolationTests` +1); undicesimo tocco in «Stato attuale» con le righe toccate.
 - [x] Commit solo documentazione.
 
-### Task 8: verifica dal vivo (Enrico, SSD collegato, app compilata da questo branch)
+### Task 8: verifica dal vivo — ✅ fatta il 2026-11-13
+
+Esito: verificato dal vivo il 2026-11-13: import di 3 file con uno illeggibile → 2 copiati, 1 errore, riga «Non copiato … (codice 513/13)» nel log, sezione «1 file non copiato» nel riepilogo, elenco in fondo al registro; poi file reso leggibile → 1 copiato, 0 errori. La prima prova era girata sulla copia vecchia dell'app, aperta da macOS al posto di quella nuova; ripetuta sulla build del branch. Il motivo nel riepilogo si vede troncato a metà riga, intero nel log.
+
+Testo originale del task:
+
+#### Task 8: verifica dal vivo (Enrico, SSD collegato, app compilata da questo branch)
 
 Si fa insieme al Task 10 del piano #43, stessa build.
 1. Sul Desktop crea la cartella `prova-49` con 3 screenshot nuovi (contenuti mai visti dall'app, altrimenti l'import li salta come doppioni). Nel Terminale: `chmod 000 ~/Desktop/prova-49/<uno dei tre>`.
