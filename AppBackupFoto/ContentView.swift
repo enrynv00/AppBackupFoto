@@ -11385,7 +11385,7 @@ nonisolated final class FileSyncer: @unchecked Sendable {
                     if !self.fm.fileExists(atPath: dst.path) {
                         try self.fm.createDirectory(at: dst, withIntermediateDirectories: true)
                     }
-                    try self.syncDir(src: src, dst: dst, base: src, deep: deep,
+                    try self.syncDir(src: src, dst: dst, base: src, relativeDir: "", deep: deep,
                                      result: &result, progress: &throttle,
                                      onStatus: onStatus, onProgress: onProgress,
                                      onCurrentFile: onCurrentFile,
@@ -11419,7 +11419,7 @@ nonisolated final class FileSyncer: @unchecked Sendable {
         return n
     }
 
-    private func syncDir(src: URL, dst: URL, base: URL, deep: Bool,
+    private func syncDir(src: URL, dst: URL, base: URL, relativeDir: String, deep: Bool,
                          result: inout SyncResult,
                          progress: inout ProgressThrottle,
                          onStatus: @escaping (String) -> Void,
@@ -11446,14 +11446,17 @@ nonisolated final class FileSyncer: @unchecked Sendable {
             if shouldExclude(item) { continue }
             let vals = try? item.resourceValues(forKeys: [.isRegularFileKey, .isDirectoryKey])
             let destItem = dst.appendingPathComponent(item.lastPathComponent)
+            // Percorso relativo costruito cartella per cartella (ADR-0020): togliere `base` dalla
+            // stringa sbaglierebbe con i collegamenti (`/var` → `/private/var`).
+            let rel = LocalCopyText.relativeChild(of: relativeDir, name: item.lastPathComponent)
             if vals?.isDirectory == true {
-                try syncDir(src: item, dst: destItem, base: base, deep: deep,
+                try syncDir(src: item, dst: destItem, base: base, relativeDir: rel, deep: deep,
                             result: &result, progress: &progress, onStatus: onStatus, onProgress: onProgress,
                             onCurrentFile: onCurrentFile,
                             isDuplicate: isDuplicate, onCopied: onCopied,
                             onUnverified: onUnverified)
             } else if vals?.isRegularFile == true {
-                syncFile(src: item, dst: destItem, deep: deep,
+                syncFile(src: item, dst: destItem, relativePath: rel, deep: deep,
                          result: &result, progress: &progress, onStatus: onStatus, onProgress: onProgress,
                          onCurrentFile: onCurrentFile,
                          isDuplicate: isDuplicate, onCopied: onCopied,
@@ -11462,7 +11465,7 @@ nonisolated final class FileSyncer: @unchecked Sendable {
         }
     }
 
-    private func syncFile(src: URL, dst: URL, deep: Bool,
+    private func syncFile(src: URL, dst: URL, relativePath: String, deep: Bool,
                           result: inout SyncResult,
                           progress: inout ProgressThrottle,
                           onStatus: @escaping (String) -> Void,
@@ -11510,7 +11513,7 @@ nonisolated final class FileSyncer: @unchecked Sendable {
                 let name = src.lastPathComponent
                 DispatchQueue.main.async { onStatus("Già in libreria, non copiato: \(name)") }
             } else {
-                let snap = result
+                let snap = result.progressSnapshot
                 DispatchQueue.main.async {
                     onStatus("Copia (\(snap.done + 1)/\(snap.total) — \(snap.percent)%): \(src.lastPathComponent)")
                     onCurrentFile(src)
@@ -11546,8 +11549,11 @@ nonisolated final class FileSyncer: @unchecked Sendable {
                             // non viene riconosciuto e il file viene copiato due volte.
                             onCopied(dst, srcHash)
                         } else {
-                            result.hashErrors += 1   // mismatch SHA256: conteggiato separato da errori I/O
-                            DispatchQueue.main.async { onStatus("⚠️ HASH MISMATCH: \(name) — copia non integra, controlla il log") }
+                            // mismatch SHA256: conteggiato separato da errori I/O, e ora anche
+                            // elencato col percorso (ADR-0020)
+                            result.recordCopyMismatch(path: relativePath)
+                            let line = LocalCopyText.mismatchLine(path: relativePath)
+                            DispatchQueue.main.async { onStatus(line) }
                         }
                     } else {
                         result.copiedUnverified += 1
@@ -11559,13 +11565,18 @@ nonisolated final class FileSyncer: @unchecked Sendable {
                         onUnverified(dst)
                         DispatchQueue.main.async { onStatus("⚠️ Copiato ma non verificato: \(name) — la verifica SHA256 non ha potuto concludersi") }
                     }
-                } catch { result.errors += 1 }
+                } catch {
+                    let reason = LocalCopyText.reason(for: error)
+                    result.recordCopyFailure(path: relativePath, reason: reason)
+                    let line = LocalCopyText.failedLine(path: relativePath, reason: reason)
+                    DispatchQueue.main.async { onStatus(line) }
+                }
             }
         } else {
             result.skipped += 1
         }
         result.done += 1
-        let snap = result
+        let snap = result.progressSnapshot
         // Diradato alla fonte (ADR-0010, ROADMAP #37): al massimo ~10 aggiornamenti al
         // secondo, sempre quello finale (`isFinal` quando il conteggio combacia — non e' la
         // sola garanzia: `sync` pubblica comunque un ultimo valore su ogni uscita).

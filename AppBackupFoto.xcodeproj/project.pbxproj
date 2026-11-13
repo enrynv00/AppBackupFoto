@@ -89,6 +89,7 @@
 		FA5F6A8DDFB9AB28A1BAA9BA /* JobLogFileTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C53CCEF7AF2529DD863E818D /* JobLogFileTests.swift */; };
 		DC2CC96B22A4D122F6F6E4CE /* S3UploadTextTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F901D97C39FFEDA58D187B40 /* S3UploadTextTests.swift */; };
 		AEEB14414B517F69BAD8E045 /* LocalCopyTextTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 635D798B96BD62D040CB88F9 /* LocalCopyTextTests.swift */; };
+		6232D0E79307D96CCF0CEB4A /* FileSyncerFailedCopiesTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C15AE6A68B2D49F478DE2901 /* FileSyncerFailedCopiesTests.swift */; };
 		255A3AA71DDFE641F9C6F2AE /* FileChunkReaderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5F270C13D1A381946DF4E81B /* FileChunkReaderTests.swift */; };
 		B8FEBDB3EAD640DBA38947CB /* S3SyncerShouldUploadTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 341852AA3B0747288264B871 /* S3SyncerShouldUploadTests.swift */; };
 		34FFD73F7D614F9B912BFEDE /* FileSyncerChangedSkippedTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5FB09246AC4F438A9234A536 /* FileSyncerChangedSkippedTests.swift */; };
@@ -200,6 +201,7 @@
 		C53CCEF7AF2529DD863E818D /* JobLogFileTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = JobLogFileTests.swift; sourceTree = "<group>"; };
 		F901D97C39FFEDA58D187B40 /* S3UploadTextTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = S3UploadTextTests.swift; sourceTree = "<group>"; };
 		635D798B96BD62D040CB88F9 /* LocalCopyTextTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = LocalCopyTextTests.swift; sourceTree = "<group>"; };
+		C15AE6A68B2D49F478DE2901 /* FileSyncerFailedCopiesTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = FileSyncerFailedCopiesTests.swift; sourceTree = "<group>"; };
 		5F270C13D1A381946DF4E81B /* FileChunkReaderTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = FileChunkReaderTests.swift; sourceTree = "<group>"; };
 		86D59F53CF7A4DCE8C207DBC /* S3SyncerMultipartXMLTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = S3SyncerMultipartXMLTests.swift; sourceTree = "<group>"; };
 		DF69E956480846C09D2D1D03 /* S3ListSpecialCharsTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = S3ListSpecialCharsTests.swift; sourceTree = "<group>"; };
@@ -338,6 +340,7 @@
 				C53CCEF7AF2529DD863E818D /* JobLogFileTests.swift */,
 				F901D97C39FFEDA58D187B40 /* S3UploadTextTests.swift */,
 				635D798B96BD62D040CB88F9 /* LocalCopyTextTests.swift */,
+				C15AE6A68B2D49F478DE2901 /* FileSyncerFailedCopiesTests.swift */,
 				5F270C13D1A381946DF4E81B /* FileChunkReaderTests.swift */,
 				86D59F53CF7A4DCE8C207DBC /* S3SyncerMultipartXMLTests.swift */,
 				DF69E956480846C09D2D1D03 /* S3ListSpecialCharsTests.swift */,
@@ -569,6 +572,7 @@
 				FA5F6A8DDFB9AB28A1BAA9BA /* JobLogFileTests.swift in Sources */,
 				DC2CC96B22A4D122F6F6E4CE /* S3UploadTextTests.swift in Sources */,
 				AEEB14414B517F69BAD8E045 /* LocalCopyTextTests.swift in Sources */,
+				6232D0E79307D96CCF0CEB4A /* FileSyncerFailedCopiesTests.swift in Sources */,
 				255A3AA71DDFE641F9C6F2AE /* FileChunkReaderTests.swift in Sources */,
 				3232CD64269D4A9094F04D9E /* S3SyncerMultipartXMLTests.swift in Sources */,
 				B45FDD70632A473A81AC7E51 /* S3ListSpecialCharsTests.swift in Sources */,

@@ -459,4 +459,20 @@ final class MainThreadIsolationTests: XCTestCase {
         XCTAssertEqual(done.wait(timeout: .now() + 5), .success,
                        "JobLogFile ha avuto bisogno del main thread: il tipo e' tornato @MainActor?")
     }
+
+    /// ROADMAP #49: i testi delle copie locali si calcolano sulla coda di fondo di `FileSyncer`,
+    /// mai sul main.
+    func testLocalCopyText_runsWithoutTheMainThread() {
+        let done = DispatchSemaphore(value: 0)
+        Task.detached {
+            let error = NSError(domain: NSCocoaErrorDomain, code: 513,
+                                userInfo: [NSUnderlyingErrorKey: NSError(domain: NSPOSIXErrorDomain, code: 13)])
+            let reason = LocalCopyText.reason(for: error)
+            _ = LocalCopyText.failedLine(path: "a.jpg", reason: reason)
+            _ = LocalCopyText.mismatchLine(path: "a.jpg")
+            done.signal()
+        }
+        XCTAssertEqual(done.wait(timeout: .now() + 5), .success,
+                       "LocalCopyText ha avuto bisogno del main thread: il tipo e' tornato @MainActor?")
+    }
 }

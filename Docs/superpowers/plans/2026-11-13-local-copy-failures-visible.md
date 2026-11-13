@@ -120,7 +120,7 @@ Come nel piano `2026-09-26-s3-upload-failures-visible.md`, sezione «Comandi di 
   5. `testHashMismatch_isListedWithPath_andCountsAsHashError` — `hashFunction` come in `testRealMismatch_…`, file `sub/a.jpg`: `hashErrors == 1`, `errors == 0`, una voce con `mismatchReason` e `path == "sub/a.jpg"`; la riga di stato contiene «Copia non identica: «sub/a.jpg»».
   6. `testRelativePath_isRightThroughTheVarLink_andWithUnicode` — `src/a b/c/x é.jpg`, `dst/a b/c` con `0555`: `path == "a b/c/x é.jpg"` (la cartella temporanea è `/var/…`, il listing dà `/private/var/…`: è il fatto misurato).
   7. `testCountersAndList_alwaysAgree` — un fallimento per permessi più un mismatch più un file copiato: `failedCopies.count == errors + hashErrors` e `copied + skipped + errors + hashErrors + copiedUnverified == done`.
-  8. `testProgressUpdates_neverCarryTheList` — `FileSyncer(progressIntervalNanos: 0)`, due file che falliscono: ogni `SyncResult` ricevuto da `onProgress` ha `failedCopies` vuoto, il risultato restituito ne ha 2.
+  8. `testProgressUpdates_duringTheWork_neverCarryTheList` — `FileSyncer(progressIntervalNanos: 0)`, due file che falliscono: tutti i `SyncResult` ricevuti da `onProgress` tranne l'ultimo hanno `failedCopies` vuoto, l'ultimo ne ha 2 (uguale al risultato finale), e anche il risultato restituito ne ha 2.
   9. `testSuccessfulSync_hasEmptyList` — `failedCopies` vuoto, `errors == 0`.
   10. `testLocalFailures_neverFillTheCubbitList` — dopo il caso 1, `failedFiles` è vuoto.
   - In coda a `MainThreadIsolationTests`: `testLocalCopyText_runsWithoutTheMainThread`, stesso schema di `testJobLogFile_writesWithoutTheMainThread` (`Task.detached` che chiama `reason(for:)`, `failedLine`, `mismatchLine`; semaforo con 5 s).
@@ -129,7 +129,7 @@ Come nel piano `2026-09-26-s3-upload-failures-visible.md`, sezione «Comandi di 
   - `syncDir` riceve `relativeDir: String` e `syncFile` riceve `relativePath: String`, senza default, come gli altri parametri privati. `sync` passa `relativeDir: ""`. In `syncDir`, `let rel = LocalCopyText.relativeChild(of: relativeDir, name: item.lastPathComponent)` va alla ricorsione e a `syncFile`. `base` resta.
   - Ramo mismatch: `result.hashErrors += 1` + riga «HASH MISMATCH» diventano `result.recordCopyMismatch(path: relativePath)` + `let line = LocalCopyText.mismatchLine(path: relativePath)` + `DispatchQueue.main.async { onStatus(line) }`.
   - `catch`: `let reason = LocalCopyText.reason(for: error); result.recordCopyFailure(path: relativePath, reason: reason); let line = LocalCopyText.failedLine(path: relativePath, reason: reason); DispatchQueue.main.async { onStatus(line) }`.
-  - Le due copie durante il lavoro (quella prima della riga «Copia (…)» e quella dopo `result.done += 1`) diventano `let snap = result.progressSnapshot`. Le due finali in `sync` restano `let snap = result`.
+  - Le due copie durante il lavoro (quella prima della riga «Copia (…)» e quella dopo `result.done += 1`) diventano `let snap = result.progressSnapshot`. Le due finali in `sync` restano `let snap = result` (l'ultimo `onProgress` e' uno solo: l'elenco copiato li' non costa niente, e progresso finale e risultato restano identici).
 - [ ] **Step 4:** rileggi il diff: nessuna altra riga di `syncFile`/`syncDir` è cambiata; `grep -c` della regola 3 invariati; `grep -n "result.errors += 1\|hashErrors += 1" ContentView.swift` → nessuna occorrenza dentro `FileSyncer` (restano solo in `recordCopyFailure`/`recordCopyMismatch`/`recordFailure`).
 - [ ] **Step 5:** `fasttest.sh FileSyncerFailedCopiesTests` → 10; `fasttest.sh` → **1.514**, 0 warning. **Controllo `xcodebuild`**: 1.514 (1.504 = `FileSyncerFailedCopiesTests` non registrato). Devono restare verdi senza modifiche `FileSyncerZeroOverwriteTests`, `FileSyncerChangedSkippedTests`, `FileSyncerHashVerificationTests`, `ImportDedupTests`, `FileSyncerProgressThrottleTests`.
 - [ ] **Step 6: Security/Rules Auditor obbligatorio:** (1) zero-overwrite di `syncFile` invariato riga per riga; (2) nessuna operazione FileManager nuova o spostata (conteggi); (3) `LocalCopyText` è `nonisolated` e non tocca il disco; (4) il test 3 prova che una destinazione comparsa dopo il controllo non viene sovrascritta. Commit, con una riga per l'Auditor.
@@ -165,10 +165,10 @@ Ogni mutante deve risultare UCCISO:
 - 2d: `relativeChild` con «/» iniziale alla radice → `testRelativeChild`
 - 2e: `LocalCopyText` senza `nonisolated` → warning (build rossa) e `testLocalCopyText_runsWithoutTheMainThread`
 - 3a: `recordCopyFailure` senza `errors += 1` → test 3/7
-- 3b: `progressSnapshot` che non svuota → `testProgressSnapshot` e test 8
+- 3b: `progressSnapshot` che non svuota → `testProgressSnapshot` e test 8 (`testProgressUpdates_duringTheWork_neverCarryTheList`)
 - 4a: `catch` tornato a `errors += 1` → test 1/2
 - 4b: `relativePath = item.lastPathComponent` → test 1/6
-- 4c: copie durante il lavoro con `result` → test 8
+- 4c: copie durante il lavoro con `result` → `testProgressUpdates_duringTheWork_neverCarryTheList`
 - 4d: mismatch senza elenco → test 5
 - 5a: plurale invertito; 5b: `logLines` con un limite; 5c: rassicurazione senza la riga sulle copie non identiche
 
@@ -200,7 +200,7 @@ Non provabili dal vivo, coperti dai test: copia non identica, disco pieno, desti
 ## Rischi
 
 - Migliaia di righe con un disco pieno: frequenza al massimo doppia rispetto a oggi; il registro le tiene tutte.
-- `progressSnapshot` dimenticato in un punto futuro: il costo torna a crescere col quadrato a migliaia di errori; lo prende il test 8.
+- `progressSnapshot` dimenticato in un punto futuro: il costo torna a crescere col quadrato a migliaia di errori; lo prende `testProgressUpdates_duringTheWork_neverCarryTheList`.
 - La riga «HASH MISMATCH» sparisce: chi la cercava nei vecchi registri trova «Copia non identica».
 
 ## Fuori scope (dichiarato)
