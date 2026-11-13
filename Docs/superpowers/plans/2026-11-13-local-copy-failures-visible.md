@@ -158,7 +158,31 @@ Come nel piano `2026-09-26-s3-upload-failures-visible.md`, sezione «Comandi di 
 
 ### Task 6: mutation testing (copia nello scratch, mai il repository)
 
-Ogni mutante deve risultare UCCISO:
+**Fatto il 2026-11-13** (copie in `/private/tmp/claude-501/local-failures/mut/`, suite completa di 1.525 test per ogni mutante, uno alla volta): 18 uccisi su 19, più 5d equivalente dichiarato e 4c-1 equivalente dichiarato. Nessun commit nel repository.
+
+| Mutante | Esito | Test che lo uccidono |
+| :--- | :--- | :--- |
+| 2a | UCCISO | `testReason_diskFull`, `testReason_posixErrorAlone` |
+| 2b | UCCISO | `testReason_notPermittedByMacOS`, `testReason_fileTooBig`, `testReason_illegalCharacters`, `testReason_ioError`, `testReason_parentIsAFile`, `testReason_diskNotResponding` |
+| 2c | UCCISO | gli stessi di 2b più `testReason_posixErrorAlone` |
+| 2d | UCCISO | `testRelativeChild`, `FileSyncerFailedCopiesTests` 1, 2, 4, 5, 6 |
+| 2e | UCCISO | `testLocalCopyText_runsWithoutTheMainThread`; nel target vero anche build rossa (10 warning di isolamento) |
+| 2f (togliere il controllo `ns.domain == NSCocoaErrorDomain`) | UCCISO | `testReason_nonCocoaDomain_neverUsesTheCocoaBands` |
+| 3a | UCCISO | `testCountersAndList_alwaysAgree`, `testRecordCopyFailure_countsAndRemembers`, `FileSyncerFailedCopiesTests` 1 e 3, `ImportDedupTests.testUnreadableSourceFile_isNeverDeclaredDuplicate` |
+| 3b | UCCISO | `testProgressSnapshot_dropsOnlyTheList`, `testProgressUpdates_duringTheWork_neverCarryTheList` |
+| 4a | UCCISO | 8 test di `FileSyncerFailedCopiesTests` (1, 2, 3, 4, 6, 7, 8, 10) |
+| 4b | UCCISO | `FileSyncerFailedCopiesTests` 1, 2, 5, 6 |
+| 4c-2 (copia dopo `done += 1`, quella che arriva a `onProgress`) | UCCISO | `testProgressUpdates_duringTheWork_neverCarryTheList` |
+| 4c-1 (copia prima della riga «Copia (…)») | **EQUIVALENTE, dichiarato** | nessuno: la copia serve solo a comporre il testo della riga di stato e viaggia in una closure sul main; con l'elenco dentro cambia solo il costo di copia, e nessun test puo' vederla senza misurarlo |
+| 4d | UCCISO | `testHashMismatch_isListedWithPath_andCountsAsHashError`, `testCountersAndList_alwaysAgree` |
+| 5a | UCCISO | `testHeadline_failedOnly`, `testHeadline_both` |
+| 5b | UCCISO | `testLogLines_listEveryFile_noLimit` |
+| 5c | UCCISO | `testReassurance_dependsOnWhatHappened` |
+| 5d | EQUIVALENTE, dichiarato | nessuno (chiamata solo dal main) |
+
+Dopo i mutanti 5b e 5c il runner era caduto con «Index out of range»: i due test indicizzavano senza guardia. Ora un `guard` sul conteggio protegge gli indici (le asserzioni non cambiano).
+
+Elenco di partenza (i mutanti da provare):
 - 2a: 28 tradotto come «permesso negato» → `testReason_diskFull`
 - 2b: decide prima il codice Cocoa → `testReason_notPermittedByMacOS`
 - 2c: solo il codice esterno → `testReason_diskFull`
@@ -168,11 +192,12 @@ Ogni mutante deve risultare UCCISO:
 - 3b: `progressSnapshot` che non svuota → `testProgressSnapshot` e test 8 (`testProgressUpdates_duringTheWork_neverCarryTheList`)
 - 4a: `catch` tornato a `errors += 1` → test 1/2
 - 4b: `relativePath = item.lastPathComponent` → test 1/6
-- 4c: copie durante il lavoro con `result` → `testProgressUpdates_duringTheWork_neverCarryTheList`
+- 4c: copie durante il lavoro con `result` → `testProgressUpdates_duringTheWork_neverCarryTheList` (diviso in 4c-1, prima di «Copia (…)», e 4c-2, dopo `done += 1`: vedi la tabella)
+- 2f: tolto il controllo `ns.domain == NSCocoaErrorDomain` → `testReason_nonCocoaDomain_neverUsesTheCocoaBands`
 - 4d: mismatch senza elenco → test 5
 - 5a: plurale invertito; 5b: `logLines` con un limite; 5c: rassicurazione senza la riga sulle copie non identiche
 
-Equivalente dichiarato: 5d, `LocalCopySummary` senza `nonisolated` (chiamata solo dal main).
+Equivalenti dichiarati: 5d, `LocalCopySummary` senza `nonisolated` (chiamata solo dal main); 4c-1, la copia prima della riga «Copia (…)» (serve solo al testo di stato).
 
 ### Task 7: documentazione
 

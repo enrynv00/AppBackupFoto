@@ -229,16 +229,19 @@ final class LocalCopyTextTests: XCTestCase {
     func testReassurance_dependsOnWhatHappened() {
         let onlyFailed = LocalCopySummary.reassurance(failed: 2, mismatched: 0)
         XCTAssertEqual(onlyFailed.count, 1)
+        guard onlyFailed.count == 1 else { return }
         XCTAssertTrue(onlyFailed[0].contains("originali non sono stati toccati"), onlyFailed[0])
         XCTAssertTrue(onlyFailed[0].contains("non ci sono"), onlyFailed[0])
         XCTAssertTrue(onlyFailed[0].contains("a metà"), onlyFailed[0])
 
         let onlyMismatched = LocalCopySummary.reassurance(failed: 0, mismatched: 2)
         XCTAssertEqual(onlyMismatched.count, 1)
+        guard onlyMismatched.count == 1 else { return }
         XCTAssertTrue(onlyMismatched[0].contains("non sovrascrive mai"), onlyMismatched[0])
 
         let both = LocalCopySummary.reassurance(failed: 1, mismatched: 1)
         XCTAssertEqual(both.count, 2)
+        guard both.count == 2 else { return }
         XCTAssertTrue(both[0].contains("originali non sono stati toccati"), both[0])
         XCTAssertTrue(both[1].contains("non sovrascrive mai"), both[1])
     }
@@ -253,6 +256,7 @@ final class LocalCopyTextTests: XCTestCase {
         let list = entries(20)
         let lines = LocalCopySummary.logLines(list, failed: 20, mismatched: 0)
         XCTAssertEqual(lines.count, 21)
+        guard lines.count == 21 else { return }   // un conteggio sbagliato non deve far cadere la suite con un indice fuori limite
         XCTAssertTrue(lines[0].hasSuffix("— elenco completo:"), lines[0])
         XCTAssertEqual(lines[1], "  sub/f0.jpg — motivo 0")
         XCTAssertEqual(lines[20], "  sub/f19.jpg — motivo 19")
