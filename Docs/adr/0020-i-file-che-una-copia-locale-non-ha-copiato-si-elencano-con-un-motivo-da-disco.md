@@ -29,6 +29,28 @@ Ogni file non copiato lascia «Non copiato: «percorso» — motivo.» e finisce
 - `syncDir`/`syncFile` ricevono il percorso relativo (parametri privati, senza default). Nessuna `copyItem`/`moveItem`/`removeItem`/`createDirectory` aggiunta, tolta o spostata; zero-overwrite invariato.
 - La riga «HASH MISMATCH» è sostituita; la `CompletionSheet` mostra l'elenco e tiene le righe generiche solo quando l'elenco manca.
 
+## Vocabolario dei motivi (tabella di riferimento per `LocalCopyText.reason`)
+
+Si decide prima sul codice di sistema, poi sul codice Cocoa. Dopo la frase: «(codice C/S)», oppure «(codice N)» se ce n'è uno solo.
+
+| Codice di sistema | Codice Cocoa | Frase |
+|---|---|---|
+| 28 | 640 | «il disco di destinazione è pieno» |
+| 30 | 642 | «il disco di destinazione è in sola lettura» |
+| 13 | 513, 257 | «permesso negato: il Mac non ha potuto leggere il file o scrivere nella cartella di destinazione» |
+| 1 | — | «macOS non ha permesso l'operazione: il file potrebbe essere bloccato, oppure l'app ha perso «Accesso completo al disco»» |
+| 2 | 260, 4 | «il file o la sua cartella non c'è più: spostato, cancellato o disco scollegato» |
+| 17 | 516 | «a destinazione è comparso un file con lo stesso nome, che non è stato sovrascritto» |
+| 63 | 514 | «il nome del file è troppo lungo per il disco di destinazione» |
+| 20 | — | «a destinazione, al posto di una cartella, c'è un file con lo stesso nome» |
+| 27 | — | «il file è troppo grande per il disco di destinazione» |
+| 92 | — | «il nome del file contiene caratteri che il disco di destinazione non accetta» (non misurato) |
+| 5 | — | «errore di lettura o scrittura del disco» |
+| 6 | — | «il disco non risponde più: forse è stato scollegato» |
+| — | altri 256…511 | «il file non si è potuto leggere» |
+| — | altri 512…767 | «non si è potuto scrivere a destinazione» |
+| tutto il resto | | «errore imprevisto»; il dominio non compare mai |
+
 ## Decisioni di Enrico (2026-11-13)
 
 - **D1 = A.** Anche le copie non identiche all'originale entrano nell'elenco e nel riepilogo, con un motivo loro.
