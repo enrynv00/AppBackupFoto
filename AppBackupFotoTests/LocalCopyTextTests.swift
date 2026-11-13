@@ -113,6 +113,8 @@ final class LocalCopyTextTests: XCTestCase {
             cocoa(513, posix: 13), cocoa(513, posix: 1), cocoa(260, posix: 2), cocoa(4, posix: nil),
             cocoa(516, posix: 17), cocoa(642, posix: 30), cocoa(514, posix: 63), cocoa(512, posix: 20),
             cocoa(512, posix: 5), cocoa(512, posix: 6), NSError(domain: "XYZ", code: 77),
+            cocoa(512, posix: 27), cocoa(512, posix: 92), cocoa(514, posix: nil),
+            cocoa(256, posix: nil), cocoa(512, posix: nil),
         ]
         for error in all {
             let r = reason(error)
@@ -133,6 +135,36 @@ final class LocalCopyTextTests: XCTestCase {
         XCTAssertTrue(line.contains("non è identica all'originale"), line)
         XCTAssertTrue(line.contains("non la rifà da sola"), line)
         Self.assertNoJargon(line)
+    }
+
+    func testReason_fileTooBig() {
+        let r = reason(cocoa(512, posix: 27))
+        XCTAssertTrue(r.contains("troppo grande"), r)
+        XCTAssertTrue(r.contains("(codice 512/27)"), r)
+    }
+
+    func testReason_illegalCharacters() {
+        let r = reason(cocoa(512, posix: 92))
+        XCTAssertTrue(r.contains("caratteri"), r)
+        XCTAssertTrue(r.contains("non accetta"), r)
+    }
+
+    func testReason_nameTooLongCocoaAlone() {
+        let r = reason(cocoa(514, posix: nil))
+        XCTAssertTrue(r.contains("troppo lungo"), r)
+        XCTAssertTrue(r.contains("(codice 514)"), r)
+    }
+
+    func testReason_otherReadError() {
+        let r = reason(cocoa(256, posix: nil))
+        XCTAssertTrue(r.contains("non si è potuto leggere"), r)
+        XCTAssertTrue(r.contains("(codice 256)"), r)
+    }
+
+    func testReason_otherWriteError() {
+        let r = reason(cocoa(512, posix: nil))
+        XCTAssertTrue(r.contains("non si è potuto scrivere a destinazione"), r)
+        XCTAssertTrue(r.contains("(codice 512)"), r)
     }
 
     func testRelativeChild() {

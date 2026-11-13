@@ -11713,9 +11713,10 @@ nonisolated enum LocalCopyText {
         case (nil, nil): code = "\(ns.code)"
         }
         // Codici di sistema: 28 ENOSPC, 13 EACCES, 1 EPERM, 2 ENOENT, 17 EEXIST, 30 EROFS,
-        // 63 ENAMETOOLONG, 20 ENOTDIR, 5 EIO, 6 ENXIO.
+        // 63 ENAMETOOLONG, 20 ENOTDIR, 27 EFBIG, 92 EILSEQ, 5 EIO, 6 ENXIO.
         // Codici Cocoa: 640 spazio, 513/257 permesso, 4/260 file assente, 516 esiste gia',
-        // 642 volume in sola lettura.
+        // 642 volume in sola lettura, 514 nome troppo lungo, poi le fasce generiche 256...511
+        // (lettura) e 512...767 (scrittura). Tabella: ADR-0020, «Vocabolario dei motivi».
         let kind: Kind
         if let posix {
             switch posix {
@@ -11727,6 +11728,8 @@ nonisolated enum LocalCopyText {
             case 30: kind = .readOnlyDisk
             case 63: kind = .nameTooLong
             case 20: kind = .parentIsAFile
+            case 27: kind = .fileTooBig
+            case 92: kind = .illegalCharacters
             case 5: kind = .ioError
             case 6: kind = .diskNotResponding
             default: kind = cocoaKind(cocoa)
@@ -11739,7 +11742,8 @@ nonisolated enum LocalCopyText {
 
     private enum Kind {
         case diskFull, permissionDenied, notPermittedByMacOS, vanished, alreadyThere, readOnlyDisk
-        case nameTooLong, parentIsAFile, ioError, diskNotResponding, unknown
+        case nameTooLong, parentIsAFile, fileTooBig, illegalCharacters, ioError, diskNotResponding
+        case readFailed, writeFailed, unknown
     }
 
     private static func cocoaKind(_ cocoa: Int?) -> Kind {
@@ -11749,6 +11753,9 @@ nonisolated enum LocalCopyText {
         case 4?, 260?: return .vanished
         case 516?: return .alreadyThere
         case 642?: return .readOnlyDisk
+        case 514?: return .nameTooLong
+        case let c? where (256...511).contains(c): return .readFailed
+        case let c? where (512...767).contains(c): return .writeFailed
         default: return .unknown
         }
     }
@@ -11757,17 +11764,22 @@ nonisolated enum LocalCopyText {
         switch kind {
         case .diskFull: return "il disco di destinazione è pieno"
         case .permissionDenied:
-            return "permesso negato: non si è potuto leggere il file o scrivere nella cartella di destinazione"
+            return "permesso negato: il Mac non ha potuto leggere il file o scrivere nella cartella di destinazione"
         case .notPermittedByMacOS:
-            return "macOS non ha dato il permesso: il file è bloccato oppure all'app manca l'«Accesso completo al disco»"
-        case .vanished: return "il file non c'è più dove l'app lo cercava"
+            return "macOS non ha permesso l'operazione: il file potrebbe essere bloccato, oppure l'app ha perso «Accesso completo al disco»"
+        case .vanished: return "il file o la sua cartella non c'è più: spostato, cancellato o disco scollegato"
         case .alreadyThere:
-            return "a destinazione c'è già un file con questo nome: non è stato sovrascritto"
+            return "a destinazione è comparso un file con lo stesso nome, che non è stato sovrascritto"
         case .readOnlyDisk: return "il disco di destinazione è in sola lettura"
-        case .nameTooLong: return "il nome del file o di una cartella è troppo lungo"
-        case .parentIsAFile: return "a destinazione c'è un file al posto di una cartella"
-        case .ioError: return "il disco ha dato un errore di lettura o scrittura"
-        case .diskNotResponding: return "il disco non risponde: forse è stato scollegato"
+        case .nameTooLong: return "il nome del file è troppo lungo per il disco di destinazione"
+        case .parentIsAFile: return "a destinazione, al posto di una cartella, c'è un file con lo stesso nome"
+        case .fileTooBig: return "il file è troppo grande per il disco di destinazione"
+        case .illegalCharacters:
+            return "il nome del file contiene caratteri che il disco di destinazione non accetta"
+        case .ioError: return "errore di lettura o scrittura del disco"
+        case .diskNotResponding: return "il disco non risponde più: forse è stato scollegato"
+        case .readFailed: return "il file non si è potuto leggere"
+        case .writeFailed: return "non si è potuto scrivere a destinazione"
         case .unknown: return "errore imprevisto"
         }
     }

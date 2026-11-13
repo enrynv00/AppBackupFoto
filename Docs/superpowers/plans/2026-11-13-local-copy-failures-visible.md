@@ -16,15 +16,15 @@
 | :--- | :--- | :--- | ---: |
 | 0 | branch, ADR-0020, piano | — | — |
 | 1 | baseline | — | **1.477** |
-| 2 | `LocalCopyText` | `LocalCopyTextTests` **nuovo** +18 | **1.495** |
-| 3 | `SyncResult`: elenco, due punti di registrazione, `progressSnapshot` | `LocalCopyTextTests` +3 | **1.498** |
-| 4 | cablaggio in `FileSyncer.syncFile` | `FileSyncerFailedCopiesTests` **nuovo** +10, `MainThreadIsolationTests` +1 | **1.509** |
-| 5 | `LocalCopySummary`, `JobStats`, `finishCopyStep`, `CompletionSheet` | `LocalCopyTextTests` +8 | **1.517** |
+| 2 | `LocalCopyText` | `LocalCopyTextTests` **nuovo** +23 | **1.500** |
+| 3 | `SyncResult`: elenco, due punti di registrazione, `progressSnapshot` | `LocalCopyTextTests` +3 | **1.503** |
+| 4 | cablaggio in `FileSyncer.syncFile` | `FileSyncerFailedCopiesTests` **nuovo** +10, `MainThreadIsolationTests` +1 | **1.514** |
+| 5 | `LocalCopySummary`, `JobStats`, `finishCopyStep`, `CompletionSheet` | `LocalCopyTextTests` +8 | **1.522** |
 | 6 | mutation testing (copia nello scratch) | — | — |
 | 7 | documentazione | — | — |
 | 8 | verifica dal vivo (Enrico) | — | — |
 
-**Conteggio finale atteso: 1.517** (1.477 + 40). Fascia ammessa solo con test in più chiesti da un revisore e dichiarati nel commit: 1.517–1.527.
+**Conteggio finale atteso: 1.522** (1.477 + 45: 40 del piano + 5 dell'allineamento alla tabella dell'ADR, Task 2). Fascia ammessa solo con test in più chiesti da un revisore e dichiarati nel commit: 1.522–1.532.
 
 **Due file di test nuovi**, registrati a mano in `AppBackupFoto.xcodeproj/project.pbxproj` nei 4 punti (`PBXBuildFile`, `PBXFileReference`, figli del gruppo `AppBackupFotoTests`, `PBXSourcesBuildPhase`), accanto alle righe di `S3UploadTextTests.swift` (`DC2CC96B22A4D122F6F6E4CE` / `F901D97C39FFEDA58D187B40`). ID controllati assenti il 2026-11-13:
 
@@ -65,7 +65,7 @@ Come nel piano `2026-09-26-s3-upload-failures-visible.md`, sezione «Comandi di 
 
 **File:** `ContentView.swift`, subito DOPO la chiusura di `enum UploadFailureSummary` e PRIMA di `// MARK: - S3Syncer (native Swift, no rclone subprocess)`; `AppBackupFotoTests/LocalCopyTextTests.swift` (nuovo, pbxproj).
 
-- [ ] **Step 1 (test prima, rossi in compilazione):** `final class LocalCopyTextTests: XCTestCase` con `static let jargon = S3UploadTextTests.jargon + [...]`, `assertNoJargon` e un aiuto `cocoa(_ code: Int, posix: Int?) -> NSError` (`NSCocoaErrorDomain`, `NSUnderlyingErrorKey` = `NSError(domain: NSPOSIXErrorDomain, code: posix)`). I 18 test:
+- [ ] **Step 1 (test prima, rossi in compilazione):** `final class LocalCopyTextTests: XCTestCase` con `static let jargon = S3UploadTextTests.jargon + [...]`, `assertNoJargon` e un aiuto `cocoa(_ code: Int, posix: Int?) -> NSError` (`NSCocoaErrorDomain`, `NSUnderlyingErrorKey` = `NSError(domain: NSPOSIXErrorDomain, code: posix)`). I 18 test (più 5 aggiunti in coda con l'allineamento alla tabella dell'ADR, «Vocabolario dei motivi»: `testReason_fileTooBig`, `testReason_illegalCharacters`, `testReason_nameTooLongCocoaAlone`, `testReason_otherReadError`, `testReason_otherWriteError`; entrano anche in `testReason_everyReasonHasNoJargon_andACode`):
   - `testReason_diskFull` — (640, 28): contiene «pieno» e finisce con «(codice 640/28)»
   - `testReason_diskFull_withoutUnderlying` — (640, nil): «pieno», «(codice 640)»
   - `testReason_posixErrorAlone` — `NSError(domain: NSPOSIXErrorDomain, code: 28)`: «pieno», «(codice 28)»
@@ -90,7 +90,7 @@ Come nel piano `2026-09-26-s3-upload-failures-visible.md`, sezione «Comandi di 
   - `static let mismatchReason = "la copia appena fatta non è identica all'originale"`
   - `static func failedLine(path:reason:)`, `static func mismatchLine(path:)`, `static func relativeChild(of parent: String, name: String) -> String`.
   - Doc-comment: le misure del 2026-11-13 (stesso 513/13 sui due lati, nessuna copia parziale col disco pieno, i casi non misurati) e il motivo per cui la riga non promette niente.
-- [ ] **Step 4:** `fasttest.sh LocalCopyTextTests` → 18; `fasttest.sh` → **1.495**, 0 warning. **Controllo `xcodebuild`**: 1.495 (1.477 = file non registrato). Commit.
+- [ ] **Step 4:** `fasttest.sh LocalCopyTextTests` → 23; `fasttest.sh` → **1.500**, 0 warning. **Controllo `xcodebuild`**: 1.500 (1.477 = file non registrato). Commit.
 
 ### Task 3: l'elenco in `SyncResult`
 
@@ -106,7 +106,7 @@ Come nel piano `2026-09-26-s3-upload-failures-visible.md`, sezione «Comandi di 
   - `mutating func recordCopyMismatch(path: String)` (`hashErrors += 1` + append con `mismatchReason`).
   - `var progressSnapshot: SyncResult` (copia con `failedCopies = []`; doc-comment: evita di ricopiare l'elenco a ogni file).
   - Aggiorna il doc-comment di `failedFiles`: «FileSyncer usa `failedCopies` (ADR-0020)».
-- [ ] **Step 3:** `fasttest.sh` → **1.498**. Commit.
+- [ ] **Step 3:** `fasttest.sh` → **1.503**. Commit.
 
 ### Task 4: cablaggio in `FileSyncer.syncFile`
 
@@ -131,7 +131,7 @@ Come nel piano `2026-09-26-s3-upload-failures-visible.md`, sezione «Comandi di 
   - `catch`: `let reason = LocalCopyText.reason(for: error); result.recordCopyFailure(path: relativePath, reason: reason); let line = LocalCopyText.failedLine(path: relativePath, reason: reason); DispatchQueue.main.async { onStatus(line) }`.
   - Le due copie durante il lavoro (quella prima della riga «Copia (…)» e quella dopo `result.done += 1`) diventano `let snap = result.progressSnapshot`. Le due finali in `sync` restano `let snap = result`.
 - [ ] **Step 4:** rileggi il diff: nessuna altra riga di `syncFile`/`syncDir` è cambiata; `grep -c` della regola 3 invariati; `grep -n "result.errors += 1\|hashErrors += 1" ContentView.swift` → nessuna occorrenza dentro `FileSyncer` (restano solo in `recordCopyFailure`/`recordCopyMismatch`/`recordFailure`).
-- [ ] **Step 5:** `fasttest.sh FileSyncerFailedCopiesTests` → 10; `fasttest.sh` → **1.509**, 0 warning. **Controllo `xcodebuild`**: 1.509 (1.499 = `FileSyncerFailedCopiesTests` non registrato). Devono restare verdi senza modifiche `FileSyncerZeroOverwriteTests`, `FileSyncerChangedSkippedTests`, `FileSyncerHashVerificationTests`, `ImportDedupTests`, `FileSyncerProgressThrottleTests`.
+- [ ] **Step 5:** `fasttest.sh FileSyncerFailedCopiesTests` → 10; `fasttest.sh` → **1.514**, 0 warning. **Controllo `xcodebuild`**: 1.514 (1.504 = `FileSyncerFailedCopiesTests` non registrato). Devono restare verdi senza modifiche `FileSyncerZeroOverwriteTests`, `FileSyncerChangedSkippedTests`, `FileSyncerHashVerificationTests`, `ImportDedupTests`, `FileSyncerProgressThrottleTests`.
 - [ ] **Step 6: Security/Rules Auditor obbligatorio:** (1) zero-overwrite di `syncFile` invariato riga per riga; (2) nessuna operazione FileManager nuova o spostata (conteggi); (3) `LocalCopyText` è `nonisolated` e non tocca il disco; (4) il test 3 prova che una destinazione comparsa dopo il controllo non viene sovrascritta. Commit, con una riga per l'Auditor.
 
 ### Task 5: riepilogo e fondo del registro
@@ -154,7 +154,7 @@ Come nel piano `2026-09-26-s3-upload-failures-visible.md`, sezione «Comandi di 
   - `JobStats.failedCopies: [FailedFile] = []` (doc: non persistito, come `failedFiles`).
   - `finishCopyStep`: `stats.failedCopies = r.failedCopies` accanto a `stats.failedFiles`; `failureList = UploadFailureSummary.logLines(stats.failedFiles) + LocalCopySummary.logLines(stats.failedCopies, failed: stats.errors, mismatched: stats.hashErrors)`; resta una sola `append`.
   - `CompletionSheet`: sezione nuova `if !stats.failedCopies.isEmpty`, stessa forma di quella di Cubbit (titolo con icona in `AppColor.warning`, righe di rassicurazione, 8 righe `.caption` `.lineLimit(1)` `.truncationMode(.middle)`, `id: \.offset`, «L'elenco completo…»). La riga «N hash mismatch — controlla il log» si vede solo se `stats.failedCopies.isEmpty`; la riga generica solo se `stats.errors > 0 && stats.failedFiles.isEmpty && stats.failedCopies.isEmpty`.
-- [ ] **Step 3:** `fasttest.sh` → **1.517**, 0 warning. **Controllo `xcodebuild`**: 1.517, `TEST SUCCEEDED`. Dichiara nel commit: la sezione SwiftUI e `finishCopyStep` non sono coperti da test (li copre il Task 8). Commit.
+- [ ] **Step 3:** `fasttest.sh` → **1.522**, 0 warning. **Controllo `xcodebuild`**: 1.522, `TEST SUCCEEDED`. Dichiara nel commit: la sezione SwiftUI e `finishCopyStep` non sono coperti da test (li copre il Task 8). Commit.
 
 ### Task 6: mutation testing (copia nello scratch, mai il repository)
 
@@ -179,7 +179,7 @@ Equivalente dichiarato: 5d, `LocalCopySummary` senza `nonisolated` (chiamata sol
 - [ ] `.claude/rules/architecture.md`, sezione `FileSyncer`: voce nuova (ogni file non copiato e ogni copia non identica lascia una riga e finisce in `failedCopies`; due soli punti; percorso relativo costruito cartella per cartella, con il fatto `/private/var`; `progressSnapshot`; motivi da `LocalCopyText` con codice/codice; le misure del 2026-11-13; cosa non è coperto da test).
 - [ ] `.claude/rules/bug-history.md`: in coda a BUG-11 «stesso buco nelle copie locali chiuso da ADR-0020», senza un BUG nuovo.
 - [ ] `Docs/ROADMAP.md` #49: «⏳ implementato il …, verifica dal vivo da fare», correggendo «`failedFiles` già pronto» in «elenco a parte `failedCopies`, ADR-0020»; non ✅ prima del Task 8.
-- [ ] `Docs/CLAUDE.md`: righe «Mac → SSD» e «SSD → HDD» (elenco dei file non copiati e dei motivi); riga «Test automatici» (1.477 → 1.517 misurati; `LocalCopyTextTests` (29) e `FileSyncerFailedCopiesTests` (10) nuovi, `MainThreadIsolationTests` +1); undicesimo tocco in «Stato attuale» con le righe toccate.
+- [ ] `Docs/CLAUDE.md`: righe «Mac → SSD» e «SSD → HDD» (elenco dei file non copiati e dei motivi); riga «Test automatici» (1.477 → 1.522 misurati; `LocalCopyTextTests` (34) e `FileSyncerFailedCopiesTests` (10) nuovi, `MainThreadIsolationTests` +1); undicesimo tocco in «Stato attuale» con le righe toccate.
 - [ ] Commit solo documentazione.
 
 ### Task 8: verifica dal vivo (Enrico, SSD collegato, app compilata da questo branch)
