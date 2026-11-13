@@ -11139,10 +11139,31 @@ nonisolated final class FileSyncer: @unchecked Sendable {
         /// l'utente sono la stessa cosa ("questa foto ce l'avevi gia'").
         /// E' un sottoinsieme di `skipped`, come `changedSkipped`.
         var duplicatesSkipped = 0
-        /// I file non caricati, con il motivo (ROADMAP #43). Oggi lo riempie solo il job verso
-        /// Cubbit (`runSyncS3`, da `S3Syncer.SyncResult.failures`); `FileSyncer` non lo tocca:
-        /// lo stesso buco nelle copie locali e' un ticket a parte (D4 = A).
+        /// I file non caricati, con il motivo (ROADMAP #43). Lo riempie solo il job verso Cubbit
+        /// (`runSyncS3`, da `S3Syncer.SyncResult.failures`); `FileSyncer` usa `failedCopies`
+        /// (ADR-0020), mai questo.
         var failedFiles: [FailedFile] = []
+        /// I file che una copia locale non ha copiato e le copie non identiche all'originale
+        /// (ROADMAP #49, ADR-0020): `failedFiles` resta di Cubbit. `path` e' relativo alla
+        /// sorgente del job. `errors + hashErrors` e la lunghezza di questo elenco si muovono
+        /// INSIEME, sempre e solo da `recordCopyFailure`/`recordCopyMismatch`.
+        var failedCopies: [FailedFile] = []
+        mutating func recordCopyFailure(path: String, reason: String) {
+            errors += 1
+            failedCopies.append(FailedFile(path: path, reason: reason))
+        }
+        mutating func recordCopyMismatch(path: String) {
+            hashErrors += 1
+            failedCopies.append(FailedFile(path: path, reason: LocalCopyText.mismatchReason))
+        }
+        /// Copia per il progresso, senza l'elenco: a ogni file si ricopierebbe un elenco che con
+        /// un disco pieno arriva a migliaia di voci (costo quadratico). L'elenco viaggia solo nel
+        /// risultato finale.
+        var progressSnapshot: SyncResult {
+            var copy = self
+            copy.failedCopies = []
+            return copy
+        }
         var startDate = Date()
         var percent: Int { total > 0 ? min(100, done * 100 / total) : 0 }
         var elapsedSec: Int { Int(Date().timeIntervalSince(startDate)) }

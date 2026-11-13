@@ -171,4 +171,37 @@ final class LocalCopyTextTests: XCTestCase {
         XCTAssertEqual(LocalCopyText.relativeChild(of: "", name: "a.jpg"), "a.jpg")
         XCTAssertEqual(LocalCopyText.relativeChild(of: "a b/c", name: "x é.jpg"), "a b/c/x é.jpg")
     }
+
+    // MARK: - L'elenco in FileSyncer.SyncResult (Task 3)
+
+    func testRecordCopyFailure_countsAndRemembers() {
+        var r = FileSyncer.SyncResult()
+        r.recordCopyFailure(path: "a", reason: "r")
+        XCTAssertEqual(r.errors, 1)
+        XCTAssertEqual(r.failedCopies, [FailedFile(path: "a", reason: "r")])
+        XCTAssertEqual(r.hashErrors, 0)
+    }
+
+    func testRecordCopyMismatch_countsAsHashErrorAndRemembers() {
+        var r = FileSyncer.SyncResult()
+        r.recordCopyMismatch(path: "a")
+        XCTAssertEqual(r.hashErrors, 1)
+        XCTAssertEqual(r.errors, 0)
+        XCTAssertEqual(r.failedCopies, [FailedFile(path: "a", reason: LocalCopyText.mismatchReason)])
+    }
+
+    func testProgressSnapshot_dropsOnlyTheList() {
+        var r = FileSyncer.SyncResult()
+        r.total = 10; r.done = 4; r.copied = 2
+        r.recordCopyFailure(path: "a", reason: "r")
+        r.recordCopyMismatch(path: "b")
+        let snap = r.progressSnapshot
+        XCTAssertTrue(snap.failedCopies.isEmpty)
+        XCTAssertEqual(snap.errors, r.errors)
+        XCTAssertEqual(snap.hashErrors, r.hashErrors)
+        XCTAssertEqual(snap.done, 4)
+        XCTAssertEqual(snap.total, 10)
+        XCTAssertEqual(snap.copied, 2)
+        XCTAssertEqual(r.failedCopies.count, 2)
+    }
 }
