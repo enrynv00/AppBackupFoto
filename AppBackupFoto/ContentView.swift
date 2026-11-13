@@ -1276,6 +1276,10 @@ struct JobStats {
     /// I file non caricati su Cubbit (ROADMAP #43). Come `listStepOutcome`: NON persistito e
     /// nessun conteggio lo legge; serve alla `CompletionSheet` e al fondo del log.
     var failedFiles: [FailedFile] = []
+    /// I file che una copia locale non ha copiato e le copie non identiche (ROADMAP #49,
+    /// ADR-0020). Come `failedFiles`: NON persistito, serve alla `CompletionSheet` e al fondo
+    /// del registro.
+    var failedCopies: [FailedFile] = []
 }
 
 struct SpeedSample: Identifiable {
@@ -11835,6 +11839,50 @@ nonisolated enum LocalCopyText {
     }
 }
 
+/// I testi del riepilogo di fine job sulle copie locali non riuscite (ROADMAP #49, ADR-0020).
+/// Logica pura: la `CompletionSheet` e `finishCopyStep` li usano e basta. Le regole delle righe
+/// visibili e il rimando all'elenco completo sono quelle di Cubbit (`UploadFailureSummary`).
+// `nonisolated`: pura, senza stato; la chiama solo il main, quindi il tipo e' marcato per
+// coerenza con i tipi gemelli, non perche' serva (equivalente dichiarato, Task 6 mutante 5d).
+nonisolated enum LocalCopySummary {
+    /// «2 file non copiati», «1 copia non identica all'originale», o le due insieme.
+    static func headline(failed: Int, mismatched: Int) -> String {
+        let failedPart = failed == 1 ? "1 file non copiato" : "\(failed) file non copiati"
+        let mismatchedPart = mismatched == 1
+            ? "1 copia non identica all'originale"
+            : "\(mismatched) copie non identiche all'originale"
+        if failed > 0 && mismatched > 0 { return "\(failedPart) e \(mismatchedPart)" }
+        return mismatched > 0 ? mismatchedPart : failedPart
+    }
+
+    /// Le righe che dicono cosa succede dopo, una per ogni cosa capitata. Le copie non identiche
+    /// non si rifanno da sole (D2 = A): per la regola zero-overwrite restano come sono.
+    static func reassurance(failed: Int, mismatched: Int) -> [String] {
+        var lines: [String] = []
+        if failed > 0 {
+            lines.append("Gli originali non sono stati toccati: il prossimo backup riprova da solo i file che a destinazione mancano ancora.")
+        }
+        if mismatched > 0 {
+            lines.append("Le copie non identiche restano come sono: l'app non sovrascrive mai, quindi non le rifà da sola. Vanno controllate a mano.")
+        }
+        return lines
+    }
+
+    /// Al massimo `limit` righe `percorso — motivo`, poi «…e altri N»: la stessa regola di Cubbit.
+    static func visibleLines(_ failures: [FailedFile], limit: Int) -> [String] {
+        UploadFailureSummary.visibleLines(failures, limit: limit)
+    }
+
+    static let whereIsTheFullList = UploadFailureSummary.whereIsTheFullList
+
+    /// L'elenco COMPLETO, senza limite, per il fondo del registro su disco.
+    static func logLines(_ failures: [FailedFile], failed: Int, mismatched: Int) -> [String] {
+        guard !failures.isEmpty else { return [] }
+        return ["\(headline(failed: failed, mismatched: mismatched)) — elenco completo:"]
+            + failures.map { "  \($0.path) — \($0.reason)" }
+    }
+}
+
 // MARK: - S3Syncer (native Swift, no rclone subprocess)
 final class S3Syncer {
 
@@ -16964,6 +17012,7 @@ final class BackupRunner: ObservableObject {
             stats.changedSkipped = r.changedSkipped  // file cambiati, non copiati (roadmap #13)
             stats.duplicatesSkipped = r.duplicatesSkipped  // gia' in libreria, non copiati (roadmap #31)
             stats.failedFiles = r.failedFiles        // non caricati su Cubbit (roadmap #43)
+            stats.failedCopies = r.failedCopies      // non copiati / copie non identiche (roadmap #49)
         }
         // L'elenco completo dei file non caricati finisce in fondo al log QUI, in modo sincrono.
         // Le singole righe «Non caricato» di `S3Syncer.sync` arrivano per strade asincrone e
@@ -16971,6 +17020,7 @@ final class BackupRunner: ObservableObject {
         // per tutto l'elenco: ognuna misura e taglia `output` sul main, e con migliaia di file
         // (rete caduta a meta' job) una per riga bloccherebbe la finestra.
         let failureList = UploadFailureSummary.logLines(stats.failedFiles)
+            + LocalCopySummary.logLines(stats.failedCopies, failed: stats.errors, mismatched: stats.hashErrors)
         if !failureList.isEmpty { append(failureList.joined(separator: "\n") + "\n") }
         JobHistoryStore.save(JobSummary(date: Date(), label: label, copied: stats.copied,
             skipped: stats.skipped, errors: stats.errors,
@@ -19232,7 +19282,7 @@ struct CompletionSheet: View {
                       systemImage: "checkmark.shield.fill")
                     .font(.caption).foregroundStyle(AppColor.success).multilineTextAlignment(.center)
             }
-            if stats.hashErrors > 0 {
+            if stats.hashErrors > 0 && stats.failedCopies.isEmpty {
                 Label("\(stats.hashErrors) hash mismatch — controlla il log",
                       systemImage: "exclamationmark.triangle.fill")
                     .font(.caption).foregroundStyle(AppColor.warning).multilineTextAlignment(.center)
@@ -19269,8 +19319,27 @@ struct CompletionSheet: View {
                 }
                 .frame(maxWidth: 520, alignment: .leading)
             }
-            // La riga generica resta per gli errori senza elenco (copie locali, D4 = A).
-            if stats.errors > 0 && stats.failedFiles.isEmpty {
+            if !stats.failedCopies.isEmpty {
+                // ROADMAP #49, ADR-0020: quali file una copia locale non ha copiato (o ha copiato
+                // non identici) e perche'. Stessa forma della sezione di Cubbit.
+                VStack(alignment: .leading, spacing: AppSpacing.xs) {
+                    Label(LocalCopySummary.headline(failed: stats.errors, mismatched: stats.hashErrors),
+                          systemImage: "exclamationmark.triangle.fill")
+                        .font(.callout).foregroundStyle(AppColor.warning)
+                    ForEach(Array(LocalCopySummary.reassurance(failed: stats.errors, mismatched: stats.hashErrors).enumerated()),
+                            id: \.offset) { _, line in
+                        Text(line).font(.caption).foregroundStyle(.secondary)
+                    }
+                    ForEach(Array(LocalCopySummary.visibleLines(stats.failedCopies, limit: 8).enumerated()),
+                            id: \.offset) { _, line in
+                        Text(line).font(.caption).lineLimit(1).truncationMode(.middle)
+                    }
+                    Text(LocalCopySummary.whereIsTheFullList).font(.caption).foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: 520, alignment: .leading)
+            }
+            // La riga generica resta per gli errori senza nessun elenco (ne' Cubbit ne' copie locali).
+            if stats.errors > 0 && stats.failedFiles.isEmpty && stats.failedCopies.isEmpty {
                 Label("Controlla il log per i dettagli sugli errori.", systemImage: "exclamationmark.triangle.fill")
                     .font(.caption).foregroundStyle(AppColor.warning).multilineTextAlignment(.center)
             }

@@ -204,4 +204,68 @@ final class LocalCopyTextTests: XCTestCase {
         XCTAssertEqual(snap.copied, 2)
         XCTAssertEqual(r.failedCopies.count, 2)
     }
+
+    // MARK: - Il riepilogo di fine job (Task 5)
+
+    private func entries(_ n: Int) -> [FailedFile] {
+        (0..<n).map { FailedFile(path: "sub/f\($0).jpg", reason: "motivo \($0)") }
+    }
+
+    func testHeadline_failedOnly() {
+        XCTAssertEqual(LocalCopySummary.headline(failed: 1, mismatched: 0), "1 file non copiato")
+        XCTAssertEqual(LocalCopySummary.headline(failed: 3, mismatched: 0), "3 file non copiati")
+    }
+
+    func testHeadline_mismatchedOnly() {
+        XCTAssertEqual(LocalCopySummary.headline(failed: 0, mismatched: 1), "1 copia non identica all'originale")
+        XCTAssertEqual(LocalCopySummary.headline(failed: 0, mismatched: 2), "2 copie non identiche all'originale")
+    }
+
+    func testHeadline_both() {
+        XCTAssertEqual(LocalCopySummary.headline(failed: 2, mismatched: 1),
+                       "2 file non copiati e 1 copia non identica all'originale")
+    }
+
+    func testReassurance_dependsOnWhatHappened() {
+        let onlyFailed = LocalCopySummary.reassurance(failed: 2, mismatched: 0)
+        XCTAssertEqual(onlyFailed.count, 1)
+        XCTAssertTrue(onlyFailed[0].contains("originali non sono stati toccati"), onlyFailed[0])
+        XCTAssertTrue(onlyFailed[0].contains("mancano ancora"), onlyFailed[0])
+
+        let onlyMismatched = LocalCopySummary.reassurance(failed: 0, mismatched: 2)
+        XCTAssertEqual(onlyMismatched.count, 1)
+        XCTAssertTrue(onlyMismatched[0].contains("non sovrascrive mai"), onlyMismatched[0])
+
+        let both = LocalCopySummary.reassurance(failed: 1, mismatched: 1)
+        XCTAssertEqual(both.count, 2)
+        XCTAssertTrue(both[0].contains("originali non sono stati toccati"), both[0])
+        XCTAssertTrue(both[1].contains("non sovrascrive mai"), both[1])
+    }
+
+    func testVisibleLines_sameRuleAsCubbit() {
+        let list = entries(10)
+        XCTAssertEqual(LocalCopySummary.visibleLines(list, limit: 8),
+                       UploadFailureSummary.visibleLines(list, limit: 8))
+    }
+
+    func testLogLines_listEveryFile_noLimit() {
+        let list = entries(20)
+        let lines = LocalCopySummary.logLines(list, failed: 20, mismatched: 0)
+        XCTAssertEqual(lines.count, 21)
+        XCTAssertTrue(lines[0].hasSuffix("— elenco completo:"), lines[0])
+        XCTAssertEqual(lines[1], "  sub/f0.jpg — motivo 0")
+        XCTAssertEqual(lines[20], "  sub/f19.jpg — motivo 19")
+    }
+
+    func testLogLines_empty_isEmpty() {
+        XCTAssertTrue(LocalCopySummary.logLines([], failed: 0, mismatched: 0).isEmpty)
+    }
+
+    func testAllSummaryTexts_haveNoJargon() {
+        for (f, m) in [(1, 0), (3, 0), (0, 1), (0, 2), (2, 1)] {
+            Self.assertNoJargon(LocalCopySummary.headline(failed: f, mismatched: m))
+            for line in LocalCopySummary.reassurance(failed: f, mismatched: m) { Self.assertNoJargon(line) }
+        }
+        Self.assertNoJargon(LocalCopySummary.whereIsTheFullList)
+    }
 }
