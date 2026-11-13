@@ -32,8 +32,9 @@ Enrico vuole che la finestra Foto funzioni «stile Google Foto»: le foto nuove 
 1. **L'SSD resta in sola lettura per Immich.** Non cambia niente: bind mount `:ro` nel compose e montaggio di Colima senza `:w`. Tutto quello che l'allineamento fa (togliere offline, impilare, archiviare) tocca **solo il database di Immich**.
 2. **Mai «risolvi duplicati» di Immich** (`POST /duplicates/resolve`, `DELETE /duplicates`): cancellano. Solo pile (`POST /stacks`).
 3. **Mai scansionare senza SSD.** Una scansione con il punto di montaggio vuoto segnerebbe offline tutte le 52.139 foto, e il passo 2 le toglierebbe da Immich con volti, album e pile. Due guardie:
-   - prima della scansione: `VolumeMonitor.ssdMounted` vero e la radice dell'SSD leggibile dal Mac;
-   - dopo la scansione: se le foto offline **nuove** (offline non ancora presenti al giro prima) sono più di **500** o più del **2 %** delle foto attive, il passo 2 non parte, l'allineamento si ferma e la finestra Foto lo dice. Le foto restano nel Cestino di Immich, recuperabili. Soglia scelta perché il backup più grande visto in un giro (#46) toglieva blocchi da 500.
+   - prima della scansione, e di nuovo prima di togliere le offline: `VolumeMonitor.ssdMounted` vero (che conta solo un vero punto di montaggio, `VolumeCapacityReader.isMounted`, #40);
+   - dopo la scansione: se le foto attive della libreria sono calate di più di **500** o di più del **2 %** rispetto a un **riferimento ricordato**, le offline non si tolgono, l'allineamento si ferma e la finestra Foto lo dice. Le foto restano nel Cestino di Immich, recuperabili. Il riferimento è il numero di foto attive dopo l'ultimo allineamento riuscito, salvato in `immich-alignment.json`; al primo giro è il numero prima della scansione, e **viene salvato subito anche quando la guardia scatta**. Così un «Riprova» con l'SSD ancora vuoto dentro la macchina virtuale scatta di nuovo invece di confrontarsi con un numero già crollato. Uno spostamento di doppioni dell'app abbassa il riferimento di quanti file ha spostato. Per un calo voluto e più grande, la finestra offre «Togli comunque», dopo una conferma che dice quante foto escono da Immich; il riferimento diventa allora il numero attuale. Soglia scelta perché il blocco più grande dei Doppioni (#46) è di 500 file.
+   - Verificato il 2026-11-13 che Immich non indicizza le cartelle nascoste: 0 foto con un componente nascosto nel percorso (`.Trashes` compreso, che sull'SSD esiste). Le copie spostate nel Cestino dell'SSD diventano offline, non doppioni.
 4. **Si toglie solo ciò che è offline e già nel Cestino di Immich**, e appartiene alla libreria dell'SSD (`importPaths` contiene `/external-ssd`). Le 31 cestinate a mano restano.
 5. **Ciò che Enrico disfa non si rifà.** Se toglie una foto dall'Archivio o separa una pila, l'allineamento successivo non la riarchivia e non la reimpila. L'app tiene l'elenco degli ID già archiviati e dei gruppi già impilati in `~/Library/Application Support/AppBackupFoto/immich-alignment.json` (mai sull'SSD).
 6. **Idempotente.** Rifare l'allineamento su uno stato già allineato non cambia niente in Immich.
@@ -65,7 +66,7 @@ Sottile, `nonisolated`, `URLSession`, header `x-api-key`, solo verso `ImmichMana
 |---|---|
 | trovare la libreria dell'SSD | `GET /libraries` (quella con `/external-ssd` negli `importPaths`; la vecchia «New External Library» senza percorsi si ignora) |
 | scansione | `POST /libraries/{id}/scan` |
-| attendere la fine della scansione e del rilevamento simili | `GET /jobs` (code `library` e `duplicateDetection` senza lavori attivi né in attesa) |
+| attendere la fine della scansione | `GET /jobs` (coda `library` senza lavori attivi, in attesa o rimandati). Non si aspetta la coda `duplicateDetection`: con 19.076 foto ancora da analizzare terrebbe fermo ogni allineamento per il tetto intero; le pile si fanno con i gruppi che ci sono e crescono ai giri dopo |
 | offline nel Cestino | `POST /search/metadata` con `libraryId`, `isOffline: true`, `withDeleted: true`, a pagine |
 | togliere le offline | `DELETE /assets` `{ids, force: true}`, a blocchi di 500 |
 | gruppi di simili | `GET /duplicates` |
