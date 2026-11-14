@@ -741,12 +741,12 @@ extension ImmichManager {
         name: appbackupfoto-immich
         services:
           immich-server:
-            image: ghcr.io/immich-app/immich-server:release
+            image: ghcr.io/immich-app/immich-server:\(Self.immichVersion)
             ports:
               - "127.0.0.1:2283:2283"
             volumes:
               \(Self.bindMountYAML(source: "\(data)/upload", target: "/data", readOnly: false, indent: 6))
-              \(Self.bindMountYAML(source: sourceLibraryPath, target: "/external-ssd", readOnly: true, indent: 6))
+              \(Self.bindMountYAML(source: sourceLibraryPath, target: Self.ssdMountTarget, readOnly: true, indent: 6))
               - /etc/localtime:/etc/localtime:ro
             environment:
               - DB_HOSTNAME=immich-database
@@ -759,7 +759,7 @@ extension ImmichManager {
               - immich-database
             restart: unless-stopped
           immich-machine-learning:
-            image: ghcr.io/immich-app/immich-machine-learning:release
+            image: ghcr.io/immich-app/immich-machine-learning:\(Self.immichVersion)
             volumes:
               \(Self.bindMountYAML(source: "\(data)/model-cache", target: "/cache", readOnly: false, indent: 6))
             restart: unless-stopped
@@ -889,6 +889,15 @@ extension ImmichManager {
     private static let composePluginSHA256 = isARM
         ? "6777710e5a5db5709e5f4b5985844e74b73cc1a6123e3a6690b6ababf2deaf51"
         : "d0f0c867fd740953899a63d6d1a291dc60200b0961de9612a01bcc560e6e29a6"
+
+    /// Versione di Immich su cui l'app e' verificata (API dell'allineamento, ROADMAP #50).
+    /// Fissata di proposito: con `release` un aggiornamento di Immich arriverebbe da solo e
+    /// potrebbe cambiare l'API sotto i piedi dell'app. Aggiornare Immich = cambiare questo numero.
+    nonisolated static let immichVersion = "v3.2.0"
+
+    /// Dove il compose monta l'SSD dentro il container. L'allineamento riconosce la libreria
+    /// dell'SSD da questo percorso (`ImmichAlignmentRules.ssdLibrary`).
+    nonisolated static let ssdMountTarget = "/external-ssd"
 
     /// Web UI di Immich. Loopback, non raggiungibile dalla rete: il compose file pubblica la
     /// porta solo su `127.0.0.1` (vedi `composeFileContent`).

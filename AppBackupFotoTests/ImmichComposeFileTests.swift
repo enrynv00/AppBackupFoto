@@ -188,4 +188,31 @@ final class ImmichComposeFileTests: XCTestCase {
         XCTAssertEqual(Set(services.keys),
                        ["immich-server", "immich-machine-learning", "immich-redis", "immich-database"])
     }
+
+    // MARK: - Versione fissata (ROADMAP #50, ADR-0021)
+
+    /// `release` cambia da solo a ogni versione nuova di Immich: l'allineamento parla con l'API
+    /// di Immich e va verificato su una versione precisa (v3.2.0, spec 2026-11-13 §7).
+    func testImmichImagesArePinnedToTheVerifiedVersion() throws {
+        let parsed = try parseYAML(yaml())
+        for name in ["immich-server", "immich-machine-learning"] {
+            let image = try XCTUnwrap(try service(name, in: parsed)["image"] as? String)
+            XCTAssertTrue(image.hasSuffix(":\(ImmichManager.immichVersion)"), "\(name) usa \(image)")
+        }
+        XCTAssertEqual(ImmichManager.immichVersion, "v3.2.0")
+    }
+
+    func testNoImmichImageUsesTheFloatingReleaseTag() {
+        XCTAssertFalse(yaml().contains(":release"))
+    }
+
+    /// L'allineamento riconosce la libreria dell'SSD dal suo percorso dentro il container:
+    /// compose e regole devono usare la stessa costante.
+    func testSSDIsMountedWhereTheAlignerLooksForIt() throws {
+        let parsed = try parseYAML(yaml())
+        let server = try service("immich-server", in: parsed)
+        let ssd = try XCTUnwrap(mount(targeting: ImmichManager.ssdMountTarget, in: server))
+        XCTAssertEqual(ssd["read_only"] as? Bool, true)
+        XCTAssertEqual(ImmichManager.ssdMountTarget, "/external-ssd")
+    }
 }
