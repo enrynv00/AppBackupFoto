@@ -343,6 +343,33 @@ final class ImmichAlignmentRulesTests: XCTestCase {
         XCTAssertNil(ImmichAlignmentStatus.done(ImmichAlignmentReport(), Date()).missingToConfirm)
     }
 
+    func testConfirmFirstRemovalStatus() {
+        let status = ImmichAlignmentStatus.confirmFirstRemoval(active: 52139, toRemove: 89514)
+        XCTAssertEqual(status.line(),
+            "Prima di togliere foto da Immich mi serve un tuo sì: Immich vede 52.139 foto sull'SSD e ne toglierebbe 89.514 che sull'SSD non ci sono più.")
+        XCTAssertFalse(status.isProblem)
+        XCTAssertEqual(status.actions, [.acceptDrop])
+        XCTAssertEqual(status.missingToConfirm, 89514)
+    }
+
+    func testConfirmationTextPerStatus() {
+        XCTAssertEqual(ImmichAlignmentText.firstRemovalConfirmation(active: 52139, toRemove: 89514),
+            "89.514 foto escono da Immich (solo dal suo elenco: i file sull'SSD non vengono toccati). Le 52.139 foto che Immich vede restano.")
+        XCTAssertEqual(ImmichAlignmentText.confirmation(for: .confirmFirstRemoval(active: 10, toRemove: 25)),
+                       ImmichAlignmentText.firstRemovalConfirmation(active: 10, toRemove: 25))
+        XCTAssertEqual(ImmichAlignmentText.confirmation(for: .dropGuard(missing: 600)),
+                       ImmichAlignmentText.acceptDropConfirmation(missing: 600))
+        XCTAssertNil(ImmichAlignmentText.confirmation(for: .idle))
+        XCTAssertNil(ImmichAlignmentText.confirmation(for: .needsKey))
+        XCTAssertNil(ImmichAlignmentText.confirmation(for: .failed(.notReachable)))
+        XCTAssertNil(ImmichAlignmentText.confirmation(for: .done(ImmichAlignmentReport(), Date())))
+    }
+
+    func testStateNotSavedLine() {
+        XCTAssertEqual(ImmichAlignmentText.failure(.stateNotSaved),
+            "Non riesco a salvare il file dell'allineamento sul Mac: per sicurezza non tolgo nessuna foto da Immich.")
+    }
+
     func testStatusActionsAndProblems() {
         XCTAssertEqual(ImmichAlignmentStatus.idle.actions, [])
         XCTAssertEqual(ImmichAlignmentStatus.running("x").actions, [])

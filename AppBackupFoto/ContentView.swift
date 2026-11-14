@@ -283,9 +283,11 @@ struct ImmichView: View {
     @ObservedObject private var aligner = ImmichAligner.shared
     @State private var showsKeySheet = false
     @State private var confirmsDrop = false
-    /// Il numero di foto mancanti mostrato nella conferma, congelato quando l'alert si apre:
-    /// e' quello che Enrico legge, ed e' quello che `acceptDropAndRetry(missing:)` riceve.
+    /// Il numero di foto mostrato nella conferma, congelato quando l'alert si apre: e' quello
+    /// che Enrico legge, ed e' quello che `acceptDropAndRetry(missing:)` riceve.
     @State private var confirmedMissing = 0
+    /// Il testo della conferma, congelato insieme al numero (dipende dallo stato che l'ha aperta).
+    @State private var confirmationText = ""
 
     /// La libreria da indicizzare è l'SSD già configurato in `BookmarkManager`: nessuna
     /// nuova destinazione, nessun nuovo bookmark (vedi spec).
@@ -331,8 +333,10 @@ struct ImmichView: View {
                                    onAcceptDrop: {
                                        // Si congela il numero che l'alert mostrera': se lo stato
                                        // non e' piu' il blocco del calo, non c'e' niente da confermare.
-                                       guard let missing = aligner.status.missingToConfirm else { return }
+                                       guard let missing = aligner.status.missingToConfirm,
+                                             let text = ImmichAlignmentText.confirmation(for: aligner.status) else { return }
                                        confirmedMissing = missing
+                                       confirmationText = text
                                        confirmsDrop = true
                                    })
                 ImmichWebView(url: ImmichManager.webUIURL)
@@ -344,7 +348,7 @@ struct ImmichView: View {
                 }
                 Button("Annulla", role: .cancel) {}
             } message: {
-                Text(ImmichAlignmentText.acceptDropConfirmation(missing: confirmedMissing))
+                Text(confirmationText)
             }
         case .ssdNotConfigured:
             ImmichMessageView(
@@ -1232,6 +1236,16 @@ nonisolated struct ImmichAlignmentReport: Equatable, Sendable {
     var stateWasUnreadable = false
     /// Una scansione e' partita per conto suo durante la pulizia: si e' smesso di togliere.
     var removalStopped = false
+    /// Senza un riferimento affidabile (primo giro, o file di stato perso) le offline non si
+    /// tolgono finche' Enrico non conferma: qui cosa vedrebbe e cosa toglierebbe.
+    var needsFirstConfirmation: ImmichFirstRemoval? = nil
+}
+
+/// La richiesta di conferma alla prima rimozione: `active` sono le foto che Immich vede sull'SSD
+/// dopo la scansione, `toRemove` quelle offline che l'app toglierebbe.
+nonisolated struct ImmichFirstRemoval: Equatable, Sendable {
+    let active: Int
+    let toRemove: Int
 }
 
 nonisolated enum ImmichAlignmentFailure: Error, Equatable, Sendable {
@@ -1243,6 +1257,8 @@ nonisolated enum ImmichAlignmentFailure: Error, Equatable, Sendable {
     case http(Int)
     case badResponse
     case keychain
+    /// Il file dove l'app ricorda cosa ha fatto non si e' potuto salvare: il giro si ferma.
+    case stateNotSaved
 }
 
 nonisolated enum ImmichAlignmentReason: Equatable, Sendable {
@@ -1318,11 +1334,31 @@ nonisolated enum ImmichAlignmentText {
         case .http(let code): return "Immich non aggiornato: Immich ha risposto con un errore (codice \(code))."
         case .badResponse: return "Immich non aggiornato: Immich ha risposto in un modo che l'app non capisce (è ancora la versione \(ImmichManager.immichVersion)?)."
         case .keychain: return "Immich non aggiornato: non riesco a salvare la chiave nel Portachiavi."
+        case .stateNotSaved: return "Non riesco a salvare il file dell'allineamento sul Mac: per sicurezza non tolgo nessuna foto da Immich."
         }
     }
 
     static func acceptDropConfirmation(missing: Int) -> String {
         "Dopo la scansione mancano \(number(missing)) foto rispetto all'ultima volta. Se le hai tolte tu dall'SSD, Immich le toglie anche dal suo archivio, con volti e album. I file sull'SSD non vengono toccati."
+    }
+
+    static func firstRemovalLine(active: Int, toRemove: Int) -> String {
+        "Prima di togliere foto da Immich mi serve un tuo sì: Immich vede \(number(active)) foto sull'SSD e ne toglierebbe \(number(toRemove)) che sull'SSD non ci sono più."
+    }
+
+    static func firstRemovalConfirmation(active: Int, toRemove: Int) -> String {
+        "\(number(toRemove)) foto escono da Immich (solo dal suo elenco: i file sull'SSD non vengono toccati). Le \(number(active)) foto che Immich vede restano."
+    }
+
+    /// Il testo dell'alert «Togliere comunque…» per lo stato dato, o `nil` se non c'e' niente da
+    /// confermare. Chi apre l'alert lo congela insieme al numero di `missingToConfirm`.
+    static func confirmation(for status: ImmichAlignmentStatus) -> String? {
+        switch status {
+        case .dropGuard(let missing): return acceptDropConfirmation(missing: missing)
+        case .confirmFirstRemoval(let active, let toRemove):
+            return firstRemovalConfirmation(active: active, toRemove: toRemove)
+        case .idle, .running, .done, .needsKey, .failed: return nil
+        }
     }
 }
 
@@ -1336,6 +1372,8 @@ nonisolated enum ImmichAlignmentStatus: Equatable, Sendable {
     case done(ImmichAlignmentReport, Date)
     case needsKey
     case dropGuard(missing: Int)
+    /// Senza riferimento affidabile l'app non toglie niente finche' Enrico non dice di si.
+    case confirmFirstRemoval(active: Int, toRemove: Int)
     case failed(ImmichAlignmentFailure)
 
     func line(timeZone: TimeZone = .current) -> String {
@@ -1345,6 +1383,8 @@ nonisolated enum ImmichAlignmentStatus: Equatable, Sendable {
         case .done(let report, let date): return ImmichAlignmentText.done(report, at: date, timeZone: timeZone)
         case .needsKey: return ImmichAlignmentText.needsKey
         case .dropGuard(let missing): return ImmichAlignmentText.failure(.dropGuard(missing: missing))
+        case .confirmFirstRemoval(let active, let toRemove):
+            return ImmichAlignmentText.firstRemovalLine(active: active, toRemove: toRemove)
         case .failed(let failure): return ImmichAlignmentText.failure(failure)
         }
     }
@@ -1352,22 +1392,27 @@ nonisolated enum ImmichAlignmentStatus: Equatable, Sendable {
     var isProblem: Bool {
         switch self {
         case .needsKey, .dropGuard, .failed: return true
-        case .idle, .running, .done: return false
+        case .idle, .running, .done, .confirmFirstRemoval: return false
         }
     }
 
     /// Il numero che la finestra mostra nella conferma «Togliere comunque…»: c'e' solo se lo
-    /// stato e' proprio il blocco del calo. Chi apre la conferma lo congela e lo passa a
+    /// stato e' il blocco del calo (le foto mancanti) o la prima rimozione (le foto da togliere).
+    /// Chi apre la conferma lo congela e lo passa a
     /// `acceptDropAndRetry(missing:)`: la conferma vale per quel numero.
     var missingToConfirm: Int? {
-        if case .dropGuard(let missing) = self { return missing }
-        return nil
+        switch self {
+        case .dropGuard(let missing): return missing
+        case .confirmFirstRemoval(_, let toRemove): return toRemove
+        default: return nil
+        }
     }
 
     var actions: [ImmichAlignmentBarAction] {
         switch self {
         case .needsKey: return [.enterPassword]
         case .dropGuard: return [.retry, .acceptDrop]
+        case .confirmFirstRemoval: return [.acceptDrop]
         case .failed: return [.retry]
         case .idle, .running, .done: return []
         }
@@ -1702,7 +1747,8 @@ nonisolated enum ImmichAlignmentRun {
         var now: @Sendable () -> Date = { Date() }
         var scanWaitLimit: TimeInterval = 1800
         var pollInterval: TimeInterval = 5
-        var saveState: @Sendable (ImmichAlignmentState) -> Void = { _ in }
+        /// Se lancia, il giro si ferma con `stateNotSaved`: senza un riferimento durevole non si toglie niente.
+        var saveState: @Sendable (ImmichAlignmentState) throws -> Void = { _ in }
         var progress: @Sendable (String) async -> Void = { _ in }
     }
 
@@ -1728,10 +1774,20 @@ nonisolated enum ImmichAlignmentRun {
             throw ImmichAlignmentFailure.libraryNotFound
         }
         let before = try await api.statistics(libraryId: library.id).total
+        // Il riferimento e' affidabile solo se l'app lo ha ricordato da un giro precedente (o
+        // confermato da Enrico). Al primo giro e dopo un file di stato perso `before` non lo e':
+        // se Immich aveva gia' marcato tutto offline (cron con il mount vuoto) vale 0.
+        let referenceReliable = state.healthyActiveCount != nil && !stateWasUnreadable
         // `healthy` e' il riferimento che si SALVA: mai abbassato dal margine dei doppioni, che
         // vale solo per il confronto in memoria (altrimenti ogni «Riprova» lo abbasserebbe ancora).
+        // Senza riferimento affidabile `before` serve solo per il tetto del margine e la guardia del calo.
         let healthy = state.healthyActiveCount ?? before
         let baseline = max(0, healthy - ImmichAlignmentRules.effectiveAllowance(allowance, healthy: healthy))
+
+        /// Ogni salvataggio fallito ferma il giro.
+        func save() throws {
+            do { try env.saveState(state) } catch { throw ImmichAlignmentFailure.stateNotSaved }
+        }
 
         // Regola 3, prima guardia: mai una scansione con l'SSD staccato.
         guard await env.ssdMounted() else { throw ImmichAlignmentFailure.ssdNotMounted }
@@ -1752,43 +1808,71 @@ nonisolated enum ImmichAlignmentRun {
         report.newAssets = max(0, after - before)
 
         // Regola 3, seconda guardia: il riferimento (non abbassato) si salva anche quando scatta,
-        // cosi' un «Riprova» su un SSD ancora vuoto nella VM scatta di nuovo.
+        // cosi' un «Riprova» su un SSD ancora vuoto nella VM scatta di nuovo. Se il salvataggio
+        // fallisce, l'errore e' `stateNotSaved` al posto di `dropGuard`.
         func tripped(_ active: Int) -> Bool {
             ImmichAlignmentRules.dropGuardTripped(baseline: baseline, activeAfter: active, acceptedMissing: acceptedMissing)
         }
-        func dropGuardFailure(missingFrom active: Int) -> ImmichAlignmentFailure {
-            state.healthyActiveCount = healthy
-            env.saveState(state)
-            return .dropGuard(missing: baseline - active)
+        func dropGuardFailure(missing: Int, savingReference: Bool = true) -> ImmichAlignmentFailure {
+            if savingReference { state.healthyActiveCount = healthy }
+            do { try env.saveState(state) } catch { return .stateNotSaved }
+            return .dropGuard(missing: missing)
         }
-        if tripped(after) { throw dropGuardFailure(missingFrom: after) }
+        if tripped(after) { throw dropGuardFailure(missing: baseline - after) }
         guard await env.ssdMounted() else { throw ImmichAlignmentFailure.ssdNotMounted }
 
         // Con una scansione non finita (Immich puo' non aver ancora riletto l'SSD: tutto
-        // risulterebbe offline) o senza il riferimento ricordato, le offline non si toccano.
-        if report.scanTimedOut || stateWasUnreadable {
+        // risulterebbe offline) le offline non si toccano.
+        var mayAdvanceReference = referenceReliable
+        if report.scanTimedOut {
             report.offlineSkipped = true
         } else {
             await env.progress(ImmichAlignmentText.cleaning)
             let offline = ImmichAlignmentRules.offlineToRemove(try await api.searchAll(.offline(libraryId: library.id)),
                                                                libraryId: library.id)
-            for chunk in ImmichAlignmentRules.chunks(offline) {
-                // Ricontrollo prima di OGNI blocco, il primo compreso: tra un blocco e l'altro l'SSD
-                // puo' sparire, il cron di Immich puo' far partire una scansione, il conteggio crollare.
-                guard await env.ssdMounted() else { throw ImmichAlignmentFailure.ssdNotMounted }
-                guard try await api.jobs().libraryIsIdle else {
-                    report.removalStopped = true
-                    break
+            var mayRemove = true
+            if !referenceReliable {
+                // Senza riferimento affidabile si toglie solo con la conferma di Enrico, e solo se
+                // il numero non supera quello che ha visto (piu' la soglia).
+                let confirmed = acceptedMissing.map { offline.count <= max(0, $0) + ImmichAlignmentRules.dropThreshold(baseline: after) } ?? false
+                if confirmed {
+                    mayAdvanceReference = true
+                } else {
+                    mayRemove = false
+                    if !offline.isEmpty {
+                        report.needsFirstConfirmation = ImmichFirstRemoval(active: after, toRemove: offline.count)
+                        report.offlineSkipped = true
+                    }
                 }
-                let now = try await api.statistics(libraryId: library.id).total
-                if tripped(now) { throw dropGuardFailure(missingFrom: now) }
-                try await api.deleteAssets(ids: chunk)
-                report.offlineRemoved += chunk.count
+            }
+            if mayRemove && !offline.isEmpty {
+                // Prima del primo blocco ci dev'essere uno stato corrente salvato davvero.
+                try save()
+                for chunk in ImmichAlignmentRules.chunks(offline) {
+                    // Ricontrollo prima di OGNI blocco, il primo compreso: tra un blocco e l'altro l'SSD
+                    // puo' sparire, il cron di Immich puo' far partire una scansione, il conteggio crollare.
+                    guard await env.ssdMounted() else { throw ImmichAlignmentFailure.ssdNotMounted }
+                    guard try await api.jobs().libraryIsIdle else {
+                        report.removalStopped = true
+                        break
+                    }
+                    let now = try await api.statistics(libraryId: library.id).total
+                    if referenceReliable {
+                        if tripped(now) { throw dropGuardFailure(missing: baseline - now) }
+                    } else if ImmichAlignmentRules.dropGuardTripped(baseline: after, activeAfter: now) {
+                        // Riferimento non affidabile: il confronto e' con l'`after` confermato e non si
+                        // inventa nessun riferimento da salvare.
+                        throw dropGuardFailure(missing: after - now, savingReference: false)
+                    }
+                    try await api.deleteAssets(ids: chunk)
+                    report.offlineRemoved += chunk.count
+                }
             }
         }
-        // Il riferimento avanza solo se la lettura dell'SSD e' finita e la pulizia non e' stata interrotta.
-        if !report.scanTimedOut && !report.removalStopped { state.healthyActiveCount = after }
-        env.saveState(state)
+        // Il riferimento avanza solo se la lettura dell'SSD e' finita, la pulizia non e' stata
+        // interrotta e il riferimento e' affidabile (o Enrico ha confermato la rimozione).
+        if mayAdvanceReference && !report.scanTimedOut && !report.removalStopped { state.healthyActiveCount = after }
+        try save()
 
         await env.progress(ImmichAlignmentText.stacking)
         let groups = try await api.duplicates()
@@ -1798,7 +1882,7 @@ nonisolated enum ImmichAlignmentRun {
                 try await api.createStack(assetIds: plan.assetIds)
                 report.stacksCreated += 1
                 state.stackedDuplicateIds.insert(plan.duplicateId)
-                env.saveState(state)
+                try save()
             } catch ImmichAlignmentFailure.http(let code) where (400..<500).contains(code) {
                 // Una pila rifiutata (foto impilata nel frattempo, gruppo cambiato) non ferma
                 // le altre e non si ricorda: si riprova al prossimo giro.
@@ -1814,9 +1898,9 @@ nonisolated enum ImmichAlignmentRun {
             try await api.archive(ids: chunk)
             report.archived += chunk.count
             state.archivedAssetIds.formUnion(chunk)
-            env.saveState(state)
+            try save()
         }
-        env.saveState(state)
+        try save()
         return (report, state)
     }
 }
@@ -1866,6 +1950,9 @@ final class ImmichAligner: ObservableObject {
     /// mancanti che la finestra ha mostrato e Enrico ha confermato: la conferma vale per quel
     /// numero (piu' la soglia), non per qualunque calo.
     func acceptDropAndRetry(missing: Int) {
+        // Con Immich spento `request` non fa partire nessun giro: la conferma non deve restare
+        // appesa fino a un giro successivo, che Enrico non avrebbe confermato.
+        guard isImmichRunning() else { acceptedMissingOnce = nil; return }
         acceptedMissingOnce = missing
         request(.manual)
     }
@@ -1884,15 +1971,18 @@ final class ImmichAligner: ObservableObject {
     }
 
     private func runOnce() async {
+        // La conferma vale per questo giro e basta: si consuma subito, prima di qualunque
+        // uscita anticipata (chiave mancante compresa).
+        let acceptedMissing = acceptedMissingOnce
+        acceptedMissingOnce = nil
         guard let key = keyStore.load() else { status = .needsKey; return }
         let api = makeAPI(key)
         let allowance = pendingAllowance
         pendingAllowance = 0
-        let acceptedMissing = acceptedMissingOnce
-        acceptedMissingOnce = nil
         let stateURL = self.stateURL
         let mounted = self.ssdMounted
         let loaded = ImmichAlignmentStateStore.load(from: stateURL)
+        let referenceBefore = loaded.state.healthyActiveCount
         status = .running(ImmichAlignmentText.scanning)
 
         let env = ImmichAlignmentRun.Environment(
@@ -1900,30 +1990,40 @@ final class ImmichAligner: ObservableObject {
             sleep: sleep,
             scanWaitLimit: scanWaitLimit,
             pollInterval: pollInterval,
-            saveState: { try? ImmichAlignmentStateStore.save($0, to: stateURL) },
+            saveState: { try ImmichAlignmentStateStore.save($0, to: stateURL) },
             progress: { [weak self] line in await self?.publishProgress(line) })
+
+        /// Il margine dei Doppioni si restituisce solo se il riferimento salvato non e' avanzato:
+        /// se e' avanzato, il margine e' stato usato e un'altra sottrazione conterebbe due volte.
+        /// Si rilegge il file, cosi' vale per qualunque uscita (successo o errore a meta' giro).
+        func returnAllowanceIfUnused() {
+            let referenceAfter = ImmichAlignmentStateStore.load(from: stateURL).state.healthyActiveCount
+            if referenceAfter == referenceBefore { pendingAllowance += allowance }
+        }
 
         do {
             let (report, _) = try await ImmichAlignmentRun.run(api: api, state: loaded.state, allowance: allowance,
                                                                acceptedMissing: acceptedMissing,
                                                                stateWasUnreadable: loaded.wasUnreadable, env: env)
+            returnAllowanceIfUnused()
             let now = Date()
-            status = .done(report, now)
-            log(ImmichAlignmentText.done(report, at: now))
+            if let first = report.needsFirstConfirmation {
+                status = .confirmFirstRemoval(active: first.active, toRemove: first.toRemove)
+                log(status.line())
+            } else {
+                status = .done(report, now)
+                log(ImmichAlignmentText.done(report, at: now))
+            }
         } catch {
+            returnAllowanceIfUnused()
             let failure = (error as? ImmichAlignmentFailure) ?? .notReachable
             switch failure {
             case .unauthorized:
                 keyStore.delete()
                 status = .needsKey
             case .dropGuard(let missing):
-                // Il margine dei doppioni resta per il «Riprova»: il riferimento salvato non e' stato
-                // abbassato, quindi il margine va tenuto, non perso (e non raddoppiato).
-                pendingAllowance += allowance
                 status = .dropGuard(missing: missing)
             default:
-                // Il margine dei Doppioni non e' stato usato: resta per il prossimo giro.
-                pendingAllowance += allowance
                 status = .failed(failure)
             }
             log(ImmichAlignmentText.failure(failure))
