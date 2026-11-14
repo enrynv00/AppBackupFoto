@@ -309,4 +309,24 @@ final class ImmichAlignmentRulesTests: XCTestCase {
         XCTAssertEqual(of(error: "boom"), .stopped(error: "boom"))
         XCTAssertEqual(of(), .stopped(error: nil))
     }
+
+    // MARK: - Avvio automatico
+
+    func testAutoStartAction() {
+        func act(installed: Bool = true, mounted: Bool = true, path: Bool = true, running: Bool = false,
+                 starting: Bool = false, vm: Bool = false) -> ImmichAutoStart.Action {
+            ImmichAutoStart.action(installed: installed, ssdMounted: mounted, ssdPathKnown: path,
+                                   isRunning: running, isStarting: starting, vmPossiblyUp: vm)
+        }
+        XCTAssertEqual(act(), .start)
+        XCTAssertEqual(act(vm: true), .start)                          // VM su, Immich giu': si rilancia
+        XCTAssertEqual(act(running: true), .none)
+        XCTAssertEqual(act(starting: true), .none)
+        XCTAssertEqual(act(path: false), .none)                        // SSD mai configurato
+        XCTAssertEqual(act(installed: false), .none)
+        XCTAssertEqual(act(mounted: false, running: true), .stop)
+        XCTAssertEqual(act(mounted: false, vm: true), .stop)
+        XCTAssertEqual(act(mounted: false), .none)
+        XCTAssertEqual(act(mounted: false, running: true, starting: true), .none) // mai a meta' di un avvio
+    }
 }

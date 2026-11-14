@@ -127,6 +127,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// scatterebbe la rete di sicurezza proprio mentre l'arresto sta ancora lavorando.
     private static let shutdownSafetyNet: TimeInterval = 200
 
+    /// Immich parte da solo con l'SSD collegato e si ferma quando lo si scollega (ROADMAP #50).
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        ImmichAutoStartCoordinator.shared.begin()
+    }
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         let immich = ImmichManager.shared
 
@@ -424,6 +429,8 @@ struct ImmichSetupPromptView: View {
                     Task {
                         try? await immich.install()
                         await MainActor.run { isInstalling = false }
+                        // Appena installato parte da solo, se l'SSD e' collegato.
+                        await ImmichAutoStartCoordinator.shared.react()
                     }
                 }
                 .buttonStyle(.borderedProminent)
@@ -1671,6 +1678,61 @@ final class ImmichAligner: ObservableObject {
     }
 }
 
+// MARK: Avvio e arresto automatici (spec §1)
+
+nonisolated enum ImmichAutoStart {
+    nonisolated enum Action: Equatable, Sendable { case start, stop, none }
+
+    /// Con l'SSD collegato Immich deve essere acceso; senza, spento. Mai a meta' di un avvio:
+    /// fermare un `colima start` in corso lascerebbe la VM in uno stato incerto.
+    static func action(installed: Bool, ssdMounted: Bool, ssdPathKnown: Bool,
+                       isRunning: Bool, isStarting: Bool, vmPossiblyUp: Bool) -> Action {
+        guard installed, !isStarting else { return .none }
+        if ssdMounted { return (ssdPathKnown && !isRunning) ? .start : .none }
+        return (isRunning || vmPossiblyUp) ? .stop : .none
+    }
+}
+
+/// Segue `VolumeMonitor.ssdMounted`: SSD collegato → Immich acceso, scollegato → spento.
+/// Avviato una volta sola da `AppDelegate.applicationDidFinishLaunching`.
+final class ImmichAutoStartCoordinator {
+    static let shared = ImmichAutoStartCoordinator()
+    private var cancellable: AnyCancellable?
+
+    func begin() {
+        guard cancellable == nil else { return }
+        cancellable = VolumeMonitor.shared.$ssdMounted
+            .removeDuplicates()
+            .sink { _ in Task { await ImmichAutoStartCoordinator.shared.react() } }
+    }
+
+    /// Legge lo stato di adesso (non quello di quando e' stato chiamato) e agisce.
+    func react() async {
+        let immich = ImmichManager.shared
+        guard immich.detectInstalled() else { return }
+        await immich.detectRunning()
+        let path = BookmarkManager.shared.urls[.ssd]?.path
+        let action = ImmichAutoStart.action(installed: true,
+                                            ssdMounted: VolumeMonitor.shared.ssdMounted,
+                                            ssdPathKnown: path != nil,
+                                            isRunning: immich.isRunning,
+                                            isStarting: immich.isStarting,
+                                            vmPossiblyUp: immich.vmPossiblyUp)
+        switch action {
+        case .start:
+            guard let path else { return }
+            try? await immich.start(sourceLibraryPath: path)
+            // L'SSD puo' essere sparito durante l'avvio (minuti): il segnale di allora non
+            // ha fermato niente perche' l'avvio era in corso, quindi si ricontrolla qui.
+            if !VolumeMonitor.shared.ssdMounted { await react() }
+        case .stop:
+            await immich.stop()
+        case .none:
+            break
+        }
+    }
+}
+
 // MARK: - ImmichManager — ciclo di vita (Colima + Docker Compose)
 
 /// Buffer thread-safe per l'output di un `Process`: senza leggere la pipe *mentre* il processo
@@ -1994,7 +2056,11 @@ extension ImmichManager {
             let deadline = Date().addingTimeInterval(120)
             while Date() < deadline {
                 if await healthCheck() {
-                    await MainActor.run { self.isRunning = true }
+                    await MainActor.run {
+                        self.isRunning = true
+                        // Ogni avvio riallinea Immich all'SSD (spec, decisione 2).
+                        ImmichAligner.shared.request(.immichStarted)
+                    }
                     return
                 }
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
