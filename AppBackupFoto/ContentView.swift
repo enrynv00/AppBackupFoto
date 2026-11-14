@@ -865,6 +865,26 @@ nonisolated struct ImmichJobCounts: Decodable, Equatable, Sendable {
     let active: Int
     let waiting: Int
     let delayed: Int
+    /// Job in pausa: una coda con job in pausa non e' ferma (puo' ripartire da sola).
+    /// Opzionale nella risposta: se manca vale 0.
+    let paused: Int
+
+    init(active: Int, waiting: Int, delayed: Int, paused: Int = 0) {
+        self.active = active
+        self.waiting = waiting
+        self.delayed = delayed
+        self.paused = paused
+    }
+
+    enum CodingKeys: String, CodingKey { case active, waiting, delayed, paused }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        active = try c.decode(Int.self, forKey: .active)
+        waiting = try c.decode(Int.self, forKey: .waiting)
+        delayed = try c.decode(Int.self, forKey: .delayed)
+        paused = try c.decodeIfPresent(Int.self, forKey: .paused) ?? 0
+    }
 }
 
 /// Risposta di `GET /jobs`: di tutte le code serve solo `library`, quella della scansione.
@@ -874,7 +894,8 @@ nonisolated struct ImmichJobs: Decodable, Sendable {
     let library: Queue
 
     var libraryIsIdle: Bool {
-        library.jobCounts.active + library.jobCounts.waiting + library.jobCounts.delayed == 0
+        let c = library.jobCounts
+        return c.active + c.waiting + c.delayed + c.paused == 0
     }
 }
 
@@ -914,8 +935,17 @@ nonisolated enum ImmichAlignmentRules {
         return min(dropGuardAbsolute, fraction)
     }
 
-    static func dropGuardTripped(baseline: Int, activeAfter: Int) -> Bool {
-        baseline - activeAfter > dropThreshold(baseline: baseline)
+    /// `acceptedMissing`: il numero di foto mancanti che Enrico ha visto e confermato con
+    /// «Togli comunque». Allarga la tolleranza di quel numero e basta: se dopo la conferma
+    /// manca molto di piu' (SSD sparito), la guardia scatta di nuovo.
+    static func dropGuardTripped(baseline: Int, activeAfter: Int, acceptedMissing: Int? = nil) -> Bool {
+        baseline - activeAfter > max(0, acceptedMissing ?? 0) + dropThreshold(baseline: baseline)
+    }
+
+    /// Il margine dei doppioni spostati dall'app abbassa il riferimento in memoria, ma non
+    /// oltre un quarto: un margine enorme (o sbagliato) non deve spegnere la guardia.
+    static func effectiveAllowance(_ allowance: Int, healthy: Int) -> Int {
+        min(max(0, allowance), max(0, healthy) / 4)
     }
 
     private static func pixels(_ asset: ImmichAsset) -> Int? {
@@ -939,10 +969,16 @@ nonisolated enum ImmichAlignmentRules {
     /// Gruppi da impilare: mai uno gia' impilato dall'app (Enrico potrebbe averlo separato,
     /// spec regola 5), mai uno con una foto gia' in una pila (non si fondono pile altrui).
     /// Le foto cestinate o offline non entrano nella pila.
-    static func groupsToStack(_ groups: [ImmichDuplicateGroup], alreadyStacked: Set<String>) -> [ImmichStackPlan] {
+    ///
+    /// Con `libraryId` si tengono solo le foto di quella libreria: i gruppi di simili di Immich
+    /// attraversano le librerie, e l'app non impila mai una foto che non e' dell'SSD.
+    static func groupsToStack(_ groups: [ImmichDuplicateGroup], alreadyStacked: Set<String>,
+                              libraryId: String? = nil) -> [ImmichStackPlan] {
         groups.compactMap { group in
             guard !alreadyStacked.contains(group.duplicateId) else { return nil }
-            let live = group.assets.filter { !$0.isTrashed && !$0.isOffline }
+            let live = group.assets.filter {
+                !$0.isTrashed && !$0.isOffline && (libraryId == nil || $0.libraryId == libraryId)
+            }
             guard live.count >= 2, live.allSatisfy({ $0.stack == nil }) else { return nil }
             return ImmichStackPlan(duplicateId: group.duplicateId, assetIds: stackOrder(live))
         }
@@ -956,9 +992,12 @@ nonisolated enum ImmichAlignmentRules {
 
     /// Minuscole ancora in griglia e mai archiviate prima dall'app: una foto che Enrico ha
     /// tolto dall'Archivio non ci torna (spec, regola 5).
-    static func assetsToArchive(_ assets: [ImmichAsset], alreadyArchived: Set<String>) -> [String] {
+    /// Con `libraryId` si archivia solo cio' che e' di quella libreria (oltre al filtro del server).
+    static func assetsToArchive(_ assets: [ImmichAsset], alreadyArchived: Set<String>,
+                                libraryId: String? = nil) -> [String] {
         assets.filter { isTiny($0) && $0.visibility == "timeline" && !$0.isTrashed && !$0.isOffline
-                        && !alreadyArchived.contains($0.id) }.map(\.id)
+                        && !alreadyArchived.contains($0.id)
+                        && (libraryId == nil || $0.libraryId == libraryId) }.map(\.id)
     }
 
     static func chunks(_ ids: [String], size: Int = chunkSize) -> [[String]] {
@@ -1000,14 +1039,29 @@ nonisolated enum ImmichAlignmentStateStore {
             .appendingPathComponent("AppBackupFoto/immich-alignment.json")
     }
 
-    /// File assente o illeggibile = stato vuoto. Conseguenza accettata: senza riferimento la
-    /// guardia del calo usa il numero prima della scansione (come al primo giro).
-    static func load(from url: URL) -> ImmichAlignmentState {
-        guard let data = try? Data(contentsOf: url),
-              let state = try? JSONDecoder().decode(ImmichAlignmentState.self, from: data) else {
-            return ImmichAlignmentState()
+    nonisolated struct Loaded: Equatable, Sendable {
+        let state: ImmichAlignmentState
+        /// Il file c'era ma non si e' potuto leggere: e' stato messo da parte e lo stato e' vuoto.
+        let wasUnreadable: Bool
+    }
+
+    /// File assente = stato vuoto, come al primo giro. File presente ma illeggibile (corrotto,
+    /// troncato, non decodificabile) = stato vuoto **e** `wasUnreadable`: l'orchestratore in quel
+    /// giro non toglie nessuna foto, perche' senza riferimento ricordato non puo' dire se
+    /// l'SSD e' sano. Il file illeggibile si sposta in `<nome>.illeggibile` (copia di scarto
+    /// sul disco interno, mai sull'SSD; se ce n'e' gia' una, la sostituisce) cosi' il prossimo
+    /// salvataggio non la sovrascrive.
+    static func load(from url: URL) -> Loaded {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: url.path) else { return Loaded(state: ImmichAlignmentState(), wasUnreadable: false) }
+        if let data = try? Data(contentsOf: url),
+           let state = try? JSONDecoder().decode(ImmichAlignmentState.self, from: data) {
+            return Loaded(state: state, wasUnreadable: false)
         }
-        return state
+        let aside = url.appendingPathExtension("illeggibile")
+        try? fm.removeItem(at: aside)
+        try? fm.moveItem(at: url, to: aside)
+        return Loaded(state: ImmichAlignmentState(), wasUnreadable: true)
     }
 
     static func save(_ state: ImmichAlignmentState, to url: URL) throws {
@@ -1026,6 +1080,12 @@ nonisolated struct ImmichAlignmentReport: Equatable, Sendable {
     var stacksCreated = 0
     var archived = 0
     var scanTimedOut = false
+    /// Le offline non si sono cercate ne' tolte in questo giro (scansione non finita, o file
+    /// di stato illeggibile).
+    var offlineSkipped = false
+    var stateWasUnreadable = false
+    /// Una scansione e' partita per conto suo durante la pulizia: si e' smesso di togliere.
+    var removalStopped = false
 }
 
 nonisolated enum ImmichAlignmentFailure: Error, Equatable, Sendable {
@@ -1089,6 +1149,15 @@ nonisolated enum ImmichAlignmentText {
         var line = "Immich aggiornato alle \(time(date, timeZone: timeZone))"
         line += parts.isEmpty ? ": niente da cambiare." : ": " + parts.joined(separator: ", ") + "."
         if r.scanTimedOut { line += " La scansione non è finita in 30 minuti: il resto entra al prossimo giro." }
+        if r.offlineSkipped && r.scanTimedOut {
+            line += " Immich sta ancora leggendo l'SSD: le foto che non ci sono più le tolgo al prossimo giro."
+        }
+        if r.stateWasUnreadable {
+            line += " Il file dove l'app ricorda cosa ha fatto non si leggeva: per questo giro non tolgo nessuna foto, lo faccio al prossimo."
+        }
+        if r.removalStopped {
+            line += " Immich ha iniziato una nuova scansione: le foto che non ci sono più le tolgo al prossimo giro."
+        }
         return line
     }
 
@@ -1488,18 +1557,27 @@ nonisolated enum ImmichAlignmentRun {
     ///
     /// - Parameters:
     ///   - allowance: file che l'app stessa ha spostato dall'SSD (Doppioni) dall'ultimo giro.
-    ///   - acceptDrop: Enrico ha confermato «Togli comunque»: la guardia del calo non si applica.
+    ///     Abbassa il riferimento solo nel confronto in memoria, con un tetto (spec §3).
+    ///   - acceptedMissing: il numero di foto mancanti mostrato a Enrico e da lui confermato con
+    ///     «Togli comunque». Allarga la guardia di quel numero, non la spegne.
+    ///   - stateWasUnreadable: il file di stato non si leggeva: in questo giro non si toglie
+    ///     nessuna foto offline (spec §5).
     static func run(api: any ImmichAlignmentAPI, state start: ImmichAlignmentState,
-                    allowance: Int, acceptDrop: Bool, env: Environment) async throws
+                    allowance: Int, acceptedMissing: Int?, stateWasUnreadable: Bool = false,
+                    env: Environment) async throws
         -> (ImmichAlignmentReport, ImmichAlignmentState) {
         var state = start
         var report = ImmichAlignmentReport()
+        report.stateWasUnreadable = stateWasUnreadable
 
         guard let library = ImmichAlignmentRules.ssdLibrary(in: try await api.libraries()) else {
             throw ImmichAlignmentFailure.libraryNotFound
         }
         let before = try await api.statistics(libraryId: library.id).total
-        let baseline = max(0, (state.healthyActiveCount ?? before) - max(0, allowance))
+        // `healthy` e' il riferimento che si SALVA: mai abbassato dal margine dei doppioni, che
+        // vale solo per il confronto in memoria (altrimenti ogni «Riprova» lo abbasserebbe ancora).
+        let healthy = state.healthyActiveCount ?? before
+        let baseline = max(0, healthy - ImmichAlignmentRules.effectiveAllowance(allowance, healthy: healthy))
 
         // Regola 3, prima guardia: mai una scansione con l'SSD staccato.
         guard await env.ssdMounted() else { throw ImmichAlignmentFailure.ssdNotMounted }
@@ -1519,47 +1597,70 @@ nonisolated enum ImmichAlignmentRun {
         let after = try await api.statistics(libraryId: library.id).total
         report.newAssets = max(0, after - before)
 
-        // Regola 3, seconda guardia: il riferimento si salva anche quando scatta, cosi' un
-        // «Riprova» su un SSD ancora vuoto nella VM scatta di nuovo.
-        if !acceptDrop && ImmichAlignmentRules.dropGuardTripped(baseline: baseline, activeAfter: after) {
-            state.healthyActiveCount = baseline
-            env.saveState(state)
-            throw ImmichAlignmentFailure.dropGuard(missing: baseline - after)
+        // Regola 3, seconda guardia: il riferimento (non abbassato) si salva anche quando scatta,
+        // cosi' un «Riprova» su un SSD ancora vuoto nella VM scatta di nuovo.
+        func tripped(_ active: Int) -> Bool {
+            ImmichAlignmentRules.dropGuardTripped(baseline: baseline, activeAfter: active, acceptedMissing: acceptedMissing)
         }
+        func dropGuardFailure(missingFrom active: Int) -> ImmichAlignmentFailure {
+            state.healthyActiveCount = healthy
+            env.saveState(state)
+            return .dropGuard(missing: baseline - active)
+        }
+        if tripped(after) { throw dropGuardFailure(missingFrom: after) }
         guard await env.ssdMounted() else { throw ImmichAlignmentFailure.ssdNotMounted }
 
-        await env.progress(ImmichAlignmentText.cleaning)
-        let offline = ImmichAlignmentRules.offlineToRemove(try await api.searchAll(.offline(libraryId: library.id)),
-                                                           libraryId: library.id)
-        for chunk in ImmichAlignmentRules.chunks(offline) {
-            try await api.deleteAssets(ids: chunk)
-            report.offlineRemoved += chunk.count
+        // Con una scansione non finita (Immich puo' non aver ancora riletto l'SSD: tutto
+        // risulterebbe offline) o senza il riferimento ricordato, le offline non si toccano.
+        if report.scanTimedOut || stateWasUnreadable {
+            report.offlineSkipped = true
+        } else {
+            await env.progress(ImmichAlignmentText.cleaning)
+            let offline = ImmichAlignmentRules.offlineToRemove(try await api.searchAll(.offline(libraryId: library.id)),
+                                                               libraryId: library.id)
+            for chunk in ImmichAlignmentRules.chunks(offline) {
+                // Ricontrollo prima di OGNI blocco, il primo compreso: tra un blocco e l'altro l'SSD
+                // puo' sparire, il cron di Immich puo' far partire una scansione, il conteggio crollare.
+                guard await env.ssdMounted() else { throw ImmichAlignmentFailure.ssdNotMounted }
+                guard try await api.jobs().libraryIsIdle else {
+                    report.removalStopped = true
+                    break
+                }
+                let now = try await api.statistics(libraryId: library.id).total
+                if tripped(now) { throw dropGuardFailure(missingFrom: now) }
+                try await api.deleteAssets(ids: chunk)
+                report.offlineRemoved += chunk.count
+            }
         }
-        state.healthyActiveCount = after
+        // Il riferimento avanza solo se la lettura dell'SSD e' finita e la pulizia non e' stata interrotta.
+        if !report.scanTimedOut && !report.removalStopped { state.healthyActiveCount = after }
         env.saveState(state)
 
         await env.progress(ImmichAlignmentText.stacking)
-        for plan in ImmichAlignmentRules.groupsToStack(try await api.duplicates(),
-                                                       alreadyStacked: state.stackedDuplicateIds) {
+        let groups = try await api.duplicates()
+        for plan in ImmichAlignmentRules.groupsToStack(groups, alreadyStacked: state.stackedDuplicateIds,
+                                                       libraryId: library.id) {
             do {
                 try await api.createStack(assetIds: plan.assetIds)
                 report.stacksCreated += 1
                 state.stackedDuplicateIds.insert(plan.duplicateId)
+                env.saveState(state)
             } catch ImmichAlignmentFailure.http(let code) where (400..<500).contains(code) {
                 // Una pila rifiutata (foto impilata nel frattempo, gruppo cambiato) non ferma
                 // le altre e non si ricorda: si riprova al prossimo giro.
                 continue
             }
         }
-        env.saveState(state)
 
         await env.progress(ImmichAlignmentText.archiving)
         let tiny = ImmichAlignmentRules.assetsToArchive(try await api.searchAll(.images(libraryId: library.id)),
-                                                        alreadyArchived: state.archivedAssetIds)
+                                                        alreadyArchived: state.archivedAssetIds,
+                                                        libraryId: library.id)
         for chunk in ImmichAlignmentRules.chunks(tiny) {
             try await api.archive(ids: chunk)
             report.archived += chunk.count
             state.archivedAssetIds.formUnion(chunk)
+            env.saveState(state)
         }
         env.saveState(state)
         return (report, state)
@@ -1582,7 +1683,8 @@ final class ImmichAligner: ObservableObject {
     private(set) var currentTask: Task<Void, Never>?
     private var rerunRequested = false
     private var pendingAllowance = 0
-    private var acceptDropOnce = false
+    /// Il numero di foto mancanti che Enrico ha confermato, valido per un solo giro.
+    private var acceptedMissingOnce: Int?
 
     // Iniettabili per i test.
     var keyStore: any ImmichKeyStore = KeychainImmichKeyStore()
@@ -1606,9 +1708,12 @@ final class ImmichAligner: ObservableObject {
         currentTask = Task { await self.loop() }
     }
 
-    /// «Togli comunque», dopo la conferma della finestra Foto.
-    func acceptDropAndRetry() {
-        acceptDropOnce = true
+    /// «Togli comunque», dopo la conferma della finestra Foto. `missing` e' il numero di foto
+    /// mancanti che la finestra ha mostrato e Enrico ha confermato: la conferma vale per quel
+    /// numero (piu' la soglia), non per qualunque calo.
+    // Task 8: la finestra passa a acceptDropAndRetry(missing:) il numero che ha mostrato
+    func acceptDropAndRetry(missing: Int) {
+        acceptedMissingOnce = missing
         request(.manual)
     }
 
@@ -1630,11 +1735,11 @@ final class ImmichAligner: ObservableObject {
         let api = makeAPI(key)
         let allowance = pendingAllowance
         pendingAllowance = 0
-        let acceptDrop = acceptDropOnce
-        acceptDropOnce = false
+        let acceptedMissing = acceptedMissingOnce
+        acceptedMissingOnce = nil
         let stateURL = self.stateURL
         let mounted = self.ssdMounted
-        let state = ImmichAlignmentStateStore.load(from: stateURL)
+        let loaded = ImmichAlignmentStateStore.load(from: stateURL)
         status = .running(ImmichAlignmentText.scanning)
 
         let env = ImmichAlignmentRun.Environment(
@@ -1646,8 +1751,9 @@ final class ImmichAligner: ObservableObject {
             progress: { [weak self] line in await self?.publishProgress(line) })
 
         do {
-            let (report, _) = try await ImmichAlignmentRun.run(api: api, state: state, allowance: allowance,
-                                                               acceptDrop: acceptDrop, env: env)
+            let (report, _) = try await ImmichAlignmentRun.run(api: api, state: loaded.state, allowance: allowance,
+                                                               acceptedMissing: acceptedMissing,
+                                                               stateWasUnreadable: loaded.wasUnreadable, env: env)
             let now = Date()
             status = .done(report, now)
             log(ImmichAlignmentText.done(report, at: now))
@@ -1658,6 +1764,9 @@ final class ImmichAligner: ObservableObject {
                 keyStore.delete()
                 status = .needsKey
             case .dropGuard(let missing):
+                // Il margine dei doppioni resta per il «Riprova»: il riferimento salvato non e' stato
+                // abbassato, quindi il margine va tenuto, non perso (e non raddoppiato).
+                pendingAllowance += allowance
                 status = .dropGuard(missing: missing)
             default:
                 // Il margine dei Doppioni non e' stato usato: resta per il prossimo giro.

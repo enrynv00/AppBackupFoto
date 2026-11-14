@@ -33,7 +33,15 @@ Enrico vuole che la finestra Foto funzioni «stile Google Foto»: le foto nuove 
 2. **Mai «risolvi duplicati» di Immich** (`POST /duplicates/resolve`, `DELETE /duplicates`): cancellano. Solo pile (`POST /stacks`).
 3. **Mai scansionare senza SSD.** Una scansione con il punto di montaggio vuoto segnerebbe offline tutte le 52.139 foto, e il passo 2 le toglierebbe da Immich con volti, album e pile. Due guardie:
    - prima della scansione, e di nuovo prima di togliere le offline: `VolumeMonitor.ssdMounted` vero (che conta solo un vero punto di montaggio, `VolumeCapacityReader.isMounted`, #40);
-   - dopo la scansione: se le foto attive della libreria sono calate di più di **500** o di più del **2 %** rispetto a un **riferimento ricordato**, le offline non si tolgono, l'allineamento si ferma e la finestra Foto lo dice. Le foto restano nel Cestino di Immich, recuperabili. Il riferimento è il numero di foto attive dopo l'ultimo allineamento riuscito, salvato in `immich-alignment.json`; al primo giro è il numero prima della scansione, e **viene salvato subito anche quando la guardia scatta**. Così un «Riprova» con l'SSD ancora vuoto dentro la macchina virtuale scatta di nuovo invece di confrontarsi con un numero già crollato. Uno spostamento di doppioni dell'app abbassa il riferimento di quanti file ha spostato. Per un calo voluto e più grande, la finestra offre «Togli comunque», dopo una conferma che dice quante foto escono da Immich; il riferimento diventa allora il numero attuale. Soglia scelta perché il blocco più grande dei Doppioni (#46) è di 500 file.
+   - dopo la scansione: se le foto attive della libreria sono calate di più di **500** o di più del **2 %** rispetto a un **riferimento ricordato**, le offline non si tolgono, l'allineamento si ferma e la finestra Foto lo dice. Le foto restano nel Cestino di Immich, recuperabili. Il riferimento è il numero di foto attive dopo l'ultimo allineamento riuscito, salvato in `immich-alignment.json`; al primo giro è il numero prima della scansione, e **viene salvato subito anche quando la guardia scatta**, **nel valore non abbassato** (`healthyActiveCount ?? numero prima della scansione`). Così un «Riprova» con l'SSD ancora vuoto dentro la macchina virtuale scatta di nuovo invece di confrontarsi con un numero già crollato.
+   - **Margine dei doppioni (C1, C2).** Uno spostamento di doppioni dell'app abbassa il riferimento di quanti file ha spostato, ma **solo nel confronto in memoria**, mai nel valore salvato, e con un **tetto di un quarto del riferimento** (`min(max(0, margine), riferimento / 4)`): un margine enorme o sbagliato non deve spegnere la guardia (con il punto di montaggio vuoto, `dopo = 0`, la guardia scatta comunque). Quando la guardia scatta il margine resta in sospeso per il «Riprova», che quindi non lo somma due volte né abbassa il riferimento in modo cumulativo.
+   - **«Togli comunque» è legato al numero confermato (B2).** Per un calo voluto e più grande la finestra offre «Togli comunque», dopo una conferma che dice quante foto escono da Immich. La conferma vale per **quel numero** (`acceptedMissing`) e per un solo giro: la guardia scatta comunque se mancano più di `acceptedMissing + soglia` foto, così un SSD sparito dopo la conferma (600 confermate, 52.139 mancanti) non passa. Se la guardia passa, il riferimento diventa il numero attuale.
+   - **Scansione non finita (B1).** Se l'attesa della scansione arriva al tetto dei 30 minuti, Immich può non aver ancora riletto l'SSD e molte foto risulterebbero offline per errore: in quel giro il blocco «offline» non gira (niente ricerca, niente delete, riferimento invariato). Pile e archiviazione proseguono, e la finestra dice che le foto che non ci sono più si tolgono al prossimo giro.
+   - **Ricontrollo prima di ogni blocco di delete (C5), il primo compreso.** SSD ancora montato (altrimenti errore «SSD non collegato»); coda `library` ancora ferma, cioè nessun job attivo, in attesa, rimandato **o in pausa** (altrimenti si smette di togliere in quel giro, i blocchi già tolti restano contati, e si dice nell'esito); statistiche di nuovo sotto la guardia del calo, con lo stesso `acceptedMissing` (altrimenti `dropGuard`). Il riferimento avanza solo se la scansione è finita e la pulizia non è stata interrotta.
+   - **Solo la libreria dell'SSD (C3).** Pile e archiviazione si applicano solo alle foto con `libraryId` uguale a quello della libreria dell'SSD, anche se il server ha già filtrato: i gruppi di simili di Immich attraversano le librerie, e una pila si fa solo se restano almeno 2 foto dell'SSD.
+   - **Stato salvato a ogni passo (C4).** `immich-alignment.json` si scrive dopo ogni pila riuscita e dopo ogni blocco di archiviazione riuscito, non solo alla fine: un errore a metà non fa rifare né dimenticare quanto fatto.
+   - **File di stato illeggibile (M2).** Se `immich-alignment.json` esiste ma non si legge o non si decodifica, non è come se non ci fosse: il file si sposta in `immich-alignment.json.illeggibile` (copia di scarto sul disco interno, sostituisce un'eventuale precedente), lo stato parte vuoto e **in quel giro non si toglie nessuna foto offline** (senza riferimento ricordato non si può dire se l'SSD è sano). Il resto del giro e il salvataggio del riferimento avvengono come al primo giro. File assente = stato vuoto, come sempre.
+   - Soglia scelta perché il blocco più grande dei Doppioni (#46) è di 500 file.
    - Verificato il 2026-11-13 che Immich non indicizza le cartelle nascoste: 0 foto con un componente nascosto nel percorso (`.Trashes` compreso, che sull'SSD esiste). Le copie spostate nel Cestino dell'SSD diventano offline, non doppioni.
 4. **Si toglie solo ciò che è offline e già nel Cestino di Immich**, e appartiene alla libreria dell'SSD (`importPaths` contiene `/external-ssd`). Le 31 cestinate a mano restano.
 5. **Ciò che Enrico disfa non si rifà.** Se toglie una foto dall'Archivio o separa una pila, l'allineamento successivo non la riarchivia e non la reimpila. L'app tiene l'elenco degli ID già archiviati e dei gruppi già impilati in `~/Library/Application Support/AppBackupFoto/immich-alignment.json` (mai sull'SSD).
@@ -93,9 +101,9 @@ Un solo allineamento alla volta. Una richiesta mentre ne gira uno lo rifà **una
 
 1. Guardie della regola 3 (prima parte). Chiave presente. Libreria trovata.
 2. Scansione, poi attesa della fine (tetto 30 minuti, poi si prosegue con quello che c'è).
-3. Guardia della regola 3 (seconda parte), poi toglie le offline.
-4. Impila i gruppi di simili.
-5. Archivia le minuscole.
+3. Guardia della regola 3 (seconda parte; con scansione non finita o stato illeggibile le offline non si toccano, vedi B1 e M2), poi toglie le offline a blocchi di 500, ricontrollando SSD, coda `library` e statistiche prima di ogni blocco (C5).
+4. Impila i gruppi di simili della sola libreria dell'SSD, salvando lo stato dopo ogni pila (C3, C4).
+5. Archivia le minuscole della sola libreria dell'SSD, salvando lo stato dopo ogni blocco (C3, C4).
 6. Salva `immich-alignment.json` e l'esito.
 
 Chiamato da: fine di `runMacToSSD`, fine di `runImport`, fine di uno spostamento di doppioni andato a buon fine, `ImmichManager.start` riuscito. Se Immich non è acceso, la richiesta resta in sospeso fino al prossimo avvio (che allinea comunque).
@@ -124,6 +132,13 @@ Il compose oggi usa `immich-server:release` e `immich-machine-learning:release`,
   4. import di una foto nuova → compare in Immich senza toccare niente;
   5. una foto tolta a mano dall'Archivio non ci torna al giro dopo;
   6. SSD scollegato → Immich si ferma; ricollegato → riparte e allinea.
+
+## Limiti accettati
+
+Dichiarati dalla revisione di sicurezza del Task 5 (2026-11-14), non corretti di proposito:
+
+- **Foto nuove della stessa scansione possono mascherare foto mancanti.** La guardia guarda il conteggio netto: 600 foto mancanti e 200 nuove nella stessa scansione danno un calo di 400, sotto la soglia di 500. Il caso reale (SSD vuoto o sparito) dà un calo enorme e non è mascherabile; quello piccolo resta nel Cestino di Immich, recuperabile.
+- **Cali ripetuti sotto soglia passano.** Se a ogni giro mancano poche foto (meno della soglia) e il riferimento avanza a ogni giro, nessun giro scatta. La soglia protegge dal calo improvviso, non dalla lenta erosione.
 
 ## Fuori da questo progetto
 

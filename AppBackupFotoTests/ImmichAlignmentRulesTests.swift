@@ -140,6 +140,25 @@ final class ImmichAlignmentRulesTests: XCTestCase {
         XCTAssertFalse(ImmichAlignmentRules.dropGuardTripped(baseline: 0, activeAfter: 0))          // niente da perdere
     }
 
+    func testDropGuardWithAConfirmedNumberToleratesThatNumberPlusTheThreshold() {
+        XCTAssertFalse(ImmichAlignmentRules.dropGuardTripped(baseline: 52139, activeAfter: 52139 - 1100, acceptedMissing: 600))
+        XCTAssertTrue(ImmichAlignmentRules.dropGuardTripped(baseline: 52139, activeAfter: 52139 - 1101, acceptedMissing: 600))
+        XCTAssertTrue(ImmichAlignmentRules.dropGuardTripped(baseline: 52139, activeAfter: 0, acceptedMissing: 600))
+        // senza conferma resta la regola di sempre; una conferma negativa non allarga niente
+        XCTAssertTrue(ImmichAlignmentRules.dropGuardTripped(baseline: 52139, activeAfter: 51638, acceptedMissing: nil))
+        XCTAssertTrue(ImmichAlignmentRules.dropGuardTripped(baseline: 52139, activeAfter: 51638, acceptedMissing: -50))
+    }
+
+    // MARK: - Coda in pausa (M1)
+
+    func testPausedJobsMakeTheLibraryQueueNotIdle() throws {
+        XCTAssertFalse(ImmichJobs(library: .init(jobCounts: .init(active: 0, waiting: 0, delayed: 0, paused: 2))).libraryIsIdle)
+        let paused = try JSONDecoder().decode(ImmichJobs.self, from: Data(#"{"library":{"jobCounts":{"active":0,"completed":5,"failed":0,"delayed":0,"waiting":0,"paused":4}}}"#.utf8))
+        XCTAssertFalse(paused.libraryIsIdle)
+        let noPausedKey = try JSONDecoder().decode(ImmichJobs.self, from: Data(#"{"library":{"jobCounts":{"active":0,"waiting":0,"delayed":0}}}"#.utf8))
+        XCTAssertTrue(noPausedKey.libraryIsIdle)
+    }
+
     // MARK: - Pile
 
     func testStackPrimaryIsMostPixelsThenBiggestFileThenSmallestID() {
@@ -168,6 +187,18 @@ final class ImmichAlignmentRulesTests: XCTestCase {
                                ImmichStackPlan(duplicateId: "trashed-member-ignored", assetIds: ["10", "9"])])
     }
 
+    func testGroupsToStackKeepsOnlyAssetsOfTheGivenLibrary() {
+        let groups = [
+            ImmichDuplicateGroup(duplicateId: "mixed", assets: [immichTestAsset("1"), immichTestAsset("2"), immichTestAsset("x", library: "altra")]),
+            ImmichDuplicateGroup(duplicateId: "one-left", assets: [immichTestAsset("3"), immichTestAsset("y", library: "altra")]),
+            ImmichDuplicateGroup(duplicateId: "no-library", assets: [immichTestAsset("4"), immichTestAsset("z", library: nil)]),
+        ]
+        XCTAssertEqual(ImmichAlignmentRules.groupsToStack(groups, alreadyStacked: [], libraryId: "lib"),
+                       [ImmichStackPlan(duplicateId: "mixed", assetIds: ["1", "2"])])
+        // senza libreria nessun filtro (comportamento di prima)
+        XCTAssertEqual(ImmichAlignmentRules.groupsToStack(groups, alreadyStacked: []).count, 3)
+    }
+
     // MARK: - Minuscole
 
     func testTinyIsAnImageWithLongSideUnder400() {
@@ -191,6 +222,14 @@ final class ImmichAlignmentRulesTests: XCTestCase {
         XCTAssertEqual(ImmichAlignmentRules.assetsToArchive(assets, alreadyArchived: ["tiny-unarchived-by-enrico"]), ["tiny"])
     }
 
+    func testAssetsToArchiveKeepsOnlyTheGivenLibrary() {
+        let assets = [immichTestAsset("mine", width: 100, height: 100),
+                      immichTestAsset("other", width: 100, height: 100, library: "altra"),
+                      immichTestAsset("none", width: 100, height: 100, library: nil)]
+        XCTAssertEqual(ImmichAlignmentRules.assetsToArchive(assets, alreadyArchived: [], libraryId: "lib"), ["mine"])
+        XCTAssertEqual(ImmichAlignmentRules.assetsToArchive(assets, alreadyArchived: []).count, 3)
+    }
+
     // MARK: - Blocchi
 
     func testChunksOf500() {
@@ -211,10 +250,31 @@ final class ImmichAlignmentRulesTests: XCTestCase {
 
     func testStateRoundTripsAndMissingFileIsEmpty() throws {
         let url = tempURL("immich-alignment.json")
-        XCTAssertEqual(ImmichAlignmentStateStore.load(from: url), ImmichAlignmentState())
+        XCTAssertEqual(ImmichAlignmentStateStore.load(from: url).state, ImmichAlignmentState())
+        XCTAssertFalse(ImmichAlignmentStateStore.load(from: url).wasUnreadable)   // assente non e' illeggibile
         let state = ImmichAlignmentState(archivedAssetIds: ["a"], stackedDuplicateIds: ["d"], healthyActiveCount: 52139)
         try ImmichAlignmentStateStore.save(state, to: url)
-        XCTAssertEqual(ImmichAlignmentStateStore.load(from: url), state)
+        XCTAssertEqual(ImmichAlignmentStateStore.load(from: url).state, state)
+        XCTAssertFalse(ImmichAlignmentStateStore.load(from: url).wasUnreadable)
+    }
+
+    func testUnreadableStateFileIsMovedAsideAndReportedAsUnreadable() throws {
+        let url = tempURL("immich-alignment.json")
+        let aside = url.appendingPathExtension("illeggibile")
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("spazzatura".utf8).write(to: url)
+        let loaded = ImmichAlignmentStateStore.load(from: url)
+        XCTAssertEqual(loaded.state, ImmichAlignmentState())
+        XCTAssertTrue(loaded.wasUnreadable)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+        XCTAssertEqual(try String(contentsOf: aside, encoding: .utf8), "spazzatura")
+        XCTAssertEqual(aside.lastPathComponent, "immich-alignment.json.illeggibile")
+        // una seconda copia di scarto sostituisce la prima
+        try Data("altra spazzatura".utf8).write(to: url)
+        XCTAssertTrue(ImmichAlignmentStateStore.load(from: url).wasUnreadable)
+        XCTAssertEqual(try String(contentsOf: aside, encoding: .utf8), "altra spazzatura")
+        // e dopo, senza file, torna uno stato vuoto non segnalato
+        XCTAssertFalse(ImmichAlignmentStateStore.load(from: url).wasUnreadable)
     }
 
     func testStateWithMissingKeysDecodesWithDefaults() throws {
@@ -249,6 +309,18 @@ final class ImmichAlignmentRulesTests: XCTestCase {
         var report = ImmichAlignmentReport(); report.scanTimedOut = true
         XCTAssertTrue(ImmichAlignmentText.done(report, at: date, timeZone: rome)
             .hasSuffix(" La scansione non è finita in 30 minuti: il resto entra al prossimo giro."))
+    }
+
+    func testDoneLineSaysWhenNoOfflinePhotoWasRemovedAndWhy() {
+        var timedOut = ImmichAlignmentReport(); timedOut.scanTimedOut = true; timedOut.offlineSkipped = true
+        XCTAssertTrue(ImmichAlignmentText.done(timedOut, at: date, timeZone: rome)
+            .hasSuffix(" Immich sta ancora leggendo l'SSD: le foto che non ci sono più le tolgo al prossimo giro."))
+        var unreadable = ImmichAlignmentReport(); unreadable.offlineSkipped = true; unreadable.stateWasUnreadable = true
+        XCTAssertTrue(ImmichAlignmentText.done(unreadable, at: date, timeZone: rome)
+            .hasSuffix(" Il file dove l'app ricorda cosa ha fatto non si leggeva: per questo giro non tolgo nessuna foto, lo faccio al prossimo."))
+        var busy = ImmichAlignmentReport(); busy.removalStopped = true
+        XCTAssertTrue(ImmichAlignmentText.done(busy, at: date, timeZone: rome)
+            .hasSuffix(" Immich ha iniziato una nuova scansione: le foto che non ci sono più le tolgo al prossimo giro."))
     }
 
     func testFailureLines() {
