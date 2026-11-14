@@ -781,6 +781,176 @@ extension ImmichManager {
     }
 }
 
+// MARK: - Immich sempre allineato (ROADMAP #50, ADR-0021)
+//
+// L'app guida Immich con la sua API dopo ogni backup che scrive sull'SSD, ogni spostamento di
+// doppioni e ogni avvio di Immich: scansione della libreria dell'SSD, offline tolte, foto simili
+// impilate, minuscole archiviate. Tutto tocca SOLO il database di Immich: l'SSD resta montato in
+// sola lettura due volte (compose `:ro` + Colima senza `:w`). Spec
+// `Docs/superpowers/specs/2026-11-13-immich-always-aligned-design.md`.
+
+// MARK: Modelli JSON (Immich v3.2.0). Solo i campi che servono: gli altri si ignorano.
+
+nonisolated struct ImmichLibrary: Decodable, Equatable, Sendable {
+    let id: String
+    let name: String
+    let importPaths: [String]
+}
+
+nonisolated struct ImmichLibraryStats: Decodable, Equatable, Sendable {
+    let photos: Int
+    let videos: Int
+    let total: Int
+}
+
+nonisolated struct ImmichExif: Decodable, Equatable, Sendable {
+    var exifImageWidth: Int? = nil
+    var exifImageHeight: Int? = nil
+    var fileSizeInByte: Int64? = nil
+}
+
+nonisolated struct ImmichStackRef: Decodable, Equatable, Sendable {
+    let id: String
+    let primaryAssetId: String
+}
+
+nonisolated struct ImmichAsset: Decodable, Equatable, Sendable {
+    let id: String
+    /// "IMAGE", "VIDEO", "AUDIO", "OTHER".
+    let type: String
+    var libraryId: String? = nil
+    var isOffline: Bool = false
+    var isTrashed: Bool = false
+    /// "timeline", "archive", "hidden" (la parte video delle Live Photo), "locked".
+    var visibility: String = "timeline"
+    var width: Int? = nil
+    var height: Int? = nil
+    var exifInfo: ImmichExif? = nil
+    var stack: ImmichStackRef? = nil
+
+    var pixelWidth: Int? { exifInfo?.exifImageWidth ?? width }
+    var pixelHeight: Int? { exifInfo?.exifImageHeight ?? height }
+}
+
+nonisolated struct ImmichDuplicateGroup: Decodable, Equatable, Sendable {
+    let duplicateId: String
+    let assets: [ImmichAsset]
+}
+
+nonisolated struct ImmichSearchResponse: Decodable, Sendable {
+    nonisolated struct Page: Decodable, Sendable {
+        let items: [ImmichAsset]
+        var nextPage: String? = nil
+        var nextCursor: String? = nil
+    }
+    let assets: Page
+}
+
+nonisolated struct ImmichJobCounts: Decodable, Equatable, Sendable {
+    let active: Int
+    let waiting: Int
+    let delayed: Int
+}
+
+/// Risposta di `GET /jobs`: di tutte le code serve solo `library`, quella della scansione.
+/// La coda `duplicateDetection` non si aspetta di proposito (spec §3).
+nonisolated struct ImmichJobs: Decodable, Sendable {
+    nonisolated struct Queue: Decodable, Sendable { let jobCounts: ImmichJobCounts }
+    let library: Queue
+
+    var libraryIsIdle: Bool {
+        library.jobCounts.active + library.jobCounts.waiting + library.jobCounts.delayed == 0
+    }
+}
+
+nonisolated struct ImmichLoginResponse: Decodable, Sendable { let accessToken: String }
+nonisolated struct ImmichAPIKeyCreated: Decodable, Sendable { let secret: String }
+
+nonisolated struct ImmichStackPlan: Equatable, Sendable {
+    let duplicateId: String
+    /// Il primo e' quello che resta davanti nella griglia.
+    let assetIds: [String]
+}
+
+// MARK: Regole pure
+
+nonisolated enum ImmichAlignmentRules {
+    /// Lato lungo sotto il quale un'immagine si archivia (spec, decisione 3).
+    static let tinyLongSide = 400
+    /// Guardia del calo: piu' di 500 foto o piu' del 2 % in meno rispetto al riferimento
+    /// fermano l'allineamento prima di togliere le offline (spec, regola 3).
+    static let dropGuardAbsolute = 500
+    static let dropGuardFraction = 0.02
+    /// Quanti ID per richiesta di cancellazione/archiviazione.
+    static let chunkSize = 500
+
+    static func ssdLibrary(in libraries: [ImmichLibrary]) -> ImmichLibrary? {
+        libraries.first { $0.importPaths.contains(ImmichManager.ssdMountTarget) }
+    }
+
+    /// Solo cio' che e' offline, gia' nel Cestino di Immich e della libreria dell'SSD: le foto
+    /// cestinate a mano dentro Immich (non offline) restano dove sono (spec, regola 4).
+    static func offlineToRemove(_ assets: [ImmichAsset], libraryId: String) -> [String] {
+        assets.filter { $0.isOffline && $0.isTrashed && $0.libraryId == libraryId }.map(\.id)
+    }
+
+    static func dropThreshold(baseline: Int) -> Int {
+        let fraction = Int((Double(max(0, baseline)) * dropGuardFraction).rounded(.down))
+        return min(dropGuardAbsolute, fraction)
+    }
+
+    static func dropGuardTripped(baseline: Int, activeAfter: Int) -> Bool {
+        baseline - activeAfter > dropThreshold(baseline: baseline)
+    }
+
+    private static func pixels(_ asset: ImmichAsset) -> Int? {
+        guard let w = asset.pixelWidth, let h = asset.pixelHeight, w > 0, h > 0 else { return nil }
+        return w * h
+    }
+
+    /// Ordine di una pila: piu' pixel; a parita' il file piu' grande; a parita' l'ID piu'
+    /// piccolo (stabile). Senza dimensioni in fondo.
+    static func stackOrder(_ assets: [ImmichAsset]) -> [String] {
+        assets.sorted { l, r in
+            let lp = pixels(l), rp = pixels(r)
+            if (lp != nil) != (rp != nil) { return lp != nil }
+            if let lp, let rp, lp != rp { return lp > rp }
+            let ls = l.exifInfo?.fileSizeInByte ?? -1, rs = r.exifInfo?.fileSizeInByte ?? -1
+            if ls != rs { return ls > rs }
+            return l.id < r.id
+        }.map(\.id)
+    }
+
+    /// Gruppi da impilare: mai uno gia' impilato dall'app (Enrico potrebbe averlo separato,
+    /// spec regola 5), mai uno con una foto gia' in una pila (non si fondono pile altrui).
+    /// Le foto cestinate o offline non entrano nella pila.
+    static func groupsToStack(_ groups: [ImmichDuplicateGroup], alreadyStacked: Set<String>) -> [ImmichStackPlan] {
+        groups.compactMap { group in
+            guard !alreadyStacked.contains(group.duplicateId) else { return nil }
+            let live = group.assets.filter { !$0.isTrashed && !$0.isOffline }
+            guard live.count >= 2, live.allSatisfy({ $0.stack == nil }) else { return nil }
+            return ImmichStackPlan(duplicateId: group.duplicateId, assetIds: stackOrder(live))
+        }
+    }
+
+    static func isTiny(_ asset: ImmichAsset) -> Bool {
+        guard asset.type == "IMAGE", let w = asset.pixelWidth, let h = asset.pixelHeight,
+              w > 0, h > 0 else { return false }
+        return max(w, h) < tinyLongSide
+    }
+
+    /// Minuscole ancora in griglia e mai archiviate prima dall'app: una foto che Enrico ha
+    /// tolto dall'Archivio non ci torna (spec, regola 5).
+    static func assetsToArchive(_ assets: [ImmichAsset], alreadyArchived: Set<String>) -> [String] {
+        assets.filter { isTiny($0) && $0.visibility == "timeline" && !$0.isTrashed
+                        && !alreadyArchived.contains($0.id) }.map(\.id)
+    }
+
+    static func chunks(_ ids: [String], size: Int = chunkSize) -> [[String]] {
+        stride(from: 0, to: ids.count, by: size).map { Array(ids[$0..<min($0 + size, ids.count)]) }
+    }
+}
+
 // MARK: - ImmichManager — ciclo di vita (Colima + Docker Compose)
 
 /// Buffer thread-safe per l'output di un `Process`: senza leggere la pipe *mentre* il processo
