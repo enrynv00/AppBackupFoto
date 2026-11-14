@@ -43,6 +43,24 @@ final class ImmichAlignmentRulesTests: XCTestCase {
         XCTAssertNil(asset.stack)
     }
 
+    func testPixelSizeComesFromOneSourceOnly() {
+        // exif con la sola larghezza + primo livello completo: vale la coppia di primo livello.
+        let mixed = ImmichAsset(id: "m", type: "IMAGE", width: 1920, height: 1080,
+                                exifInfo: ImmichExif(exifImageWidth: 320, exifImageHeight: nil))
+        XCTAssertEqual(mixed.pixelWidth, 1920)
+        XCTAssertEqual(mixed.pixelHeight, 1080)
+        // exif completo: vince sul primo livello.
+        let exifWins = ImmichAsset(id: "e", type: "IMAGE", width: 1920, height: 1080,
+                                   exifInfo: ImmichExif(exifImageWidth: 320, exifImageHeight: 240))
+        XCTAssertEqual(exifWins.pixelWidth, 320)
+        XCTAssertEqual(exifWins.pixelHeight, 240)
+        // nessuna coppia completa: nil per tutte e due.
+        let half = ImmichAsset(id: "h", type: "IMAGE", width: 1920, height: nil,
+                               exifInfo: ImmichExif(exifImageWidth: nil, exifImageHeight: 240))
+        XCTAssertNil(half.pixelWidth)
+        XCTAssertNil(half.pixelHeight)
+    }
+
     func testDecodesSearchPageLibrariesStatsJobsAndKey() throws {
         let page = try JSONDecoder().decode(ImmichSearchResponse.self, from: Data(#"""
         {"albums":{"total":0,"count":0,"items":[],"facets":[]},
@@ -117,6 +135,9 @@ final class ImmichAlignmentRulesTests: XCTestCase {
         XCTAssertTrue(ImmichAlignmentRules.dropGuardTripped(baseline: 52139, activeAfter: 51638))  // -501
         XCTAssertTrue(ImmichAlignmentRules.dropGuardTripped(baseline: 52139, activeAfter: 0))      // SSD vuoto nella VM
         XCTAssertFalse(ImmichAlignmentRules.dropGuardTripped(baseline: 52139, activeAfter: 60000)) // foto nuove
+        XCTAssertFalse(ImmichAlignmentRules.dropGuardTripped(baseline: 10000, activeAfter: 9800))   // -2 % esatto
+        XCTAssertTrue(ImmichAlignmentRules.dropGuardTripped(baseline: 10000, activeAfter: 9799))    // oltre il 2 %
+        XCTAssertFalse(ImmichAlignmentRules.dropGuardTripped(baseline: 0, activeAfter: 0))          // niente da perdere
     }
 
     // MARK: - Pile
@@ -165,6 +186,7 @@ final class ImmichAlignmentRulesTests: XCTestCase {
             immichTestAsset("tiny-hidden", width: 200, height: 150, visibility: "hidden"),
             immichTestAsset("tiny-trashed", width: 200, height: 150, trashed: true),
             immichTestAsset("tiny-unarchived-by-enrico", width: 200, height: 150),
+            immichTestAsset("tiny-offline", width: 200, height: 150, offline: true),
         ]
         XCTAssertEqual(ImmichAlignmentRules.assetsToArchive(assets, alreadyArchived: ["tiny-unarchived-by-enrico"]), ["tiny"])
     }

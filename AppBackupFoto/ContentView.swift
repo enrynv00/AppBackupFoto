@@ -828,8 +828,16 @@ nonisolated struct ImmichAsset: Decodable, Equatable, Sendable {
     var exifInfo: ImmichExif? = nil
     var stack: ImmichStackRef? = nil
 
-    var pixelWidth: Int? { exifInfo?.exifImageWidth ?? width }
-    var pixelHeight: Int? { exifInfo?.exifImageHeight ?? height }
+    /// Le due misure vengono da UNA fonte sola: se mescolassimo larghezza e altezza di fonti
+    /// diverse (una dell'exif, l'altra di primo livello) otterremmo una coppia che non descrive
+    /// nessuna immagine. Prima l'exif, se ha tutte e due; poi il primo livello, se ha tutte e due.
+    private var pixelSize: (width: Int, height: Int)? {
+        if let w = exifInfo?.exifImageWidth, let h = exifInfo?.exifImageHeight { return (w, h) }
+        if let w = width, let h = height { return (w, h) }
+        return nil
+    }
+    var pixelWidth: Int? { pixelSize?.width }
+    var pixelHeight: Int? { pixelSize?.height }
 }
 
 nonisolated struct ImmichDuplicateGroup: Decodable, Equatable, Sendable {
@@ -942,7 +950,7 @@ nonisolated enum ImmichAlignmentRules {
     /// Minuscole ancora in griglia e mai archiviate prima dall'app: una foto che Enrico ha
     /// tolto dall'Archivio non ci torna (spec, regola 5).
     static func assetsToArchive(_ assets: [ImmichAsset], alreadyArchived: Set<String>) -> [String] {
-        assets.filter { isTiny($0) && $0.visibility == "timeline" && !$0.isTrashed
+        assets.filter { isTiny($0) && $0.visibility == "timeline" && !$0.isTrashed && !$0.isOffline
                         && !alreadyArchived.contains($0.id) }.map(\.id)
     }
 
