@@ -1186,6 +1186,245 @@ nonisolated enum ImmichWindowState: Equatable, Sendable {
     }
 }
 
+// MARK: Richieste verso Immich (pure, testabili)
+
+nonisolated enum ImmichSearch: Equatable, Sendable {
+    case offline(libraryId: String)
+    case images(libraryId: String)
+}
+
+nonisolated enum ImmichPageToken: Equatable, Sendable {
+    case cursor(String)
+    case page(Int)
+}
+
+nonisolated enum ImmichRequests {
+    /// Solo loopback: lo stesso indirizzo di `ImmichManager.webUIURL`, con il prefisso `/api`.
+    static let apiBase = URL(string: "http://127.0.0.1:2283/api")!
+    static let pageSize = 1000
+
+    static func make(_ method: String, _ path: String, apiKey: String? = nil, bearer: String? = nil,
+                     json: [String: Any]? = nil) -> URLRequest {
+        var request = URLRequest(url: apiBase.appendingPathComponent(path))
+        request.httpMethod = method
+        request.timeoutInterval = 60
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        if let apiKey { request.setValue(apiKey, forHTTPHeaderField: "x-api-key") }
+        if let bearer { request.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization") }
+        if let json {
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try? JSONSerialization.data(withJSONObject: json, options: [.sortedKeys])
+        }
+        return request
+    }
+
+    static func libraries(apiKey: String) -> URLRequest { make("GET", "libraries", apiKey: apiKey) }
+    static func statistics(libraryId: String, apiKey: String) -> URLRequest { make("GET", "libraries/\(libraryId)/statistics", apiKey: apiKey) }
+    static func scan(libraryId: String, apiKey: String) -> URLRequest { make("POST", "libraries/\(libraryId)/scan", apiKey: apiKey) }
+    static func jobs(apiKey: String) -> URLRequest { make("GET", "jobs", apiKey: apiKey) }
+    static func duplicates(apiKey: String) -> URLRequest { make("GET", "duplicates", apiKey: apiKey) }
+
+    static func search(_ search: ImmichSearch, token: ImmichPageToken?, apiKey: String) -> URLRequest {
+        var body: [String: Any]
+        switch search {
+        case .offline(let id):
+            body = ["libraryId": id, "isOffline": true, "withDeleted": true, "size": pageSize]
+        case .images(let id):
+            body = ["libraryId": id, "type": "IMAGE", "visibility": "timeline", "withExif": true, "size": pageSize]
+        }
+        switch token {
+        case .cursor(let c): body["cursor"] = c
+        case .page(let p): body["page"] = p
+        case nil: break
+        }
+        return make("POST", "search/metadata", apiKey: apiKey, json: body)
+    }
+
+    /// `page` e' deprecato in v3.2.0 ma ancora presente: si usa il cursore quando c'e'.
+    static func nextToken(after page: ImmichSearchResponse.Page) -> ImmichPageToken? {
+        if let cursor = page.nextCursor, !cursor.isEmpty { return .cursor(cursor) }
+        if let next = page.nextPage, let number = Int(next) { return .page(number) }
+        return nil
+    }
+
+    /// Toglie dal database di Immich. I file sull'SSD restano: e' montato in sola lettura.
+    static func deleteAssets(ids: [String], apiKey: String) -> URLRequest {
+        make("DELETE", "assets", apiKey: apiKey, json: ["ids": ids, "force": true])
+    }
+
+    static func createStack(assetIds: [String], apiKey: String) -> URLRequest {
+        make("POST", "stacks", apiKey: apiKey, json: ["assetIds": assetIds])
+    }
+
+    /// `PUT /assets` e' segnato «Deprecated» in v3.2.0 ma e' l'unico modo di cambiare la
+    /// visibilita' di piu' foto insieme: funziona sulla versione fissata (Task 10 lo verifica).
+    static func archive(ids: [String], apiKey: String) -> URLRequest {
+        make("PUT", "assets", apiKey: apiKey, json: ["ids": ids, "visibility": "archive"])
+    }
+
+    static func login(email: String, password: String) -> URLRequest {
+        make("POST", "auth/login", json: ["email": email, "password": password])
+    }
+
+    static func createKey(bearer: String) -> URLRequest {
+        make("POST", "api-keys", bearer: bearer,
+             json: ["name": ImmichKeyMaker.keyName, "permissions": ImmichKeyPermissions.granted])
+    }
+
+    static func logout(bearer: String) -> URLRequest { make("POST", "auth/logout", bearer: bearer) }
+}
+
+nonisolated enum ImmichKeyPermissions {
+    /// Lista chiusa (spec §2). `asset.delete` serve per togliere le offline e tocca solo il
+    /// database di Immich.
+    static let granted = ["library.read", "library.update", "library.statistics", "asset.read",
+                          "asset.update", "asset.delete", "duplicate.read", "stack.create",
+                          "stack.read", "job.read"]
+    /// Mai, per nessun motivo: blindato da un test.
+    static let neverGranted: Set<String> = ["all", "library.create", "library.delete", "duplicate.delete",
+                                            "stack.update", "stack.delete", "apiKey.create", "apiKey.update",
+                                            "apiKey.delete", "user.delete", "adminUser.delete",
+                                            "asset.upload", "asset.download", "systemConfig.update"]
+}
+
+// MARK: Client verso Immich
+
+nonisolated protocol ImmichAlignmentAPI: Sendable {
+    func libraries() async throws -> [ImmichLibrary]
+    func statistics(libraryId: String) async throws -> ImmichLibraryStats
+    func scan(libraryId: String) async throws
+    func jobs() async throws -> ImmichJobs
+    func searchAll(_ search: ImmichSearch) async throws -> [ImmichAsset]
+    func deleteAssets(ids: [String]) async throws
+    func duplicates() async throws -> [ImmichDuplicateGroup]
+    func createStack(assetIds: [String]) async throws
+    func archive(ids: [String]) async throws
+}
+
+nonisolated struct ImmichHTTPClient: ImmichAlignmentAPI {
+    let apiKey: String
+    /// `.ephemeral`: nessun cookie o cache su disco (il login della chiave lascia un cookie).
+    var session: URLSession = URLSession(configuration: .ephemeral)
+    /// Tetto di sicurezza alle pagine di una ricerca (1.000 x 1.000 foto).
+    static let maxPages = 1000
+
+    static func check(statusCode: Int) throws {
+        if statusCode == 401 || statusCode == 403 { throw ImmichAlignmentFailure.unauthorized }
+        guard (200..<300).contains(statusCode) else { throw ImmichAlignmentFailure.http(statusCode) }
+    }
+
+    static func send(_ request: URLRequest, session: URLSession) async throws -> Data {
+        let data: Data
+        let response: URLResponse
+        do { (data, response) = try await session.data(for: request) }
+        catch { throw ImmichAlignmentFailure.notReachable }
+        try check(statusCode: (response as? HTTPURLResponse)?.statusCode ?? 0)
+        return data
+    }
+
+    static func decode<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
+        do { return try JSONDecoder().decode(type, from: data) }
+        catch { throw ImmichAlignmentFailure.badResponse }
+    }
+
+    private func fetch<T: Decodable>(_ request: URLRequest, as type: T.Type) async throws -> T {
+        try Self.decode(type, from: try await Self.send(request, session: session))
+    }
+
+    private func perform(_ request: URLRequest) async throws {
+        _ = try await Self.send(request, session: session)
+    }
+
+    func libraries() async throws -> [ImmichLibrary] { try await fetch(ImmichRequests.libraries(apiKey: apiKey), as: [ImmichLibrary].self) }
+    func statistics(libraryId: String) async throws -> ImmichLibraryStats { try await fetch(ImmichRequests.statistics(libraryId: libraryId, apiKey: apiKey), as: ImmichLibraryStats.self) }
+    func scan(libraryId: String) async throws { try await perform(ImmichRequests.scan(libraryId: libraryId, apiKey: apiKey)) }
+    func jobs() async throws -> ImmichJobs { try await fetch(ImmichRequests.jobs(apiKey: apiKey), as: ImmichJobs.self) }
+    func deleteAssets(ids: [String]) async throws { try await perform(ImmichRequests.deleteAssets(ids: ids, apiKey: apiKey)) }
+    func duplicates() async throws -> [ImmichDuplicateGroup] { try await fetch(ImmichRequests.duplicates(apiKey: apiKey), as: [ImmichDuplicateGroup].self) }
+    func createStack(assetIds: [String]) async throws { try await perform(ImmichRequests.createStack(assetIds: assetIds, apiKey: apiKey)) }
+    func archive(ids: [String]) async throws { try await perform(ImmichRequests.archive(ids: ids, apiKey: apiKey)) }
+
+    func searchAll(_ search: ImmichSearch) async throws -> [ImmichAsset] {
+        var all: [ImmichAsset] = []
+        var token: ImmichPageToken? = nil
+        for _ in 0..<Self.maxPages {
+            let page = try await fetch(ImmichRequests.search(search, token: token, apiKey: apiKey),
+                                       as: ImmichSearchResponse.self).assets
+            all += page.items
+            guard let next = ImmichRequests.nextToken(after: page) else { return all }
+            token = next
+        }
+        return all
+    }
+}
+
+// MARK: Chiave API nel Portachiavi
+
+nonisolated protocol ImmichKeyStore: Sendable {
+    func load() -> String?
+    func save(_ key: String) throws
+    func delete()
+}
+
+/// Stesso schema delle credenziali di Cubbit (`S3Syncer.writeToKeychain`): servizio
+/// `AppBackupFoto`, un account per credenziale.
+nonisolated struct KeychainImmichKeyStore: ImmichKeyStore {
+    static let service = "AppBackupFoto"
+    static let account = "immich-api-key"
+
+    private var query: [String: Any] {
+        [kSecClass as String: kSecClassGenericPassword,
+         kSecAttrService as String: Self.service,
+         kSecAttrAccount as String: Self.account]
+    }
+
+    func load() -> String? {
+        var q = query
+        q[kSecReturnData as String] = true
+        q[kSecMatchLimit as String] = kSecMatchLimitOne
+        var result: AnyObject?
+        guard SecItemCopyMatching(q as CFDictionary, &result) == errSecSuccess,
+              let data = result as? Data else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    func save(_ key: String) throws {
+        let data = Data(key.utf8)
+        let status = SecItemUpdate(query as CFDictionary, [kSecValueData as String: data] as CFDictionary)
+        if status == errSecItemNotFound {
+            var add = query
+            add[kSecValueData as String] = data
+            guard SecItemAdd(add as CFDictionary, nil) == errSecSuccess else { throw ImmichAlignmentFailure.keychain }
+        } else if status != errSecSuccess {
+            throw ImmichAlignmentFailure.keychain
+        }
+    }
+
+    func delete() { SecItemDelete(query as CFDictionary) }
+}
+
+/// Crea la chiave una volta sola con email e password di Immich. La password vive solo nel
+/// corpo della richiesta di login: non si salva, non si scrive nel log.
+nonisolated enum ImmichKeyMaker {
+    static let keyName = "AppBackupFoto — allineamento"
+
+    static func makeKey(email: String, password: String,
+                        send: @Sendable (URLRequest) async throws -> Data) async throws -> String {
+        let login = try ImmichHTTPClient.decode(ImmichLoginResponse.self,
+            from: try await send(ImmichRequests.login(email: email, password: password)))
+        do {
+            let created = try ImmichHTTPClient.decode(ImmichAPIKeyCreated.self,
+                from: try await send(ImmichRequests.createKey(bearer: login.accessToken)))
+            _ = try? await send(ImmichRequests.logout(bearer: login.accessToken))
+            return created.secret
+        } catch {
+            _ = try? await send(ImmichRequests.logout(bearer: login.accessToken))
+            throw error
+        }
+    }
+}
+
 // MARK: - ImmichManager — ciclo di vita (Colima + Docker Compose)
 
 /// Buffer thread-safe per l'output di un `Process`: senza leggere la pipe *mentre* il processo

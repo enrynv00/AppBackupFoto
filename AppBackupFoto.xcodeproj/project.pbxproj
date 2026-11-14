@@ -89,6 +89,7 @@
 		FA5F6A8DDFB9AB28A1BAA9BA /* JobLogFileTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C53CCEF7AF2529DD863E818D /* JobLogFileTests.swift */; };
 		DC2CC96B22A4D122F6F6E4CE /* S3UploadTextTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F901D97C39FFEDA58D187B40 /* S3UploadTextTests.swift */; };
 		C887CC0D70D973B2A07A6B4C /* ImmichAlignmentRulesTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9D204B744626C805A7F3333 /* ImmichAlignmentRulesTests.swift */; };
+		1C2B935F3FE231ADF40C7CE9 /* ImmichRequestsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = EC3FF8E5DB0E8DBB86A4ECAD /* ImmichRequestsTests.swift */; };
 		AEEB14414B517F69BAD8E045 /* LocalCopyTextTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 635D798B96BD62D040CB88F9 /* LocalCopyTextTests.swift */; };
 		6232D0E79307D96CCF0CEB4A /* FileSyncerFailedCopiesTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C15AE6A68B2D49F478DE2901 /* FileSyncerFailedCopiesTests.swift */; };
 		255A3AA71DDFE641F9C6F2AE /* FileChunkReaderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5F270C13D1A381946DF4E81B /* FileChunkReaderTests.swift */; };
@@ -202,6 +203,7 @@
 		C53CCEF7AF2529DD863E818D /* JobLogFileTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = JobLogFileTests.swift; sourceTree = "<group>"; };
 		F901D97C39FFEDA58D187B40 /* S3UploadTextTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = S3UploadTextTests.swift; sourceTree = "<group>"; };
 		B9D204B744626C805A7F3333 /* ImmichAlignmentRulesTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ImmichAlignmentRulesTests.swift; sourceTree = "<group>"; };
+		EC3FF8E5DB0E8DBB86A4ECAD /* ImmichRequestsTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ImmichRequestsTests.swift; sourceTree = "<group>"; };
 		635D798B96BD62D040CB88F9 /* LocalCopyTextTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = LocalCopyTextTests.swift; sourceTree = "<group>"; };
 		C15AE6A68B2D49F478DE2901 /* FileSyncerFailedCopiesTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = FileSyncerFailedCopiesTests.swift; sourceTree = "<group>"; };
 		5F270C13D1A381946DF4E81B /* FileChunkReaderTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = FileChunkReaderTests.swift; sourceTree = "<group>"; };
@@ -342,6 +344,7 @@
 				C53CCEF7AF2529DD863E818D /* JobLogFileTests.swift */,
 				F901D97C39FFEDA58D187B40 /* S3UploadTextTests.swift */,
 				B9D204B744626C805A7F3333 /* ImmichAlignmentRulesTests.swift */,
+				EC3FF8E5DB0E8DBB86A4ECAD /* ImmichRequestsTests.swift */,
 				635D798B96BD62D040CB88F9 /* LocalCopyTextTests.swift */,
 				C15AE6A68B2D49F478DE2901 /* FileSyncerFailedCopiesTests.swift */,
 				5F270C13D1A381946DF4E81B /* FileChunkReaderTests.swift */,
@@ -575,6 +578,7 @@
 				FA5F6A8DDFB9AB28A1BAA9BA /* JobLogFileTests.swift in Sources */,
 				DC2CC96B22A4D122F6F6E4CE /* S3UploadTextTests.swift in Sources */,
 				C887CC0D70D973B2A07A6B4C /* ImmichAlignmentRulesTests.swift in Sources */,
+				1C2B935F3FE231ADF40C7CE9 /* ImmichRequestsTests.swift in Sources */,
 				AEEB14414B517F69BAD8E045 /* LocalCopyTextTests.swift in Sources */,
 				6232D0E79307D96CCF0CEB4A /* FileSyncerFailedCopiesTests.swift in Sources */,
 				255A3AA71DDFE641F9C6F2AE /* FileChunkReaderTests.swift in Sources */,
