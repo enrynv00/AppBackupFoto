@@ -1425,6 +1425,104 @@ nonisolated enum ImmichKeyMaker {
     }
 }
 
+// MARK: L'allineamento
+
+nonisolated enum ImmichAlignmentRun {
+    nonisolated struct Environment: Sendable {
+        var ssdMounted: @Sendable () async -> Bool
+        var sleep: @Sendable (TimeInterval) async -> Void = { seconds in
+            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+        }
+        var now: @Sendable () -> Date = { Date() }
+        var scanWaitLimit: TimeInterval = 1800
+        var pollInterval: TimeInterval = 5
+        var saveState: @Sendable (ImmichAlignmentState) -> Void = { _ in }
+        var progress: @Sendable (String) async -> Void = { _ in }
+    }
+
+    /// Un giro completo (spec §5). Lancia `ImmichAlignmentFailure`; lo stato viene salvato con
+    /// `env.saveState` a ogni passo che lo cambia, cosi' un errore a meta' non perde quanto fatto.
+    ///
+    /// - Parameters:
+    ///   - allowance: file che l'app stessa ha spostato dall'SSD (Doppioni) dall'ultimo giro.
+    ///   - acceptDrop: Enrico ha confermato «Togli comunque»: la guardia del calo non si applica.
+    static func run(api: any ImmichAlignmentAPI, state start: ImmichAlignmentState,
+                    allowance: Int, acceptDrop: Bool, env: Environment) async throws
+        -> (ImmichAlignmentReport, ImmichAlignmentState) {
+        var state = start
+        var report = ImmichAlignmentReport()
+
+        guard let library = ImmichAlignmentRules.ssdLibrary(in: try await api.libraries()) else {
+            throw ImmichAlignmentFailure.libraryNotFound
+        }
+        let before = try await api.statistics(libraryId: library.id).total
+        let baseline = max(0, (state.healthyActiveCount ?? before) - max(0, allowance))
+
+        // Regola 3, prima guardia: mai una scansione con l'SSD staccato.
+        guard await env.ssdMounted() else { throw ImmichAlignmentFailure.ssdNotMounted }
+        await env.progress(ImmichAlignmentText.scanning)
+        try await api.scan(libraryId: library.id)
+
+        let started = env.now()
+        await env.sleep(env.pollInterval)
+        while !(try await api.jobs().libraryIsIdle) {
+            if env.now().timeIntervalSince(started) >= env.scanWaitLimit {
+                report.scanTimedOut = true
+                break
+            }
+            await env.sleep(env.pollInterval)
+        }
+
+        let after = try await api.statistics(libraryId: library.id).total
+        report.newAssets = max(0, after - before)
+
+        // Regola 3, seconda guardia: il riferimento si salva anche quando scatta, cosi' un
+        // «Riprova» su un SSD ancora vuoto nella VM scatta di nuovo.
+        if !acceptDrop && ImmichAlignmentRules.dropGuardTripped(baseline: baseline, activeAfter: after) {
+            state.healthyActiveCount = baseline
+            env.saveState(state)
+            throw ImmichAlignmentFailure.dropGuard(missing: baseline - after)
+        }
+        guard await env.ssdMounted() else { throw ImmichAlignmentFailure.ssdNotMounted }
+
+        await env.progress(ImmichAlignmentText.cleaning)
+        let offline = ImmichAlignmentRules.offlineToRemove(try await api.searchAll(.offline(libraryId: library.id)),
+                                                           libraryId: library.id)
+        for chunk in ImmichAlignmentRules.chunks(offline) {
+            try await api.deleteAssets(ids: chunk)
+            report.offlineRemoved += chunk.count
+        }
+        state.healthyActiveCount = after
+        env.saveState(state)
+
+        await env.progress(ImmichAlignmentText.stacking)
+        for plan in ImmichAlignmentRules.groupsToStack(try await api.duplicates(),
+                                                       alreadyStacked: state.stackedDuplicateIds) {
+            do {
+                try await api.createStack(assetIds: plan.assetIds)
+                report.stacksCreated += 1
+                state.stackedDuplicateIds.insert(plan.duplicateId)
+            } catch ImmichAlignmentFailure.http(let code) where (400..<500).contains(code) {
+                // Una pila rifiutata (foto impilata nel frattempo, gruppo cambiato) non ferma
+                // le altre e non si ricorda: si riprova al prossimo giro.
+                continue
+            }
+        }
+        env.saveState(state)
+
+        await env.progress(ImmichAlignmentText.archiving)
+        let tiny = ImmichAlignmentRules.assetsToArchive(try await api.searchAll(.images(libraryId: library.id)),
+                                                        alreadyArchived: state.archivedAssetIds)
+        for chunk in ImmichAlignmentRules.chunks(tiny) {
+            try await api.archive(ids: chunk)
+            report.archived += chunk.count
+            state.archivedAssetIds.formUnion(chunk)
+        }
+        env.saveState(state)
+        return (report, state)
+    }
+}
+
 // MARK: - ImmichManager — ciclo di vita (Colima + Docker Compose)
 
 /// Buffer thread-safe per l'output di un `Process`: senza leggere la pipe *mentre* il processo
