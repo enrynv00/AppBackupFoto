@@ -334,6 +334,15 @@ final class ImmichAlignmentRulesTests: XCTestCase {
         }
     }
 
+    func testMissingToConfirm_isOnlyTheDropGuardNumber() {
+        XCTAssertEqual(ImmichAlignmentStatus.dropGuard(missing: 52139).missingToConfirm, 52139)
+        XCTAssertNil(ImmichAlignmentStatus.idle.missingToConfirm)
+        XCTAssertNil(ImmichAlignmentStatus.needsKey.missingToConfirm)
+        XCTAssertNil(ImmichAlignmentStatus.failed(.notReachable).missingToConfirm)
+        XCTAssertNil(ImmichAlignmentStatus.failed(.dropGuard(missing: 7)).missingToConfirm)
+        XCTAssertNil(ImmichAlignmentStatus.done(ImmichAlignmentReport(), Date()).missingToConfirm)
+    }
+
     func testStatusActionsAndProblems() {
         XCTAssertEqual(ImmichAlignmentStatus.idle.actions, [])
         XCTAssertEqual(ImmichAlignmentStatus.running("x").actions, [])

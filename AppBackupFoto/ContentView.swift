@@ -279,10 +279,22 @@ struct ImmichView: View {
     @ObservedObject private var gate = AuthGateManager.shared
     @ObservedObject private var immich = ImmichManager.shared
     @ObservedObject private var bm = BookmarkManager.shared
+    @ObservedObject private var volumes = VolumeMonitor.shared
+    @ObservedObject private var aligner = ImmichAligner.shared
+    @State private var showsKeySheet = false
+    @State private var confirmsDrop = false
+    /// Il numero di foto mancanti mostrato nella conferma, congelato quando l'alert si apre:
+    /// e' quello che Enrico legge, ed e' quello che `acceptDropAndRetry(missing:)` riceve.
+    @State private var confirmedMissing = 0
 
     /// La libreria da indicizzare è l'SSD già configurato in `BookmarkManager`: nessuna
     /// nuova destinazione, nessun nuovo bookmark (vedi spec).
     private var ssdPath: String? { bm.urls[.ssd]?.path }
+
+    private var windowState: ImmichWindowState {
+        .of(installed: immich.installed, isStarting: immich.isStarting, isRunning: immich.isRunning,
+            ssdPathKnown: ssdPath != nil, ssdMounted: volumes.ssdMounted, lastError: immich.lastError)
+    }
 
     var body: some View {
         if gate.touchIDEnabled && !gate.unlocked {
@@ -302,39 +314,59 @@ struct ImmichView: View {
 
     @ViewBuilder
     private var content: some View {
-        if !immich.installed {
+        switch windowState {
+        case .notInstalled:
             ImmichSetupPromptView()
-        } else if immich.isStarting {
+        case .starting:
             ImmichMessageView(
                 icon: "hourglass",
                 title: "Avvio di Immich…",
                 message: "La prima volta richiede diversi minuti: viene avviata una macchina virtuale e scaricate le immagini dei container.",
                 showsProgress: true)
-        } else if immich.isRunning {
-            ImmichWebView(url: ImmichManager.webUIURL)
-        } else {
-            idle
-        }
-    }
-
-    @ViewBuilder
-    private var idle: some View {
-        if let path = ssdPath {
-            ImmichMessageView(
-                icon: "photo.on.rectangle.angled",
-                title: "Immich è fermo",
-                message: "Le foto vengono lette in sola lettura da:\n\(path)",
-                error: immich.lastError) {
-                    Button("Avvia Immich") {
-                        Task { try? await immich.start(sourceLibraryPath: path) }
-                    }
-                    .buttonStyle(.borderedProminent)
+        case .ready:
+            VStack(spacing: 0) {
+                ImmichAlignmentBar(status: aligner.status,
+                                   onRetry: { aligner.request(.manual) },
+                                   onEnterPassword: { showsKeySheet = true },
+                                   onAcceptDrop: {
+                                       // Si congela il numero che l'alert mostrera': se lo stato
+                                       // non e' piu' il blocco del calo, non c'e' niente da confermare.
+                                       guard let missing = aligner.status.missingToConfirm else { return }
+                                       confirmedMissing = missing
+                                       confirmsDrop = true
+                                   })
+                ImmichWebView(url: ImmichManager.webUIURL)
+            }
+            .sheet(isPresented: $showsKeySheet) { ImmichKeySheet { showsKeySheet = false } }
+            .alert("Togliere comunque le foto da Immich?", isPresented: $confirmsDrop) {
+                Button("Togli comunque", role: .destructive) {
+                    aligner.acceptDropAndRetry(missing: confirmedMissing)
                 }
-        } else {
+                Button("Annulla", role: .cancel) {}
+            } message: {
+                Text(ImmichAlignmentText.acceptDropConfirmation(missing: confirmedMissing))
+            }
+        case .ssdNotConfigured:
             ImmichMessageView(
                 icon: "externaldrive.badge.questionmark",
                 title: "SSD non configurato",
                 message: "Configura prima l'SSD esterno nella schermata iniziale: è la cartella che Immich indicizzerà in sola lettura.")
+        case .ssdNotConnected:
+            ImmichMessageView(
+                icon: "externaldrive.badge.xmark",
+                title: "SSD non collegato",
+                message: "Collega l'SSD: Immich parte da solo e si aggiorna con le foto nuove.")
+        case .stopped(let error):
+            ImmichMessageView(
+                icon: "photo.on.rectangle.angled",
+                title: "Immich è fermo",
+                message: "Le foto vengono lette in sola lettura da:\n\(ssdPath ?? "")",
+                error: error) {
+                    Button("Riprova") {
+                        Task { await ImmichAutoStartCoordinator.shared.react() }
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
         }
     }
 }
@@ -449,6 +481,120 @@ struct ImmichSetupPromptView: View {
                 .foregroundStyle(.secondary)
                 .frame(width: 16)
             Text(text).font(AppFont.caption).foregroundStyle(.secondary)
+        }
+    }
+}
+
+/// Riga sopra l'interfaccia di Immich: cosa sta facendo l'allineamento e, se serve, cosa fare.
+struct ImmichAlignmentBar: View {
+    let status: ImmichAlignmentStatus
+    let onRetry: () -> Void
+    let onEnterPassword: () -> Void
+    let onAcceptDrop: () -> Void
+
+    var body: some View {
+        if status != .idle {
+            VStack(spacing: 0) {
+                HStack(spacing: AppSpacing.sm) {
+                    if case .running = status { ProgressView().controlSize(.small) }
+                    Text(status.line())
+                        .font(AppFont.caption)
+                        .foregroundStyle(status.isProblem ? AppColor.error : .secondary)
+                        .lineLimit(3)
+                        .textSelection(.enabled)
+                    Spacer()
+                    ForEach(status.actions, id: \.self) { action in
+                        switch action {
+                        case .retry: Button("Riprova", action: onRetry)
+                        case .enterPassword: Button("Inserisci la password", action: onEnterPassword)
+                        case .acceptDrop: Button("Togli comunque…", action: onAcceptDrop)
+                        }
+                    }
+                }
+                .padding(.horizontal, AppSpacing.md)
+                .padding(.vertical, AppSpacing.sm)
+                Divider()
+            }
+        }
+    }
+}
+
+/// Email e password di Immich, una volta sola: l'app crea la chiave e dimentica la password.
+/// La password vive solo nel campo e nella chiamata di `makeKey`: si azzera subito dopo (successo
+/// o errore) e quando il foglio si chiude. Non va mai in un log, in un messaggio o in `UserDefaults`.
+/// L'email non si ricorda: il campo parte sempre vuoto.
+struct ImmichKeySheet: View {
+    let onDone: () -> Void
+    @State private var email = ""
+    @State private var password = ""
+    @State private var isWorking = false
+    @State private var error: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: AppSpacing.md) {
+            Text("Collega l'app a Immich").font(AppFont.title)
+            Text("Serve una volta sola. Con la password l'app crea una chiave per aggiornare Immich da sola e la salva nel Portachiavi. La password non viene salvata.")
+                .font(AppFont.caption)
+                .foregroundStyle(.secondary)
+            TextField("Email di Immich", text: $email)
+                .textContentType(.username)
+            SecureField("Password di Immich", text: $password)
+                .textContentType(.password)
+            if let error {
+                Text(error).font(AppFont.caption).foregroundStyle(AppColor.error)
+            }
+            HStack {
+                Spacer()
+                Button("Annulla", role: .cancel) {
+                    password = ""
+                    onDone()
+                }
+                Button(isWorking ? "Collego…" : "Collega") { connect() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(isWorking || email.isEmpty || password.isEmpty)
+            }
+        }
+        .padding(AppSpacing.xl)
+        .frame(width: 420)
+        .onDisappear { password = "" }
+    }
+
+    private func connect() {
+        isWorking = true
+        error = nil
+        let email = self.email
+        let password = self.password
+        Task {
+            var made: String?
+            var failure: ImmichAlignmentFailure?
+            do {
+                // Sessione nuova e separata da quella del client con la API key: il login
+                // lascia un cookie di sessione che non deve viaggiare con la chiave.
+                let session = URLSession(configuration: .ephemeral)
+                made = try await ImmichKeyMaker.makeKey(email: email, password: password) {
+                    try await ImmichHTTPClient.send($0, session: session)
+                }
+            } catch {
+                failure = (error as? ImmichAlignmentFailure) ?? .notReachable
+            }
+            // Subito dopo makeKey, in ogni caso: la password non sopravvive alla chiamata.
+            self.password = ""
+            if let key = made {
+                do {
+                    try ImmichAligner.shared.keyStore.save(key)
+                } catch {
+                    failure = .keychain
+                    made = nil
+                }
+            }
+            isWorking = false
+            if made != nil {
+                onDone()
+                ImmichAligner.shared.request(.keyAdded)
+            } else {
+                self.error = failure == .unauthorized ? "Email o password non corrette."
+                                                      : ImmichAlignmentText.failure(failure ?? .notReachable)
+            }
         }
     }
 }
@@ -1210,6 +1356,14 @@ nonisolated enum ImmichAlignmentStatus: Equatable, Sendable {
         }
     }
 
+    /// Il numero che la finestra mostra nella conferma «Togliere comunque…»: c'e' solo se lo
+    /// stato e' proprio il blocco del calo. Chi apre la conferma lo congela e lo passa a
+    /// `acceptDropAndRetry(missing:)`: la conferma vale per quel numero.
+    var missingToConfirm: Int? {
+        if case .dropGuard(let missing) = self { return missing }
+        return nil
+    }
+
     var actions: [ImmichAlignmentBarAction] {
         switch self {
         case .needsKey: return [.enterPassword]
@@ -1711,7 +1865,6 @@ final class ImmichAligner: ObservableObject {
     /// «Togli comunque», dopo la conferma della finestra Foto. `missing` e' il numero di foto
     /// mancanti che la finestra ha mostrato e Enrico ha confermato: la conferma vale per quel
     /// numero (piu' la soglia), non per qualunque calo.
-    // Task 8: la finestra passa a acceptDropAndRetry(missing:) il numero che ha mostrato
     func acceptDropAndRetry(missing: Int) {
         acceptedMissingOnce = missing
         request(.manual)
@@ -16554,6 +16707,9 @@ final class BackupRunner: ObservableObject {
                 self.duplicateRunStopRequested = false
                 self.duplicateRunCancelFlag = nil
                 self.lastDuplicateRunOutcome = finalOutcome
+                if !finalOutcome.trashedFiles.isEmpty {
+                    ImmichAligner.shared.request(.duplicatesMoved(count: finalOutcome.trashedFiles.count))
+                }
                 self.refreshRestorableBatch()
             }
         }
@@ -16598,6 +16754,9 @@ final class BackupRunner: ObservableObject {
     }()
     private var syncTask: Task<Void, Never>?
     private var wasStopped = false
+    /// Il job in corso scrive sull'SSD (Mac -> SSD, Importa): a fine job si riallinea Immich
+    /// (ROADMAP #50). Impostato in `run`, letto in `finishJob`.
+    private var jobWritesToSSD = false
 
     // MARK: Elenco delle foto gia' salvate (roadmap #31, Task 6)
 
@@ -18154,6 +18313,8 @@ final class BackupRunner: ObservableObject {
         }
         completionSnapshot = (phase, stats)
         closeJobLog()
+        // Dopo il log chiuso: un errore di Immich non tocca mai l'esito del backup.
+        if jobWritesToSSD { ImmichAligner.shared.request(.backupFinished) }
     }
 
     /// - Parameter refreshesLibraryIndex: il job **scrive** sull'SSD (Mac -> SSD, Importa),
@@ -18180,6 +18341,7 @@ final class BackupRunner: ObservableObject {
         ArchiveWriteClock.markStarted()
         output = ""; stats = JobStats(); currentStatus = ""; currentThumbnail = nil
         wasStopped = false
+        jobWritesToSSD = refreshesLibraryIndex
         let now = Date()
         completionSnapshot = nil; startTime = now
         // ROADMAP #43: il registro completo su disco, dopo il cancello (un job rifiutato non apre
