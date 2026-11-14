@@ -231,3 +231,110 @@ final class ImmichAlignmentRunTests: XCTestCase {
         XCTAssertTrue(api.deleted.isEmpty)
     }
 }
+
+// MARK: - Coordinatore
+
+nonisolated final class MemoryKeyStore: ImmichKeyStore, @unchecked Sendable {
+    var key: String?
+    init(_ key: String?) { self.key = key }
+    func load() -> String? { key }
+    func save(_ key: String) throws { self.key = key }
+    func delete() { key = nil }
+}
+
+final class ImmichAlignerTests: XCTestCase {
+    private func makeAligner(api: FakeImmichAPI, key: String? = "K", running: Bool = true,
+                             state: ImmichAlignmentState? = nil) throws -> (ImmichAligner, URL, URL) {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("aligner-\(UUID().uuidString)")
+        let stateURL = dir.appendingPathComponent("immich-alignment.json")
+        let logURL = dir.appendingPathComponent("immich-alignment.log")
+        if let state { try ImmichAlignmentStateStore.save(state, to: stateURL) }
+        let aligner = ImmichAligner()
+        aligner.keyStore = MemoryKeyStore(key)
+        aligner.makeAPI = { _ in api }
+        aligner.isImmichRunning = { running }
+        aligner.ssdMounted = { true }
+        aligner.stateURL = stateURL
+        aligner.logURL = logURL
+        aligner.sleep = { _ in }
+        return (aligner, stateURL, logURL)
+    }
+
+    func testDoesNothingWhileImmichIsOff() throws {
+        let api = FakeImmichAPI()
+        let (aligner, _, _) = try makeAligner(api: api, running: false)
+        aligner.request(.backupFinished)
+        XCTAssertNil(aligner.currentTask)
+        XCTAssertEqual(aligner.status, .idle)
+    }
+
+    func testWithoutAKeyAsksForThePassword() async throws {
+        let api = FakeImmichAPI()
+        let (aligner, _, _) = try makeAligner(api: api, key: nil)
+        aligner.request(.immichStarted)
+        await aligner.currentTask?.value
+        XCTAssertEqual(aligner.status, .needsKey)
+        XCTAssertTrue(api.calls.isEmpty)
+    }
+
+    func testRequestsWhileRunningCollapseIntoOneMoreRun() async throws {
+        let api = FakeImmichAPI()
+        let (aligner, _, _) = try makeAligner(api: api)
+        aligner.request(.backupFinished)
+        aligner.request(.backupFinished)
+        aligner.request(.duplicatesMoved(count: 3))
+        await aligner.currentTask?.value
+        XCTAssertEqual(api.scanCount, 2)
+        XCTAssertNil(aligner.currentTask)
+        guard case .done = aligner.status else { return XCTFail("stato \(aligner.status)") }
+    }
+
+    func testUnauthorizedForgetsTheKey() async throws {
+        let api = FakeImmichAPI(); api.scanError = .unauthorized
+        let (aligner, _, _) = try makeAligner(api: api)
+        let store = aligner.keyStore as! MemoryKeyStore
+        aligner.request(.manual)
+        await aligner.currentTask?.value
+        XCTAssertEqual(aligner.status, .needsKey)
+        XCTAssertNil(store.key)
+    }
+
+    func testDropGuardThenAcceptDrop() async throws {
+        let api = FakeImmichAPI(); api.totals = [40000]
+        let (aligner, stateURL, _) = try makeAligner(api: api, state: ImmichAlignmentState(healthyActiveCount: 52139))
+        aligner.request(.manual)
+        await aligner.currentTask?.value
+        XCTAssertEqual(aligner.status, .dropGuard(missing: 12139))
+        aligner.acceptDropAndRetry()
+        await aligner.currentTask?.value
+        guard case .done = aligner.status else { return XCTFail("stato \(aligner.status)") }
+        XCTAssertEqual(ImmichAlignmentStateStore.load(from: stateURL).healthyActiveCount, 40000)
+    }
+
+    func testDuplicatesMovedWhileImmichIsOffStillCount() async throws {
+        let api = FakeImmichAPI(); api.totals = [51139]
+        var running = false
+        let (aligner, _, _) = try makeAligner(api: api, state: ImmichAlignmentState(healthyActiveCount: 52139))
+        aligner.isImmichRunning = { running }
+        aligner.request(.duplicatesMoved(count: 1000))
+        running = true
+        aligner.request(.immichStarted)
+        await aligner.currentTask?.value
+        guard case .done = aligner.status else { return XCTFail("stato \(aligner.status)") }
+    }
+
+    func testWritesOneLogLinePerRunWithoutTheKey() async throws {
+        let api = FakeImmichAPI()
+        let (aligner, _, logURL) = try makeAligner(api: api, key: "CHIAVE-SEGRETA")
+        aligner.request(.manual)
+        await aligner.currentTask?.value
+        // la scrittura del log e' in un Task staccato: si aspetta che compaia
+        for _ in 0..<50 where !FileManager.default.fileExists(atPath: logURL.path) {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        let log = try String(contentsOf: logURL, encoding: .utf8)
+        XCTAssertEqual(log.split(separator: "\n").count, 1)
+        XCTAssertTrue(log.contains("Immich aggiornato alle "))
+        XCTAssertFalse(log.contains("CHIAVE-SEGRETA"))
+    }
+}

@@ -1559,6 +1559,118 @@ nonisolated enum ImmichAlignmentRun {
     }
 }
 
+// MARK: Coordinatore (main actor): unisce le richieste, pubblica lo stato
+
+/// Un solo allineamento alla volta; le richieste che arrivano nel frattempo si riducono a
+/// UN giro in piu' alla fine (spec §5). Se Immich e' spento la richiesta si lascia cadere:
+/// il prossimo avvio di Immich allinea comunque (`ImmichManager.start`). Fanno eccezione i
+/// file spostati dai Doppioni, che si sommano comunque al margine della guardia.
+///
+/// Qui non passa mai la password di Immich: la chiave API arriva dal Portachiavi (`keyStore`)
+/// e non viene scritta nel log.
+final class ImmichAligner: ObservableObject {
+    static let shared = ImmichAligner()
+
+    @Published private(set) var status: ImmichAlignmentStatus = .idle
+    private(set) var currentTask: Task<Void, Never>?
+    private var rerunRequested = false
+    private var pendingAllowance = 0
+    private var acceptDropOnce = false
+
+    // Iniettabili per i test.
+    var keyStore: any ImmichKeyStore = KeychainImmichKeyStore()
+    var makeAPI: (String) -> any ImmichAlignmentAPI = { ImmichHTTPClient(apiKey: $0) }
+    var isImmichRunning: () -> Bool = { ImmichManager.shared.isRunning }
+    var ssdMounted: @MainActor @Sendable () -> Bool = { VolumeMonitor.shared.ssdMounted }
+    var stateURL: URL = ImmichAlignmentStateStore.defaultURL
+    var logURL: URL? = ImmichAlignmentLog.defaultURL
+    var scanWaitLimit: TimeInterval = 1800
+    var pollInterval: TimeInterval = 5
+    var sleep: @Sendable (TimeInterval) async -> Void = { seconds in
+        try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+    }
+
+    init() {}
+
+    func request(_ reason: ImmichAlignmentReason) {
+        if case .duplicatesMoved(let count) = reason { pendingAllowance += max(0, count) }
+        guard isImmichRunning() else { return }
+        if currentTask != nil { rerunRequested = true; return }
+        currentTask = Task { await self.loop() }
+    }
+
+    /// «Togli comunque», dopo la conferma della finestra Foto.
+    func acceptDropAndRetry() {
+        acceptDropOnce = true
+        request(.manual)
+    }
+
+    /// Il flag `rerunRequested` NON si azzera all'inizio di ogni giro: una richiesta arrivata dopo
+    /// la creazione del task ma prima che parta (il task parte al primo punto di sospensione del
+    /// chiamante) deve comunque dare un giro in piu', come dice il contratto («UN giro in piu'»).
+    /// Si azzera solo quando lo si consuma, subito prima del giro successivo.
+    private func loop() async {
+        while true {
+            await runOnce()
+            guard rerunRequested else { break }
+            rerunRequested = false
+        }
+        currentTask = nil
+    }
+
+    private func runOnce() async {
+        guard let key = keyStore.load() else { status = .needsKey; return }
+        let api = makeAPI(key)
+        let allowance = pendingAllowance
+        pendingAllowance = 0
+        let acceptDrop = acceptDropOnce
+        acceptDropOnce = false
+        let stateURL = self.stateURL
+        let mounted = self.ssdMounted
+        let state = ImmichAlignmentStateStore.load(from: stateURL)
+        status = .running(ImmichAlignmentText.scanning)
+
+        let env = ImmichAlignmentRun.Environment(
+            ssdMounted: { await mounted() },
+            sleep: sleep,
+            scanWaitLimit: scanWaitLimit,
+            pollInterval: pollInterval,
+            saveState: { try? ImmichAlignmentStateStore.save($0, to: stateURL) },
+            progress: { [weak self] line in await self?.publishProgress(line) })
+
+        do {
+            let (report, _) = try await ImmichAlignmentRun.run(api: api, state: state, allowance: allowance,
+                                                               acceptDrop: acceptDrop, env: env)
+            let now = Date()
+            status = .done(report, now)
+            log(ImmichAlignmentText.done(report, at: now))
+        } catch {
+            let failure = (error as? ImmichAlignmentFailure) ?? .notReachable
+            switch failure {
+            case .unauthorized:
+                keyStore.delete()
+                status = .needsKey
+            case .dropGuard(let missing):
+                status = .dropGuard(missing: missing)
+            default:
+                // Il margine dei Doppioni non e' stato usato: resta per il prossimo giro.
+                pendingAllowance += allowance
+                status = .failed(failure)
+            }
+            log(ImmichAlignmentText.failure(failure))
+        }
+    }
+
+    private func publishProgress(_ line: String) { status = .running(line) }
+
+    /// `ImmichAlignmentLog` e' `nonisolated` (solo `FileManager`/`FileHandle` su un URL passato
+    /// per valore): puo' girare su un thread di fondo senza toccare stato del main actor.
+    private func log(_ text: String) {
+        guard let url = logURL else { return }
+        Task.detached { ImmichAlignmentLog.append(text, to: url) }
+    }
+}
+
 // MARK: - ImmichManager — ciclo di vita (Colima + Docker Compose)
 
 /// Buffer thread-safe per l'output di un `Process`: senza leggere la pipe *mentre* il processo
