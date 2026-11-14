@@ -178,4 +178,113 @@ final class ImmichAlignmentRulesTests: XCTestCase {
         XCTAssertEqual(chunks.flatMap { $0 }, ids)
         XCTAssertEqual(ImmichAlignmentRules.chunks([]), [])
     }
+
+    // MARK: - Stato salvato
+
+    private func tempURL(_ name: String) -> URL {
+        FileManager.default.temporaryDirectory
+            .appendingPathComponent("immich-align-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent(name)
+    }
+
+    func testStateRoundTripsAndMissingFileIsEmpty() throws {
+        let url = tempURL("immich-alignment.json")
+        XCTAssertEqual(ImmichAlignmentStateStore.load(from: url), ImmichAlignmentState())
+        let state = ImmichAlignmentState(archivedAssetIds: ["a"], stackedDuplicateIds: ["d"], healthyActiveCount: 52139)
+        try ImmichAlignmentStateStore.save(state, to: url)
+        XCTAssertEqual(ImmichAlignmentStateStore.load(from: url), state)
+    }
+
+    func testStateWithMissingKeysDecodesWithDefaults() throws {
+        let state = try JSONDecoder().decode(ImmichAlignmentState.self, from: Data(#"{"archivedAssetIds":["x"]}"#.utf8))
+        XCTAssertEqual(state, ImmichAlignmentState(archivedAssetIds: ["x"]))
+    }
+
+    func testStateLivesOnTheMacNeverOnTheSSD() {
+        let path = ImmichAlignmentStateStore.defaultURL.path
+        XCTAssertTrue(path.hasSuffix("Library/Application Support/AppBackupFoto/immich-alignment.json"), path)
+        XCTAssertFalse(path.hasPrefix("/Volumes/"))
+        XCTAssertTrue(ImmichAlignmentLog.defaultURL.path.hasSuffix("Library/Logs/AppBackupFoto/immich-alignment.log"))
+    }
+
+    // MARK: - Testi
+
+    private let rome = TimeZone(identifier: "Europe/Rome")!
+    /// 2026-11-13 21:41 UTC = 22:41 a Roma.
+    private let date = Date(timeIntervalSince1970: 1_794_606_060)
+
+    func testDoneLineListsOnlyNonZeroNumbers() {
+        let report = ImmichAlignmentReport(newAssets: 12, offlineRemoved: 89514, stacksCreated: 340, archived: 4561)
+        XCTAssertEqual(ImmichAlignmentText.done(report, at: date, timeZone: rome),
+            "Immich aggiornato alle 22:41: 12 foto nuove, 89.514 tolte perché non più sull'SSD, 340 pile, 4.561 archiviate.")
+        XCTAssertEqual(ImmichAlignmentText.done(ImmichAlignmentReport(newAssets: 1, offlineRemoved: 1, stacksCreated: 1, archived: 1), at: date, timeZone: rome),
+            "Immich aggiornato alle 22:41: 1 foto nuova, 1 tolta perché non più sull'SSD, 1 pila, 1 archiviata.")
+        XCTAssertEqual(ImmichAlignmentText.done(ImmichAlignmentReport(), at: date, timeZone: rome),
+            "Immich aggiornato alle 22:41: niente da cambiare.")
+    }
+
+    func testDoneLineSaysWhenTheScanDidNotFinish() {
+        var report = ImmichAlignmentReport(); report.scanTimedOut = true
+        XCTAssertTrue(ImmichAlignmentText.done(report, at: date, timeZone: rome)
+            .hasSuffix(" La scansione non è finita in 30 minuti: il resto entra al prossimo giro."))
+    }
+
+    func testFailureLines() {
+        XCTAssertEqual(ImmichAlignmentText.failure(.ssdNotMounted), "Immich non aggiornato: l'SSD non è collegato.")
+        XCTAssertEqual(ImmichAlignmentText.failure(.unauthorized), ImmichAlignmentText.needsKey)
+        XCTAssertEqual(ImmichAlignmentText.failure(.http(500)), "Immich non aggiornato: Immich ha risposto con un errore (codice 500).")
+        XCTAssertEqual(ImmichAlignmentText.failure(.dropGuard(missing: 52139)),
+            "Immich non aggiornato: dopo la scansione mancano 52.139 foto rispetto all'ultima volta. Non tolgo niente: controlla che l'SSD sia collegato bene e premi «Riprova». Le foto sono nel Cestino di Immich.")
+        for failure: ImmichAlignmentFailure in [.libraryNotFound, .notReachable, .badResponse, .keychain] {
+            XCTAssertTrue(ImmichAlignmentText.failure(failure).hasPrefix("Immich non aggiornato: "), "\(failure)")
+        }
+    }
+
+    func testStatusActionsAndProblems() {
+        XCTAssertEqual(ImmichAlignmentStatus.idle.actions, [])
+        XCTAssertEqual(ImmichAlignmentStatus.running("x").actions, [])
+        XCTAssertEqual(ImmichAlignmentStatus.done(ImmichAlignmentReport(), date).actions, [])
+        XCTAssertEqual(ImmichAlignmentStatus.needsKey.actions, [.enterPassword])
+        XCTAssertEqual(ImmichAlignmentStatus.dropGuard(missing: 1).actions, [.retry, .acceptDrop])
+        XCTAssertEqual(ImmichAlignmentStatus.failed(.notReachable).actions, [.retry])
+        XCTAssertFalse(ImmichAlignmentStatus.running("x").isProblem)
+        XCTAssertTrue(ImmichAlignmentStatus.needsKey.isProblem)
+        XCTAssertTrue(ImmichAlignmentStatus.dropGuard(missing: 1).isProblem)
+        XCTAssertEqual(ImmichAlignmentStatus.running("Impilo…").line(), "Impilo…")
+        XCTAssertEqual(ImmichAlignmentStatus.idle.line(), "")
+    }
+
+    func testAcceptDropConfirmationSaysTheSSDIsNotTouched() {
+        let text = ImmichAlignmentText.acceptDropConfirmation(missing: 1200)
+        XCTAssertTrue(text.contains("1.200"))
+        XCTAssertTrue(text.contains("I file sull'SSD non vengono toccati."))
+    }
+
+    // MARK: - Log
+
+    func testLogAppendsOneLinePerCall() throws {
+        let url = tempURL("immich-alignment.log")
+        ImmichAlignmentLog.append("primo", at: date, to: url)
+        ImmichAlignmentLog.append("secondo", at: date, to: url)
+        let lines = try String(contentsOf: url, encoding: .utf8).split(separator: "\n")
+        XCTAssertEqual(lines.count, 2)
+        XCTAssertEqual(lines.first.map(String.init), "2026-11-13T21:41:00Z primo")
+    }
+
+    // MARK: - Stato della finestra Foto
+
+    func testWindowState() {
+        func of(installed: Bool = true, starting: Bool = false, running: Bool = false,
+                pathKnown: Bool = true, mounted: Bool = true, error: String? = nil) -> ImmichWindowState {
+            ImmichWindowState.of(installed: installed, isStarting: starting, isRunning: running,
+                                 ssdPathKnown: pathKnown, ssdMounted: mounted, lastError: error)
+        }
+        XCTAssertEqual(of(installed: false, running: true), .notInstalled)
+        XCTAssertEqual(of(starting: true, running: true), .starting)
+        XCTAssertEqual(of(running: true, mounted: false), .ready)
+        XCTAssertEqual(of(pathKnown: false), .ssdNotConfigured)
+        XCTAssertEqual(of(mounted: false), .ssdNotConnected)
+        XCTAssertEqual(of(error: "boom"), .stopped(error: "boom"))
+        XCTAssertEqual(of(), .stopped(error: nil))
+    }
 }

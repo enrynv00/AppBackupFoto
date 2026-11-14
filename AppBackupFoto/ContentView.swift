@@ -951,6 +951,233 @@ nonisolated enum ImmichAlignmentRules {
     }
 }
 
+// MARK: Stato salvato sul Mac (mai sull'SSD)
+
+/// Cio' che l'app ricorda fra un allineamento e l'altro (spec, regole 3 e 5).
+nonisolated struct ImmichAlignmentState: Codable, Equatable, Sendable {
+    /// Minuscole archiviate dall'app: se Enrico ne toglie una dall'Archivio, non ci torna.
+    var archivedAssetIds: Set<String> = []
+    /// Gruppi di simili gia' impilati dall'app: se Enrico separa una pila, non si rifa'.
+    var stackedDuplicateIds: Set<String> = []
+    /// Foto attive della libreria dopo l'ultimo allineamento riuscito: il riferimento della
+    /// guardia del calo. Salvato anche quando la guardia scatta (spec, regola 3).
+    var healthyActiveCount: Int? = nil
+
+    enum CodingKeys: String, CodingKey { case archivedAssetIds, stackedDuplicateIds, healthyActiveCount }
+
+    init(archivedAssetIds: Set<String> = [], stackedDuplicateIds: Set<String> = [], healthyActiveCount: Int? = nil) {
+        self.archivedAssetIds = archivedAssetIds
+        self.stackedDuplicateIds = stackedDuplicateIds
+        self.healthyActiveCount = healthyActiveCount
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        archivedAssetIds = try c.decodeIfPresent(Set<String>.self, forKey: .archivedAssetIds) ?? []
+        stackedDuplicateIds = try c.decodeIfPresent(Set<String>.self, forKey: .stackedDuplicateIds) ?? []
+        healthyActiveCount = try c.decodeIfPresent(Int.self, forKey: .healthyActiveCount)
+    }
+}
+
+nonisolated enum ImmichAlignmentStateStore {
+    static var defaultURL: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("AppBackupFoto/immich-alignment.json")
+    }
+
+    /// File assente o illeggibile = stato vuoto. Conseguenza accettata: senza riferimento la
+    /// guardia del calo usa il numero prima della scansione (come al primo giro).
+    static func load(from url: URL) -> ImmichAlignmentState {
+        guard let data = try? Data(contentsOf: url),
+              let state = try? JSONDecoder().decode(ImmichAlignmentState.self, from: data) else {
+            return ImmichAlignmentState()
+        }
+        return state
+    }
+
+    static func save(_ state: ImmichAlignmentState, to url: URL) throws {
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        try encoder.encode(state).write(to: url, options: .atomic)
+    }
+}
+
+// MARK: Esito, errori, motivi
+
+nonisolated struct ImmichAlignmentReport: Equatable, Sendable {
+    var newAssets = 0
+    var offlineRemoved = 0
+    var stacksCreated = 0
+    var archived = 0
+    var scanTimedOut = false
+}
+
+nonisolated enum ImmichAlignmentFailure: Error, Equatable, Sendable {
+    case ssdNotMounted
+    case libraryNotFound
+    case dropGuard(missing: Int)
+    case unauthorized
+    case notReachable
+    case http(Int)
+    case badResponse
+    case keychain
+}
+
+nonisolated enum ImmichAlignmentReason: Equatable, Sendable {
+    case backupFinished
+    /// Quanti file la corsa dei Doppioni ha spostato: abbassano il riferimento della guardia.
+    case duplicatesMoved(count: Int)
+    case immichStarted
+    case keyAdded
+    case manual
+}
+
+// MARK: Testi
+
+nonisolated enum ImmichAlignmentText {
+    static let scanning = "Aggiorno Immich con le foto dell'SSD…"
+    static let cleaning = "Tolgo da Immich le foto che non sono più sull'SSD…"
+    static let stacking = "Impilo le foto simili…"
+    static let archiving = "Archivio le immagini minuscole…"
+    static let needsKey = "Per aggiornare Immich da solo serve la tua password di Immich, una volta sola."
+
+    /// Punto ogni tre cifre, sempre: la lingua italiana di sistema non raggruppa i numeri a
+    /// quattro cifre (4561), ma nelle frasi dell'app «4.561» si legge meglio accanto a «89.514».
+    static func number(_ n: Int) -> String {
+        let digits = String(n.magnitude)
+        var out = ""
+        for (i, ch) in digits.reversed().enumerated() {
+            if i > 0 && i % 3 == 0 { out.append(".") }
+            out.append(ch)
+        }
+        return (n < 0 ? "-" : "") + String(out.reversed())
+    }
+
+    static func time(_ date: Date, timeZone: TimeZone) -> String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "it_IT")
+        f.timeZone = timeZone
+        f.dateFormat = "HH:mm"
+        return f.string(from: date)
+    }
+
+    static func done(_ r: ImmichAlignmentReport, at date: Date, timeZone: TimeZone = .current) -> String {
+        var parts: [String] = []
+        if r.newAssets > 0 { parts.append(r.newAssets == 1 ? "1 foto nuova" : "\(number(r.newAssets)) foto nuove") }
+        if r.offlineRemoved > 0 {
+            parts.append(r.offlineRemoved == 1 ? "1 tolta perché non più sull'SSD"
+                                               : "\(number(r.offlineRemoved)) tolte perché non più sull'SSD")
+        }
+        if r.stacksCreated > 0 { parts.append(r.stacksCreated == 1 ? "1 pila" : "\(number(r.stacksCreated)) pile") }
+        if r.archived > 0 { parts.append(r.archived == 1 ? "1 archiviata" : "\(number(r.archived)) archiviate") }
+        var line = "Immich aggiornato alle \(time(date, timeZone: timeZone))"
+        line += parts.isEmpty ? ": niente da cambiare." : ": " + parts.joined(separator: ", ") + "."
+        if r.scanTimedOut { line += " La scansione non è finita in 30 minuti: il resto entra al prossimo giro." }
+        return line
+    }
+
+    static func failure(_ f: ImmichAlignmentFailure) -> String {
+        switch f {
+        case .ssdNotMounted: return "Immich non aggiornato: l'SSD non è collegato."
+        case .libraryNotFound: return "Immich non aggiornato: dentro Immich non trovo la libreria dell'SSD (\(ImmichManager.ssdMountTarget))."
+        case .dropGuard(let missing):
+            return "Immich non aggiornato: dopo la scansione mancano \(number(missing)) foto rispetto all'ultima volta. Non tolgo niente: controlla che l'SSD sia collegato bene e premi «Riprova». Le foto sono nel Cestino di Immich."
+        case .unauthorized: return needsKey
+        case .notReachable: return "Immich non aggiornato: Immich non risponde."
+        case .http(let code): return "Immich non aggiornato: Immich ha risposto con un errore (codice \(code))."
+        case .badResponse: return "Immich non aggiornato: Immich ha risposto in un modo che l'app non capisce (è ancora la versione \(ImmichManager.immichVersion)?)."
+        case .keychain: return "Immich non aggiornato: non riesco a salvare la chiave nel Portachiavi."
+        }
+    }
+
+    static func acceptDropConfirmation(missing: Int) -> String {
+        "Dopo la scansione mancano \(number(missing)) foto rispetto all'ultima volta. Se le hai tolte tu dall'SSD, Immich le toglie anche dal suo archivio, con volti e album. I file sull'SSD non vengono toccati."
+    }
+}
+
+// MARK: Stato pubblicato per la finestra Foto
+
+nonisolated enum ImmichAlignmentBarAction: Hashable, Sendable { case retry, enterPassword, acceptDrop }
+
+nonisolated enum ImmichAlignmentStatus: Equatable, Sendable {
+    case idle
+    case running(String)
+    case done(ImmichAlignmentReport, Date)
+    case needsKey
+    case dropGuard(missing: Int)
+    case failed(ImmichAlignmentFailure)
+
+    func line(timeZone: TimeZone = .current) -> String {
+        switch self {
+        case .idle: return ""
+        case .running(let text): return text
+        case .done(let report, let date): return ImmichAlignmentText.done(report, at: date, timeZone: timeZone)
+        case .needsKey: return ImmichAlignmentText.needsKey
+        case .dropGuard(let missing): return ImmichAlignmentText.failure(.dropGuard(missing: missing))
+        case .failed(let failure): return ImmichAlignmentText.failure(failure)
+        }
+    }
+
+    var isProblem: Bool {
+        switch self {
+        case .needsKey, .dropGuard, .failed: return true
+        case .idle, .running, .done: return false
+        }
+    }
+
+    var actions: [ImmichAlignmentBarAction] {
+        switch self {
+        case .needsKey: return [.enterPassword]
+        case .dropGuard: return [.retry, .acceptDrop]
+        case .failed: return [.retry]
+        case .idle, .running, .done: return []
+        }
+    }
+}
+
+// MARK: Log dell'allineamento (una riga per giro, mai chiave o password)
+
+nonisolated enum ImmichAlignmentLog {
+    static var defaultURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Logs/AppBackupFoto/immich-alignment.log")
+    }
+
+    static func line(_ text: String, at date: Date) -> String {
+        ISO8601DateFormatter().string(from: date) + " " + text + "\n"
+    }
+
+    static func append(_ text: String, at date: Date = Date(), to url: URL) {
+        let data = Data(line(text, at: date).utf8)
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if let handle = try? FileHandle(forWritingTo: url) {
+            defer { try? handle.close() }
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: data)
+        } else {
+            try? data.write(to: url)
+        }
+    }
+}
+
+// MARK: Cosa mostra la finestra Foto
+
+nonisolated enum ImmichWindowState: Equatable, Sendable {
+    case notInstalled, starting, ready, ssdNotConfigured, ssdNotConnected
+    case stopped(error: String?)
+
+    static func of(installed: Bool, isStarting: Bool, isRunning: Bool,
+                   ssdPathKnown: Bool, ssdMounted: Bool, lastError: String?) -> ImmichWindowState {
+        if !installed { return .notInstalled }
+        if isStarting { return .starting }
+        if isRunning { return .ready }
+        if !ssdPathKnown { return .ssdNotConfigured }
+        if !ssdMounted { return .ssdNotConnected }
+        return .stopped(error: lastError)
+    }
+}
+
 // MARK: - ImmichManager — ciclo di vita (Colima + Docker Compose)
 
 /// Buffer thread-safe per l'output di un `Process`: senza leggere la pipe *mentre* il processo
