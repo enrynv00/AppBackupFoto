@@ -143,15 +143,18 @@ final class ImmichAlignmentRunTests: XCTestCase {
 
     // MARK: - Guardia del calo (spec, regola 3)
 
-    func testEmptyMountTripsTheGuardAndRemembersTheBaseline() async {
+    /// Senza riferimento affidabile la guardia del calo non blocca: si chiede conferma (Q1), e
+    /// non si salva nessun candidato. Resta zero delete.
+    func testEmptyMountWithoutAReliableReferenceAsksInsteadOfTrippingTheGuard() async throws {
         let api = FakeImmichAPI()
         api.totals = [52139, 0]
         api.offlineAssets = (0..<10).map { immichTestAsset("o\($0)", offline: true, trashed: true) }
         let saved = SavedStates()
-        do { _ = try await run(api, env: immichTestEnv(saved: saved)); XCTFail("doveva fermarsi") }
-        catch { XCTAssertEqual(error as? ImmichAlignmentFailure, .dropGuard(missing: 52139)) }
+        let (report, state) = try await run(api, env: immichTestEnv(saved: saved))
+        XCTAssertEqual(report.needsFirstConfirmation, ImmichFirstRemoval(active: 0, toRemove: 10, before: 52139))
         XCTAssertTrue(api.deleted.isEmpty)
-        XCTAssertEqual(saved.all.last?.healthyActiveCount, 52139)
+        XCTAssertNil(state.healthyActiveCount)
+        XCTAssertTrue(saved.all.allSatisfy { $0.healthyActiveCount == nil })
     }
 
     /// Il caso che la guardia esiste per chiudere: «Riprova» con l'SSD ancora vuoto dentro la
@@ -317,12 +320,16 @@ final class ImmichAlignmentRunTests: XCTestCase {
         }
     }
 
-    func testFirstRunTrippedGuardSavesTheCountBeforeTheScan() async {
+    /// Al primo giro un calo oltre la soglia non scatta piu' (Q1): senza nulla da togliere non si
+    /// chiede niente, non si toglie niente e non si salva nessun riferimento.
+    func testFirstRunWithADropAndNothingOfflineDoesNotTripNorSaveAReference() async throws {
         let api = FakeImmichAPI(); api.totals = [52139, 0]
         let saved = SavedStates()
-        do { _ = try await run(api, allowance: 1000, env: immichTestEnv(saved: saved)); XCTFail("doveva fermarsi") }
-        catch { XCTAssertEqual(error as? ImmichAlignmentFailure, .dropGuard(missing: 51139)) }
-        XCTAssertEqual(saved.all.last?.healthyActiveCount, 52139)
+        let (report, state) = try await run(api, allowance: 1000, env: immichTestEnv(saved: saved))
+        XCTAssertNil(report.needsFirstConfirmation)
+        XCTAssertTrue(api.deleted.isEmpty)
+        XCTAssertNil(state.healthyActiveCount)
+        XCTAssertTrue(saved.all.allSatisfy { $0.healthyActiveCount == nil })
     }
 
     // MARK: - C2: tetto al margine
@@ -676,15 +683,19 @@ final class ImmichAlignmentRunTests: XCTestCase {
 
     // MARK: - P4: un riferimento non confermato non diventa affidabile da solo
 
-    /// `before` avvelenato (Immich aveva gia' marcato quasi tutto offline): la guardia scatta e
-    /// salva il candidato, ma il giro dopo non lo tratta come affidabile.
+    /// `before` avvelenato (Immich aveva gia' marcato quasi tutto offline): da Q1 la guardia non
+    /// scatta piu' senza riferimento affidabile e non salva nessun candidato. Un candidato non
+    /// confermato puo' comunque esistere (file di stato scritto da una versione precedente): il
+    /// giro dopo non lo tratta come affidabile.
     func testAPoisonedCandidateReferenceDoesNotMakeTheNextRunRemoveAnything() async throws {
         let first = FakeImmichAPI(); first.totals = [600, 0]; offline(first, 10)
         let saved = SavedStates()
-        do { _ = try await run(first, env: immichTestEnv(saved: saved)); XCTFail("doveva fermarsi") }
-        catch { XCTAssertEqual(error as? ImmichAlignmentFailure, .dropGuard(missing: 600)) }
-        let candidate = try XCTUnwrap(saved.all.last)
-        XCTAssertEqual(candidate.healthyActiveCount, 600)
+        let (firstReport, firstState) = try await run(first, env: immichTestEnv(saved: saved))
+        XCTAssertTrue(first.deleted.isEmpty)
+        XCTAssertEqual(firstReport.needsFirstConfirmation, ImmichFirstRemoval(active: 0, toRemove: 10, before: 600))
+        XCTAssertNil(firstState.healthyActiveCount)
+        XCTAssertTrue(saved.all.allSatisfy { $0.healthyActiveCount == nil })   // nessun candidato salvato
+        let candidate = ImmichAlignmentState(healthyActiveCount: 600)
         XCTAssertFalse(candidate.referenceConfirmed)
         // Giro dopo: l'SSD e' ancora (quasi) vuoto, il conteggio e' dentro la soglia del candidato.
         let second = FakeImmichAPI(); second.totals = [600, 590]; offline(second, 52000)
@@ -715,13 +726,91 @@ final class ImmichAlignmentRunTests: XCTestCase {
         XCTAssertTrue(state.referenceConfirmed)
     }
 
-    func testATrippedGuardWithAnUnreliableReferenceKeepsItUnconfirmed() async {
-        let api = FakeImmichAPI(); api.totals = [52139, 0]
+    /// Da Q1, con un riferimento non affidabile il calo non scatta e non si salva nessun candidato:
+    /// un riferimento non confermato resta com'e' (qui un candidato di una versione precedente).
+    func testADropWithAnUnreliableReferenceKeepsItUnconfirmedAndSavesNoNewCandidate() async throws {
+        let api = FakeImmichAPI(); api.totals = [52139, 0]; offline(api, 10)
         let saved = SavedStates()
-        do { _ = try await run(api, env: immichTestEnv(saved: saved)); XCTFail("doveva fermarsi") }
-        catch { XCTAssertEqual(error as? ImmichAlignmentFailure, .dropGuard(missing: 52139)) }
-        XCTAssertEqual(saved.all.last?.healthyActiveCount, 52139)
-        XCTAssertEqual(saved.all.last?.referenceConfirmed, false)
+        let (report, state) = try await run(api, state: ImmichAlignmentState(healthyActiveCount: 700),
+                                            env: immichTestEnv(saved: saved))
+        XCTAssertTrue(api.deleted.isEmpty)
+        XCTAssertEqual(report.needsFirstConfirmation, ImmichFirstRemoval(active: 0, toRemove: 10, before: 52139))
+        XCTAssertEqual(state.healthyActiveCount, 700)
+        XCTAssertFalse(state.referenceConfirmed)
+        XCTAssertTrue(saved.all.allSatisfy { $0.healthyActiveCount == 700 && !$0.referenceConfirmed })
+    }
+
+
+    // MARK: - Q1: senza riferimento affidabile la guardia del calo non blocca, si chiede conferma
+
+    /// Il ciclo di prima: 600 foto tolte dall'SSD, la guardia scattava, `.drop(600)` si ignorava e
+    /// la guardia riscattava. Ora si va alla richiesta, che dice anche quante foto c'erano prima.
+    func testAnUnconfirmedReferenceWithADropOverTheThresholdAsksWithBeforeAndRemovesNothing() async throws {
+        let api = FakeImmichAPI(); api.totals = [52139, 51539]; offline(api, 600)
+        let saved = SavedStates()
+        let (report, state) = try await run(api, state: ImmichAlignmentState(healthyActiveCount: 52139),
+                                            env: immichTestEnv(saved: saved))
+        XCTAssertEqual(report.needsFirstConfirmation, ImmichFirstRemoval(active: 51539, toRemove: 600, before: 52139))
+        XCTAssertTrue(api.deleted.isEmpty)
+        XCTAssertFalse(state.referenceConfirmed)
+        XCTAssertEqual(state.healthyActiveCount, 52139)   // il candidato di prima resta com'era, nessun salvataggio nuovo
+    }
+
+    func testTheFirstRemovalAskedAfterADropIsAcceptedWithTheSameNumbersAndDeletes() async throws {
+        let ask = FakeImmichAPI(); ask.totals = [52139, 51539]; offline(ask, 600)
+        let (report, _) = try await run(ask)
+        let first = try XCTUnwrap(report.needsFirstConfirmation)
+        XCTAssertEqual(first.before, 52139)
+        XCTAssertTrue(ask.deleted.isEmpty)
+        let again = FakeImmichAPI(); again.totals = [52139, 51539]; offline(again, 600)
+        let (done, state) = try await run(again, accepted: .firstRemoval(active: first.active, toRemove: first.toRemove))
+        XCTAssertEqual(again.deleted.map(\.count), [500, 100])
+        XCTAssertEqual(done.offlineRemoved, 600)
+        XCTAssertNil(done.needsFirstConfirmation)
+        XCTAssertEqual(state.healthyActiveCount, 51539)
+        XCTAssertTrue(state.referenceConfirmed)
+    }
+
+    /// SSD vuoto con un riferimento non affidabile: si arriva alla richiesta con `active` 0 e il `before`.
+    func testAnEmptySSDWithAnUnconfirmedReferenceAsksWithActiveZeroAndBefore() async throws {
+        let api = FakeImmichAPI(); api.totals = [1000, 0]; offline(api, 40)
+        let (report, state) = try await run(api, state: ImmichAlignmentState(healthyActiveCount: 1000))
+        XCTAssertEqual(report.needsFirstConfirmation, ImmichFirstRemoval(active: 0, toRemove: 40, before: 1000))
+        XCTAssertTrue(api.deleted.isEmpty)
+        XCTAssertFalse(state.referenceConfirmed)
+    }
+
+    /// `before` solo quando `before - after > soglia(before)` (2 % di 1000 = 20): 20 no, 21 si.
+    func testBeforeIsReportedOnlyWhenTheDropExceedsTheThreshold() async throws {
+        let atEdge = FakeImmichAPI(); atEdge.totals = [1000, 980]; offline(atEdge, 5)
+        let (edge, _) = try await run(atEdge)
+        XCTAssertEqual(edge.needsFirstConfirmation, ImmichFirstRemoval(active: 980, toRemove: 5))
+        XCTAssertNil(edge.needsFirstConfirmation?.before)
+        let over = FakeImmichAPI(); over.totals = [1000, 979]; offline(over, 5)
+        let (overReport, _) = try await run(over)
+        XCTAssertEqual(overReport.needsFirstConfirmation, ImmichFirstRemoval(active: 979, toRemove: 5, before: 1000))
+        let grew = FakeImmichAPI(); grew.totals = [10, 1000]; offline(grew, 5)
+        let (grewReport, _) = try await run(grew)
+        XCTAssertNil(grewReport.needsFirstConfirmation?.before)
+        XCTAssertTrue(over.deleted.isEmpty && atEdge.deleted.isEmpty && grew.deleted.isEmpty)
+    }
+
+    /// Con un riferimento affidabile la guardia del calo scatta come prima.
+    func testAReliableReferenceStillTripsTheDropGuardAfterTheScan() async {
+        let api = FakeImmichAPI(); api.totals = [52139, 51539]; offline(api, 600)
+        do { _ = try await run(api, state: ImmichAlignmentState(healthyActiveCount: 52139, referenceConfirmed: true)); XCTFail("doveva fermarsi") }
+        catch { XCTAssertEqual(error as? ImmichAlignmentFailure, .dropGuard(missing: 600)) }
+        XCTAssertTrue(api.deleted.isEmpty)
+    }
+
+    /// Il ricontrollo prima di ogni blocco resta, e con un riferimento non affidabile si confronta
+    /// con l'`active` confermato: un crollo a meta' si ferma anche dopo la richiesta saltata.
+    func testTheCheckBeforeEachBlockStillComparesWithTheConfirmedActiveAfterADrop() async {
+        let api = FakeImmichAPI(); offline(api, 1201)
+        api.totals = [52139, 5000, 5000, 4000]   // prima, dopo, blocco 1, blocco 2 (crollo)
+        do { _ = try await run(api, accepted: .firstRemoval(active: 5000, toRemove: 1201)); XCTFail("doveva fermarsi") }
+        catch { XCTAssertEqual(error as? ImmichAlignmentFailure, .dropGuard(missing: 1000)) }
+        XCTAssertEqual(api.deleted.map(\.count), [500])
     }
 
     // MARK: - P5: il segnale che il riferimento e' avanzato
@@ -975,6 +1064,23 @@ final class ImmichAlignerTests: XCTestCase {
         guard case .done = aligner.status else { return XCTFail("stato \(aligner.status)") }
         XCTAssertEqual(api.deleted.map(\.count), [25])
         XCTAssertEqual(ImmichAlignmentStateStore.load(from: stateURL).state.healthyActiveCount, 10)
+    }
+
+    /// Q1 sul coordinatore: dopo un calo oltre la soglia con riferimento non affidabile lo stato
+    /// porta il `before`, la conferma resta `(active, toRemove)`, e accettarla toglie le foto.
+    func testFirstRemovalAfterADropShowsBeforeAndAcceptDeletes() async throws {
+        let api = FakeImmichAPI(); api.totals = [600, 0]
+        api.offlineAssets = (0..<10).map { immichTestAsset("o\($0)", offline: true, trashed: true) }
+        let (aligner, _, _) = try makeAligner(api: api)
+        aligner.request(.manual)
+        await aligner.currentTask?.value
+        XCTAssertEqual(aligner.status, .confirmFirstRemoval(active: 0, toRemove: 10, before: 600))
+        XCTAssertEqual(aligner.status.firstRemovalBefore, 600)
+        XCTAssertEqual(aligner.status.confirmationToAccept, .firstRemoval(active: 0, toRemove: 10))
+        XCTAssertTrue(api.deleted.isEmpty)
+        aligner.accept(.firstRemoval(active: 0, toRemove: 10))
+        await aligner.currentTask?.value
+        XCTAssertEqual(api.deleted.map(\.count), [10])
     }
 
     // MARK: - N2: la conferma non resta appesa

@@ -286,6 +286,8 @@ struct ImmichView: View {
     /// La conferma mostrata nell'alert, congelata quando l'alert si apre: il testo si ricava da
     /// lei (quindi sono i valori che Enrico legge) e al clic si confronta con lo stato di adesso.
     @State private var frozenConfirmation: ImmichConfirmation?
+    /// Informativo, congelato con la conferma: non entra in `shouldAccept`.
+    @State private var frozenBefore: Int?
 
     /// La libreria da indicizzare è l'SSD già configurato in `BookmarkManager`: nessuna
     /// nuova destinazione, nessun nuovo bookmark (vedi spec).
@@ -316,9 +318,13 @@ struct ImmichView: View {
                     }
                     Button("Annulla", role: .cancel) {}
                 } message: {
-                    Text(frozenConfirmation.map { ImmichAlignmentText.confirmation(for: $0) } ?? "")
+                    Text(frozenConfirmation.map { ImmichAlignmentText.confirmation(for: $0, before: frozenBefore) } ?? "")
                 }
-                .onChange(of: aligner.status) { confirmsDrop = false }
+                // Si chiude solo se lo stato non chiede piu' la conferma congelata: gli aggiornamenti
+                // di avanzamento non la cambiano. Al clic `shouldAccept` resta l'ultima difesa.
+                .onChange(of: aligner.status.confirmationToAccept) { _, current in
+                    if ImmichConfirmation.alertMustClose(frozen: frozenConfirmation, current: current) { confirmsDrop = false }
+                }
                 .onChange(of: windowState) { if windowState != .ready { confirmsDrop = false } }
                 // Riallinea lo stato a com'è davvero il sistema: se i container sono rimasti
                 // accesi da una sessione precedente (crash, force-quit) o se lo stack è partito
@@ -352,6 +358,7 @@ struct ImmichView: View {
                                        // chiede piu' una conferma, non c'e' niente da confermare.
                                        guard let frozen = aligner.status.confirmationToAccept else { return }
                                        frozenConfirmation = frozen
+                                       frozenBefore = aligner.status.firstRemovalBefore
                                        confirmsDrop = true
                                    })
                 ImmichWebView(url: ImmichManager.webUIURL)
@@ -1272,6 +1279,9 @@ nonisolated struct ImmichAlignmentReport: Equatable, Sendable {
 nonisolated struct ImmichFirstRemoval: Equatable, Sendable {
     let active: Int
     let toRemove: Int
+    /// Le foto che Immich vedeva prima della scansione, solo se il calo supera la soglia della
+    /// guardia: e' un'informazione per Enrico, non entra nella conferma.
+    var before: Int? = nil
 }
 
 nonisolated enum ImmichAlignmentFailure: Error, Equatable, Sendable {
@@ -1368,26 +1378,34 @@ nonisolated enum ImmichAlignmentText {
         "Dopo la scansione mancano \(number(missing)) foto rispetto all'ultima volta. Se le hai tolte tu dall'SSD, Immich le toglie anche dal suo archivio, con volti e album. I file sull'SSD non vengono toccati."
     }
 
-    static func firstRemovalLine(active: Int, toRemove: Int) -> String {
+    static func firstRemovalLine(active: Int, toRemove: Int, before: Int? = nil) -> String {
         "Prima di togliere foto da Immich mi serve un tuo sì: Immich vede \(number(active)) foto sull'SSD e ne toglierebbe \(number(toRemove)) che sull'SSD non ci sono più."
+            + beforeWarning(before)
     }
 
-    static func firstRemovalConfirmation(active: Int, toRemove: Int) -> String {
+    /// Quando il calo supera la soglia: quante foto c'erano prima della scansione, perche' Enrico giudichi.
+    private static func beforeWarning(_ before: Int?) -> String {
+        before.map { " Attenzione: prima della scansione Immich ne vedeva \(number($0))." } ?? ""
+    }
+
+    static func firstRemovalConfirmation(active: Int, toRemove: Int, before: Int? = nil) -> String {
         "\(number(toRemove)) foto escono da Immich (solo dal suo elenco: i file sull'SSD non vengono toccati). Le \(number(active)) foto che Immich vede restano."
+            + beforeWarning(before)
     }
 
     /// Il testo dell'alert «Togliere comunque…» per la conferma data. L'alert lo ricava dalla
     /// `ImmichConfirmation` congelata quando si apre: mostra i valori congelati, mai quelli di adesso.
-    static func confirmation(for confirmation: ImmichConfirmation) -> String {
+    static func confirmation(for confirmation: ImmichConfirmation, before: Int? = nil) -> String {
         switch confirmation {
         case .drop(let missing): return acceptDropConfirmation(missing: missing)
-        case .firstRemoval(let active, let toRemove): return firstRemovalConfirmation(active: active, toRemove: toRemove)
+        case .firstRemoval(let active, let toRemove):
+            return firstRemovalConfirmation(active: active, toRemove: toRemove, before: before)
         }
     }
 
     /// Lo stesso testo per lo stato dato, o `nil` se non c'e' niente da confermare.
     static func confirmation(for status: ImmichAlignmentStatus) -> String? {
-        status.confirmationToAccept.map { confirmation(for: $0) }
+        status.confirmationToAccept.map { confirmation(for: $0, before: status.firstRemovalBefore) }
     }
 }
 
@@ -1406,6 +1424,12 @@ nonisolated enum ImmichConfirmation: Equatable, Sendable {
     static func shouldAccept(frozen: ImmichConfirmation, current: ImmichConfirmation?) -> ImmichConfirmation? {
         current == frozen ? frozen : nil
     }
+
+    /// L'alert aperto si chiude solo se lo stato non chiede piu' la conferma congelata. Gli
+    /// aggiornamenti di avanzamento non la cambiano e non lo chiudono.
+    static func alertMustClose(frozen: ImmichConfirmation?, current: ImmichConfirmation?) -> Bool {
+        frozen != nil && frozen != current
+    }
 }
 
 nonisolated enum ImmichAlignmentBarAction: Hashable, Sendable { case retry, enterPassword, acceptDrop }
@@ -1417,7 +1441,7 @@ nonisolated enum ImmichAlignmentStatus: Equatable, Sendable {
     case needsKey
     case dropGuard(missing: Int)
     /// Senza riferimento affidabile l'app non toglie niente finche' Enrico non dice di si.
-    case confirmFirstRemoval(active: Int, toRemove: Int)
+    case confirmFirstRemoval(active: Int, toRemove: Int, before: Int? = nil)
     case failed(ImmichAlignmentFailure)
 
     func line(timeZone: TimeZone = .current) -> String {
@@ -1427,8 +1451,8 @@ nonisolated enum ImmichAlignmentStatus: Equatable, Sendable {
         case .done(let report, let date): return ImmichAlignmentText.done(report, at: date, timeZone: timeZone)
         case .needsKey: return ImmichAlignmentText.needsKey
         case .dropGuard(let missing): return ImmichAlignmentText.failure(.dropGuard(missing: missing))
-        case .confirmFirstRemoval(let active, let toRemove):
-            return ImmichAlignmentText.firstRemovalLine(active: active, toRemove: toRemove)
+        case .confirmFirstRemoval(let active, let toRemove, let before):
+            return ImmichAlignmentText.firstRemovalLine(active: active, toRemove: toRemove, before: before)
         case .failed(let failure): return ImmichAlignmentText.failure(failure)
         }
     }
@@ -1446,9 +1470,15 @@ nonisolated enum ImmichAlignmentStatus: Equatable, Sendable {
     var confirmationToAccept: ImmichConfirmation? {
         switch self {
         case .dropGuard(let missing): return .drop(missing: missing)
-        case .confirmFirstRemoval(let active, let toRemove): return .firstRemoval(active: active, toRemove: toRemove)
+        case .confirmFirstRemoval(let active, let toRemove, _): return .firstRemoval(active: active, toRemove: toRemove)
         default: return nil
         }
+    }
+
+    /// Informativo: le foto che Immich vedeva prima della scansione, se il calo era oltre la soglia.
+    var firstRemovalBefore: Int? {
+        if case .confirmFirstRemoval(_, _, let before) = self { return before }
+        return nil
     }
 
     var actions: [ImmichAlignmentBarAction] {
@@ -1836,7 +1866,8 @@ nonisolated enum ImmichAlignmentRun {
         }
         // `healthy` e' il riferimento che si SALVA: mai abbassato dal margine dei doppioni, che
         // vale solo per il confronto in memoria (altrimenti ogni «Riprova» lo abbasserebbe ancora).
-        // Senza riferimento affidabile `before` serve solo per il tetto del margine e la guardia del calo.
+        // Senza riferimento affidabile `before` serve solo per il tetto del margine e per dire a Enrico
+        // quante foto c'erano prima della scansione.
         let healthy = state.healthyActiveCount ?? before
         let baseline = max(0, healthy - ImmichAlignmentRules.effectiveAllowance(allowance, healthy: healthy))
 
@@ -1863,18 +1894,20 @@ nonisolated enum ImmichAlignmentRun {
         let after = try await api.statistics(libraryId: library.id).total
         report.newAssets = max(0, after - before)
 
-        // Regola 3, seconda guardia: il riferimento (non abbassato) si salva anche quando scatta,
-        // cosi' un «Riprova» su un SSD ancora vuoto nella VM scatta di nuovo. Se il salvataggio
-        // fallisce, l'errore e' `stateNotSaved` al posto di `dropGuard`.
+        // Regola 3, seconda guardia, solo con un riferimento affidabile: lo stato corrente (con il
+        // riferimento non abbassato) si salva anche quando scatta, cosi' un «Riprova» su un SSD
+        // ancora vuoto nella VM scatta di nuovo. Se il salvataggio fallisce, l'errore e'
+        // `stateNotSaved` al posto di `dropGuard`. Senza riferimento affidabile non c'e' niente con
+        // cui confrontare il calo e un `.drop` non potrebbe mai sbloccarlo (si ignora): si va alla
+        // richiesta di conferma `.firstRemoval`, che dice anche quante foto c'erano prima.
         func tripped(_ active: Int) -> Bool {
             ImmichAlignmentRules.dropGuardTripped(baseline: baseline, activeAfter: active, acceptedMissing: acceptedDrop)
         }
-        func dropGuardFailure(missing: Int, savingReference: Bool = true) -> ImmichAlignmentFailure {
-            if savingReference { state.healthyActiveCount = healthy }
+        func dropGuardFailure(missing: Int) -> ImmichAlignmentFailure {
             do { try env.saveState(state) } catch { return .stateNotSaved }
             return .dropGuard(missing: missing)
         }
-        if tripped(after) { throw dropGuardFailure(missing: baseline - after) }
+        if referenceReliable && tripped(after) { throw dropGuardFailure(missing: baseline - after) }
         guard await env.ssdMounted() else { throw ImmichAlignmentFailure.ssdNotMounted }
 
         // Con una scansione non finita (Immich puo' non aver ancora riletto l'SSD: tutto
@@ -1900,7 +1933,10 @@ nonisolated enum ImmichAlignmentRun {
                 } else {
                     mayRemove = false
                     if !offline.isEmpty {
-                        report.needsFirstConfirmation = ImmichFirstRemoval(active: after, toRemove: offline.count)
+                        // `before` solo se il calo supera la soglia: e' cio' che farebbe scattare la guardia.
+                        let dropped = before - after > ImmichAlignmentRules.dropThreshold(baseline: before)
+                        report.needsFirstConfirmation = ImmichFirstRemoval(active: after, toRemove: offline.count,
+                                                                           before: dropped ? before : nil)
                         report.offlineSkipped = true
                     }
                 }
@@ -1923,7 +1959,7 @@ nonisolated enum ImmichAlignmentRun {
                               ImmichAlignmentRules.dropGuardTripped(baseline: first.active, activeAfter: now) {
                         // Riferimento non affidabile: il confronto e' con le foto attive che Enrico ha
                         // visto e confermato, e non si inventa nessun riferimento da salvare.
-                        throw dropGuardFailure(missing: first.active - now, savingReference: false)
+                        throw dropGuardFailure(missing: first.active - now)
                     }
                     try await api.deleteAssets(ids: chunk)
                     report.offlineRemoved += chunk.count
@@ -2086,7 +2122,7 @@ final class ImmichAligner: ObservableObject {
             returnAllowanceIfUnused()
             let now = Date()
             if let first = report.needsFirstConfirmation {
-                status = .confirmFirstRemoval(active: first.active, toRemove: first.toRemove)
+                status = .confirmFirstRemoval(active: first.active, toRemove: first.toRemove, before: first.before)
                 log(status.line())
             } else {
                 status = .done(report, now)

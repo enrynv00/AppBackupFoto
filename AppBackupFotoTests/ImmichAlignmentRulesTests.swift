@@ -407,6 +407,53 @@ final class ImmichAlignmentRulesTests: XCTestCase {
         XCTAssertNil(ImmichAlignmentText.confirmation(for: .done(ImmichAlignmentReport(), Date())))
     }
 
+    // MARK: - Q1: quante foto c'erano prima della scansione
+
+    func testFirstRemovalLineAddsTheBeforeWhenKnown() {
+        let status = ImmichAlignmentStatus.confirmFirstRemoval(active: 51539, toRemove: 600, before: 52139)
+        XCTAssertEqual(status.line(),
+            "Prima di togliere foto da Immich mi serve un tuo sì: Immich vede 51.539 foto sull'SSD e ne toglierebbe 600 che sull'SSD non ci sono più. Attenzione: prima della scansione Immich ne vedeva 52.139.")
+        // il `before` e' solo informativo: non entra nella conferma
+        XCTAssertEqual(status.confirmationToAccept, .firstRemoval(active: 51539, toRemove: 600))
+        XCTAssertEqual(status.firstRemovalBefore, 52139)
+        XCTAssertNil(ImmichAlignmentStatus.confirmFirstRemoval(active: 1, toRemove: 2).firstRemovalBefore)
+        XCTAssertFalse(ImmichAlignmentStatus.confirmFirstRemoval(active: 1, toRemove: 2).line().contains("Attenzione"))
+    }
+
+    func testFirstRemovalAlertTextAddsTheBeforeWhenKnown() {
+        let confirmation = ImmichConfirmation.firstRemoval(active: 51539, toRemove: 600)
+        XCTAssertEqual(ImmichAlignmentText.confirmation(for: confirmation, before: 52139),
+            "600 foto escono da Immich (solo dal suo elenco: i file sull'SSD non vengono toccati). Le 51.539 foto che Immich vede restano. Attenzione: prima della scansione Immich ne vedeva 52.139.")
+        XCTAssertEqual(ImmichAlignmentText.confirmation(for: .confirmFirstRemoval(active: 51539, toRemove: 600, before: 52139)),
+                       ImmichAlignmentText.confirmation(for: confirmation, before: 52139))
+        XCTAssertEqual(ImmichAlignmentText.confirmation(for: confirmation),
+                       ImmichAlignmentText.firstRemovalConfirmation(active: 51539, toRemove: 600))
+        // il `before` non riguarda il blocco del calo
+        XCTAssertEqual(ImmichAlignmentText.confirmation(for: ImmichConfirmation.drop(missing: 600), before: 52139),
+                       ImmichAlignmentText.acceptDropConfirmation(missing: 600))
+    }
+
+    // MARK: - Q2: l'alert non si chiude a ogni aggiornamento di avanzamento
+
+    func testAlertMustCloseOnlyWhenTheFrozenConfirmationIsNoLongerAsked() {
+        let frozen = ImmichConfirmation.firstRemoval(active: 10, toRemove: 25)
+        XCTAssertFalse(ImmichConfirmation.alertMustClose(frozen: frozen, current: frozen))
+        XCTAssertTrue(ImmichConfirmation.alertMustClose(frozen: frozen, current: nil))
+        XCTAssertTrue(ImmichConfirmation.alertMustClose(frozen: frozen, current: .firstRemoval(active: 10, toRemove: 26)))
+        XCTAssertTrue(ImmichConfirmation.alertMustClose(frozen: frozen, current: .drop(missing: 25)))
+        XCTAssertFalse(ImmichConfirmation.alertMustClose(frozen: nil, current: nil))
+        XCTAssertFalse(ImmichConfirmation.alertMustClose(frozen: nil, current: frozen))
+    }
+
+    /// Gli aggiornamenti di avanzamento non cambiano la conferma richiesta, quindi non chiudono l'alert.
+    func testProgressUpdatesDoNotChangeTheConfirmationToAccept() {
+        let a = ImmichAlignmentStatus.running(ImmichAlignmentText.scanning)
+        let b = ImmichAlignmentStatus.running(ImmichAlignmentText.cleaning)
+        XCTAssertNotEqual(a, b)
+        XCTAssertEqual(a.confirmationToAccept, b.confirmationToAccept)
+        XCTAssertFalse(ImmichConfirmation.alertMustClose(frozen: nil, current: b.confirmationToAccept))
+    }
+
     func testStateNotSavedLine() {
         XCTAssertEqual(ImmichAlignmentText.failure(.stateNotSaved),
             "Non riesco a salvare il file dell'allineamento sul Mac: per sicurezza non tolgo nessuna foto da Immich.")
