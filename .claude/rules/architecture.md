@@ -152,6 +152,48 @@ paths:
 - **Perché una WebView e non un client nativo**: Immich ha già griglia, ricerca smart e pagina persone/facce nella propria web UI; rifarle native sarebbe lavoro duplicato senza beneficio per un'app single-user. Se un giorno l'esperienza WebView risultasse insoddisfacente, il client nativo via API resta possibile — questa scelta non lo preclude.
 - **Da riverificare a ogni manutenzione**: i tag delle immagini Docker e i path API di Immich cambiano in fretta (sviluppo molto attivo, breaking change dichiarati solo tra major). Il tag `valkey:9-bookworm` indicato nel piano **non esisteva già più** al momento dell'implementazione (valkey 9 è passato a trixie) ed è stato sostituito con `valkey:9`, come nel compose ufficiale. Fonte di verità: `https://github.com/immich-app/immich/blob/main/docker/docker-compose.yml`.
 
+### Allineamento di Immich (#50, ADR-0021, 2026-11-14 — implementato, verifica dal vivo da fare)
+
+Immich parte e si ferma con l'SSD, e dopo ogni scrittura sull'SSD l'app lo riallinea: scansiona la libreria, toglie dal database di Immich le foto offline già nel suo Cestino, impila i simili, archivia le immagini sotto i 400 px. Tocca solo il database di Immich: l'SSD resta in sola lettura (`:ro` nel compose, Colima senza `:w`). Spec: `Docs/superpowers/specs/2026-11-13-immich-always-aligned-design.md`. Tutti i tipi sono in `ContentView.swift`, accanto a `ImmichManager`.
+
+**Tipi e cosa fa ciascuno**
+
+- `ImmichAlignmentRules` (`nonisolated enum`, pura) — libreria dell'SSD (`importPaths` contiene `/external-ssd`), offline da togliere (`isOffline && isTrashed && libraryId`), soglia del calo (`min(500, 2 %)`), margine dei doppioni con tetto al 25 % del riferimento (`effectiveAllowance`), foto davanti a una pila, gruppi da impilare, minuscole da archiviare, blocchi da 500.
+- `ImmichAlignmentState` / `ImmichAlignmentStateStore` — stato in `~/Library/Application Support/AppBackupFoto/immich-alignment.json` (mai sull'SSD): `archivedAssetIds`, `stackedDuplicateIds`, `healthyActiveCount` (il riferimento), `referenceConfirmed`. Un file senza `referenceConfirmed` si decodifica come non confermato. Un file illeggibile si sposta in `.illeggibile` e lo stato parte vuoto (`Loaded.wasUnreadable`).
+- `ImmichConfirmation` — la conferma tipata: `.drop(missing)` oppure `.firstRemoval(active, toRemove)`. `shouldAccept(frozen:current:)` dice se lo stato di adesso è ancora quello che l'alert ha congelato.
+- `ImmichRequests` (richieste, fixture JSON in `ImmichRequestsTests`), `ImmichKeyPermissions` (la lista chiusa dei 10 permessi), `ImmichAlignmentAPI` (protocollo) con `ImmichHTTPClient` (`URLSession` `.ephemeral`, `httpShouldHandleCookies = false`, header `x-api-key`, solo verso `127.0.0.1:2283`).
+- `ImmichKeyStore` con `KeychainImmichKeyStore` (servizio `AppBackupFoto`, account `immich-api-key`) e `ImmichKeyMaker` (login, creazione della chiave, logout, fuori dalla cancellazione; la password non si salva né si logga).
+- `ImmichAlignmentRun.run` — il giro (sotto). `ImmichAlignmentReport`, `ImmichFirstRemoval`, `ImmichAlignmentFailure`, `ImmichAlignmentText`, `ImmichAlignmentStatus`, `ImmichAlignmentLog` — esito e testi.
+- `ImmichAligner` (`@MainActor ObservableObject`, `shared`) — un solo giro alla volta, `request(_:)` unisce le richieste arrivate durante un giro in **un** giro in più, `accept(_:)` per «Togli comunque», tiene in memoria il margine dei doppioni e la conferma (si consuma all'inizio di ogni giro e si scarta se Immich è spento). `AdvancedFlag` raccoglie il segnale `referenceAdvanced`.
+- `ImmichAutoStart.action` (pura) e `ImmichAutoStartCoordinator` — Immich parte con l'SSD e si ferma senza, solo se installato e mai a metà di un avvio. Avviato da `AppDelegate.applicationDidFinishLaunching`.
+- UI: `ImmichAlignmentBar` (la riga sopra l'interfaccia web) e `ImmichKeySheet` (email e password per creare la chiave).
+
+**Chi chiama `ImmichAligner.request`**: la fine di `finishJob`, solo con `jobWritesToSSD` (`.backupFinished`); la fine di `startDuplicateTrashRun`, con il numero di file davvero spostati (`.duplicatesMoved(count:)`); `ImmichManager.start` riuscito (`.immichStarted`); il foglio della chiave (`.keyAdded`); il pulsante «Riprova» (`.manual`). Con Immich spento la richiesta non parte: l'avvio successivo allinea comunque.
+
+**Ordine dei passi di `ImmichAlignmentRun.run`**
+
+1. libreria dell'SSD (`GET /libraries`) e foto attive prima della scansione (`before`);
+2. SSD montato, poi `POST /libraries/{id}/scan` e attesa della coda `library` ferma (con `paused` contato), tetto 1.800 s: allo scadere `scanTimedOut` e in quel giro non si toglie niente;
+3. foto attive dopo la scansione (`after`); con un riferimento affidabile, guardia del calo; poi seconda verifica dell'SSD;
+4. offline da togliere (`POST /search/metadata`); senza riferimento affidabile serve la conferma `.firstRemoval`, altrimenti l'esito è `needsFirstConfirmation`;
+5. **stato salvato** (`stateNotSaved` se non ci riesce), poi blocchi da 500 con `DELETE /assets` (`force: true`), ricontrollando prima di ogni blocco SSD montato, coda `library` ferma e statistiche contro la guardia;
+6. il riferimento avanza (`healthyActiveCount = after`, `referenceConfirmed = true`) solo se la scansione è finita, la pulizia non è stata interrotta e il riferimento era affidabile o confermato da Enrico; stato salvato, poi `env.referenceAdvanced()`;
+7. pile (`GET /duplicates`, `POST /stacks`) solo per le foto della libreria SSD (filtro `libraryId` lato client), stato salvato dopo ogni pila; un 4xx si salta, 401 e 403 fermano il giro;
+8. archiviazione (`POST /search/metadata`, `PUT /assets` con `visibility: archive`), stato salvato dopo ogni blocco.
+
+**Le due guardie**
+
+- *SSD*: `VolumeMonitor.ssdMounted` prima della scansione, prima di togliere e prima di ogni blocco.
+- *Calo*: con un riferimento **confermato** (`healthyActiveCount` presente, `referenceConfirmed` vero, stato leggibile) un calo di più di min(500, 2 %) ferma il giro con `dropGuard`. Il riferimento salvato non si abbassa. Con un `.drop(missing)` confermato la soglia si allarga di `missing`. **Senza** riferimento confermato non si toglie niente finché Enrico non conferma `.firstRemoval(active, toRemove)`; la conferma vale solo se `offline ≤ toRemove + soglia` e `after ≥ active − soglia`. Il margine dei doppioni abbassa il riferimento solo nel confronto in memoria, con tetto al 25 %, e si restituisce solo se `referenceAdvanced` non è scattato.
+
+**Dove stanno le cose**: stato in `~/Library/Application Support/AppBackupFoto/immich-alignment.json`; log in `~/Library/Logs/AppBackupFoto/immich-alignment.log` (mai chiave o password); chiave nel Portachiavi (servizio `AppBackupFoto`, account `immich-api-key`). Se Immich risponde 401 l'app cancella la chiave e la richiede; quella vecchia va revocata a mano dalle impostazioni di Immich.
+
+**Mai** `POST /duplicates/resolve` né `DELETE /duplicates` (cancellano): solo pile. Versione fissata a `ImmichManager.immichVersion` (`v3.2.0`): aggiornare Immich vuol dire cambiarla e riverificare gli endpoint.
+
+**Limiti accettati**: foto nuove nella stessa scansione possono mascherare foto mancanti (conta il calo netto); cali ripetuti sotto soglia passano; `PUT /assets` è deprecato in Immich v3.2.0 (funziona, il sostituto va verificato); da verificare dal vivo che `GET /duplicates` restituisca `libraryId`.
+
+**Test**: `ImmichAlignmentRulesTests`, `ImmichRequestsTests`, `ImmichAlignmentRunTests` (con la classe `ImmichAlignerTests`), `ImmichComposeFileTests` (+3). Non coperti: `ImmichAlignmentBar`, `ImmichKeySheet`, il cablaggio nelle scene e le chiamate vere a Immich.
+
 ### Bug critico risolto: `sha256(of:)` e file molto grandi (2026-07-30)
 
 Un restore locale reale della cartella `Zip` dell'SSD (15 file, tra cui due archivi da ~50GB: `takeout-001.zip` 53,5GB e `takeout-002.zip` 44,5GB) ha fatto salire il processo a 41-43GB di RAM (37GB di swap), quasi bloccando il Mac. Causa trovata e verificata empiricamente (non solo per lettura del codice): `sha256(of:)` — la funzione condivisa usata sia da `FileSyncer` (verifica integrità post-copia, su sorgente **e** destinazione) sia da `ReviewEngine` — leggeva il file con `FileHandle.readData(ofLength: 65536)` in un ciclo. Il chunking a 64KB è corretto sulla carta, ma su questo carico `FileHandle`/`NSData` mantiene le pagine lette residenti in memoria invece di rilasciarle tra una lettura e l'altra: la RAM cresce in proporzione ai byte totali letti, non alla dimensione del buffer. Per un file di pochi MB non si nota; per un file da 50GB, letto due volte (sorgente + destinazione), diventa un problema di sistema.
