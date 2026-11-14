@@ -27,6 +27,45 @@ final class ImmichRequestsTests: XCTestCase {
         XCTAssertEqual(ImmichRequests.createKey(bearer: "T").value(forHTTPHeaderField: "Authorization"), "Bearer T")
     }
 
+    func testNoRequestSendsOrStoresCookies() {
+        let requests = [ImmichRequests.libraries(apiKey: "K"), ImmichRequests.statistics(libraryId: "L", apiKey: "K"),
+                        ImmichRequests.scan(libraryId: "L", apiKey: "K"), ImmichRequests.jobs(apiKey: "K"),
+                        ImmichRequests.duplicates(apiKey: "K"),
+                        ImmichRequests.search(.offline(libraryId: "L"), token: nil, apiKey: "K"),
+                        ImmichRequests.search(.images(libraryId: "L"), token: .page(2), apiKey: "K"),
+                        ImmichRequests.deleteAssets(ids: ["a"], apiKey: "K"),
+                        ImmichRequests.createStack(assetIds: ["a", "b"], apiKey: "K"),
+                        ImmichRequests.archive(ids: ["a"], apiKey: "K"),
+                        ImmichRequests.login(email: "e", password: "p"),
+                        ImmichRequests.createKey(bearer: "T"), ImmichRequests.logout(bearer: "T")]
+        for r in requests { XCTAssertFalse(r.httpShouldHandleCookies, r.url?.path ?? "") }
+    }
+
+    // MARK: - ID nei percorsi
+
+    func testNormalIDsAreUnchangedInPaths() {
+        let uuid = "0b9d7a4e-1c2f-4f6a-9d3e-5a8b7c6d5e4f"
+        XCTAssertEqual(ImmichRequests.statistics(libraryId: uuid, apiKey: "K").url?.absoluteString,
+                       "http://127.0.0.1:2283/api/libraries/\(uuid)/statistics")
+        XCTAssertEqual(ImmichRequests.scan(libraryId: "lib1", apiKey: "K").url?.absoluteString,
+                       "http://127.0.0.1:2283/api/libraries/lib1/scan")
+    }
+
+    func testAnIDCannotChangeTheEndpoint() throws {
+        for evil in ["../x", "a/b", "..", "x/../../jobs", "a?b=c", "a#b", "100%"] {
+            for r in [ImmichRequests.statistics(libraryId: evil, apiKey: "K"), ImmichRequests.scan(libraryId: evil, apiKey: "K")] {
+                let url = try XCTUnwrap(r.url, evil)
+                let components = try XCTUnwrap(URLComponents(url: url, resolvingAgainstBaseURL: false))
+                let segments = components.percentEncodedPath.split(separator: "/", omittingEmptySubsequences: false)
+                XCTAssertEqual(segments.count, 5, "\(evil) -> \(url)")   // "", api, libraries, <id>, statistics|scan
+                XCTAssertNil(components.query, evil)
+                XCTAssertNil(components.fragment, evil)
+                XCTAssertFalse(segments.contains(".."), evil)
+                XCTAssertFalse(segments.contains("."), evil)
+            }
+        }
+    }
+
     // MARK: - Metodi, percorsi, corpi
 
     func testScanStatisticsJobsDuplicates() {
@@ -113,6 +152,30 @@ final class ImmichRequestsTests: XCTestCase {
         XCTAssertThrowsError(try ImmichHTTPClient.check(statusCode: 0)) { XCTAssertEqual($0 as? ImmichAlignmentFailure, .http(0)) }
     }
 
+    // MARK: - Ricerca oltre il tetto delle pagine
+
+    func testSearchBeyondMaxPagesFailsInsteadOfReturningAPartialList() async {
+        var calls = 0
+        do {
+            _ = try await ImmichHTTPClient.collectPages(maxPages: 3) { _ in
+                calls += 1
+                return ImmichSearchResponse.Page(items: [], nextPage: nil, nextCursor: "C\(calls)")
+            }
+            XCTFail("doveva lanciare")
+        } catch { XCTAssertEqual(error as? ImmichAlignmentFailure, .badResponse) }
+        XCTAssertEqual(calls, 3)
+    }
+
+    func testSearchEndingExactlyAtMaxPagesIsComplete() async throws {
+        var calls = 0
+        let all = try await ImmichHTTPClient.collectPages(maxPages: 3) { _ in
+            calls += 1
+            return ImmichSearchResponse.Page(items: [immichTestAsset("a\(calls)")], nextPage: nil,
+                                             nextCursor: calls < 3 ? "C" : nil)
+        }
+        XCTAssertEqual(all.map(\.id), ["a1", "a2", "a3"])
+    }
+
     func testBadJSONIsBadResponse() {
         XCTAssertThrowsError(try ImmichHTTPClient.decode(ImmichLibraryStats.self, from: Data("{}".utf8))) {
             XCTAssertEqual($0 as? ImmichAlignmentFailure, .badResponse)
@@ -125,6 +188,9 @@ final class ImmichRequestsTests: XCTestCase {
         var paths: [String] = []
         var failCreate = false
         var failLogin = false
+        /// Se true, la richiesta di creazione cancella il task che sta eseguendo `makeKey`.
+        var cancelDuringCreate = false
+        var logoutSawCancellation: Bool?
     }
 
     private func send(_ rec: Recorder) -> @Sendable (URLRequest) async throws -> Data {
@@ -136,9 +202,13 @@ final class ImmichRequestsTests: XCTestCase {
                 if rec.failLogin { throw ImmichAlignmentFailure.unauthorized }
                 return Data(#"{"accessToken":"TOKEN"}"#.utf8)
             case "/api/api-keys":
+                if rec.cancelDuringCreate { withUnsafeCurrentTask { $0?.cancel() } }
                 if rec.failCreate { throw ImmichAlignmentFailure.http(400) }
                 XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer TOKEN")
                 return Data(#"{"secret":"CHIAVE"}"#.utf8)
+            case "/api/auth/logout":
+                rec.logoutSawCancellation = Task.isCancelled
+                return Data("{}".utf8)
             default:
                 return Data("{}".utf8)
             }
@@ -157,6 +227,22 @@ final class ImmichRequestsTests: XCTestCase {
         do { _ = try await ImmichKeyMaker.makeKey(email: "e", password: "p", send: send(rec)); XCTFail("doveva fallire") }
         catch { XCTAssertEqual(error as? ImmichAlignmentFailure, .http(400)) }
         XCTAssertEqual(rec.paths, ["/api/auth/login", "/api/api-keys", "/api/auth/logout"])
+    }
+
+    func testLogoutStillRunsWhenTheTaskIsCancelledAfterCreation() async throws {
+        let rec = Recorder(); rec.cancelDuringCreate = true
+        let key = try await ImmichKeyMaker.makeKey(email: "e", password: "p", send: send(rec))
+        XCTAssertEqual(key, "CHIAVE")
+        XCTAssertEqual(rec.paths.last, "/api/auth/logout")
+        XCTAssertEqual(rec.logoutSawCancellation, false, "il logout non deve ereditare la cancellazione")
+    }
+
+    func testLogoutStillRunsWhenTheTaskIsCancelledAndCreationFails() async {
+        let rec = Recorder(); rec.cancelDuringCreate = true; rec.failCreate = true
+        do { _ = try await ImmichKeyMaker.makeKey(email: "e", password: "p", send: send(rec)); XCTFail("doveva fallire") }
+        catch { XCTAssertEqual(error as? ImmichAlignmentFailure, .http(400)) }
+        XCTAssertEqual(rec.paths.last, "/api/auth/logout")
+        XCTAssertEqual(rec.logoutSawCancellation, false)
     }
 
     func testWrongPasswordStopsAtLogin() async {

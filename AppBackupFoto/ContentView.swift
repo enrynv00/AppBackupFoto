@@ -1203,12 +1203,24 @@ nonisolated enum ImmichRequests {
     static let apiBase = URL(string: "http://127.0.0.1:2283/api")!
     static let pageSize = 1000
 
+    /// Un ID di Immich come singolo componente di percorso: un `/` o un `..` non deve poter
+    /// cambiare l'endpoint. Il punto si codifica anch'esso, cosi' `..` non e' mai un segmento.
+    /// Gli ID veri (UUID, «lib1») restano uguali.
+    static func pathComponent(_ id: String) -> String {
+        let allowed = CharacterSet.urlPathAllowed.subtracting(CharacterSet(charactersIn: "/."))
+        return id.addingPercentEncoding(withAllowedCharacters: allowed) ?? ""
+    }
+
     static func make(_ method: String, _ path: String, apiKey: String? = nil, bearer: String? = nil,
                      json: [String: Any]? = nil) -> URLRequest {
-        var request = URLRequest(url: apiBase.appendingPathComponent(path))
+        // Non `appendingPathComponent`: ri-codificherebbe il `%` di un ID gia' codificato.
+        var request = URLRequest(url: URL(string: apiBase.absoluteString + "/" + path)!)
         request.httpMethod = method
         request.timeoutInterval = 60
         request.cachePolicy = .reloadIgnoringLocalCacheData
+        // Il login risponde con `Set-Cookie: immich_access_token`: rispedito dopo il logout
+        // insieme alla x-api-key darebbe 401 falsi (e l'app cancellerebbe la chiave buona).
+        request.httpShouldHandleCookies = false
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         if let apiKey { request.setValue(apiKey, forHTTPHeaderField: "x-api-key") }
         if let bearer { request.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization") }
@@ -1220,8 +1232,8 @@ nonisolated enum ImmichRequests {
     }
 
     static func libraries(apiKey: String) -> URLRequest { make("GET", "libraries", apiKey: apiKey) }
-    static func statistics(libraryId: String, apiKey: String) -> URLRequest { make("GET", "libraries/\(libraryId)/statistics", apiKey: apiKey) }
-    static func scan(libraryId: String, apiKey: String) -> URLRequest { make("POST", "libraries/\(libraryId)/scan", apiKey: apiKey) }
+    static func statistics(libraryId: String, apiKey: String) -> URLRequest { make("GET", "libraries/\(pathComponent(libraryId))/statistics", apiKey: apiKey) }
+    static func scan(libraryId: String, apiKey: String) -> URLRequest { make("POST", "libraries/\(pathComponent(libraryId))/scan", apiKey: apiKey) }
     static func jobs(apiKey: String) -> URLRequest { make("GET", "jobs", apiKey: apiKey) }
     static func duplicates(apiKey: String) -> URLRequest { make("GET", "duplicates", apiKey: apiKey) }
 
@@ -1346,16 +1358,26 @@ nonisolated struct ImmichHTTPClient: ImmichAlignmentAPI {
     func archive(ids: [String]) async throws { try await perform(ImmichRequests.archive(ids: ids, apiKey: apiKey)) }
 
     func searchAll(_ search: ImmichSearch) async throws -> [ImmichAsset] {
+        try await Self.collectPages { token in
+            try await fetch(ImmichRequests.search(search, token: token, apiKey: apiKey),
+                            as: ImmichSearchResponse.self).assets
+        }
+    }
+
+    /// Tutte le pagine di una ricerca. Oltre `maxPages` lancia `badResponse`: un elenco
+    /// parziale scambiato per completo farebbe togliere o archiviare in base a mezza lista.
+    static func collectPages(maxPages: Int = ImmichHTTPClient.maxPages,
+                             fetchPage: (ImmichPageToken?) async throws -> ImmichSearchResponse.Page)
+        async throws -> [ImmichAsset] {
         var all: [ImmichAsset] = []
         var token: ImmichPageToken? = nil
-        for _ in 0..<Self.maxPages {
-            let page = try await fetch(ImmichRequests.search(search, token: token, apiKey: apiKey),
-                                       as: ImmichSearchResponse.self).assets
+        for _ in 0..<maxPages {
+            let page = try await fetchPage(token)
             all += page.items
             guard let next = ImmichRequests.nextToken(after: page) else { return all }
             token = next
         }
-        return all
+        throw ImmichAlignmentFailure.badResponse
     }
 }
 
@@ -1409,17 +1431,31 @@ nonisolated struct KeychainImmichKeyStore: ImmichKeyStore {
 nonisolated enum ImmichKeyMaker {
     static let keyName = "AppBackupFoto — allineamento"
 
+    /// - Parameter send: chi la chiama deve passare un `send` che usa una
+    ///   `URLSession(configuration: .ephemeral)` **separata** da quella del client con la API
+    ///   key: il login lascia un cookie di sessione, che non deve mai viaggiare con la chiave.
+    ///
+    /// Il logout parte anche se il task e' stato cancellato (task non strutturato: non eredita
+    /// la cancellazione), cosi' la sessione di login non resta aperta su Immich.
+    ///
+    /// Limite noto: se la decodifica fallisce dopo la creazione, o se l'app cancella la chiave
+    /// locale dopo un 401, la chiave resta su Immich. Si revoca a mano dalle impostazioni di
+    /// Immich (Account → Chiavi API).
     static func makeKey(email: String, password: String,
-                        send: @Sendable (URLRequest) async throws -> Data) async throws -> String {
+                        send: @escaping @Sendable (URLRequest) async throws -> Data) async throws -> String {
         let login = try ImmichHTTPClient.decode(ImmichLoginResponse.self,
             from: try await send(ImmichRequests.login(email: email, password: password)))
+        let token = login.accessToken
+        func logout() async {
+            await Task { _ = try? await send(ImmichRequests.logout(bearer: token)) }.value
+        }
         do {
             let created = try ImmichHTTPClient.decode(ImmichAPIKeyCreated.self,
-                from: try await send(ImmichRequests.createKey(bearer: login.accessToken)))
-            _ = try? await send(ImmichRequests.logout(bearer: login.accessToken))
+                from: try await send(ImmichRequests.createKey(bearer: token)))
+            await logout()
             return created.secret
         } catch {
-            _ = try? await send(ImmichRequests.logout(bearer: login.accessToken))
+            await logout()
             throw error
         }
     }
