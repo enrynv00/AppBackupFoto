@@ -68,6 +68,7 @@ nonisolated final class MountedSequence: @unchecked Sendable {
     func next() -> Bool { values.count > 1 ? values.removeFirst() : (values.first ?? true) }
 }
 nonisolated final class SavedStates: @unchecked Sendable { var all: [ImmichAlignmentState] = [] }
+nonisolated final class SignalCounter: @unchecked Sendable { var count = 0 }
 
 nonisolated func immichTestEnv(mounted: MountedSequence = MountedSequence([true]), clock: TestClock = TestClock(),
                    saved: SavedStates = SavedStates(), waitLimit: TimeInterval = 60) -> ImmichAlignmentRun.Environment {
@@ -86,14 +87,14 @@ final class ImmichAlignmentRunTests: XCTestCase {
 
     /// Stato con un riferimento gia' ricordato: l'unico caso in cui l'app toglie le offline
     /// senza chiedere (N1). I test che non parlano di conferma partono da qui.
-    private let known = ImmichAlignmentState(healthyActiveCount: 100)
+    private let known = ImmichAlignmentState(healthyActiveCount: 100, referenceConfirmed: true)
     private struct SaveFailed: Error {}
 
     private func run(_ api: FakeImmichAPI, state: ImmichAlignmentState = ImmichAlignmentState(),
-                     allowance: Int = 0, acceptedMissing: Int? = nil, stateWasUnreadable: Bool = false,
+                     allowance: Int = 0, accepted: ImmichConfirmation? = nil, stateWasUnreadable: Bool = false,
                      env: ImmichAlignmentRun.Environment = immichTestEnv()) async throws
         -> (ImmichAlignmentReport, ImmichAlignmentState) {
-        try await ImmichAlignmentRun.run(api: api, state: state, allowance: allowance, acceptedMissing: acceptedMissing,
+        try await ImmichAlignmentRun.run(api: api, state: state, allowance: allowance, accepted: accepted,
                                          stateWasUnreadable: stateWasUnreadable, env: env)
     }
 
@@ -113,7 +114,8 @@ final class ImmichAlignmentRunTests: XCTestCase {
         XCTAssertEqual(api.deleted, [["off"]])
         XCTAssertEqual(api.stacks, [["s1", "s2"]])
         XCTAssertEqual(api.archived, [["tiny"]])
-        XCTAssertEqual(state, ImmichAlignmentState(archivedAssetIds: ["tiny"], stackedDuplicateIds: ["d1"], healthyActiveCount: 112))
+        XCTAssertEqual(state, ImmichAlignmentState(archivedAssetIds: ["tiny"], stackedDuplicateIds: ["d1"], healthyActiveCount: 112,
+                                                   referenceConfirmed: true))
     }
 
     func testNoScanWithoutSSD() async {
@@ -159,7 +161,7 @@ final class ImmichAlignmentRunTests: XCTestCase {
         api.totals = [0, 0]
         api.offlineAssets = (0..<10).map { immichTestAsset("o\($0)", offline: true, trashed: true) }
         do {
-            _ = try await run(api, state: ImmichAlignmentState(healthyActiveCount: 52139))
+            _ = try await run(api, state: ImmichAlignmentState(healthyActiveCount: 52139, referenceConfirmed: true))
             XCTFail("doveva fermarsi")
         } catch { XCTAssertEqual(error as? ImmichAlignmentFailure, .dropGuard(missing: 52139)) }
         XCTAssertTrue(api.deleted.isEmpty)
@@ -167,20 +169,20 @@ final class ImmichAlignmentRunTests: XCTestCase {
 
     func testADropOfExactly500Passes() async throws {
         let api = FakeImmichAPI(); api.totals = [52139, 51639]
-        _ = try await run(api, state: ImmichAlignmentState(healthyActiveCount: 52139))
+        _ = try await run(api, state: ImmichAlignmentState(healthyActiveCount: 52139, referenceConfirmed: true))
         XCTAssertTrue(api.calls.contains("search-offline"))
     }
 
     func testDuplicatesMovedByTheAppLowerTheBaseline() async throws {
         let api = FakeImmichAPI(); api.totals = [52139, 51139]
-        _ = try await run(api, state: ImmichAlignmentState(healthyActiveCount: 52139), allowance: 1000)
+        _ = try await run(api, state: ImmichAlignmentState(healthyActiveCount: 52139, referenceConfirmed: true), allowance: 1000)
         XCTAssertTrue(api.calls.contains("search-offline"))
     }
 
     func testAcceptedMissingLetsTheConfirmedDropThroughAndResetsTheBaseline() async throws {
         let api = FakeImmichAPI(); api.totals = [40000, 40000]
         api.offlineAssets = [immichTestAsset("off", offline: true, trashed: true)]
-        let (report, state) = try await run(api, state: ImmichAlignmentState(healthyActiveCount: 52139), acceptedMissing: 12139)
+        let (report, state) = try await run(api, state: ImmichAlignmentState(healthyActiveCount: 52139, referenceConfirmed: true), accepted: .drop(missing: 12139))
         XCTAssertEqual(report.offlineRemoved, 1)
         XCTAssertEqual(state.healthyActiveCount, 40000)
     }
@@ -201,7 +203,7 @@ final class ImmichAlignmentRunTests: XCTestCase {
         api.offlineAssets = (0..<10).map { immichTestAsset("o\($0)", offline: true, trashed: true) }
         api.duplicateGroups = [ImmichDuplicateGroup(duplicateId: "d1", assets: [immichTestAsset("s1"), immichTestAsset("s2")])]
         let saved = SavedStates()
-        let (report, state) = try await run(api, state: ImmichAlignmentState(healthyActiveCount: 90),
+        let (report, state) = try await run(api, state: ImmichAlignmentState(healthyActiveCount: 90, referenceConfirmed: true),
                                             env: immichTestEnv(saved: saved, waitLimit: 60))
         XCTAssertTrue(report.scanTimedOut)
         XCTAssertTrue(report.offlineSkipped)
@@ -257,7 +259,7 @@ final class ImmichAlignmentRunTests: XCTestCase {
     func testAcceptedMissingOf600WithExactly600MissingRemoves() async throws {
         let api = FakeImmichAPI(); api.totals = [52139, 51539]   // mancano 600
         api.offlineAssets = [immichTestAsset("off", offline: true, trashed: true)]
-        let (report, state) = try await run(api, state: ImmichAlignmentState(healthyActiveCount: 52139), acceptedMissing: 600)
+        let (report, state) = try await run(api, state: ImmichAlignmentState(healthyActiveCount: 52139, referenceConfirmed: true), accepted: .drop(missing: 600))
         XCTAssertEqual(report.offlineRemoved, 1)
         XCTAssertEqual(state.healthyActiveCount, 51539)
     }
@@ -268,7 +270,7 @@ final class ImmichAlignmentRunTests: XCTestCase {
         api.offlineAssets = (0..<10).map { immichTestAsset("o\($0)", offline: true, trashed: true) }
         let saved = SavedStates()
         do {
-            _ = try await run(api, state: ImmichAlignmentState(healthyActiveCount: 52139), acceptedMissing: 600,
+            _ = try await run(api, state: ImmichAlignmentState(healthyActiveCount: 52139, referenceConfirmed: true), accepted: .drop(missing: 600),
                               env: immichTestEnv(saved: saved))
             XCTFail("doveva fermarsi")
         } catch { XCTAssertEqual(error as? ImmichAlignmentFailure, .dropGuard(missing: 52139)) }
@@ -279,11 +281,11 @@ final class ImmichAlignmentRunTests: XCTestCase {
 
     func testAcceptedMissingToleranceIsTheConfirmedNumberPlusTheThreshold() async throws {
         let ok = FakeImmichAPI(); ok.totals = [52139, 52139 - 1100]   // 600 + 500
-        _ = try await run(ok, state: ImmichAlignmentState(healthyActiveCount: 52139), acceptedMissing: 600)
+        _ = try await run(ok, state: ImmichAlignmentState(healthyActiveCount: 52139, referenceConfirmed: true), accepted: .drop(missing: 600))
         XCTAssertTrue(ok.calls.contains("search-offline"))
         let over = FakeImmichAPI(); over.totals = [52139, 52139 - 1101]
         do {
-            _ = try await run(over, state: ImmichAlignmentState(healthyActiveCount: 52139), acceptedMissing: 600)
+            _ = try await run(over, state: ImmichAlignmentState(healthyActiveCount: 52139, referenceConfirmed: true), accepted: .drop(missing: 600))
             XCTFail("doveva fermarsi")
         } catch { XCTAssertEqual(error as? ImmichAlignmentFailure, .dropGuard(missing: 1101)) }
     }
@@ -294,7 +296,7 @@ final class ImmichAlignmentRunTests: XCTestCase {
         let api = FakeImmichAPI(); api.totals = [0, 0]
         let saved = SavedStates()
         do {
-            _ = try await run(api, state: ImmichAlignmentState(healthyActiveCount: 52139), allowance: 1000,
+            _ = try await run(api, state: ImmichAlignmentState(healthyActiveCount: 52139, referenceConfirmed: true), allowance: 1000,
                               env: immichTestEnv(saved: saved))
             XCTFail("doveva fermarsi")
         } catch { XCTAssertEqual(error as? ImmichAlignmentFailure, .dropGuard(missing: 51139)) }
@@ -302,7 +304,7 @@ final class ImmichAlignmentRunTests: XCTestCase {
     }
 
     func testTwoTrippedRunsInARowDoNotLowerTheReference() async {
-        var state = ImmichAlignmentState(healthyActiveCount: 52139)
+        var state = ImmichAlignmentState(healthyActiveCount: 52139, referenceConfirmed: true)
         for _ in 0..<2 {
             let api = FakeImmichAPI(); api.totals = [0, 0]
             let saved = SavedStates()
@@ -335,7 +337,7 @@ final class ImmichAlignmentRunTests: XCTestCase {
     func testNegativeAllowanceCountsAsZero() async {
         let api = FakeImmichAPI(); api.totals = [52139, 51638]   // -501: scatta come con 0
         do {
-            _ = try await run(api, state: ImmichAlignmentState(healthyActiveCount: 52139), allowance: -1000)
+            _ = try await run(api, state: ImmichAlignmentState(healthyActiveCount: 52139, referenceConfirmed: true), allowance: -1000)
             XCTFail("doveva fermarsi")
         } catch { XCTAssertEqual(error as? ImmichAlignmentFailure, .dropGuard(missing: 501)) }
     }
@@ -343,11 +345,11 @@ final class ImmichAlignmentRunTests: XCTestCase {
     func testHugeAllowanceIsCapped() async throws {
         // tetto = 52139 / 4 = 13034, quindi il riferimento in memoria e' 39105
         let ok = FakeImmichAPI(); ok.totals = [52139, 39105 - 500]
-        _ = try await run(ok, state: ImmichAlignmentState(healthyActiveCount: 52139), allowance: 1_000_000_000)
+        _ = try await run(ok, state: ImmichAlignmentState(healthyActiveCount: 52139, referenceConfirmed: true), allowance: 1_000_000_000)
         XCTAssertTrue(ok.calls.contains("search-offline"))
         let over = FakeImmichAPI(); over.totals = [52139, 39105 - 501]
         do {
-            _ = try await run(over, state: ImmichAlignmentState(healthyActiveCount: 52139), allowance: 1_000_000_000)
+            _ = try await run(over, state: ImmichAlignmentState(healthyActiveCount: 52139, referenceConfirmed: true), allowance: 1_000_000_000)
             XCTFail("doveva fermarsi")
         } catch { XCTAssertEqual(error as? ImmichAlignmentFailure, .dropGuard(missing: 501)) }
     }
@@ -356,7 +358,7 @@ final class ImmichAlignmentRunTests: XCTestCase {
         let api = FakeImmichAPI(); api.totals = [52139, 0]
         api.offlineAssets = (0..<10).map { immichTestAsset("o\($0)", offline: true, trashed: true) }
         do {
-            _ = try await run(api, state: ImmichAlignmentState(healthyActiveCount: 52139), allowance: Int.max)
+            _ = try await run(api, state: ImmichAlignmentState(healthyActiveCount: 52139, referenceConfirmed: true), allowance: Int.max)
             XCTFail("doveva fermarsi")
         } catch { XCTAssertEqual(error as? ImmichAlignmentFailure, .dropGuard(missing: 39105)) }
         XCTAssertTrue(api.deleted.isEmpty)
@@ -460,7 +462,7 @@ final class ImmichAlignmentRunTests: XCTestCase {
         api.totals = [52139, 52139, 52139, 0]   // prima, dopo, blocco 1, blocco 2
         let saved = SavedStates()
         do {
-            _ = try await run(api, state: ImmichAlignmentState(healthyActiveCount: 52139), env: immichTestEnv(saved: saved))
+            _ = try await run(api, state: ImmichAlignmentState(healthyActiveCount: 52139, referenceConfirmed: true), env: immichTestEnv(saved: saved))
             XCTFail("doveva fermarsi")
         } catch { XCTAssertEqual(error as? ImmichAlignmentFailure, .dropGuard(missing: 52139)) }
         XCTAssertEqual(api.deleted.map(\.count), [500])
@@ -471,7 +473,7 @@ final class ImmichAlignmentRunTests: XCTestCase {
         let api = FakeImmichAPI(); offlineBlocks(api)
         api.totals = [52139, 52139, 0]
         do {
-            _ = try await run(api, state: ImmichAlignmentState(healthyActiveCount: 52139))
+            _ = try await run(api, state: ImmichAlignmentState(healthyActiveCount: 52139, referenceConfirmed: true))
             XCTFail("doveva fermarsi")
         } catch { XCTAssertEqual(error as? ImmichAlignmentFailure, .dropGuard(missing: 52139)) }
         XCTAssertTrue(api.deleted.isEmpty)
@@ -531,7 +533,7 @@ final class ImmichAlignmentRunTests: XCTestCase {
 
     func testConfirmedFirstRemovalDeletesAndTheReferenceBecomesAfter() async throws {
         let api = FakeImmichAPI(); api.totals = [0, 10]; offline(api, 25)
-        let (report, state) = try await run(api, acceptedMissing: 25, stateWasUnreadable: true)
+        let (report, state) = try await run(api, accepted: .firstRemoval(active: 10, toRemove: 25), stateWasUnreadable: true)
         XCTAssertEqual(api.deleted.map(\.count), [25])
         XCTAssertEqual(report.offlineRemoved, 25)
         XCTAssertNil(report.needsFirstConfirmation)
@@ -540,7 +542,7 @@ final class ImmichAlignmentRunTests: XCTestCase {
 
     func testConfirmedFirstRemovalOnAnEmptyStateAlsoSetsTheReference() async throws {
         let api = FakeImmichAPI(); api.totals = [10, 10]; offline(api, 25)
-        let (_, state) = try await run(api, acceptedMissing: 25)
+        let (_, state) = try await run(api, accepted: .firstRemoval(active: 10, toRemove: 25))
         XCTAssertEqual(api.deleted.map(\.count), [25])
         XCTAssertEqual(state.healthyActiveCount, 10)
     }
@@ -548,7 +550,7 @@ final class ImmichAlignmentRunTests: XCTestCase {
     /// Conferma di 25 con 10 foto viste: molte piu' offline dopo la conferma (SSD sparito?) non passano.
     func testAMuchBiggerRemovalAfterTheConfirmationAsksAgainWithTheNewNumbers() async throws {
         let api = FakeImmichAPI(); api.totals = [10, 10]; offline(api, 40)
-        let (report, state) = try await run(api, acceptedMissing: 25)
+        let (report, state) = try await run(api, accepted: .firstRemoval(active: 10, toRemove: 25))
         XCTAssertTrue(api.deleted.isEmpty)
         XCTAssertNil(state.healthyActiveCount)
         XCTAssertEqual(report.needsFirstConfirmation, ImmichFirstRemoval(active: 10, toRemove: 40))
@@ -557,12 +559,12 @@ final class ImmichAlignmentRunTests: XCTestCase {
     /// Il confine: conferma + soglia (2 % di 1000 = 20).
     func testFirstRemovalToleranceIsTheConfirmedNumberPlusTheThreshold() async throws {
         let ok = FakeImmichAPI(); ok.totals = [1000, 1000]; offline(ok, 45)
-        let (report, state) = try await run(ok, acceptedMissing: 25)
+        let (report, state) = try await run(ok, accepted: .firstRemoval(active: 1000, toRemove: 25))
         XCTAssertEqual(ok.deleted.map(\.count), [45])
         XCTAssertNil(report.needsFirstConfirmation)
         XCTAssertEqual(state.healthyActiveCount, 1000)
         let over = FakeImmichAPI(); over.totals = [1000, 1000]; offline(over, 46)
-        let (overReport, overState) = try await run(over, acceptedMissing: 25)
+        let (overReport, overState) = try await run(over, accepted: .firstRemoval(active: 1000, toRemove: 25))
         XCTAssertTrue(over.deleted.isEmpty)
         XCTAssertNil(overState.healthyActiveCount)
         XCTAssertEqual(overReport.needsFirstConfirmation, ImmichFirstRemoval(active: 1000, toRemove: 46))
@@ -581,10 +583,168 @@ final class ImmichAlignmentRunTests: XCTestCase {
         let api = FakeImmichAPI(); offline(api, 1201)
         api.totals = [5000, 5000, 5000, 0]   // prima, dopo, blocco 1, blocco 2 (SSD sparito)
         let saved = SavedStates()
-        do { _ = try await run(api, acceptedMissing: 1201, env: immichTestEnv(saved: saved)); XCTFail("doveva fermarsi") }
+        do { _ = try await run(api, accepted: .firstRemoval(active: 5000, toRemove: 1201), env: immichTestEnv(saved: saved)); XCTFail("doveva fermarsi") }
         catch { XCTAssertEqual(error as? ImmichAlignmentFailure, .dropGuard(missing: 5000)) }
         XCTAssertEqual(api.deleted.map(\.count), [500])
         XCTAssertTrue(saved.all.allSatisfy { $0.healthyActiveCount == nil })   // nessun riferimento inventato
+    }
+
+    // MARK: - P1: la conferma e' tipata
+
+    /// La falla: Enrico apre la conferma del primo giro (89.514 da togliere); mentre l'alert e'
+    /// aperto un giro in background con l'SSD vuoto fa scattare la guardia e salva un riferimento
+    /// affidabile. Il suo clic non puo' diventare una tolleranza di calo di 89.514 + 500.
+    func testAFirstRemovalConfirmationNeverWidensTheDropGuardOfAReliableReference() async {
+        let api = FakeImmichAPI(); api.totals = [0, 0]   // SSD vuoto
+        offline(api, 10)
+        do {
+            _ = try await run(api, state: ImmichAlignmentState(healthyActiveCount: 52139, referenceConfirmed: true),
+                              accepted: .firstRemoval(active: 52139, toRemove: 89514))
+            XCTFail("la guardia doveva scattare")
+        } catch { XCTAssertEqual(error as? ImmichAlignmentFailure, .dropGuard(missing: 52139)) }
+        XCTAssertTrue(api.deleted.isEmpty)
+    }
+
+    func testAFirstRemovalConfirmationIsIgnoredWithAReliableReferenceAndNoExtraToleranceApplies() async throws {
+        // Calo di 501 con riferimento affidabile: scatta come senza conferma, anche se la
+        // conferma di prima rimozione avrebbe una tolleranza enorme.
+        let api = FakeImmichAPI(); api.totals = [52139, 52139 - 501]
+        do {
+            _ = try await run(api, state: ImmichAlignmentState(healthyActiveCount: 52139, referenceConfirmed: true),
+                              accepted: .firstRemoval(active: 52139, toRemove: 89514))
+            XCTFail("doveva fermarsi")
+        } catch { XCTAssertEqual(error as? ImmichAlignmentFailure, .dropGuard(missing: 501)) }
+    }
+
+    func testADropConfirmationIsIgnoredWithAnUnreliableReferenceAndAsksAgain() async throws {
+        let api = FakeImmichAPI(); api.totals = [10, 10]; offline(api, 25)
+        let (report, state) = try await run(api, accepted: .drop(missing: 25))
+        XCTAssertTrue(api.deleted.isEmpty)
+        XCTAssertEqual(report.needsFirstConfirmation, ImmichFirstRemoval(active: 10, toRemove: 25))
+        XCTAssertNil(state.healthyActiveCount)
+        XCTAssertFalse(state.referenceConfirmed)
+    }
+
+    func testADropConfirmationIsIgnoredWhenTheReferenceIsNotConfirmed() async throws {
+        let api = FakeImmichAPI(); api.totals = [1000, 1000]; offline(api, 25)
+        let (report, _) = try await run(api, state: ImmichAlignmentState(healthyActiveCount: 1000),
+                                        accepted: .drop(missing: 1000))
+        XCTAssertTrue(api.deleted.isEmpty)
+        XCTAssertEqual(report.needsFirstConfirmation, ImmichFirstRemoval(active: 1000, toRemove: 25))
+    }
+
+    /// `after` crollato rispetto all'`active` che Enrico ha visto: nessun delete.
+    func testAFirstRemovalConfirmationWithACollapsedAfterDeletesNothing() async throws {
+        let api = FakeImmichAPI(); api.totals = [10, 5000]; offline(api, 25)
+        let (report, state) = try await run(api, accepted: .firstRemoval(active: 52139, toRemove: 25))
+        XCTAssertTrue(api.deleted.isEmpty)
+        XCTAssertEqual(report.needsFirstConfirmation, ImmichFirstRemoval(active: 5000, toRemove: 25))
+        XCTAssertNil(state.healthyActiveCount)
+        XCTAssertFalse(state.referenceConfirmed)
+    }
+
+    /// I casi limite: `after >= active - soglia` (2 % di 1000 = 20) e `offline <= toRemove + soglia`.
+    func testFirstRemovalBoundariesOfActiveAndToRemove() async throws {
+        let atActiveEdge = FakeImmichAPI(); atActiveEdge.totals = [980, 980]; offline(atActiveEdge, 25)
+        _ = try await run(atActiveEdge, accepted: .firstRemoval(active: 1000, toRemove: 25))
+        XCTAssertEqual(atActiveEdge.deleted.map(\.count), [25])
+        let underActiveEdge = FakeImmichAPI(); underActiveEdge.totals = [979, 979]; offline(underActiveEdge, 25)
+        let (report, _) = try await run(underActiveEdge, accepted: .firstRemoval(active: 1000, toRemove: 25))
+        XCTAssertTrue(underActiveEdge.deleted.isEmpty)
+        XCTAssertEqual(report.needsFirstConfirmation, ImmichFirstRemoval(active: 979, toRemove: 25))
+        // La soglia sul numero da togliere e' quella di `active`, non quella di `after`.
+        let atRemoveEdge = FakeImmichAPI(); atRemoveEdge.totals = [980, 980]; offline(atRemoveEdge, 45)
+        _ = try await run(atRemoveEdge, accepted: .firstRemoval(active: 1000, toRemove: 25))
+        XCTAssertEqual(atRemoveEdge.deleted.map(\.count), [45])
+        let overRemoveEdge = FakeImmichAPI(); overRemoveEdge.totals = [980, 980]; offline(overRemoveEdge, 46)
+        _ = try await run(overRemoveEdge, accepted: .firstRemoval(active: 1000, toRemove: 25))
+        XCTAssertTrue(overRemoveEdge.deleted.isEmpty)
+        // toRemove e active a zero: nessuna tolleranza.
+        let zero = FakeImmichAPI(); zero.totals = [0, 0]; offline(zero, 1)
+        _ = try await run(zero, accepted: .firstRemoval(active: 0, toRemove: 0))
+        XCTAssertTrue(zero.deleted.isEmpty)
+    }
+
+    /// Ogni blocco si confronta con l'`active` confermato da Enrico (non con l'`after` del giro).
+    func testBlocksOfAConfirmedFirstRemovalAreGuardedAgainstTheConfirmedActive() async {
+        let api = FakeImmichAPI(); offline(api, 1201)
+        api.totals = [5000, 4950, 4950, 4890]   // prima, dopo, blocco 1, blocco 2: 110 sotto `active`
+        do { _ = try await run(api, accepted: .firstRemoval(active: 5000, toRemove: 1201)); XCTFail("doveva fermarsi") }
+        catch { XCTAssertEqual(error as? ImmichAlignmentFailure, .dropGuard(missing: 110)) }
+        XCTAssertEqual(api.deleted.map(\.count), [500])
+    }
+
+    // MARK: - P4: un riferimento non confermato non diventa affidabile da solo
+
+    /// `before` avvelenato (Immich aveva gia' marcato quasi tutto offline): la guardia scatta e
+    /// salva il candidato, ma il giro dopo non lo tratta come affidabile.
+    func testAPoisonedCandidateReferenceDoesNotMakeTheNextRunRemoveAnything() async throws {
+        let first = FakeImmichAPI(); first.totals = [600, 0]; offline(first, 10)
+        let saved = SavedStates()
+        do { _ = try await run(first, env: immichTestEnv(saved: saved)); XCTFail("doveva fermarsi") }
+        catch { XCTAssertEqual(error as? ImmichAlignmentFailure, .dropGuard(missing: 600)) }
+        let candidate = try XCTUnwrap(saved.all.last)
+        XCTAssertEqual(candidate.healthyActiveCount, 600)
+        XCTAssertFalse(candidate.referenceConfirmed)
+        // Giro dopo: l'SSD e' ancora (quasi) vuoto, il conteggio e' dentro la soglia del candidato.
+        let second = FakeImmichAPI(); second.totals = [600, 590]; offline(second, 52000)
+        let (report, state) = try await run(second, state: candidate)
+        XCTAssertTrue(second.deleted.isEmpty)
+        XCTAssertEqual(report.needsFirstConfirmation, ImmichFirstRemoval(active: 590, toRemove: 52000))
+        XCTAssertFalse(state.referenceConfirmed)
+        XCTAssertEqual(state.healthyActiveCount, 600)
+    }
+
+    func testAConfirmedReferenceStaysConfirmedAcrossTwoSuccessfulRuns() async throws {
+        let one = FakeImmichAPI(); one.totals = [100, 110]
+        let (_, afterOne) = try await run(one, state: known)
+        XCTAssertEqual(afterOne.healthyActiveCount, 110)
+        XCTAssertTrue(afterOne.referenceConfirmed)
+        let two = FakeImmichAPI(); two.totals = [110, 120]; offline(two, 3)
+        let (report, afterTwo) = try await run(two, state: afterOne)
+        XCTAssertEqual(two.deleted.map(\.count), [3])
+        XCTAssertEqual(report.offlineRemoved, 3)
+        XCTAssertEqual(afterTwo.healthyActiveCount, 120)
+        XCTAssertTrue(afterTwo.referenceConfirmed)
+    }
+
+    func testAnAcceptedFirstRemovalMakesTheReferenceConfirmed() async throws {
+        let api = FakeImmichAPI(); api.totals = [10, 10]; offline(api, 25)
+        let (_, state) = try await run(api, accepted: .firstRemoval(active: 10, toRemove: 25))
+        XCTAssertEqual(state.healthyActiveCount, 10)
+        XCTAssertTrue(state.referenceConfirmed)
+    }
+
+    func testATrippedGuardWithAnUnreliableReferenceKeepsItUnconfirmed() async {
+        let api = FakeImmichAPI(); api.totals = [52139, 0]
+        let saved = SavedStates()
+        do { _ = try await run(api, env: immichTestEnv(saved: saved)); XCTFail("doveva fermarsi") }
+        catch { XCTAssertEqual(error as? ImmichAlignmentFailure, .dropGuard(missing: 52139)) }
+        XCTAssertEqual(saved.all.last?.healthyActiveCount, 52139)
+        XCTAssertEqual(saved.all.last?.referenceConfirmed, false)
+    }
+
+    // MARK: - P5: il segnale che il riferimento e' avanzato
+
+    func testRunSignalsWhenTheReferenceAdvancesEvenIfALaterStepFails() async {
+        let api = FakeImmichAPI(); api.totals = [100, 100]
+        api.duplicateGroups = [ImmichDuplicateGroup(duplicateId: "d1", assets: [immichTestAsset("s1"), immichTestAsset("s2")])]
+        api.stackErrors = ["s1": .notReachable]
+        let signals = SignalCounter()
+        var env = immichTestEnv()
+        env.referenceAdvanced = { signals.count += 1 }
+        do { _ = try await run(api, state: known, env: env); XCTFail("doveva fermarsi") }
+        catch { XCTAssertEqual(error as? ImmichAlignmentFailure, .notReachable) }
+        XCTAssertEqual(signals.count, 1)
+    }
+
+    func testRunDoesNotSignalWhenTheReferenceDoesNotAdvance() async throws {
+        let api = FakeImmichAPI(); api.busyPolls = 10_000
+        let signals = SignalCounter()
+        var env = immichTestEnv(waitLimit: 60)
+        env.referenceAdvanced = { signals.count += 1 }
+        _ = try await run(api, state: known, env: env)
+        XCTAssertEqual(signals.count, 0)
     }
 
     // MARK: - N4: il salvataggio dello stato non e' silenzioso
@@ -593,7 +753,7 @@ final class ImmichAlignmentRunTests: XCTestCase {
         let api = FakeImmichAPI(); api.totals = [52139, 0]
         var env = immichTestEnv()
         env.saveState = { _ in throw SaveFailed() }
-        do { _ = try await run(api, state: ImmichAlignmentState(healthyActiveCount: 52139), env: env); XCTFail("doveva fermarsi") }
+        do { _ = try await run(api, state: ImmichAlignmentState(healthyActiveCount: 52139, referenceConfirmed: true), env: env); XCTFail("doveva fermarsi") }
         catch { XCTAssertEqual(error as? ImmichAlignmentFailure, .stateNotSaved) }
         XCTAssertTrue(api.deleted.isEmpty)
     }
@@ -722,11 +882,11 @@ final class ImmichAlignerTests: XCTestCase {
 
     func testDropGuardThenAcceptDrop() async throws {
         let api = FakeImmichAPI(); api.totals = [40000]
-        let (aligner, stateURL, _) = try makeAligner(api: api, state: ImmichAlignmentState(healthyActiveCount: 52139))
+        let (aligner, stateURL, _) = try makeAligner(api: api, state: ImmichAlignmentState(healthyActiveCount: 52139, referenceConfirmed: true))
         aligner.request(.manual)
         await aligner.currentTask?.value
         XCTAssertEqual(aligner.status, .dropGuard(missing: 12139))
-        aligner.acceptDropAndRetry(missing: 12139)
+        aligner.accept(.drop(missing: 12139))
         await aligner.currentTask?.value
         guard case .done = aligner.status else { return XCTFail("stato \(aligner.status)") }
         XCTAssertEqual(ImmichAlignmentStateStore.load(from: stateURL).state.healthyActiveCount, 40000)
@@ -735,10 +895,10 @@ final class ImmichAlignerTests: XCTestCase {
     /// B2: la conferma vale per il numero mostrato, e per un solo giro.
     func testAcceptedNumberCoversOnlyThatDropAndOnlyOnce() async throws {
         let api = FakeImmichAPI(); api.totals = [40000]
-        let (aligner, stateURL, _) = try makeAligner(api: api, state: ImmichAlignmentState(healthyActiveCount: 52139))
+        let (aligner, stateURL, _) = try makeAligner(api: api, state: ImmichAlignmentState(healthyActiveCount: 52139, referenceConfirmed: true))
         aligner.request(.manual)
         await aligner.currentTask?.value
-        aligner.acceptDropAndRetry(missing: 600)   // l'utente ha confermato 600, ma ne mancano 12.139
+        aligner.accept(.drop(missing: 600))   // l'utente ha confermato 600, ma ne mancano 12.139
         await aligner.currentTask?.value
         XCTAssertEqual(aligner.status, .dropGuard(missing: 12139))
         XCTAssertTrue(api.deleted.isEmpty)
@@ -751,7 +911,7 @@ final class ImmichAlignerTests: XCTestCase {
     /// C1: «Riprova» dopo una guardia scattata non abbassa il riferimento in modo cumulativo.
     func testRetryAfterATrippedGuardKeepsTheAllowanceAndTheReference() async throws {
         let api = FakeImmichAPI(); api.totals = [0]
-        let (aligner, stateURL, _) = try makeAligner(api: api, state: ImmichAlignmentState(healthyActiveCount: 52139))
+        let (aligner, stateURL, _) = try makeAligner(api: api, state: ImmichAlignmentState(healthyActiveCount: 52139, referenceConfirmed: true))
         aligner.request(.duplicatesMoved(count: 1000))
         await aligner.currentTask?.value
         XCTAssertEqual(aligner.status, .dropGuard(missing: 51139))
@@ -780,7 +940,7 @@ final class ImmichAlignerTests: XCTestCase {
         await aligner.currentTask?.value
         XCTAssertTrue(api.deleted.isEmpty)
         // Con la conferma di Enrico toglie le offline.
-        aligner.acceptDropAndRetry(missing: 1)
+        aligner.accept(.firstRemoval(active: 100, toRemove: 1))
         await aligner.currentTask?.value
         XCTAssertEqual(api.deleted, [["off"]])
     }
@@ -788,7 +948,7 @@ final class ImmichAlignerTests: XCTestCase {
     func testDuplicatesMovedWhileImmichIsOffStillCount() async throws {
         let api = FakeImmichAPI(); api.totals = [51139]
         var running = false
-        let (aligner, _, _) = try makeAligner(api: api, state: ImmichAlignmentState(healthyActiveCount: 52139))
+        let (aligner, _, _) = try makeAligner(api: api, state: ImmichAlignmentState(healthyActiveCount: 52139, referenceConfirmed: true))
         aligner.isImmichRunning = { running }
         aligner.request(.duplicatesMoved(count: 1000))
         running = true
@@ -807,10 +967,10 @@ final class ImmichAlignerTests: XCTestCase {
         aligner.request(.manual)
         await aligner.currentTask?.value
         XCTAssertEqual(aligner.status, .confirmFirstRemoval(active: 10, toRemove: 25))
-        XCTAssertEqual(aligner.status.missingToConfirm, 25)
+        XCTAssertEqual(aligner.status.confirmationToAccept, .firstRemoval(active: 10, toRemove: 25))
         XCTAssertTrue(api.deleted.isEmpty)
         XCTAssertNil(ImmichAlignmentStateStore.load(from: stateURL).state.healthyActiveCount)
-        aligner.acceptDropAndRetry(missing: 25)
+        aligner.accept(.firstRemoval(active: 10, toRemove: 25))
         await aligner.currentTask?.value
         guard case .done = aligner.status else { return XCTFail("stato \(aligner.status)") }
         XCTAssertEqual(api.deleted.map(\.count), [25])
@@ -822,9 +982,9 @@ final class ImmichAlignerTests: XCTestCase {
     func testConfirmationGivenWhileImmichIsOffDoesNotSurviveToALaterRun() async throws {
         let api = FakeImmichAPI(); api.totals = [40000]
         var running = false
-        let (aligner, stateURL, _) = try makeAligner(api: api, state: ImmichAlignmentState(healthyActiveCount: 52139))
+        let (aligner, stateURL, _) = try makeAligner(api: api, state: ImmichAlignmentState(healthyActiveCount: 52139, referenceConfirmed: true))
         aligner.isImmichRunning = { running }
-        aligner.acceptDropAndRetry(missing: 12139)   // Immich spento: nessun giro parte
+        aligner.accept(.drop(missing: 12139))   // Immich spento: nessun giro parte
         XCTAssertNil(aligner.currentTask)
         running = true
         aligner.request(.manual)
@@ -835,8 +995,8 @@ final class ImmichAlignerTests: XCTestCase {
 
     func testConfirmationGivenWithoutAKeyDoesNotSurviveToALaterRun() async throws {
         let api = FakeImmichAPI(); api.totals = [40000]
-        let (aligner, _, _) = try makeAligner(api: api, key: nil, state: ImmichAlignmentState(healthyActiveCount: 52139))
-        aligner.acceptDropAndRetry(missing: 12139)
+        let (aligner, _, _) = try makeAligner(api: api, key: nil, state: ImmichAlignmentState(healthyActiveCount: 52139, referenceConfirmed: true))
+        aligner.accept(.drop(missing: 12139))
         await aligner.currentTask?.value
         XCTAssertEqual(aligner.status, .needsKey)
         (aligner.keyStore as! MemoryKeyStore).key = "K"
@@ -853,7 +1013,7 @@ final class ImmichAlignerTests: XCTestCase {
         api.totals = [51139, 51139, 50139]   // giro 1: prima, dopo; giro 2: prima (poi resta 50139)
         api.duplicateGroups = [ImmichDuplicateGroup(duplicateId: "d1", assets: [immichTestAsset("s1"), immichTestAsset("s2")])]
         api.stackErrors = ["s1": .notReachable]
-        let (aligner, stateURL, _) = try makeAligner(api: api, state: ImmichAlignmentState(healthyActiveCount: 52139))
+        let (aligner, stateURL, _) = try makeAligner(api: api, state: ImmichAlignmentState(healthyActiveCount: 52139, referenceConfirmed: true))
         aligner.request(.duplicatesMoved(count: 1000))
         await aligner.currentTask?.value
         XCTAssertEqual(aligner.status, .failed(.notReachable))   // errore dopo che il riferimento e' avanzato
@@ -866,7 +1026,7 @@ final class ImmichAlignerTests: XCTestCase {
 
     func testAllowanceIsKeptWhenASuccessfulRunTimedOutAndSoTheReferenceDidNotAdvance() async throws {
         let api = FakeImmichAPI(); api.totals = [51139]; api.busyPolls = 1
-        let (aligner, stateURL, _) = try makeAligner(api: api, state: ImmichAlignmentState(healthyActiveCount: 52139))
+        let (aligner, stateURL, _) = try makeAligner(api: api, state: ImmichAlignmentState(healthyActiveCount: 52139, referenceConfirmed: true))
         aligner.scanWaitLimit = 0
         aligner.request(.duplicatesMoved(count: 1000))
         await aligner.currentTask?.value
@@ -878,12 +1038,43 @@ final class ImmichAlignerTests: XCTestCase {
         guard case .done = aligner.status else { return XCTFail("il margine doveva restare: \(aligner.status)") }
     }
 
+    /// P5: il margine si restituisce in base al segnale, non al confronto dei valori: un riferimento
+    /// avanzato a un valore identico al precedente ha comunque usato il margine.
+    func testAllowanceUsedByARunWhoseReferenceAdvancedToTheSameValueIsNotReturned() async throws {
+        let api = FakeImmichAPI(); api.totals = [51139, 52139]   // giro 1: before 51139, after 52139 (= riferimento)
+        api.duplicateGroups = [ImmichDuplicateGroup(duplicateId: "d1", assets: [immichTestAsset("s1"), immichTestAsset("s2")])]
+        api.stackErrors = ["s1": .notReachable]
+        let (aligner, stateURL, _) = try makeAligner(api: api, state: ImmichAlignmentState(healthyActiveCount: 52139, referenceConfirmed: true))
+        aligner.request(.duplicatesMoved(count: 1000))
+        await aligner.currentTask?.value
+        XCTAssertEqual(aligner.status, .failed(.notReachable))
+        XCTAssertEqual(ImmichAlignmentStateStore.load(from: stateURL).state.healthyActiveCount, 52139)   // identico al precedente
+        api.stackErrors = [:]
+        api.totals = [51139]   // un calo di 1000: senza margine scatta (con il margine restituito passerebbe)
+        aligner.request(.manual)
+        await aligner.currentTask?.value
+        XCTAssertEqual(aligner.status, .dropGuard(missing: 1000))
+    }
+
+    /// P1 sul coordinatore: la conferma della prima rimozione, arrivata a un giro con riferimento
+    /// affidabile e SSD vuoto, non toglie niente e non allarga la guardia.
+    func testAFirstRemovalConfirmationReachingAReliableEmptyRunRemovesNothing() async throws {
+        let api = FakeImmichAPI(); api.totals = [0]
+        api.offlineAssets = (0..<10).map { immichTestAsset("o\($0)", offline: true, trashed: true) }
+        let (aligner, stateURL, _) = try makeAligner(api: api, state: ImmichAlignmentState(healthyActiveCount: 52139, referenceConfirmed: true))
+        aligner.accept(.firstRemoval(active: 52139, toRemove: 89514))
+        await aligner.currentTask?.value
+        XCTAssertEqual(aligner.status, .dropGuard(missing: 52139))
+        XCTAssertTrue(api.deleted.isEmpty)
+        XCTAssertEqual(ImmichAlignmentStateStore.load(from: stateURL).state.healthyActiveCount, 52139)
+    }
+
     // MARK: - N4: stato non salvato
 
     func testAnUnwritableStateFileStopsTheRunWithStateNotSaved() async throws {
         let api = FakeImmichAPI()
         api.offlineAssets = [immichTestAsset("off", offline: true, trashed: true)]
-        let (aligner, stateURL, _) = try makeAligner(api: api, state: ImmichAlignmentState(healthyActiveCount: 100))
+        let (aligner, stateURL, _) = try makeAligner(api: api, state: ImmichAlignmentState(healthyActiveCount: 100, referenceConfirmed: true))
         // Il file di stato si legge ma la sua cartella non e' piu' scrivibile: il salvataggio atomico fallisce.
         let dir = stateURL.deletingLastPathComponent()
         try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: dir.path)

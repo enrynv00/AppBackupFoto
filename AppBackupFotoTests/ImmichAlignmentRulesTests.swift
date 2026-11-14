@@ -252,7 +252,8 @@ final class ImmichAlignmentRulesTests: XCTestCase {
         let url = tempURL("immich-alignment.json")
         XCTAssertEqual(ImmichAlignmentStateStore.load(from: url).state, ImmichAlignmentState())
         XCTAssertFalse(ImmichAlignmentStateStore.load(from: url).wasUnreadable)   // assente non e' illeggibile
-        let state = ImmichAlignmentState(archivedAssetIds: ["a"], stackedDuplicateIds: ["d"], healthyActiveCount: 52139)
+        let state = ImmichAlignmentState(archivedAssetIds: ["a"], stackedDuplicateIds: ["d"], healthyActiveCount: 52139,
+                                         referenceConfirmed: true)
         try ImmichAlignmentStateStore.save(state, to: url)
         XCTAssertEqual(ImmichAlignmentStateStore.load(from: url).state, state)
         XCTAssertFalse(ImmichAlignmentStateStore.load(from: url).wasUnreadable)
@@ -317,7 +318,7 @@ final class ImmichAlignmentRulesTests: XCTestCase {
             .hasSuffix(" Immich sta ancora leggendo l'SSD: le foto che non ci sono più le tolgo al prossimo giro."))
         var unreadable = ImmichAlignmentReport(); unreadable.offlineSkipped = true; unreadable.stateWasUnreadable = true
         XCTAssertTrue(ImmichAlignmentText.done(unreadable, at: date, timeZone: rome)
-            .hasSuffix(" Il file dove l'app ricorda cosa ha fatto non si leggeva: per questo giro non tolgo nessuna foto, lo faccio al prossimo."))
+            .hasSuffix(" Il file dell'allineamento non si leggeva ed è stato messo da parte: prima di togliere foto da Immich ti chiederò conferma."))
         var busy = ImmichAlignmentReport(); busy.removalStopped = true
         XCTAssertTrue(ImmichAlignmentText.done(busy, at: date, timeZone: rome)
             .hasSuffix(" Immich ha iniziato una nuova scansione: le foto che non ci sono più le tolgo al prossimo giro."))
@@ -334,13 +335,54 @@ final class ImmichAlignmentRulesTests: XCTestCase {
         }
     }
 
-    func testMissingToConfirm_isOnlyTheDropGuardNumber() {
-        XCTAssertEqual(ImmichAlignmentStatus.dropGuard(missing: 52139).missingToConfirm, 52139)
-        XCTAssertNil(ImmichAlignmentStatus.idle.missingToConfirm)
-        XCTAssertNil(ImmichAlignmentStatus.needsKey.missingToConfirm)
-        XCTAssertNil(ImmichAlignmentStatus.failed(.notReachable).missingToConfirm)
-        XCTAssertNil(ImmichAlignmentStatus.failed(.dropGuard(missing: 7)).missingToConfirm)
-        XCTAssertNil(ImmichAlignmentStatus.done(ImmichAlignmentReport(), Date()).missingToConfirm)
+    func testConfirmationToAccept_isTypedAndOnlyForTheTwoConfirmableStates() {
+        XCTAssertEqual(ImmichAlignmentStatus.dropGuard(missing: 52139).confirmationToAccept, .drop(missing: 52139))
+        XCTAssertEqual(ImmichAlignmentStatus.confirmFirstRemoval(active: 10, toRemove: 25).confirmationToAccept,
+                       .firstRemoval(active: 10, toRemove: 25))
+        XCTAssertNil(ImmichAlignmentStatus.idle.confirmationToAccept)
+        XCTAssertNil(ImmichAlignmentStatus.running("x").confirmationToAccept)
+        XCTAssertNil(ImmichAlignmentStatus.needsKey.confirmationToAccept)
+        XCTAssertNil(ImmichAlignmentStatus.failed(.notReachable).confirmationToAccept)
+        XCTAssertNil(ImmichAlignmentStatus.failed(.dropGuard(missing: 7)).confirmationToAccept)
+        XCTAssertNil(ImmichAlignmentStatus.done(ImmichAlignmentReport(), Date()).confirmationToAccept)
+    }
+
+    // MARK: - P2: il clic conferma solo lo stato che l'alert ha mostrato
+
+    func testShouldAccept_confirmsOnlyWhenTheStateIsStillTheFrozenOne() {
+        let frozen = ImmichConfirmation.firstRemoval(active: 52139, toRemove: 89514)
+        XCTAssertEqual(ImmichConfirmation.shouldAccept(frozen: frozen, current: frozen), frozen)
+        // lo stato e' diventato un'altra richiesta, o numeri diversi, o nessuna richiesta
+        XCTAssertNil(ImmichConfirmation.shouldAccept(frozen: frozen, current: .drop(missing: 89514)))
+        XCTAssertNil(ImmichConfirmation.shouldAccept(frozen: frozen, current: .firstRemoval(active: 52139, toRemove: 89515)))
+        XCTAssertNil(ImmichConfirmation.shouldAccept(frozen: frozen, current: .firstRemoval(active: 0, toRemove: 89514)))
+        XCTAssertNil(ImmichConfirmation.shouldAccept(frozen: frozen, current: nil))
+        XCTAssertNil(ImmichConfirmation.shouldAccept(frozen: .drop(missing: 5), current: .drop(missing: 6)))
+        XCTAssertEqual(ImmichConfirmation.shouldAccept(frozen: .drop(missing: 5), current: .drop(missing: 5)), .drop(missing: 5))
+    }
+
+    func testConfirmationTextComesFromTheFrozenConfirmation() {
+        XCTAssertEqual(ImmichAlignmentText.confirmation(for: ImmichConfirmation.firstRemoval(active: 52139, toRemove: 89514)),
+            "89.514 foto escono da Immich (solo dal suo elenco: i file sull'SSD non vengono toccati). Le 52.139 foto che Immich vede restano.")
+        XCTAssertEqual(ImmichAlignmentText.confirmation(for: ImmichConfirmation.drop(missing: 600)),
+                       ImmichAlignmentText.acceptDropConfirmation(missing: 600))
+    }
+
+    // MARK: - P4: il riferimento confermato sopravvive al file e un file vecchio non lo e'
+
+    func testReferenceConfirmedSurvivesSaveAndLoad() throws {
+        let url = tempURL("immich-alignment.json")
+        try ImmichAlignmentStateStore.save(ImmichAlignmentState(healthyActiveCount: 7, referenceConfirmed: true), to: url)
+        XCTAssertTrue(ImmichAlignmentStateStore.load(from: url).state.referenceConfirmed)
+        try ImmichAlignmentStateStore.save(ImmichAlignmentState(healthyActiveCount: 7, referenceConfirmed: false), to: url)
+        XCTAssertFalse(ImmichAlignmentStateStore.load(from: url).state.referenceConfirmed)
+    }
+
+    func testAnOldStateFileWithoutTheFieldDecodesAsNotConfirmed() throws {
+        let state = try JSONDecoder().decode(ImmichAlignmentState.self,
+                                             from: Data(#"{"archivedAssetIds":[],"healthyActiveCount":52139,"stackedDuplicateIds":[]}"#.utf8))
+        XCTAssertEqual(state.healthyActiveCount, 52139)
+        XCTAssertFalse(state.referenceConfirmed)
     }
 
     func testConfirmFirstRemovalStatus() {
@@ -349,7 +391,7 @@ final class ImmichAlignmentRulesTests: XCTestCase {
             "Prima di togliere foto da Immich mi serve un tuo sì: Immich vede 52.139 foto sull'SSD e ne toglierebbe 89.514 che sull'SSD non ci sono più.")
         XCTAssertFalse(status.isProblem)
         XCTAssertEqual(status.actions, [.acceptDrop])
-        XCTAssertEqual(status.missingToConfirm, 89514)
+        XCTAssertEqual(status.confirmationToAccept, .firstRemoval(active: 52139, toRemove: 89514))
     }
 
     func testConfirmationTextPerStatus() {
