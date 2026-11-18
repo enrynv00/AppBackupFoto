@@ -1104,6 +1104,23 @@ nonisolated enum ImmichAlignmentRules {
         assets.filter { $0.isOffline && $0.isTrashed && $0.libraryId == libraryId }.map(\.id)
     }
 
+    /// Le offline della libreria che `GET /libraries/{id}/statistics` conterebbe se tornassero
+    /// attive: non le parti video nascoste delle Live Photo (`hidden`), che `total` non conta.
+    static func countedOfflineIds(_ assets: [ImmichAsset], libraryId: String) -> Set<String> {
+        Set(assets.filter { $0.isOffline && $0.libraryId == libraryId && $0.visibility != "hidden" }.map(\.id))
+    }
+
+    /// Divide l'aumento delle foto attive fra foto nuove e foto ritrovate: quelle offline prima
+    /// della scansione che dopo non lo sono piu'. Senza l'elenco di dopo (scansione non finita)
+    /// si contano ritrovate al massimo tutte le offline di prima.
+    static func newAndReturned(before: Int, after: Int, offlineBefore: Set<String>,
+                               offlineAfter: Set<String>?) -> (new: Int, returned: Int) {
+        let increase = max(0, after - before)
+        let back = offlineAfter.map { offlineBefore.subtracting($0).count } ?? offlineBefore.count
+        let returned = min(increase, back)
+        return (increase - returned, returned)
+    }
+
     static func dropThreshold(baseline: Int) -> Int {
         let fraction = Int((Double(max(0, baseline)) * dropGuardFraction).rounded(.down))
         return min(dropGuardAbsolute, fraction)
@@ -1259,6 +1276,9 @@ nonisolated enum ImmichAlignmentStateStore {
 
 nonisolated struct ImmichAlignmentReport: Equatable, Sendable {
     var newAssets = 0
+    /// Foto che Immich aveva segnato offline (l'SSD si era staccato con Immich acceso) e che la
+    /// scansione ha ritrovato: tornano attive ma non sono nuove.
+    var returnedAssets = 0
     var offlineRemoved = 0
     var stacksCreated = 0
     var archived = 0
@@ -1338,6 +1358,10 @@ nonisolated enum ImmichAlignmentText {
     static func done(_ r: ImmichAlignmentReport, at date: Date, timeZone: TimeZone = .current) -> String {
         var parts: [String] = []
         if r.newAssets > 0 { parts.append(r.newAssets == 1 ? "1 foto nuova" : "\(number(r.newAssets)) foto nuove") }
+        if r.returnedAssets > 0 {
+            parts.append(r.returnedAssets == 1 ? "1 foto ritrovata sull'SSD"
+                                               : "\(number(r.returnedAssets)) foto ritrovate sull'SSD")
+        }
         if r.offlineRemoved > 0 {
             parts.append(r.offlineRemoved == 1 ? "1 tolta perché non più sull'SSD"
                                                : "\(number(r.offlineRemoved)) tolte perché non più sull'SSD")
@@ -1876,6 +1900,11 @@ nonisolated enum ImmichAlignmentRun {
             do { try env.saveState(state) } catch { throw ImmichAlignmentFailure.stateNotSaved }
         }
 
+        // Le offline di prima della scansione: se l'SSD si era staccato con Immich acceso, la
+        // scansione le ritrova e tornano attive. Servono solo per non chiamarle «foto nuove».
+        let offlineBefore = ImmichAlignmentRules.countedOfflineIds(
+            try await api.searchAll(.offline(libraryId: library.id)), libraryId: library.id)
+
         // Regola 3, prima guardia: mai una scansione con l'SSD staccato.
         guard await env.ssdMounted() else { throw ImmichAlignmentFailure.ssdNotMounted }
         await env.progress(ImmichAlignmentText.scanning)
@@ -1892,7 +1921,8 @@ nonisolated enum ImmichAlignmentRun {
         }
 
         let after = try await api.statistics(libraryId: library.id).total
-        report.newAssets = max(0, after - before)
+        // Senza l'elenco delle offline di dopo (scansione non finita) la divisione e' una stima.
+        var offlineAfter: Set<String>? = nil
 
         // Regola 3, seconda guardia, solo con un riferimento affidabile: lo stato corrente (con il
         // riferimento non abbassato) si salva anche quando scatta, cosi' un «Riprova» su un SSD
@@ -1917,8 +1947,9 @@ nonisolated enum ImmichAlignmentRun {
             report.offlineSkipped = true
         } else {
             await env.progress(ImmichAlignmentText.cleaning)
-            let offline = ImmichAlignmentRules.offlineToRemove(try await api.searchAll(.offline(libraryId: library.id)),
-                                                               libraryId: library.id)
+            let offlineFound = try await api.searchAll(.offline(libraryId: library.id))
+            offlineAfter = ImmichAlignmentRules.countedOfflineIds(offlineFound, libraryId: library.id)
+            let offline = ImmichAlignmentRules.offlineToRemove(offlineFound, libraryId: library.id)
             var mayRemove = true
             if !referenceReliable {
                 // Senza riferimento affidabile si toglie solo con la conferma di Enrico, e solo se
@@ -1977,6 +2008,9 @@ nonisolated enum ImmichAlignmentRun {
         // Il segnale parte solo dopo che il riferimento e' stato salvato davvero, e resta valido
         // anche se un passo successivo lancia: il margine dei doppioni e' stato usato.
         if advancesReference { env.referenceAdvanced() }
+
+        (report.newAssets, report.returnedAssets) = ImmichAlignmentRules.newAndReturned(
+            before: before, after: after, offlineBefore: offlineBefore, offlineAfter: offlineAfter)
 
         await env.progress(ImmichAlignmentText.stacking)
         let groups = try await api.duplicates()

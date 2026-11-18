@@ -172,7 +172,7 @@ Immich parte e si ferma con l'SSD, e dopo ogni scrittura sull'SSD l'app lo riall
 
 **Ordine dei passi di `ImmichAlignmentRun.run`**
 
-1. libreria dell'SSD (`GET /libraries`) e foto attive prima della scansione (`before`);
+1. libreria dell'SSD (`GET /libraries`), foto attive prima della scansione (`before`) e offline di prima (`POST /search/metadata`, `countedOfflineIds`: senza le parti video `hidden` delle Live Photo, che `statistics` non conta). Servono solo all'esito: `newAndReturned` divide l'aumento fra foto nuove e foto ritrovate (offline prima, non piu' dopo), così un SSD staccato con Immich acceso non produce «48.148 foto nuove» (2026-11-18); con la scansione non finita la divisione è una stima;
 2. SSD montato, poi `POST /libraries/{id}/scan` e attesa della coda `library` ferma (con `paused` contato), tetto 1.800 s: allo scadere `scanTimedOut` e in quel giro non si toglie niente;
 3. foto attive dopo la scansione (`after`); con un riferimento affidabile, guardia del calo; poi seconda verifica dell'SSD;
 4. offline da togliere (`POST /search/metadata`); senza riferimento affidabile serve la conferma `.firstRemoval`, altrimenti l'esito è `needsFirstConfirmation`;

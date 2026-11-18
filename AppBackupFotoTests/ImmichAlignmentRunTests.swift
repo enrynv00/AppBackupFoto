@@ -10,6 +10,8 @@ nonisolated final class FakeImmichAPI: ImmichAlignmentAPI, @unchecked Sendable {
     /// Quante chiamate a `jobs` rispondono «occupato» prima di «libero».
     var busyPolls = 0
     var offlineAssets: [ImmichAsset] = []
+    /// Offline restituite prima della scansione; `nil` = le stesse di `offlineAssets`.
+    var offlineAssetsBeforeScan: [ImmichAsset]? = nil
     var imageAssets: [ImmichAsset] = []
     var duplicateGroups: [ImmichDuplicateGroup] = []
     /// Primo ID di una pila → errore da lanciare per quella pila.
@@ -41,6 +43,8 @@ nonisolated final class FakeImmichAPI: ImmichAlignmentAPI, @unchecked Sendable {
     }
     func searchAll(_ search: ImmichSearch) async throws -> [ImmichAsset] {
         switch search {
+        case .offline where scanCount == 0:
+            calls.append("search-offline-before"); return offlineAssetsBeforeScan ?? offlineAssets
         case .offline: calls.append("search-offline"); return offlineAssets
         case .images: calls.append("search-images"); return imageAssets
         }
@@ -108,7 +112,7 @@ final class ImmichAlignmentRunTests: XCTestCase {
 
         let (report, state) = try await run(api, state: known)
 
-        XCTAssertEqual(api.calls, ["libraries", "statistics", "scan", "jobs", "statistics", "search-offline",
+        XCTAssertEqual(api.calls, ["libraries", "statistics", "search-offline-before", "scan", "jobs", "statistics", "search-offline",
                                    "jobs", "statistics", "delete", "duplicates", "stack", "search-images", "archive"])
         XCTAssertEqual(report, ImmichAlignmentReport(newAssets: 12, offlineRemoved: 1, stacksCreated: 1, archived: 1))
         XCTAssertEqual(api.deleted, [["off"]])
@@ -218,6 +222,39 @@ final class ImmichAlignmentRunTests: XCTestCase {
         XCTAssertEqual(api.stacks.count, 1)
         XCTAssertTrue(api.calls.contains("search-images"))
         XCTAssertLessThan(api.calls.filter { $0 == "jobs" }.count, 20)
+    }
+
+    /// SSD staccato con Immich acceso (2026-11-18): Immich aveva segnato offline quasi tutto, la
+    /// scansione le ritrova. Non sono foto nuove: si contano a parte, e non si toglie niente.
+    /// La parte video nascosta di una Live Photo non conta, come in `statistics`.
+    func testPhotosBackFromOffline_areNotCountedAsNew() async throws {
+        let api = FakeImmichAPI()
+        api.totals = [10, 15]
+        api.offlineAssetsBeforeScan = [immichTestAsset("a", offline: true, trashed: true),
+                                       immichTestAsset("b", offline: true, trashed: true),
+                                       immichTestAsset("c", offline: true),
+                                       immichTestAsset("v", type: "VIDEO", offline: true, trashed: true, visibility: "hidden")]
+        api.offlineAssets = []
+
+        let (report, _) = try await run(api, state: ImmichAlignmentState(healthyActiveCount: 15, referenceConfirmed: true))
+
+        XCTAssertEqual(report.returnedAssets, 3)
+        XCTAssertEqual(report.newAssets, 2)
+        XCTAssertEqual(report.offlineRemoved, 0)
+        XCTAssertTrue(api.deleted.isEmpty)
+    }
+
+    /// Un'offline che resta offline (file davvero tolto dall'SSD) non e' una foto ritrovata:
+    /// l'aumento e' tutto di foto nuove.
+    func testOfflineThatStaysOffline_doesNotHideNewPhotos() async throws {
+        let api = FakeImmichAPI()
+        api.totals = [100, 103]
+        api.offlineAssets = [immichTestAsset("gone", offline: true, trashed: true)]
+
+        let (report, _) = try await run(api, state: known)
+
+        XCTAssertEqual(report.newAssets, 3)
+        XCTAssertEqual(report.returnedAssets, 0)
     }
 
     // MARK: - Pile, minuscole, stato

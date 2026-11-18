@@ -306,6 +306,33 @@ final class ImmichAlignmentRulesTests: XCTestCase {
             "Immich aggiornato alle 22:41: niente da cambiare.")
     }
 
+    func testDoneLineSaysPhotosBackFromOffline_apartFromNewOnes() {
+        XCTAssertEqual(ImmichAlignmentText.done(ImmichAlignmentReport(newAssets: 507, returnedAssets: 48148), at: date, timeZone: rome),
+            "Immich aggiornato alle 22:41: 507 foto nuove, 48.148 foto ritrovate sull'SSD.")
+        XCTAssertEqual(ImmichAlignmentText.done(ImmichAlignmentReport(returnedAssets: 1), at: date, timeZone: rome),
+            "Immich aggiornato alle 22:41: 1 foto ritrovata sull'SSD.")
+    }
+
+    func testNewAndReturned_splitsTheIncrease() {
+        let before: Set<String> = ["a", "b", "c"]
+        // Tornate a e b, c resta offline: 2 ritrovate, il resto e' nuovo.
+        XCTAssertTrue(ImmichAlignmentRules.newAndReturned(before: 10, after: 15, offlineBefore: before, offlineAfter: ["c"]) == (3, 2))
+        // Nessun elenco di dopo (scansione non finita): al massimo tutte quelle di prima.
+        XCTAssertTrue(ImmichAlignmentRules.newAndReturned(before: 10, after: 15, offlineBefore: before, offlineAfter: nil) == (2, 3))
+        // Mai piu' ritrovate dell'aumento, mai numeri negativi.
+        XCTAssertTrue(ImmichAlignmentRules.newAndReturned(before: 10, after: 11, offlineBefore: before, offlineAfter: []) == (0, 1))
+        XCTAssertTrue(ImmichAlignmentRules.newAndReturned(before: 10, after: 8, offlineBefore: before, offlineAfter: []) == (0, 0))
+    }
+
+    func testCountedOfflineIds_skipsHiddenLivePhotoVideosAndOtherLibraries() {
+        let assets = [immichTestAsset("a", offline: true, trashed: true),
+                      immichTestAsset("b", offline: true),
+                      immichTestAsset("h", type: "VIDEO", offline: true, visibility: "hidden"),
+                      immichTestAsset("x", offline: true, library: "other"),
+                      immichTestAsset("on")]
+        XCTAssertEqual(ImmichAlignmentRules.countedOfflineIds(assets, libraryId: "lib"), ["a", "b"])
+    }
+
     func testDoneLineSaysWhenTheScanDidNotFinish() {
         var report = ImmichAlignmentReport(); report.scanTimedOut = true
         XCTAssertTrue(ImmichAlignmentText.done(report, at: date, timeZone: rome)
